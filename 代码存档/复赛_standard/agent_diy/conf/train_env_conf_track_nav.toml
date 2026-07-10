@@ -1,0 +1,352 @@
+# =============================================================================
+# Track Nav: joint obstacle-avoidance + navigation training (end-to-end).
+# Track Nav: 避障 + 导航联合训练（端到端）
+#
+# Based on standard_nav.toml, adapted to track terrain (5 sub-terrains per lane,
+# 10 parallel lanes with increasing difficulty).
+# 参考 standard_nav.toml，适配 track 地形（5 段子地形串联成赛道，并行 10 条难度递增）
+#
+# Learning rate is set in NavConfig (lr = 1e-4).
+# 学习率在 NavConfig 中设置（lr = 1e-4）
+# =============================================================================
+
+# === Basic Configuration ===
+# === 基础配置 ===
+[env]
+# Number of parallel environments, valid range: [1, 4096].
+# 并行环境数量，合法范围：[1, 4096]
+num_envs = 2048
+
+# Max episode duration (seconds); track course is long, keep 150s.
+# 最大 episode 时长（秒）；track 赛道较长，保留 150s
+episode_length_s = 150
+
+[env_conf]
+# Random seed.
+# Training: this seed is NOT transferred to terrain_generator.seed.
+# Terrain tile layout uses numpy's global RNG state, so layouts are not
+# locked to this field during training.
+# Evaluation: this seed is transferred to terrain_generator.seed by the
+# platform, making evaluation terrain layouts reproducible under the
+# platform-assigned seed.
+# 随机种子
+# 训练：不透传到 terrain_generator.seed，地形瓦片布局由 numpy 全局 RNG
+#      状态决定，训练阶段地形布局不被本字段锁定。
+# 评估：由平台将 seed 透传到 terrain_generator.seed，保证在平台指定的
+#      seed 下评估地形布局可复现。
+seed = 0
+
+
+# === Terrain Configuration ===
+# === 地形配置 ===
+[terrain]
+# Terrain mode, valid values: "standard" | "track".
+# 地形模式，合法值："standard" | "track"
+mode = "track"
+
+# In track mode, num_rows is overridden by [terrain.track].track_length (segments per lane).
+# track 模式下 num_rows 会被 [terrain.track].track_length 覆盖（每条赛道段数）
+num_rows = 10
+
+# In track mode, num_cols is the number of difficulty tiers (parallel lanes, l0 easiest, l9 hardest).
+# track 模式下 num_cols 代表难度档数（并行赛道数，l0 最简单，l9 最难）
+num_cols = 10
+
+# Difficulty range [min, max], valid range: [0.0, 1.0].
+# 难度范围 [min, max]，合法范围：[0.0, 1.0]
+difficulty_range = [0.0, 1.0]
+
+# Whether to enable terrain curriculum (promote/demote difficulty by performance).
+# 是否启用地形课程学习（按表现晋级/降级难度）
+curriculum = true
+
+# Max init difficulty tier for robot placement, valid range: [0, 9];
+# recommended 0 in track mode (start from the easiest tier).
+# 机器人初始放置的最大难度档，合法范围：[0, 9]；track 模式建议 0（从最简单档开始）
+max_init_terrain_level = 0
+
+[terrain.track]
+# Number of sub-terrains per lane along X-axis, valid range: [1, 5].
+# 每条赛道串联的子地形数量（X 轴方向段数），合法范围：[1, 5]
+track_length = 5
+
+# Sub-terrain sequence: length must equal track_length, no duplicates allowed,
+# and the LAST element must be "open_entry_maze" (track finish is always a maze);
+# allowed: pyramid_slope | pyramid_slope_inv | pyramid_stairs | pyramid_stairs_inv | open_entry_maze.
+# 子地形序列，长度必须等于 track_length，元素不能重复，
+# 且最后一个元素必须为 "open_entry_maze"（赛道终点恒为迷宫）；
+# 合法值：pyramid_slope | pyramid_slope_inv | pyramid_stairs | pyramid_stairs_inv | open_entry_maze
+sub_terrains = ["pyramid_slope", "pyramid_slope_inv", "pyramid_stairs", "pyramid_stairs_inv", "open_entry_maze"]
+
+
+# === Domain Randomization ===
+# === 域随机化 ===
+[domain_rand]
+# Master switch for domain randomization.
+# 域随机化总开关
+enable_domain_rand = true
+
+# Whether to randomize ground friction.
+# 是否随机化地面摩擦系数
+randomize_friction = true
+
+# Friction range [min, max], must be >= 0.
+# 摩擦系数采样范围 [min, max]，必须 >= 0
+friction_range = [0.3, 1.5]
+
+# Whether to periodically push the robot.
+# 是否周期性对机器人施加外部推力
+push_robots = true
+
+# Push interval (seconds), must be > 0.
+# 推力间隔（秒），必须 > 0
+push_interval_s = 15
+
+# Max push velocity in XY plane (m/s), must be >= 0.
+# XY 平面最大推力速度 (m/s)，必须 >= 0
+max_push_vel_xy = 0.5
+
+
+# === Observation Noise ===
+# === 观测噪声 ===
+[noise]
+# Whether to add noise to observations.
+# 是否在观测中加入噪声
+add_noise = true
+
+
+# === Initial State ===
+# === 初始状态 ===
+[init_state]
+# Robot initial position [x, y, z] (m); z valid range [0.30, 0.60]m, recommended 0.35m.
+# 机器人初始位置 [x, y, z] (m)；z 合法范围：[0.30, 0.60]m，推荐 0.35m
+pos = [0.0, 0.0, 0.35]
+
+
+# === Velocity Commands: tuned for maze nav (slow & safe traversal) ===
+# === 速度命令：迷宫导航专用，低速安全通行 ===
+# Corridor width 0.6~1.0m: high speed leads to late turning and sensor mis-alignment on strafing.
+# 通道宽 0.6~1.0m，高速来不及转弯且侧移会导致 sensor 错位
+[commands]
+# Velocity command resampling interval [min, max] (seconds).
+# 速度命令重采样区间 [min, max]（秒）
+resampling_time = [5.0, 5.0]
+
+[commands.limit]
+# Velocity command **hard limits** (curriculum may expand sampling range up to here).
+# 速度命令 **采样上限**（硬约束，curriculum 最多扩展到该范围）
+
+# X linear velocity range (m/s) — low speed for comfortable turning in mazes.
+# X 方向线速度范围 (m/s) — 迷宫低速，转弯从容
+lin_vel_x = [0.0, 0.8]
+
+# Y linear velocity range (m/s) — narrowed to suppress strafing.
+# Y 方向线速度范围 (m/s) — 收窄侧向，抑制侧移
+lin_vel_y = [-0.3, 0.3]
+
+# Yaw angular velocity range (rad/s) — kept wide for wall circumvention.
+# Z 轴角速度范围 (rad/s) — 保持，导航绕墙需要
+ang_vel_z = [-1.5, 1.5]
+
+[commands.ranges]
+# Velocity command **initial sampling ranges** (expand towards limit when curriculum is enabled).
+# 速度命令 **初始采样范围**（curriculum 开启时会动态扩大到 limit）
+
+# Normal forward speed.
+# 常规前进
+lin_vel_x = [0.0, 0.5]
+
+# Narrowed lateral.
+# 收窄侧向
+lin_vel_y = [-0.15, 0.15]
+
+ang_vel_yaw = [-1.0, 1.0]
+
+
+# =====================================================================
+# Reward configuration: locomotion base + obstacle avoidance + navigation
+# (reference: standard_nav.toml)
+# 奖励配置：locomotion 基础 + 避障 + 导航（参考 standard_nav.toml）
+#
+# Each reward term must have a numeric `weight`; parameterized rewards use [rewards.<name>.params].
+# 每个奖励项必须包含数值型 weight；带参数的奖励用 [rewards.<name>.params] 配置
+# =====================================================================
+
+# --- Positive: velocity tracking (down-weighted so navigation signal dominates) ---
+# --- 正向：速度跟踪（降权，让导航信号主导）---
+[rewards.track_lin_vel_xy]
+weight = 0.15
+[rewards.track_lin_vel_xy.params]
+# Std of Gaussian kernel, controls how sharp the error → reward decay is.
+# 高斯核标准差，控制误差 → 奖励的衰减陡峭程度
+std = 0.25
+# Velocity command name.
+# 速度命令名
+command_name = "base_velocity"
+
+[rewards.track_ang_vel_z]
+weight = 0.1
+[rewards.track_ang_vel_z.params]
+std = 0.25
+command_name = "base_velocity"
+
+# --- Negative: base stability ---
+# --- 负向：基座稳定 ---
+[rewards.lin_vel_z]
+# Penalty on vertical linear velocity.
+# Z 方向线速度惩罚（抑制上下跳跃）
+weight = -2.0
+
+[rewards.ang_vel_xy]
+# Penalty on pitch/roll angular velocity.
+# X/Y 方向角速度惩罚（抑制 pitch/roll 抖动）
+weight = -0.05
+
+# --- Negative: joint smoothness ---
+# --- 负向：关节 ---
+[rewards.joint_acc]
+# Joint acceleration penalty.
+# 关节加速度惩罚
+weight = -2.5e-7
+
+[rewards.energy]
+# Energy penalty (torque × joint velocity).
+# 能耗惩罚（扭矩 × 角速度）
+weight = -2e-5
+
+[rewards.joint_torques]
+# Joint torque penalty.
+# 关节扭矩惩罚
+weight = -1e-4
+
+[rewards.dof_pos_limits]
+# Penalty when joints approach position limits.
+# 接近关节位置极限时的惩罚
+weight = -2.0
+
+# --- Negative: posture ---
+# --- 负向：姿态 ---
+[rewards.correct_base_height]
+# Base height tracking.
+# 基座高度跟踪
+weight = -1.0
+[rewards.correct_base_height.params]
+# Target base height (m).
+# 目标基座高度 (m)
+target_height = 0.38
+
+# --- Negative: action smoothness ---
+# --- 负向：动作平滑 ---
+[rewards.action_rate]
+# Delta between consecutive actions (1st order).
+# 相邻动作差（一阶）
+weight = -0.01
+
+[rewards.action_smoothness]
+# 2nd-order action smoothness.
+# 动作二阶平滑
+weight = -0.01
+
+# --- Negative: undesired contacts ---
+# --- 负向：碰撞 ---
+# High weight: wall-collision cost must exceed the discounted reward of rushing into walls.
+# 提高权重：撞墙代价必须高于冲墙的折扣收益差
+[rewards.undesired_contacts]
+weight = -5.0
+[rewards.undesired_contacts.params]
+# Max allowed contacts before penalty kicks in.
+# 触发阈值：被罚前允许的最大接触数
+threshold = 1
+
+# --- Negative: foot height regulation (body frame) ---
+# --- 负向：脚部调节（body frame）---
+[rewards.feet_height_body]
+weight = -0.05
+[rewards.feet_height_body.params]
+command_name = "base_velocity"
+# Foot z-target in body frame (closer to 0 → higher swing).
+# body frame 下脚 z 目标（越接近 0 抬腿越高）
+target_height = -0.30
+# tanh saturation slope.
+# tanh 饱和斜率
+tanh_mult = 2.0
+
+# --- Negative: hip joint returning to default ---
+# --- 负向：髋关节回默认 ---
+[rewards.hip_to_default]
+weight = -0.05
+
+# --- Termination penalty (high weight so falling cost >> discounted wall-rush reward) ---
+# --- 终止惩罚（提高权重，撞死代价远超冲墙折扣收益）---
+[rewards.termination]
+weight = -10.0
+
+# --- Anti-tipping ---
+# --- 防倾倒 ---
+[rewards.flat_orientation]
+# Penalty on deviation from flat base orientation.
+# 基座偏离水平姿态的惩罚
+weight = -1.5
+
+# --- Anti-stumbling ---
+# --- 防绊倒 ---
+[rewards.feet_stumble]
+# Penalty when foot hits edge: horizontal force >> vertical.
+# 脚碰台阶边缘时水平力 >> 垂直力的惩罚
+weight = -0.1
+
+# --- Avoidance: penalize not turning when blocked ahead ---
+# --- 避障：前方被障碍阻挡时未主动转向的惩罚 ---
+[rewards.obstacle_evasion]
+weight = -1.0
+[rewards.obstacle_evasion.params]
+command_name = "base_velocity"
+
+
+# =====================================================================
+# Navigation rewards
+# 导航奖励
+# =====================================================================
+
+# Main navigation: the only positive nav signal (clear ahead → towards goal; blocked → by clearance).
+# 主导航：唯一的正向导航信号（前方通 → 朝 goal；堵 → 按 clearance 走）
+[rewards.heuristic_navigation]
+weight = 8.0
+[rewards.heuristic_navigation.params]
+# Obstacle threshold (height delta in meters, negative = wall/pit).
+# 障碍判定阈值（高度差，米，负值 = 下凹/墙）
+obstacle_threshold = -0.3
+
+# Fallback when blocked: reward turning (nav_scanner detects L-shaped turns 2.5m ahead).
+# 前方堵兜底：奖励转向（nav_scanner 2.5m 提前检测 L 型转角）
+[rewards.deadend_escape]
+weight = 4.0
+[rewards.deadend_escape.params]
+obstacle_threshold = -0.3
+# Trapped threshold (0~1, larger = more lenient).
+# 判定"被困"的阈值（0~1，越大越宽松）
+trapped_threshold = 0.3
+
+# Wall-proximity brake: penalize high forward speed near walls.
+# 近墙减速：前方有墙时惩罚高速前冲
+[rewards.wall_proximity_brake]
+weight = -3.0
+[rewards.wall_proximity_brake.params]
+obstacle_threshold = -0.3
+
+# Reach-goal bonus (one-shot large reward when distance < threshold).
+# 到达目标奖励（距离 < threshold 一次性大奖）
+[rewards.reach_goal]
+weight = 10.0
+[rewards.reach_goal.params]
+# Reach threshold (m). Must equal `_goal_reached_termination` threshold
+# in velocity_env_cfg.py; mismatch causes a dead zone (terminated but
+# reward == 0).
+# 到达判定阈值 (m)，必须与 velocity_env_cfg.py 中 `_goal_reached_termination`
+# 的 threshold 一致，否则产生"死区"（终止但奖励为 0）。
+threshold = 0.6
+
+# Navigation time penalty (constant per-step, encourages fast arrival).
+# 导航时间惩罚（每步固定扣分，鼓励快速到达）
+[rewards.navigation_time]
+weight = -0.008

@@ -1,0 +1,5 @@
+.DS_Store
+.nfs*
+__pycache__/
+*.py[cod]
+kaiwu_ide_crack/

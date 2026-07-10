@@ -1,0 +1,238 @@
+# =============================================================================
+# Standard Locomotion: locomotion training on a standard grid of mixed sub-terrains.
+# Standard Locomotion: 标准地形运动训练（多种子地形按比例混合）
+#
+# Based on  Stage1 + extra terms (termination / flat_orientation / feet_stumble).
+# 基于 Stage1 + 额外项（termination / flat_orientation / feet_stumble）
+# =============================================================================
+
+# === Basic Configuration ===
+# === 基础配置 ===
+[env]
+# Number of parallel environments, valid range: [1, 4096].
+# 并行环境数量，合法范围：[1, 4096]
+num_envs = 2048
+
+# Max episode duration (seconds).
+# 最大 episode 时长（秒）
+episode_length_s = 25
+
+[env_conf]
+# Random seed.
+# 随机种子
+seed = 0
+
+
+# === Terrain Configuration ===
+# === 地形配置 ===
+[terrain]
+# Terrain mode, valid values: "standard" | "track".
+# 地形模式，合法值："standard" | "track"
+mode = "standard"
+
+# In standard mode, num_rows = number of difficulty tiers (curriculum levels along X),
+# valid range [1, 10], recommended 10.
+# standard 模式下 num_rows 表示**难度级别数**（沿 X 轴的课程档位），合法范围：[1, 10]，推荐 10
+num_rows = 10
+
+# In standard mode, num_cols = parallel plots within the same difficulty tier along Y,
+# valid range [1, 40], recommended 20.
+# Note: in standard mode num_cols is NOT a difficulty tier, just parallel plots for env distribution.
+# standard 模式下 num_cols 表示**同一难度下的并行地块数**（沿 Y 轴），合法范围：[1, 40]，推荐 20
+# 注意：standard 模式下 num_cols 不是难度档，而是用于分散大量 env 到不同地块的并行数
+num_cols = 20
+
+# Difficulty range [min, max], valid range: [0.0, 1.0].
+# 难度范围 [min, max]，合法范围：[0.0, 1.0]
+difficulty_range = [0.0, 1.0]
+
+# Whether to enable terrain curriculum (promote/demote difficulty by performance).
+# 是否启用地形课程学习（按表现晋级/降级难度）
+curriculum = true
+
+# Max init difficulty tier for robot placement, valid range: [0, 9].
+# 机器人初始放置的最大难度档，合法范围：[0, 9]
+max_init_terrain_level = 5
+
+
+# Sub-terrain proportions (all proportions must sum to 1.0).
+# Allowed sub-terrains: pyramid_slope | pyramid_slope_inv | pyramid_stairs | pyramid_stairs_inv | maze
+# 子地形比例（所有 proportion 之和必须 = 1.0）
+# 合法子地形：pyramid_slope | pyramid_slope_inv | pyramid_stairs | pyramid_stairs_inv | maze
+[terrain.standard.pyramid_slope]
+proportion = 0.15
+
+[terrain.standard.pyramid_slope_inv]
+proportion = 0.2
+
+[terrain.standard.pyramid_stairs]
+proportion = 0.25
+
+[terrain.standard.pyramid_stairs_inv]
+proportion = 0.3
+
+[terrain.standard.maze]
+proportion = 0.1
+
+
+# === Domain Randomization ===
+# === 域随机化 ===
+[domain_rand]
+# Master switch for domain randomization.
+# 域随机化总开关
+enable_domain_rand = true
+
+# Whether to randomize ground friction.
+# 是否随机化地面摩擦系数
+randomize_friction = true
+
+# Friction range [min, max], must be >= 0.
+# 摩擦系数采样范围 [min, max]，必须 >= 0
+friction_range = [0.3, 1.5]
+
+# Whether to periodically push the robot.
+# 是否周期性对机器人施加外部推力
+push_robots = true
+
+# Push interval (seconds), must be > 0.
+# 推力间隔（秒），必须 > 0
+push_interval_s = 15
+
+# Max push velocity in XY plane (m/s), must be >= 0.
+# XY 平面最大推力速度 (m/s)，必须 >= 0
+max_push_vel_xy = 0.5
+
+
+# === Observation Noise ===
+# === 观测噪声 ===
+[noise]
+# Whether to add noise to observations.
+# 是否在观测中加入噪声
+add_noise = true
+
+
+# === Initial State ===
+# === 初始状态 ===
+[init_state]
+# Robot initial position [x, y, z] (m); z valid range [0.30, 0.60]m, recommended 0.35m.
+# 机器人初始位置 [x, y, z] (m)；z 合法范围：[0.30, 0.60]m，推荐 0.35m
+pos = [0.0, 0.0, 0.35]
+
+
+# === Velocity Commands ===
+# === 速度命令 ===
+[commands]
+# Velocity command resampling interval [min, max] (seconds).
+# 速度命令重采样区间 [min, max]（秒）
+resampling_time = [10.0, 10.0]
+
+[commands.limit]
+# Velocity command **hard limits** (curriculum may expand sampling range up to here).
+# 速度命令 **采样上限**（硬约束，curriculum 最多扩展到该范围）
+lin_vel_x = [-2.0, 2.0]
+lin_vel_y = [-1.5, 1.5]
+ang_vel_z = [-1.5, 1.5]
+
+[commands.ranges]
+# Velocity command **initial sampling ranges** (expand towards limit when curriculum is enabled).
+# 速度命令 **初始采样范围**（curriculum 开启时会动态扩大到 limit）
+
+# Start with forward-only to prevent reversing that triggers stair-curriculum demotions;
+# curriculum will expand towards limit.
+# 初始只前进，避免后退导致楼梯频繁降级；curriculum 会扩展到 limit
+lin_vel_x = [0.0, 0.5]
+lin_vel_y = [-0.3, 0.3]
+ang_vel_yaw = [-1.0, 1.0]
+
+
+# =====================================================================
+# Reward Configuration
+# 奖励配置
+#
+# Each reward term must have a numeric `weight`; parameterized rewards use [rewards.<name>.params].
+# 每个奖励项必须包含数值型 weight；带参数的奖励用 [rewards.<name>.params] 配置
+# =====================================================================
+
+# --- Positive: velocity tracking ---
+# --- 正向：速度跟踪 ---
+[rewards.track_lin_vel_xy]
+weight = 1.0
+[rewards.track_lin_vel_xy.params]
+# Std of Gaussian kernel, controls how sharp the error → reward decay is.
+# 高斯核标准差，控制误差 → 奖励的衰减陡峭程度
+std = 0.25
+# Velocity command name.
+# 速度命令名
+command_name = "base_velocity"
+
+[rewards.track_ang_vel_z]
+weight = 0.5
+[rewards.track_ang_vel_z.params]
+std = 0.25
+command_name = "base_velocity"
+
+# --- Negative: base stability ---
+# --- 负向：基座稳定 ---
+[rewards.lin_vel_z]
+# Penalty on vertical linear velocity.
+# Z 方向线速度惩罚（抑制上下跳跃）
+weight = -2.0
+
+[rewards.ang_vel_xy]
+# Penalty on pitch/roll angular velocity.
+# X/Y 方向角速度惩罚（抑制 pitch/roll 抖动）
+weight = -0.05
+
+# --- Negative: joint smoothness ---
+# --- 负向：关节 ---
+[rewards.joint_acc]
+# Joint acceleration penalty.
+# 关节加速度惩罚
+weight = -2.5e-7
+
+[rewards.joint_torques]
+# Joint torque penalty.
+# 关节扭矩惩罚
+weight = -1e-4
+
+[rewards.dof_pos_limits]
+# Penalty when joints approach position limits.
+# 接近关节位置极限时的惩罚
+weight = -2.0
+
+# --- Negative: action smoothness ---
+# --- 负向：动作平滑 ---
+[rewards.action_rate]
+# Delta between consecutive actions (1st order).
+# 相邻动作差（一阶）
+weight = -0.01
+
+# --- Negative: undesired contacts ---
+# --- 负向：碰撞 ---
+[rewards.undesired_contacts]
+weight = -1.0
+[rewards.undesired_contacts.params]
+# Max allowed contacts before penalty kicks in.
+# 触发阈值：被罚前允许的最大接触数
+threshold = 1
+
+# --- Extra: anti-tipping ---
+# --- 额外：防倾倒 ---
+[rewards.flat_orientation]
+# Penalty on deviation from flat base orientation.
+# 基座偏离水平姿态的惩罚
+weight = -1.5
+
+[rewards.reach_goal]
+# Reach-goal reward example (active only when env.goal_positions is maintained, i.e. track terrain).
+# 到达目标奖励示例（仅在 track 地形下 env.goal_positions 被维护时生效）。
+weight = 10.0
+[rewards.reach_goal.params]
+threshold = 0.6
+
+# TODO: you can add non-IsaacLab locomotion rewards such as energy /
+# correct_base_height / feet_stumble as needed.
+# After implementing the corresponding _reward_<name> method in
+# agent_diy/feature/reward_process.py, you can activate it here.
+# TODO：可按需补充 energy / correct_base_height / feet_stumble 等非 IsaacLab 运控奖励。
+# 自行在 agent_diy/feature/reward_process.py 实现对应 _reward_<name> 方法后即可在此激活。

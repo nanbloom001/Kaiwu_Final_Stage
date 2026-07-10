@@ -1,0 +1,181 @@
+# =============================================================================
+# Track Nav: joint obstacle-avoidance + navigation training (end-to-end).
+# Track Nav: 避障 + 导航联合训练（端到端）
+#
+# Policy outputs 12D joint actions directly, same as locomotion stage.
+# 策略直接输出 12D 关节动作，与 locomotion 阶段一致。
+# =============================================================================
+
+# === Basic Configuration ===
+# === 基础配置 ===
+[env]
+num_envs = 2048
+episode_length_s = 150
+
+[env_conf]
+seed = 0
+
+
+# === Terrain Configuration ===
+# === 地形配置 ===
+[terrain]
+mode = "track"
+num_rows = 10
+num_cols = 10
+difficulty_range = [0.0, 1.0]
+curriculum = true
+max_init_terrain_level = 0
+
+[terrain.track]
+track_length = 5
+sub_terrains = ["pyramid_slope", "pyramid_slope_inv", "pyramid_stairs", "pyramid_stairs_inv", "open_entry_maze"]
+
+
+# === Domain Randomization ===
+# === 域随机化 ===
+[domain_rand]
+enable_domain_rand = true
+randomize_friction = true
+friction_range = [0.3, 1.5]
+push_robots = true
+push_interval_s = 15
+max_push_vel_xy = 0.5
+
+
+# === Observation Noise ===
+# === 观测噪声 ===
+[noise]
+add_noise = true
+
+
+# === Initial State ===
+# === 初始状态 ===
+[init_state]
+pos = [0.0, 0.0, 0.35]
+
+
+# === Velocity Commands: tuned for maze nav (slow & safe traversal) ===
+# === 速度命令：迷宫导航专用，低速安全通行 ===
+[commands]
+resampling_time = [5.0, 5.0]
+
+[commands.limit]
+lin_vel_x = [0.0, 0.8]
+lin_vel_y = [-0.3, 0.3]
+ang_vel_z = [-1.5, 1.5]
+
+[commands.ranges]
+lin_vel_x = [0.0, 0.5]
+lin_vel_y = [-0.15, 0.15]
+ang_vel_yaw = [-1.0, 1.0]
+
+
+# =====================================================================
+# Reward configuration: locomotion base + obstacle avoidance + navigation
+# 奖励配置：locomotion 基础 + 避障 + 导航
+# =====================================================================
+
+# --- Positive: velocity tracking (down-weighted so navigation signal dominates) ---
+# --- 正向：速度跟踪（降权，让导航信号主导）---
+[rewards.track_lin_vel_xy]
+weight = 0.15
+[rewards.track_lin_vel_xy.params]
+std = 0.25
+command_name = "base_velocity"
+
+[rewards.track_ang_vel_z]
+weight = 0.1
+[rewards.track_ang_vel_z.params]
+std = 0.25
+command_name = "base_velocity"
+
+# --- Negative: base stability ---
+# --- 负向：基座稳定 ---
+[rewards.lin_vel_z]
+weight = -2.0
+
+[rewards.ang_vel_xy]
+weight = -0.05
+
+# --- Negative: joint smoothness ---
+# --- 负向：关节 ---
+[rewards.joint_acc]
+weight = -2.5e-7
+
+[rewards.energy]
+weight = -2e-5
+
+[rewards.joint_torques]
+weight = -1e-4
+
+[rewards.dof_pos_limits]
+weight = -2.0
+
+# --- Negative: posture ---
+# --- 负向：姿态 ---
+[rewards.correct_base_height]
+weight = -1.0
+[rewards.correct_base_height.params]
+target_height = 0.38
+
+# --- Negative: action smoothness ---
+# --- 负向：动作平滑 ---
+[rewards.action_rate]
+weight = -0.01
+
+# --- Negative: undesired contacts ---
+# --- 负向：碰撞 ---
+[rewards.undesired_contacts]
+weight = -5.0
+[rewards.undesired_contacts.params]
+threshold = 1
+
+# --- Negative: hip joint returning to default ---
+# --- 负向：髋关节回默认 ---
+[rewards.hip_to_default]
+weight = -0.05
+
+# --- Termination penalty ---
+# --- 终止惩罚 ---
+[rewards.termination]
+weight = -10.0
+
+# --- Anti-tipping ---
+# --- 防倾倒 ---
+[rewards.flat_orientation]
+weight = -1.5
+
+# --- Anti-stumbling ---
+# --- 防绊倒 ---
+[rewards.feet_stumble]
+weight = -0.1
+
+# --- Avoidance: penalize not turning when blocked ahead ---
+# --- 避障：前方被障碍阻挡时未主动转向的惩罚 ---
+[rewards.obstacle_evasion]
+weight = -1.0
+[rewards.obstacle_evasion.params]
+command_name = "base_velocity"
+
+
+# =====================================================================
+# Navigation rewards (implemented in reward_process.py)
+# 导航奖励
+# =====================================================================
+
+# Goal approach: dense reward for reducing distance to exit
+# 接近目标：距离减少的正向 dense 奖励
+[rewards.approach_goal]
+weight = 2.0
+
+# Reach-goal bonus (one-shot large reward when distance < threshold).
+# 到达目标奖励（距离 < threshold 一次性大奖）
+[rewards.reach_goal]
+weight = 10.0
+[rewards.reach_goal.params]
+threshold = 0.6
+
+# Navigation time penalty (constant per-step, encourages fast arrival).
+# 导航时间惩罚（每步固定扣分，鼓励快速到达）
+[rewards.navigation_time]
+weight = -0.008

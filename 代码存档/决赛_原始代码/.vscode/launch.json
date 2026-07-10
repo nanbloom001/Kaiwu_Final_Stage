@@ -1,0 +1,25 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "TestTrain",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/opt/conda/envs/env_isaaclab/bin/python",
+            "program": "${workspaceFolder}/train_test.py",
+            "console": "integratedTerminal",
+            "subProcess": true,
+            "justMyCode": true,
+            "env": {
+                "NVIDIA_VISIBLE_DEVICES": "all",
+                "NVIDIA_DRIVER_CAPABILITIES": "all",
+                "CONDA_DEFAULT_ENV": "env_isaaclab",
+                "CONDA_PREFIX": "/opt/conda/envs/env_isaaclab",
+                "PATH": "/opt/conda/envs/env_isaaclab/bin:${env:PATH}"
+            }
+        }
+    ]
+}
