@@ -505,6 +505,25 @@ class TrackNavX7Train1Config(TrackNavX7Nav1Config):
     model_save_interval = 5
 
 
+class TrackNavNoGateConfig(TrackNavX7Train1Config):
+    """Stage3I：Stage3H 无地形速度门控续训。
+
+    所有 PPO 参数完全继承 Stage3H（Train1）。
+    只在 TOML 中关闭门控开关，速度范围保持不变（隔离单变量）。
+    """
+
+    name = "navnogate"
+
+
+class TrackNavNoGateSafeConfig(TrackNavNoGateConfig):
+    """Stage3I-2：NoGate-Safe。
+
+    Parent: Stage3I-1 NoGate best checkpoint.
+    唯一变化：统一前进速度 [0.50,0.72] → [0.50,0.64]
+    """
+
+    name = "navx7nogate"
+
 
 class TrackNavX7BridgeBConfig(TrackNavX8D1Config):
     """Stage3E-2：低权重安全型关节奖励桥接。
@@ -635,7 +654,7 @@ class Config:
     # Default stage; can be overridden by TOML env_conf.task_name during eval.
     # 默认阶段；eval 时可由 TOML terrain.mode 推断覆盖。
     # 训练时设为当前段的阶段类，评估时自动推断到 TrackNavEvalConfig。
-    CURRENT = TrackNavX7Train1Config
+    CURRENT = TrackNavNoGateSafeConfig
 
     @staticmethod
     def load_conf(logger):
