@@ -13,9 +13,152 @@ import os
 import time
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.definition import RolloutStorage
+from agent_ppo.feature.isaac_env_bridge import sample_physics_stats
+from agent_ppo.feature.terrain_gate import worker_gate_monitor_stats
 from tools.utils import load_reward_keys_from_monitor_config
 import torch
 from collections import deque, defaultdict
+
+
+def _check_required_rewards(env, logger, usr_conf):
+    """检查 toml 里声明的 reward 是否真正被环境激活。
+
+    从 usr_conf 读 reward 名列表，从 env.reward_manager.active_terms 确认存在。
+    部分阶段对核心 reward 做硬检查（缺失直接 raise），其余只 warning。
+    """
+    rewards_conf = usr_conf.get("rewards", {})
+    if not rewards_conf:
+        return
+
+    required = set(rewards_conf.keys())
+
+    stage_name = getattr(Config.CURRENT, "name", "")
+    stage_required_rewards = {
+        "navx7bridgeb": {
+            "joint_acc",
+            "dof_pos_limits",
+        },
+        "navx7bridgec": {
+            "joint_acc",
+            "dof_pos_limits",
+            "hip_to_default",
+            "joint_position_penalty",
+            "dof_vel",
+            "base_lateral_vel",
+            "feet_slide",
+            "feet_stumble",
+        },
+    }
+    # navx7bridged 继承 bridgec 的全部要求
+    stage_required_rewards["navx7bridged"] = set(stage_required_rewards["navx7bridgec"])
+    # navx7bridgee 继承 bridged + feet_clearance
+    stage_required_rewards["navx7bridgee"] = set(stage_required_rewards["navx7bridged"]) | {"feet_clearance"}
+    # navx7bridgef 继承 bridgee + feet_air_time + air_time_variance_penalty
+    stage_required_rewards["navx7bridgef"] = set(stage_required_rewards["navx7bridgee"]) | {
+        "feet_air_time",
+        "air_time_variance_penalty",
+    }
+    # navx7bridgeg 继承 bridgef + feet_swing_forward
+    stage_required_rewards["navx7bridgeg"] = set(stage_required_rewards["navx7bridgef"]) | {
+        "feet_swing_forward",
+    }
+    # navx7bridgeh 继承 bridgeg（同样12项，只改权重不新增reward）
+    stage_required_rewards["navx7bridgeh"] = set(stage_required_rewards["navx7bridgeg"])
+    # navx7score1 继承 bridgeg + score_guidance
+    stage_required_rewards["navx7score1"] = set(stage_required_rewards["navx7bridgeg"]) | {"score_guidance"}
+    # navx7nav1 继承 score1 + 7项导航/墙体reward
+    stage_required_rewards["navx7nav1"] = set(stage_required_rewards["navx7score1"]) | {
+        "forward_heading_velocity",
+        "goal_distance",
+        "reach_goal",
+        "wall_collision",
+        "wall_stall_penalty",
+        "wall_proximity",
+        "stuck_penalty",
+    }
+    # navx7train1 继承 nav1（不新增reward，只改level_mix/速度/PPO）
+    stage_required_rewards["navx7train1"] = set(stage_required_rewards["navx7nav1"])
+    # navx7nogate 继承 train1（同样reward，只关门控+统一速度）
+    stage_required_rewards["navx7nogate"] = set(stage_required_rewards["navx7train1"])
+    hard_required = stage_required_rewards.get(stage_name, set())
+
+    active = set()
+    reward_manager = getattr(env, "reward_manager", None)
+
+    if reward_manager is not None:
+        terms = getattr(reward_manager, "active_terms", None)
+        if terms is not None:
+            try:
+                active = set(terms)
+            except TypeError:
+                active = {str(term) for term in terms}
+
+    if not active:
+        logger.warning(
+            f"[RewardCheck] reward_manager.active_terms unavailable; "
+            f"cannot verify Stage={stage_name}, required={sorted(hard_required)}"
+        )
+        return
+
+    missing_hard = hard_required - active
+    if missing_hard:
+        raise RuntimeError(
+            f"[Stage={stage_name}] required rewards are not active: "
+            f"{sorted(missing_hard)}"
+        )
+
+    missing_all = required - active
+    if missing_all:
+        logger.warning(
+            f"[RewardCheck] other reward(s) not active: "
+            f"{sorted(missing_all)}"
+        )
+    else:
+        logger.info(
+            f"[RewardCheck] all {len(required)} rewards active"
+        )
+
+
+def _log_terrain_level_histogram(env, logger):
+    """打印初始地形难度直方图，确认 level_mix 是否真正生效。
+
+    尝试从多个可能的字段名读取地形等级张量。
+    """
+    import torch as _torch
+
+    levels_tensor = None
+    field_names = [
+        "terrain_levels",
+        "terrain_level",
+        "env_terrain_levels",
+    ]
+    for attr in field_names:
+        val = getattr(env, attr, None)
+        if val is not None and hasattr(val, "shape"):
+            levels_tensor = val
+            break
+
+    if levels_tensor is None:
+        # 尝试从 scene/robot 取
+        scene = getattr(env, "scene", None)
+        if scene is not None:
+            for attr in field_names:
+                val = getattr(scene, attr, None)
+                if val is not None and hasattr(val, "shape"):
+                    levels_tensor = val
+                    break
+
+    if levels_tensor is None:
+        logger.info("[TerrainLevelHistogram] 无法获取地形等级张量，跳过直方图")
+        return
+
+    try:
+        levels_long = levels_tensor.to(_torch.long).flatten()
+        counts = _torch.bincount(levels_long, minlength=10)
+        hist = ", ".join(f"L{i}={int(counts[i])}" for i in range(min(10, len(counts))))
+        logger.info(f"[TerrainLevelHistogram] {hist}")
+    except Exception as exc:
+        logger.info(f"[TerrainLevelHistogram] 统计失败: {exc}")
 
 
 def _initialize_training_state(env, agent, logger):
@@ -123,6 +266,12 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     last_obs, last_critic_obs = torch.clone(obs), torch.clone(critic_obs)
     last_report_monitor_time = 0
     episode = 0
+
+    # 打印初始地形难度直方图（确认 level_mix 是否真正生效）
+    _log_terrain_level_histogram(env, logger)
+
+    # 检查 Stage3E-1 需要的 reward 是否真正激活
+    _check_required_rewards(env, logger, usr_conf)
 
     # Main Training Loop
     # 主训练循环
@@ -337,7 +486,7 @@ def _update_episode_statistics(
     cur_episode_length[new_ids] = 0
 
 
-def _compute_advantages_and_returns(storage, agent, critic_obs, logger):
+def _compute_advantages_and_returns(storage, agent, critic_obs, logger, env=None):
     """
     Compute advantage function and returns.
     计算优势函数和回报。
@@ -350,6 +499,18 @@ def _compute_advantages_and_returns(storage, agent, critic_obs, logger):
         "reward_mean": storage.rewards.mean().item(),
         "reward_std": storage.rewards.std().item(),
     }
+
+    # 采集命令诊断和物理量监控（Stage4A）
+    try:
+        storage_stats.update(sample_physics_stats(env, logger=None, critic_obs=critic_obs))
+    except Exception:
+        pass
+    try:
+        gate_stats = worker_gate_monitor_stats(env)
+        if gate_stats:
+            storage_stats.update(gate_stats)
+    except Exception:
+        pass
 
     return storage_stats
 
@@ -452,7 +613,7 @@ def run_episodes_(
 
         # Compute advantages and returns
         # 计算优势函数和回报
-        storage_stats = _compute_advantages_and_returns(storage, agent, critic_obs, logger)
+        storage_stats = _compute_advantages_and_returns(storage, agent, critic_obs, logger, env)
         last_obs = torch.clone(obs)
 
     # Note: batch generation now handled by AlgorithmPPO.learn()
