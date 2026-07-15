@@ -22,6 +22,7 @@ from collections import deque, defaultdict
 
 _TIMEOUT_OBS_DIAG_LOG_COUNT = 0
 _TIMEOUT_OBS_DIAG_MAX_LOGS = 8
+_TIMEOUT_OBS_DIAG_STARTED = False
 
 
 def _check_required_rewards(env, logger, usr_conf):
@@ -410,7 +411,15 @@ def _process_env_step_result(data, episode, logger):
         raise Exception(f"episode {episode}, obs is None after processing!")
 
     dones = torch.logical_or(terminated, truncated)
-    return frame_no, obs, critic_obs, rewards, dones, infos
+    return (
+        frame_no,
+        obs,
+        critic_obs,
+        rewards,
+        dones,
+        infos,
+        truncated,
+    )
 
 
 def _move_tensors_to_device(obs, critic_obs, rewards, dones, device):
@@ -426,44 +435,73 @@ def _move_tensors_to_device(obs, critic_obs, rewards, dones, device):
     )
 
 
-def _diagnose_timeout_observation(obs, command_actions, infos, logger):
-    """判断 timeout 后 env.step 返回的是终止前观测还是 reset 后观测。
+def _diagnose_timeout_observation(
+    obs,
+    command_actions,
+    truncated,
+    infos,
+    logger,
+):
+    """判断 timeout 后 obs 是终止前观测，还是自动 reset 后观测。
 
-    当前 policy proprio 布局中，第 33:45 维为上一时刻 12 维动作。
-    这里只记录日志，不修改 reward、storage 或 PPO。
+    只输出日志，不修改 reward、storage、return 或 PPO。
     """
     global _TIMEOUT_OBS_DIAG_LOG_COUNT
+    global _TIMEOUT_OBS_DIAG_STARTED
+
+    timeout_mask = torch.as_tensor(
+        truncated,
+        device=obs.device,
+    ).reshape(-1).bool()
+
+    # 确认诊断函数确实被执行。
+    if not _TIMEOUT_OBS_DIAG_STARTED:
+        info_keys = list(infos.keys()) if isinstance(infos, dict) else []
+        logger.info(
+            "[TimeoutObsCheckStart] "
+            f"obs_shape={tuple(obs.shape)}, "
+            f"action_shape={tuple(command_actions.shape)}, "
+            f"truncated_shape={tuple(timeout_mask.shape)}, "
+            f"infos_type={type(infos).__name__}, "
+            f"infos_keys={info_keys}"
+        )
+        _TIMEOUT_OBS_DIAG_STARTED = True
 
     if _TIMEOUT_OBS_DIAG_LOG_COUNT >= _TIMEOUT_OBS_DIAG_MAX_LOGS:
         return
 
-    if not isinstance(infos, dict) or "time_outs" not in infos:
+    if timeout_mask.numel() != obs.shape[0]:
+        logger.info(
+            "[TimeoutObsCheck] "
+            f"shape_mismatch: timeout={timeout_mask.numel()}, "
+            f"obs_batch={obs.shape[0]}"
+        )
+        return
+
+    if not timeout_mask.any():
         return
 
     if obs.ndim != 2 or obs.shape[-1] < 45:
-        logger.warning(
-            f"[TimeoutObsCheck] unexpected obs shape: {tuple(obs.shape)}"
+        logger.info(
+            "[TimeoutObsCheck] "
+            f"unexpected_obs_shape={tuple(obs.shape)}"
         )
         return
 
     if command_actions.ndim != 2 or command_actions.shape[-1] != 12:
-        logger.warning(
-            "[TimeoutObsCheck] unexpected action shape: "
-            f"{tuple(command_actions.shape)}"
+        logger.info(
+            "[TimeoutObsCheck] "
+            f"unexpected_action_shape={tuple(command_actions.shape)}"
         )
         return
 
-    timeout_mask = torch.as_tensor(
-        infos["time_outs"],
-        device=obs.device,
-    ).reshape(-1).bool()
-
-    if timeout_mask.numel() != obs.shape[0] or not timeout_mask.any():
-        return
-
-    # policy proprio 中的上一动作槽位。
+    # 官方 policy obs 中 [33:45] 是上一帧动作。
     next_last_action = obs[timeout_mask, 33:45]
-    sent_action = command_actions[timeout_mask].to(obs.device)
+
+    sent_action = command_actions[timeout_mask].to(
+        device=obs.device,
+        dtype=next_last_action.dtype,
+    )
 
     per_env_sent_mae = torch.mean(
         torch.abs(next_last_action - sent_action),
@@ -481,14 +519,16 @@ def _diagnose_timeout_observation(obs, command_actions, infos, logger):
         (per_env_sent_mae < per_env_zero_mae).float()
     ).item()
 
-    terminal_keys = [
-        str(key)
-        for key in infos.keys()
-        if "terminal" in str(key).lower()
-        or "final" in str(key).lower()
-    ]
+    terminal_keys = []
+    if isinstance(infos, dict):
+        terminal_keys = [
+            str(key)
+            for key in infos.keys()
+            if "terminal" in str(key).lower()
+            or "final" in str(key).lower()
+        ]
 
-    logger.warning(
+    logger.info(
         "[TimeoutObsCheck] "
         f"count={int(timeout_mask.sum().item())}, "
         f"match_sent_action_mae={sent_mae:.6f}, "
@@ -651,17 +691,31 @@ def run_episodes_(
             # Environment interaction
             # 环境交互
             data = env.step(command_actions)
-            frame_no, obs, critic_obs, rewards, dones, infos = _process_env_step_result(data, episode, logger)
+            (
+                frame_no,
+                obs,
+                critic_obs,
+                rewards,
+                dones,
+                infos,
+                truncated,
+            ) = _process_env_step_result(data, episode, logger)
 
             # Move tensors to device
             # 将张量移动到设备
             obs, critic_obs, rewards, dones = _move_tensors_to_device(obs, critic_obs, rewards, dones, agent.device)
 
+            truncated = torch.as_tensor(
+                truncated,
+                device=obs.device,
+            ).reshape(-1).bool()
+
             _diagnose_timeout_observation(
-                obs,
-                command_actions,
-                infos,
-                logger,
+                obs=obs,
+                command_actions=command_actions,
+                truncated=truncated,
+                infos=infos,
+                logger=logger,
             )
 
             # Update episode statistics (always, regardless of decimation)

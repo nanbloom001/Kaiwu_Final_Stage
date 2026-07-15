@@ -26,6 +26,11 @@ At each timeout, compare policy observation slot `obs[:, 33:45]` (last action)
 with the action just sent to `env.step()` and with zero. At most eight records
 are emitted under `[TimeoutObsCheck]`.
 
+The timeout mask is taken directly from the `truncated` tensor returned by
+`env.step()`. It does not depend on an optional `infos["time_outs"]` field. A
+single `[TimeoutObsCheckStart]` INFO record confirms that the diagnostic path
+is active and reports the available `infos` keys.
+
 ## Interpretation
 
 - `match_sent_action_mae << match_zero_mae` and `sent_closer_ratio` near 1:
