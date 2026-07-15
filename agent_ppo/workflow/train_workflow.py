@@ -20,6 +20,10 @@ import torch
 from collections import deque, defaultdict
 
 
+_TIMEOUT_OBS_DIAG_LOG_COUNT = 0
+_TIMEOUT_OBS_DIAG_MAX_LOGS = 8
+
+
 def _check_required_rewards(env, logger, usr_conf):
     """检查 toml 里声明的 reward 是否真正被环境激活。
 
@@ -422,6 +426,80 @@ def _move_tensors_to_device(obs, critic_obs, rewards, dones, device):
     )
 
 
+def _diagnose_timeout_observation(obs, command_actions, infos, logger):
+    """判断 timeout 后 env.step 返回的是终止前观测还是 reset 后观测。
+
+    当前 policy proprio 布局中，第 33:45 维为上一时刻 12 维动作。
+    这里只记录日志，不修改 reward、storage 或 PPO。
+    """
+    global _TIMEOUT_OBS_DIAG_LOG_COUNT
+
+    if _TIMEOUT_OBS_DIAG_LOG_COUNT >= _TIMEOUT_OBS_DIAG_MAX_LOGS:
+        return
+
+    if not isinstance(infos, dict) or "time_outs" not in infos:
+        return
+
+    if obs.ndim != 2 or obs.shape[-1] < 45:
+        logger.warning(
+            f"[TimeoutObsCheck] unexpected obs shape: {tuple(obs.shape)}"
+        )
+        return
+
+    if command_actions.ndim != 2 or command_actions.shape[-1] != 12:
+        logger.warning(
+            "[TimeoutObsCheck] unexpected action shape: "
+            f"{tuple(command_actions.shape)}"
+        )
+        return
+
+    timeout_mask = torch.as_tensor(
+        infos["time_outs"],
+        device=obs.device,
+    ).reshape(-1).bool()
+
+    if timeout_mask.numel() != obs.shape[0] or not timeout_mask.any():
+        return
+
+    # policy proprio 中的上一动作槽位。
+    next_last_action = obs[timeout_mask, 33:45]
+    sent_action = command_actions[timeout_mask].to(obs.device)
+
+    per_env_sent_mae = torch.mean(
+        torch.abs(next_last_action - sent_action),
+        dim=1,
+    )
+    per_env_zero_mae = torch.mean(
+        torch.abs(next_last_action),
+        dim=1,
+    )
+
+    sent_mae = per_env_sent_mae.mean().item()
+    zero_mae = per_env_zero_mae.mean().item()
+
+    sent_closer_ratio = torch.mean(
+        (per_env_sent_mae < per_env_zero_mae).float()
+    ).item()
+
+    terminal_keys = [
+        str(key)
+        for key in infos.keys()
+        if "terminal" in str(key).lower()
+        or "final" in str(key).lower()
+    ]
+
+    logger.warning(
+        "[TimeoutObsCheck] "
+        f"count={int(timeout_mask.sum().item())}, "
+        f"match_sent_action_mae={sent_mae:.6f}, "
+        f"match_zero_mae={zero_mae:.6f}, "
+        f"sent_closer_ratio={sent_closer_ratio:.3f}, "
+        f"terminal_keys={terminal_keys}"
+    )
+
+    _TIMEOUT_OBS_DIAG_LOG_COUNT += 1
+
+
 def _update_transition_data(
     transition,
     actions,
@@ -578,6 +656,13 @@ def run_episodes_(
             # Move tensors to device
             # 将张量移动到设备
             obs, critic_obs, rewards, dones = _move_tensors_to_device(obs, critic_obs, rewards, dones, agent.device)
+
+            _diagnose_timeout_observation(
+                obs,
+                command_actions,
+                infos,
+                logger,
+            )
 
             # Update episode statistics (always, regardless of decimation)
             # 更新 episode 统计（始终执行，不受降频影响）
