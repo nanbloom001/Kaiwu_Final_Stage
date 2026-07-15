@@ -525,6 +525,48 @@ class TrackNavNoGateSafeConfig(TrackNavNoGateConfig):
     name = "navx7nogate"
 
 
+class TrackNavStage3J1Config(TrackNavNoGateSafeConfig):
+    """Stage3J-1：NoGate Rough-Stability。
+
+    Parent: Stage3I-2 NoGate-Safe 60min best checkpoint.
+    保持 NoGate + 速度 [0.50,0.64]，仅增加保守粗糙地形稳定奖励组。
+    """
+
+    name = "navj1"
+
+
+class TrackNavStage3J2Config(TrackNavStage3J1Config):
+    """Stage3J-2：P04 Energy-Score Bridge。
+
+    Parent: Stage3J-1 NoGate Rough-Stability 30min best.
+    Only change: 启用低权重 energy_score_formula=0.28。
+    """
+
+    name = "navj2"
+
+
+class TrackNavStage3J3Config(TrackNavStage3J1Config):
+    """Stage3J-3：P05 Maze Safety。
+
+    Parent: Stage3J-1 NoGate Rough-Stability 30min best.
+    Changes: maze_anticipatory_turn=0.60, long_non_foot_contact=-8.0
+    不含 energy_score_formula（J2被拒绝）。继承 J1，不继承 J2。
+    """
+
+    name = "navj3"
+
+
+class TrackNavStage3J4Config(TrackNavStage3J1Config):
+    """Stage3J-4：P06 Near-Goal Finish/Retreat。
+
+    Parent: Stage3J-1 NoGate Rough-Stability 30min best.
+    Changes: near_goal_finish_drive=0.70, near_goal_retreat_penalty=-0.90.
+    不含 J2 energy_score_formula 或 J3 迷宫安全奖励。
+    """
+
+    name = "navj4"
+
+
 class TrackNavX7BridgeBConfig(TrackNavX8D1Config):
     """Stage3E-2：低权重安全型关节奖励桥接。
 
@@ -654,7 +696,7 @@ class Config:
     # Default stage; can be overridden by TOML env_conf.task_name during eval.
     # 默认阶段；eval 时可由 TOML terrain.mode 推断覆盖。
     # 训练时设为当前段的阶段类，评估时自动推断到 TrackNavEvalConfig。
-    CURRENT = TrackNavNoGateSafeConfig
+    CURRENT = TrackNavStage3J4Config
 
     @staticmethod
     def load_conf(logger):

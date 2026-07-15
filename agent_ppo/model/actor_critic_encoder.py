@@ -179,6 +179,12 @@ class ActorCriticEncoder(ActorCritic):
     # 策略（actor）路径：走 actor encoder
     def _encode_obs(self, obs: torch.Tensor) -> torch.Tensor:
         """Split policy obs and produce actor input = cat(proprio, latent, [goal])."""
+        expected_dim = self.scan_offset + self.num_scan + self.num_goal_obs
+        if obs.shape[-1] < expected_dim:
+            raise ValueError(
+                f"Policy observation too short: expected at least {expected_dim}, "
+                f"got {obs.shape[-1]}."
+            )
         proprio = obs[:, : self.num_proprio]
         scan = obs[:, self.scan_offset : self.scan_offset + self.num_scan]
         latent = self.encoder(scan)
@@ -225,6 +231,12 @@ class ActorCriticEncoder(ActorCritic):
 
         # critic_use_encoder=True：抽 scan、丢 drop、拼 latent
         ss, se = self.critic_scan_slice  # type: ignore[misc]
+        expected_dim = se + self.num_goal_obs
+        if critic_obs.shape[-1] < expected_dim:
+            raise ValueError(
+                f"Critic observation too short: expected at least {expected_dim}, "
+                f"got {critic_obs.shape[-1]}."
+            )
         scan = critic_obs[:, ss:se]
         latent = self.critic_encoder(scan)  # type: ignore[misc]
 

@@ -113,6 +113,14 @@ def build_monitor():
             .add_metric(metrics_name="reward_goal_distance",
                         expr="avg(reward_goal_distance{})")
             .end_panel()
+        .add_panel(name="近终点直推", name_en="reward_near_goal_finish_drive", type="line")
+            .add_metric(metrics_name="reward_near_goal_finish_drive",
+                        expr="avg(reward_near_goal_finish_drive{})")
+            .end_panel()
+        .add_panel(name="近终点后退惩罚", name_en="reward_near_goal_retreat_penalty", type="line")
+            .add_metric(metrics_name="reward_near_goal_retreat_penalty",
+                        expr="avg(reward_near_goal_retreat_penalty{})")
+            .end_panel()
 
         # --- 步态/姿态 reward（第一/二组，自定义，平台无默认面板）---
         .add_panel(name="姿态稳定惩罚", name_en="reward_posture_stability", type="line")
