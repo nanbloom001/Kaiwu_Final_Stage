@@ -101,6 +101,10 @@ def build_monitor():
             .add_metric(metrics_name="reward_task_complete",
                         expr="avg(reward_task_complete{})")
             .end_panel()
+        .add_panel(name="高压完成", name_en="reward_difficulty_pressure_complete", type="line")
+            .add_metric(metrics_name="reward_difficulty_pressure_complete",
+                        expr="avg(reward_difficulty_pressure_complete{})")
+            .end_panel()
         .add_panel(name="目标速度投影", name_en="reward_goal_velocity_projection", type="line")
             .add_metric(metrics_name="reward_goal_velocity_projection",
                         expr="avg(reward_goal_velocity_projection{})")

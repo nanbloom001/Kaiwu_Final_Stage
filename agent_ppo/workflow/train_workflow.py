@@ -49,6 +49,8 @@ def _check_required_rewards(env, logger, usr_conf):
             "feet_stumble",
         },
     }
+    # J5 is a single-mechanism ablation: fail fast if P14 is not registered.
+    stage_required_rewards["navj5"] = {"difficulty_pressure_complete"}
     # navx7bridged 继承 bridgec 的全部要求
     stage_required_rewards["navx7bridged"] = set(stage_required_rewards["navx7bridgec"])
     # navx7bridgee 继承 bridged + feet_clearance

@@ -567,6 +567,17 @@ class TrackNavStage3J4Config(TrackNavStage3J1Config):
     name = "navj4"
 
 
+class TrackNavStage3J5Config(TrackNavStage3J1Config):
+    """Stage3J-5: P14 High-Pressure Completion Protection.
+
+    Parent: Stage3J-1 NoGate Rough-Stability 30min best.
+    Only change: difficulty_pressure_complete=8.0.
+    J2/J3/J4 rejected rewards are intentionally excluded.
+    """
+
+    name = "navj5"
+
+
 class TrackNavX7BridgeBConfig(TrackNavX8D1Config):
     """Stage3E-2：低权重安全型关节奖励桥接。
 
@@ -696,7 +707,7 @@ class Config:
     # Default stage; can be overridden by TOML env_conf.task_name during eval.
     # 默认阶段；eval 时可由 TOML terrain.mode 推断覆盖。
     # 训练时设为当前段的阶段类，评估时自动推断到 TrackNavEvalConfig。
-    CURRENT = TrackNavStage3J4Config
+    CURRENT = TrackNavStage3J5Config
 
     @staticmethod
     def load_conf(logger):
