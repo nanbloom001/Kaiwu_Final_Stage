@@ -567,6 +567,18 @@ class TrackNavStage3J4Config(TrackNavStage3J1Config):
     name = "navj4"
 
 
+class TrackNavStage3J8Config(TrackNavStage3J1Config):
+    """Stage3J-8: Hard-Level Replay.
+
+    Parent: Stage3J-1 NoGate Rough-Stability 30min best.
+    Only change: increase the L7/L8/L9 training sample proportion.
+    Rewards, PPO, commands, NoGate switches and model structure stay at J1.
+    """
+
+    name = "navj8"
+    parent_checkpoint = "Stage3J-1 30min Best"
+
+
 class TrackNavX7BridgeBConfig(TrackNavX8D1Config):
     """Stage3E-2：低权重安全型关节奖励桥接。
 
@@ -696,7 +708,7 @@ class Config:
     # Default stage; can be overridden by TOML env_conf.task_name during eval.
     # 默认阶段；eval 时可由 TOML terrain.mode 推断覆盖。
     # 训练时设为当前段的阶段类，评估时自动推断到 TrackNavEvalConfig。
-    CURRENT = TrackNavStage3J4Config
+    CURRENT = TrackNavStage3J8Config
 
     @staticmethod
     def load_conf(logger):
