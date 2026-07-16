@@ -49,6 +49,7 @@ def _check_required_rewards(env, logger, usr_conf):
             "feet_stumble",
         },
     }
+    stage_required_rewards["navj7"] = {"rough_energy"}
     # navx7bridged 继承 bridgec 的全部要求
     stage_required_rewards["navx7bridged"] = set(stage_required_rewards["navx7bridgec"])
     # navx7bridgee 继承 bridged + feet_clearance

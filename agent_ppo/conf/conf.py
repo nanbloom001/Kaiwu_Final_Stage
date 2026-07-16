@@ -567,6 +567,12 @@ class TrackNavStage3J4Config(TrackNavStage3J1Config):
     name = "navj4"
 
 
+class TrackNavStage3J7Config(TrackNavStage3J1Config):
+    """Stage3J-7: rough-terrain-local energy constraint."""
+
+    name = "navj7"
+
+
 class TrackNavX7BridgeBConfig(TrackNavX8D1Config):
     """Stage3E-2：低权重安全型关节奖励桥接。
 
@@ -696,7 +702,7 @@ class Config:
     # Default stage; can be overridden by TOML env_conf.task_name during eval.
     # 默认阶段；eval 时可由 TOML terrain.mode 推断覆盖。
     # 训练时设为当前段的阶段类，评估时自动推断到 TrackNavEvalConfig。
-    CURRENT = TrackNavStage3J4Config
+    CURRENT = TrackNavStage3J7Config
 
     @staticmethod
     def load_conf(logger):
