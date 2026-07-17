@@ -38,6 +38,8 @@ class AlgorithmPPO:
         value_loss_coef: float = 1.0,
         entropy_coef: float = 0.01,
         learning_rate: float = 1e-3,
+        min_learning_rate: float = 1e-5,
+        max_learning_rate: float = 1e-2,
         max_grad_norm: float = 1.0,
         use_clipped_value_loss: bool = True,
         normalize_value_loss: bool = True,
@@ -74,6 +76,10 @@ class AlgorithmPPO:
             entropy_coef: 熵奖励系数
             learning_rate: Initial learning rate
             learning_rate: 初始学习率
+            min_learning_rate: Lower bound for adaptive learning rate
+            min_learning_rate: 自适应学习率下限
+            max_learning_rate: Upper bound for adaptive learning rate
+            max_learning_rate: 自适应学习率上限
             max_grad_norm: Max gradient norm for clipping
             max_grad_norm: 梯度裁剪最大范数
             use_clipped_value_loss: Whether to clip value loss
@@ -103,6 +109,8 @@ class AlgorithmPPO:
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
         self.learning_rate = learning_rate
+        self.min_learning_rate = float(min_learning_rate)
+        self.max_learning_rate = float(max_learning_rate)
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
         self.normalize_value_loss = normalize_value_loss
@@ -384,9 +392,15 @@ class AlgorithmPPO:
             kl_mean = torch.mean(kl)
 
             if kl_mean > self.desired_kl * 2.0:
-                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                self.learning_rate = max(
+                    self.min_learning_rate,
+                    self.learning_rate / 1.5,
+                )
             elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                self.learning_rate = min(
+                    self.max_learning_rate,
+                    self.learning_rate * 1.5,
+                )
 
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.learning_rate

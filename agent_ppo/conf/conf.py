@@ -579,6 +579,24 @@ class TrackNavStage3J8Config(TrackNavStage3J1Config):
     parent_checkpoint = "Stage3J-1 30min Best"
 
 
+class TrackNavStage3J9Config(TrackNavStage3J1Config):
+    """Stage3J-9: fixed-learning-rate continuation.
+
+    Parent: Stage3J-1 30min Best.
+    Only change: make the PPO learning rate truly fixed at 1e-5.
+    """
+
+    name = "navj9"
+    parent_checkpoint = "Stage3J-1 30min Best"
+
+    lr = 1.0e-5
+    min_learning_rate = 1.0e-5
+    max_learning_rate = 1.0e-5
+    schedule = "fixed"
+
+    model_save_interval = 5
+
+
 class TrackNavX7BridgeBConfig(TrackNavX8D1Config):
     """Stage3E-2：低权重安全型关节奖励桥接。
 
@@ -708,7 +726,7 @@ class Config:
     # Default stage; can be overridden by TOML env_conf.task_name during eval.
     # 默认阶段；eval 时可由 TOML terrain.mode 推断覆盖。
     # 训练时设为当前段的阶段类，评估时自动推断到 TrackNavEvalConfig。
-    CURRENT = TrackNavStage3J8Config
+    CURRENT = TrackNavStage3J9Config
 
     @staticmethod
     def load_conf(logger):

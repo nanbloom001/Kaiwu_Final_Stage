@@ -175,6 +175,7 @@ class Agent(BaseAgent):
             monitor=self.monitor,
             # PPO 核心参数全部从 stage 显式传入（计划 6.3：不让 AlgorithmPPO 隐式读取）
             learning_rate=stage.lr,
+            schedule=getattr(stage, "schedule", "adaptive"),
             min_learning_rate=getattr(stage, "min_learning_rate", 1e-5),
             max_learning_rate=getattr(stage, "max_learning_rate", 1e-2),
             clip_param=getattr(stage, "clip_param", 0.2),

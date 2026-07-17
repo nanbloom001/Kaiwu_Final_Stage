@@ -39,6 +39,19 @@ _J8_NO_GATE_SWITCHES = (
     "terrain_phase_speed_enabled",
     "raw_terrain_gate_enabled",
 )
+_J9_TARGET_LR = 1.0e-5
+_J9_J1_LEVEL_WEIGHTS = (
+    0.08,
+    0.09,
+    0.09,
+    0.10,
+    0.12,
+    0.14,
+    0.14,
+    0.08,
+    0.08,
+    0.08,
+)
 
 
 def _check_required_rewards(env, logger, usr_conf):
@@ -239,7 +252,10 @@ def _validate_navj8_contract(usr_conf):
         )
     if commands.get("lin_vel_x") != [0.50, 0.64]:
         errors.append("commands.ranges.lin_vel_x must remain [0.50, 0.64]")
-    if commands.get("lin_vel_y") != [0.0, 0.0] or commands.get("ang_vel_yaw") != [0.0, 0.0]:
+    if (
+        commands.get("lin_vel_y") != [0.0, 0.0]
+        or commands.get("ang_vel_yaw") != [0.0, 0.0]
+    ):
         errors.append("lateral and yaw command ranges must remain zero")
     if float(rewards.get("termination", {}).get("weight", 0.0)) != -7.0:
         errors.append("rewards.termination.weight must remain -7.0")
@@ -261,6 +277,131 @@ def _read_learning_rate(agent):
     if param_groups:
         return param_groups[0].get("lr")
     return getattr(Config.CURRENT, "lr", None)
+
+
+def _validate_navj9_contract(usr_conf, agent):
+    """Fail fast unless J9 is a fixed-LR continuation of the J1 setup."""
+    if getattr(Config.CURRENT, "name", "") != "navj9":
+        return
+
+    errors = []
+    stage = Config.CURRENT
+    algorithm = getattr(agent, "algorithm", None)
+    terrain = usr_conf.get("terrain", {})
+    level_mix = terrain.get("level_mix", {})
+    commands = usr_conf.get("commands", {}).get("ranges", {})
+    rewards = usr_conf.get("rewards", {})
+    navigation = usr_conf.get("rl_navigation", {})
+
+    expected_stage_values = {
+        "lr": _J9_TARGET_LR,
+        "min_learning_rate": _J9_TARGET_LR,
+        "max_learning_rate": _J9_TARGET_LR,
+        "entropy_coef": 0.001,
+        "desired_kl": 0.0032,
+        "init_noise_std": 0.95,
+        "num_steps_per_env": 64,
+        "num_learning_epochs": 3,
+        "num_mini_batches": 4,
+    }
+    for name, expected in expected_stage_values.items():
+        if getattr(stage, name, None) != expected:
+            errors.append(f"stage.{name} must be {expected!r}")
+    if getattr(stage, "schedule", None) != "fixed":
+        errors.append("stage.schedule must be 'fixed'")
+
+    if algorithm is None:
+        errors.append("agent.algorithm is unavailable")
+    else:
+        expected_algorithm_values = {
+            "learning_rate": _J9_TARGET_LR,
+            "min_learning_rate": _J9_TARGET_LR,
+            "max_learning_rate": _J9_TARGET_LR,
+            "entropy_coef": 0.001,
+            "desired_kl": 0.0032,
+            "num_learning_epochs": 3,
+            "num_mini_batches": 4,
+        }
+        for name, expected in expected_algorithm_values.items():
+            if getattr(algorithm, name, None) != expected:
+                errors.append(f"algorithm.{name} must be {expected!r}")
+        if getattr(algorithm, "schedule", None) != "fixed":
+            errors.append("algorithm.schedule must be 'fixed'")
+
+    if tuple(level_mix.get("levels", ())) != _J8_LEVELS:
+        errors.append("terrain.level_mix.levels must remain L0-L9")
+    weights = tuple(float(value) for value in level_mix.get("weights", ()))
+    if weights != _J9_J1_LEVEL_WEIGHTS:
+        errors.append(f"terrain.level_mix.weights must remain J1 values, got {weights}")
+    if terrain.get("curriculum") is not False:
+        errors.append("terrain.curriculum must remain false")
+    if commands.get("lin_vel_x") != [0.50, 0.64]:
+        errors.append("commands.ranges.lin_vel_x must remain [0.50, 0.64]")
+    if commands.get("lin_vel_y") != [0.0, 0.0] or commands.get("ang_vel_yaw") != [0.0, 0.0]:
+        errors.append("lateral and yaw command ranges must remain zero")
+    if float(rewards.get("termination", {}).get("weight", 0.0)) != -7.0:
+        errors.append("rewards.termination.weight must remain -7.0")
+
+    forbidden_active = sorted(_J8_FORBIDDEN_REWARDS.intersection(rewards))
+    if forbidden_active:
+        errors.append(f"non-J1 experimental rewards configured: {forbidden_active}")
+    enabled_gates = [name for name in _J8_NO_GATE_SWITCHES if navigation.get(name) is not False]
+    if enabled_gates:
+        errors.append(f"NoGate switches must remain false: {enabled_gates}")
+
+    optimizer = getattr(algorithm, "optimizer", None)
+    param_groups = getattr(optimizer, "param_groups", ())
+    optimizer_lrs = [float(group.get("lr", -1.0)) for group in param_groups]
+    if not optimizer_lrs or any(abs(lr - _J9_TARGET_LR) > 1.0e-12 for lr in optimizer_lrs):
+        errors.append(f"optimizer learning rates must all be {_J9_TARGET_LR}, got {optimizer_lrs}")
+
+    if errors:
+        raise RuntimeError("[Stage=navj9] config contract failed: " + "; ".join(errors))
+
+
+def _log_navj9_startup_summary(agent, logger, usr_conf):
+    if getattr(Config.CURRENT, "name", "") != "navj9":
+        return
+
+    stage = Config.CURRENT
+    algorithm = agent.algorithm
+    level_mix = usr_conf["terrain"]["level_mix"]
+    expected_parent = getattr(stage, "parent_checkpoint", "unspecified")
+    loaded_checkpoint = getattr(agent, "cur_model_name", None) or "platform-managed/unavailable"
+    logger.info(
+        "[StageStartup] "
+        f"stage_name=navj9, expected_parent={expected_parent!r}, "
+        f"loaded_checkpoint={loaded_checkpoint!r}"
+    )
+    logger.info(
+        "[StageStartup] "
+        f"learning_rate={_read_learning_rate(agent)}, schedule={algorithm.schedule}, "
+        f"min_learning_rate={algorithm.min_learning_rate}, "
+        f"max_learning_rate={algorithm.max_learning_rate}, "
+        f"entropy_coef={algorithm.entropy_coef}, desired_kl={algorithm.desired_kl}"
+    )
+    logger.info(
+        "[StageStartup] "
+        f"level_mix={{'levels': {level_mix['levels']}, 'weights': {level_mix['weights']}, "
+        f"'pool_size': {level_mix['pool_size']}}}"
+    )
+
+
+def _validate_navj9_runtime_lr(agent):
+    """Keep the J9 experiment fixed-LR after every PPO update."""
+    if getattr(Config.CURRENT, "name", "") != "navj9":
+        return
+
+    algorithm = agent.algorithm
+    optimizer_lrs = [float(group["lr"]) for group in algorithm.optimizer.param_groups]
+    if (
+        abs(float(algorithm.learning_rate) - _J9_TARGET_LR) > 1.0e-12
+        or any(abs(lr - _J9_TARGET_LR) > 1.0e-12 for lr in optimizer_lrs)
+    ):
+        raise RuntimeError(
+            "[Stage=navj9] fixed learning rate drifted: "
+            f"algorithm={algorithm.learning_rate}, optimizer={optimizer_lrs}"
+        )
 
 
 def _log_navj8_startup_summary(env, agent, logger, usr_conf):
@@ -496,8 +637,10 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     # J8 is a single-variable distribution experiment. Validate and log it
     # after reset, when the actual terrain allocation is available.
     _validate_navj8_contract(usr_conf)
+    _validate_navj9_contract(usr_conf, agent)
     _log_terrain_level_histogram(env, logger)
     _log_navj8_startup_summary(env, agent, logger, usr_conf)
+    _log_navj9_startup_summary(agent, logger, usr_conf)
 
     # 检查 Stage3E-1 需要的 reward 是否真正激活
     _check_required_rewards(env, logger, usr_conf)
@@ -531,6 +674,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         # Phase 2: Policy Update
         # 阶段2：策略更新
         agent.learn(list_sample_data=None)
+        _validate_navj9_runtime_lr(agent)
         # Reset buffer pointer for next data collection
         # 重置 buffer 指针，为下一轮数据收集做准备
         storage.clear()
