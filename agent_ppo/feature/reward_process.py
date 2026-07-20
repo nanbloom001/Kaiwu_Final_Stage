@@ -434,6 +434,54 @@ class RewardProcess(RewardProcessBase):
         pitch_excess = torch.relu(torch.abs(pitch) - max(float(max_pitch_rad), 0.0))
         return torch.square(roll_excess) + torch.square(pitch_excess)
 
+    def _reward_dynamic_tilt_risk(
+        self,
+        soft_roll: float = 0.12,
+        hard_roll: float = 0.30,
+        soft_pitch: float = 0.22,
+        hard_pitch: float = 0.55,
+        soft_roll_rate: float = 0.60,
+        hard_roll_rate: float = 1.80,
+        soft_pitch_rate: float = 0.80,
+        hard_pitch_rate: float = 2.20,
+        max_penalty: float = 2.0,
+    ):
+        """Penalize growing roll/pitch risk before a hard tilt limit is reached."""
+        asset = self._get_robot_asset()
+        roll, pitch = self._quat_to_roll_pitch(asset.data.root_quat_w)
+        roll_rate = asset.data.root_ang_vel_b[:, 0]
+        pitch_rate = asset.data.root_ang_vel_b[:, 1]
+
+        def normalized_risk(value, soft_limit, hard_limit):
+            soft_limit = max(float(soft_limit), 0.0)
+            span = max(float(hard_limit) - soft_limit, 1e-6)
+            return torch.clamp((torch.abs(value) - soft_limit) / span, 0.0, 1.0)
+
+        roll_risk = normalized_risk(roll, soft_roll, hard_roll)
+        pitch_risk = normalized_risk(pitch, soft_pitch, hard_pitch)
+        roll_rate_risk = normalized_risk(
+            roll_rate,
+            soft_roll_rate,
+            hard_roll_rate,
+        )
+        pitch_rate_risk = normalized_risk(
+            pitch_rate,
+            soft_pitch_rate,
+            hard_pitch_rate,
+        )
+
+        risk = (
+            torch.square(roll_risk)
+            + 0.8 * torch.square(pitch_risk)
+            + 0.25 * torch.square(roll_rate_risk)
+            + 0.20 * torch.square(pitch_rate_risk)
+        )
+        return torch.clamp(
+            torch.nan_to_num(risk, nan=0.0, posinf=max_penalty, neginf=0.0),
+            min=0.0,
+            max=max(float(max_penalty), 0.0),
+        )
+
     def _reward_energy(self):
         """Energy penalty: sum of |torque  joint_velocity|.
 

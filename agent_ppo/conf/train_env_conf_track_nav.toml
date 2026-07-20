@@ -159,12 +159,19 @@ weight = -5.0
 [rewards.flat_orientation]
 weight = -1.65
 
-[rewards.tilt_limit]
-weight = -0.8
+[rewards.dynamic_tilt_risk]
+weight = -0.30
 
-[rewards.tilt_limit.params]
-max_roll_rad = 0.30
-max_pitch_rad = 0.55
+[rewards.dynamic_tilt_risk.params]
+soft_roll = 0.12
+hard_roll = 0.30
+soft_pitch = 0.22
+hard_pitch = 0.55
+soft_roll_rate = 0.60
+hard_roll_rate = 1.80
+soft_pitch_rate = 0.80
+hard_pitch_rate = 2.20
+max_penalty = 2.0
 
 [rewards.pose_score_formula]
 weight = 2.2

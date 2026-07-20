@@ -95,6 +95,12 @@ def build_monitor():
         .add_panel(name="倾斜速度", name_en="tilt_rate", type="line")
             .add_metric(metrics_name="tilt_rate", expr="avg(tilt_rate{})")
             .end_panel()
+        .add_panel(name="动态倾斜风险", name_en="reward_dynamic_tilt_risk", type="line")
+            .add_metric(
+                metrics_name="reward_dynamic_tilt_risk",
+                expr="avg(reward_dynamic_tilt_risk{})",
+            )
+            .end_panel()
         .end_group()
 
         .add_group(group_name="能耗动作", group_name_en="energy_act")
