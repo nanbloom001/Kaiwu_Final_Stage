@@ -43,6 +43,25 @@ max_push_vel_xy = 0.5
 [noise]
 add_noise = true
 
+# =============================================================================
+# ST7-Opt3: small residual UWB goal noise for Actor observations only.
+# Critic observations, rewards and terminations keep the clean simulator goal.
+# =============================================================================
+[goal_noise]
+enabled = true
+apply_probability = 0.75
+bearing_noise_std_rad = 0.015
+distance_noise_std_m = 0.03
+bearing_bias_std_rad = 0.020
+bearing_bias_clip_rad = 0.060
+distance_bias_std_m = 0.050
+distance_bias_clip_m = 0.150
+min_distance_m = 0.05
+max_distance_m = 25.0
+jump_enabled = false
+stale_enabled = false
+dropout_enabled = false
+
 [init_state]
 pos = [0.0, 0.0, 0.35]
 
