@@ -65,8 +65,8 @@ raw_terrain_gate_enabled = false
 suggested_speed_fallback = 0.62
 pre_maze_lin_vel_x = [0.82, 1.02]
 slope_lin_vel_x = [0.90, 1.10]
-stairs_lin_vel_x = [0.52, 0.68]
-maze_lin_vel_x = [0.60, 0.80]
+stairs_lin_vel_x = [0.48, 0.60]
+maze_lin_vel_x = [0.55, 0.70]
 phase_maze_goal_dist_gate = 8.5
 phase_maze_distance_mode = "longitudinal"
 phase_maze_goal_longitudinal_min = -1.0
@@ -452,7 +452,7 @@ maze_goal_dist_gate = 14.0
 maze_gate_obstacle_threshold = -0.80
 
 [rewards.wall_stall_penalty]
-weight = -1.2
+weight = -1.8
 [rewards.wall_stall_penalty.params]
 obstacle_threshold = -0.70
 front_cols = 5
@@ -506,7 +506,7 @@ memory_size = 96
 goal_heading_std = 1.0
 
 [rewards.stuck_penalty]
-weight = -2.2
+weight = -0.6
 [rewards.stuck_penalty.params]
 min_command = 0.05
 still_speed = 0.12
