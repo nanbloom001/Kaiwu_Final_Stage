@@ -269,7 +269,7 @@ class Config:
     # 训练和评估均显式使用该阶段，避免环境名称误改模型结构。
     # T2 continues the previous TrackNav checkpoint with a reference-13-style
     # full-track stabilization setup, capped at 0.8 m/s.
-    CURRENT = TrackNavConfig
+    CURRENT = TrackLBCLocoConfig
 
     @staticmethod
     def load_conf(logger):

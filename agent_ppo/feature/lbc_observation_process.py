@@ -5,45 +5,44 @@ Output layout:
     [proprio(45) | height_scan(256) | optional_goal(num_goal_obs) | depth]
 """
 
-import traceback as _tb
-
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature import nav_observation_utils
-from agent_ppo.feature.goal_features import build_track_goal_features
-from agent_ppo.feature.terrain_gate import apply_worker_gate_command
+from agent_ppo.feature.goal_features import (
+    build_track_goal_features,
+    build_track_goal_raw,
+    encode_track_goal,
+)
+from agent_ppo.feature.goal_noise import (
+    GoalNoiseAugmenter,
+    resolve_goal_noise_config,
+)
 from tools.base_env.observation_process import ObservationProcess
-
-_GATE_ERR_COUNT = 0
-
-
-def _log_gate_exc_once():
-    global _GATE_ERR_COUNT
-    if _GATE_ERR_COUNT >= 3:
-        return
-    _GATE_ERR_COUNT += 1
-    try:
-        import sys
-        print(
-            "[LBCObservationProcess] apply_worker_gate_command failed "
-            "(#" + str(_GATE_ERR_COUNT) + "/3), skip patch:\n" + _tb.format_exc(),
-            file=sys.stderr,
-            flush=True,
-        )
-    except Exception:
-        pass
 
 
 class LBCObservationProcess(ObservationProcess):
     target_group = "policy"
 
+    def _goal_features(self):
+        feature_dim = getattr(Config.CURRENT, "num_goal_obs", 0)
+        if hasattr(self, "goal_position_in_robot_frame"):
+            self.goal_position_in_robot_frame()
+        if feature_dim != 3:
+            return build_track_goal_features(self.env, feature_dim)
+
+        raw_goal = build_track_goal_raw(self.env)
+        if not hasattr(self, "goal_noise_augmenter"):
+            self.goal_noise_augmenter = GoalNoiseAugmenter(
+                env=self.env,
+                config=resolve_goal_noise_config(self.env),
+            )
+        # This one tensor is concatenated once and then shared by teacher and
+        # student action paths through AlgorithmLBC._split_obs().
+        shared_raw_goal = self.goal_noise_augmenter.apply(raw_goal)
+        return encode_track_goal(shared_raw_goal)
+
     def process(self):
         obs = self.default_observation()
-        try:
-            obs = apply_worker_gate_command(self.env, obs, "policy")
-        except Exception:
-            _log_gate_exc_once()
-        feature_dim = getattr(Config.CURRENT, "num_goal_obs", 0)
-        goal_features = build_track_goal_features(self.env, feature_dim)
+        goal_features = self._goal_features()
         if goal_features is not None:
             obs = self.concatenate_terms(obs, goal_features)
         depth = nav_observation_utils.depth_camera_image(self.env)

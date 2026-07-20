@@ -5,8 +5,70 @@
 from kaiwudrl.common.monitor.monitor_config_builder import MonitorConfigBuilder
 
 
+def _add_line_panel(monitor, display_name, panel_name, metric_name):
+    return (
+        monitor.add_panel(name=display_name, name_en=panel_name, type="line")
+        .add_metric(metrics_name=metric_name, expr=f"avg({metric_name}{{}})")
+        .end_panel()
+    )
+
+
+def _build_lbc_monitor():
+    monitor = MonitorConfigBuilder().title("ST9_Opt3_D1")
+    groups = (
+        (
+            "蒸馏",
+            "distill",
+            (
+                ("潜变量MSE", "latent_mse", "latent_mse"),
+                ("余弦相似度", "cosine_sim", "cosine_similarity"),
+                ("夹角", "angle_deg", "angle_deg"),
+                ("梯度范数", "grad_norm", "grad_norm"),
+                ("学习率", "learning_rate", "learning_rate"),
+                ("动作MSE", "action_mse", "teacher_student_action_mse"),
+                ("学生驱动率", "student_drive", "student_drive_ratio"),
+            ),
+        ),
+        (
+            "Goal噪声",
+            "goal_noise",
+            (
+                ("启用率", "goal_active", "goal_noise_active_ratio"),
+                ("方向噪声", "goal_bear_noise", "goal_bearing_noise_abs_mean"),
+                ("距离噪声", "goal_dist_noise", "goal_distance_noise_abs_mean"),
+                ("方向偏差", "goal_bear_bias", "goal_bearing_bias_abs_mean"),
+                ("距离偏差", "goal_dist_bias", "goal_distance_bias_abs_mean"),
+            ),
+        ),
+        (
+            "深度增强",
+            "depth_aug",
+            (
+                ("散点空洞", "pixel_dropout", "depth_random_dropout_ratio"),
+                ("块帧占比", "block_frames", "depth_block_dropout_frame_ratio"),
+                ("块面积占比", "block_area", "depth_block_dropout_area_ratio"),
+                ("活动块数", "active_blocks", "active_block_count"),
+                ("块持续帧", "block_persist", "block_persistence_mean"),
+                ("增强前有效率", "valid_before", "valid_depth_ratio_before"),
+                ("增强后有效率", "valid_after", "valid_depth_ratio_after"),
+            ),
+        ),
+    )
+    for group_name, group_name_en, panels in groups:
+        monitor.add_group(group_name=group_name, group_name_en=group_name_en)
+        for display_name, panel_name, metric_name in panels:
+            _add_line_panel(monitor, display_name, panel_name, metric_name)
+        monitor.end_group()
+    return monitor.build()
+
+
 def build_monitor():
     """Build panels whose display and metric names stay within 20 characters."""
+    from agent_ppo.conf.conf import Config
+
+    if getattr(Config.CURRENT, "algorithm", "ppo") == "lbc_loco":
+        return _build_lbc_monitor()
+
     monitor = MonitorConfigBuilder()
     return (
         monitor.title("Standard_PPO")
