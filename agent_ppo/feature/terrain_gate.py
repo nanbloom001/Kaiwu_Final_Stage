@@ -45,6 +45,28 @@ def _diagnostics_enabled(conf):
     return bool(conf.get("gate_diagnostics_enabled", False))
 
 
+_NO_SCAN_LOGGED = False
+
+
+def _log_no_scan_once(fallback_vx):
+    """Log once when height_scanner is unavailable and the fallback speed is in use."""
+    global _NO_SCAN_LOGGED
+    if _NO_SCAN_LOGGED:
+        return
+    _NO_SCAN_LOGGED = True
+    try:
+        import sys as _sys
+        print(
+            "[terrain_gate] height_scanner unavailable -> terrain detection disabled -> "
+            "fallback cmd_vx=" + str(fallback_vx)
+            + " (de-speed fallback, close to trained stairs 0.70)",
+            file=_sys.stderr,
+            flush=True,
+        )
+    except Exception:
+        pass
+
+
 def _zeros(env, dtype=torch.float32):
     return torch.zeros(env.num_envs, device=env.device, dtype=dtype)
 
@@ -828,6 +850,34 @@ def apply_worker_gate_command(env, obs, group):
         return obs
     if not enabled and not diagnostics_enabled and not reward_metrics_enabled:
         return obs
+
+    # De-speed fallback (root cause: test/deploy env has no height_scanner, so
+    # _compute_gates sees an all-zero height_scan and mis-classifies it as flat ->
+    # command 0.80 full speed; but teacher_actor was trained with stairs cmd=0.70,
+    # 0.80 is OOD -> no climbing gait -> robot stuck on stairs). When height_scan is
+    # unavailable, drop to suggested_speed_fallback (~0.68, close to trained 0.70)
+    # so teacher_actor still produces a climbing gait.
+    if enabled and mode != "shadow":
+        _scan_sensor = _sensor_grid(env, "height_scanner")
+        _scan_ok = _scan_sensor is not None
+        if not _scan_ok:
+            _og = _obs_grid(obs, group)
+            if _og is not None:
+                _scan_ok = float(_og.abs().sum().item()) > 1.0e-6
+        if not _scan_ok:
+            _fallback_vx = float(conf.get("suggested_speed_fallback", conf.get("phase_command_fallback_vx", 0.62)))
+            _cmd = _current_command(env).clone()
+            _cmd[:, 0] = _fallback_vx
+            _cmd[:, 1] = 0.0
+            _cmd[:, 2] = 0.0
+            _write_command(env, _cmd)
+            _patched = obs.clone()
+            if group == "policy" and _patched.shape[-1] >= 9:
+                _patched[:, 6:9] = _cmd.to(device=_patched.device, dtype=_patched.dtype)
+            elif group == "critic" and _patched.shape[-1] >= 12:
+                _patched[:, 9:12] = _cmd.to(device=_patched.device, dtype=_patched.dtype)
+            _log_no_scan_once(_fallback_vx)
+            return _patched
 
     state = _get_state(env)
     step = _step_key(env)

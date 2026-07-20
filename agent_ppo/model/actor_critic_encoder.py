@@ -179,12 +179,6 @@ class ActorCriticEncoder(ActorCritic):
     # 策略（actor）路径：走 actor encoder
     def _encode_obs(self, obs: torch.Tensor) -> torch.Tensor:
         """Split policy obs and produce actor input = cat(proprio, latent, [goal])."""
-        expected_dim = self.scan_offset + self.num_scan + self.num_goal_obs
-        if obs.shape[-1] < expected_dim:
-            raise ValueError(
-                f"Policy observation too short: expected at least {expected_dim}, "
-                f"got {obs.shape[-1]}."
-            )
         proprio = obs[:, : self.num_proprio]
         scan = obs[:, self.scan_offset : self.scan_offset + self.num_scan]
         latent = self.encoder(scan)
@@ -231,12 +225,6 @@ class ActorCriticEncoder(ActorCritic):
 
         # critic_use_encoder=True：抽 scan、丢 drop、拼 latent
         ss, se = self.critic_scan_slice  # type: ignore[misc]
-        expected_dim = se + self.num_goal_obs
-        if critic_obs.shape[-1] < expected_dim:
-            raise ValueError(
-                f"Critic observation too short: expected at least {expected_dim}, "
-                f"got {critic_obs.shape[-1]}."
-            )
         scan = critic_obs[:, ss:se]
         latent = self.critic_encoder(scan)  # type: ignore[misc]
 
@@ -250,6 +238,10 @@ class ActorCriticEncoder(ActorCritic):
         keep_parts = []
         cur = 0
         total = critic_obs.shape[-1]
+        goal = None
+        if self.num_goal_obs > 0:
+            goal = critic_obs[:, -self.num_goal_obs :]
+            total -= self.num_goal_obs
         for s, e in bad_intervals:
             if cur < s:
                 keep_parts.append(critic_obs[:, cur:s])
@@ -258,6 +250,8 @@ class ActorCriticEncoder(ActorCritic):
             keep_parts.append(critic_obs[:, cur:total])
 
         keep_parts.append(latent)
+        if goal is not None:
+            keep_parts.append(goal)
         return torch.cat(keep_parts, dim=-1)
 
     def evaluate(self, critic_obs: torch.Tensor, **kwargs) -> torch.Tensor:

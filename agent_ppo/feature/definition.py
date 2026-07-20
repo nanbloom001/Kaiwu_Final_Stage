@@ -8,10 +8,8 @@ Author: Tencent AI Arena Authors
 """
 
 
-from common_python.utils.common_func import create_cls, Frame
+from common_python.utils.common_func import create_cls
 import torch
-import numpy as np
-from agent_ppo.conf.conf import Config
 
 
 ObsData = create_cls("ObsData", feature=None, legal_action=None)
@@ -140,7 +138,7 @@ class RolloutStorage:
         Save RNN hidden states.
         保存 RNN 隐藏状态。
         """
-        if hidden_states is None or hidden_states == (None, None):
+        if hidden_states is None or (isinstance(hidden_states, tuple) and hidden_states[0] is None):
             return
         hid_a, hid_c = self._normalize_hidden_states(hidden_states)
         if self.saved_hidden_states_a is None:
@@ -239,6 +237,22 @@ class RolloutStorage:
                 batch_idx = indices[start:end]
                 yield self._create_mini_batch(flattened_data, batch_idx)
 
+    def recurrent_mini_batch_generator(self, num_mini_batches, num_epochs=8):
+        """
+        Generate recurrent mini-batches as full time sequences.
+        Shuffle environment IDs, keep the time axis intact.
+        """
+        envs_per_batch = self.num_envs // num_mini_batches
+        if envs_per_batch <= 0:
+            raise ValueError(f"num_mini_batches={num_mini_batches} exceeds num_envs={self.num_envs}")
+
+        usable_envs = envs_per_batch * num_mini_batches
+        for epoch in range(num_epochs):
+            env_perm = torch.randperm(self.num_envs, requires_grad=False, device=self.device)[:usable_envs]
+            for i in range(num_mini_batches):
+                env_ids = env_perm[i * envs_per_batch : (i + 1) * envs_per_batch]
+                yield self._create_recurrent_mini_batch(env_ids)
+
     def _flatten_buffers(self):
         """Flatten all buffer tensors for batch generation.
 
@@ -281,4 +295,35 @@ class RolloutStorage:
             # masks placeholder
             # 掩码占位符
             None,
+        )
+
+    def _create_recurrent_mini_batch(self, env_ids):
+        observations = self.observations[:, env_ids]
+        critic_observations = (
+            self.privileged_observations[:, env_ids]
+            if self.privileged_observations is not None
+            else observations
+        )
+
+        if self.saved_hidden_states_a is not None and self.saved_hidden_states_c is not None:
+            hidden_states = (
+                self.saved_hidden_states_a[0][0, :, env_ids, :].detach(),
+                self.saved_hidden_states_c[0][0, :, env_ids, :].detach(),
+            )
+        else:
+            hidden_states = (None, None)
+
+        masks = 1.0 - self.dones[:, env_ids].float()
+        return (
+            observations,
+            critic_observations,
+            self.actions[:, env_ids],
+            self.values[:, env_ids],
+            self.advantages[:, env_ids],
+            self.returns[:, env_ids],
+            self.actions_log_prob[:, env_ids],
+            self.mu[:, env_ids],
+            self.sigma[:, env_ids],
+            hidden_states,
+            masks,
         )

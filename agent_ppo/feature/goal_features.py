@@ -1,15 +1,14 @@
 # -*- coding: UTF-8 -*-
-"""Goal features shared by Track policy and critic observations."""
+###########################################################################
+# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+###########################################################################
+"""Public goal-feature helpers for Track navigation observations."""
 
 import torch
 
 
 def build_track_goal_features(env, feature_dim: int):
-    """Build the J1/p22-compatible 3-D goal feature from public env state.
-
-    Layout:
-        [local_goal_x / 10, local_goal_y / 10, clipped_goal_distance / 20]
-    """
+    """Build goal features from public env state only."""
     if feature_dim <= 0:
         return None
 
@@ -30,10 +29,7 @@ def build_track_goal_features(env, feature_dim: int):
 
     delta_w = goal_positions[:, :2] - root_pos_w[:, :2]
     qw, qx, qy, qz = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-    heading = torch.atan2(
-        2.0 * (qw * qz + qx * qy),
-        1.0 - 2.0 * (qy * qy + qz * qz),
-    )
+    heading = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
     cos_h = torch.cos(-heading)
     sin_h = torch.sin(-heading)
     local_x = cos_h * delta_w[:, 0] - sin_h * delta_w[:, 1]

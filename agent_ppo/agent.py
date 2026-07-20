@@ -8,8 +8,8 @@ Author: Tencent AI Arena Authors
 """
 
 
+import copy
 import os
-import re
 
 import numpy as np
 import torch
@@ -22,10 +22,72 @@ import torch.optim as optim
 
 from kaiwudrl.interface.agent import BaseAgent
 from agent_ppo.feature.definition import ActData
-from agent_ppo.conf.conf import Config
+from agent_ppo.conf.conf import Config, _load_toml
 from agent_ppo.model.actor_critic_encoder import ActorCriticEncoder
 from agent_ppo.algorithm.algorithm_ppo import AlgorithmPPO
 from tools.train_env_conf_validate import check_usr_conf
+
+
+def _obs_height_grid(obs, scan_start: int = 45, scan_size: int = 256):
+    if obs is None or not hasattr(obs, "shape") or obs.shape[-1] < scan_start + scan_size:
+        return None
+    side = int(scan_size ** 0.5)
+    if side * side != scan_size:
+        return None
+    return obs[:, scan_start : scan_start + scan_size].view(obs.shape[0], side, side)
+
+
+def _classify_pre_maze_terrain(obs, rl_nav_conf):
+    grid = _obs_height_grid(
+        obs,
+        scan_start=int(rl_nav_conf.get("scan_start", 45)),
+        scan_size=int(rl_nav_conf.get("scan_size", 256)),
+    )
+    if grid is None:
+        return None
+
+    row_start = max(int(rl_nav_conf.get("terrain_row_start", 3)), 0)
+    row_end = min(int(rl_nav_conf.get("terrain_row_end", 13)), grid.shape[1])
+    front_cols = min(int(rl_nav_conf.get("terrain_front_cols", 8)), grid.shape[2])
+    if row_end <= row_start or front_cols <= 1:
+        return None
+
+    sector = grid[:, row_start:row_end, :front_cols]
+    if sector.shape[1] == 0 or sector.shape[2] <= 1:
+        return None
+
+    lateral_std = sector.std(dim=1, unbiased=False).mean(dim=1)
+    dx = sector[:, :, 1:] - sector[:, :, :-1]
+    abs_dx = dx.abs()
+    if abs_dx.numel() == 0:
+        return None
+
+    q = float(rl_nav_conf.get("terrain_step_quantile", 0.85))
+    q = min(max(q, 0.0), 1.0)
+    step_strength = torch.quantile(abs_dx.flatten(1), q, dim=1)
+    sign_consistency = dx.mean(dim=(1, 2)).abs() / (abs_dx.mean(dim=(1, 2)) + 1e-6)
+    if dx.shape[2] > 1:
+        second_diff = (dx[:, :, 1:] - dx[:, :, :-1]).abs().mean(dim=(1, 2))
+    else:
+        second_diff = torch.zeros(obs.shape[0], device=obs.device, dtype=obs.dtype)
+
+    is_uniform = lateral_std < float(rl_nav_conf.get("terrain_lateral_std_threshold", 0.18))
+    not_wall = sector.amin(dim=(1, 2)) > float(rl_nav_conf.get("terrain_wall_height_threshold", -1.05))
+    terrain_like = is_uniform & not_wall & (
+        step_strength > float(rl_nav_conf.get("terrain_slope_delta_threshold", 0.035))
+    )
+    stair_like = terrain_like & (
+        (step_strength > float(rl_nav_conf.get("terrain_stair_delta_threshold", 0.10)))
+        | (second_diff > float(rl_nav_conf.get("terrain_stair_second_diff_threshold", 0.055)))
+    )
+    slope_like = terrain_like & ~stair_like & (
+        sign_consistency > float(rl_nav_conf.get("terrain_slope_sign_consistency_threshold", 0.55))
+    )
+
+    terrain_id = torch.zeros(obs.shape[0], dtype=torch.long, device=obs.device)
+    terrain_id = torch.where(slope_like, torch.ones_like(terrain_id), terrain_id)
+    terrain_id = torch.where(stair_like, torch.full_like(terrain_id, 2), terrain_id)
+    return terrain_id
 
 
 class Agent(BaseAgent):
@@ -65,7 +127,7 @@ class Agent(BaseAgent):
 
         # Critic obs layout: [critic_proprio | height_scan] = 316 D
         # critic 观测 = critic_proprio + height_scan
-        self.num_critic_obs = stage.num_critic_observations
+        self.num_critic_obs = stage.num_critic_observations + num_goal_obs
 
         # Algorithm dispatch
         # 算法分发
@@ -78,24 +140,65 @@ class Agent(BaseAgent):
         else:
             self._init_flat(num_proprio, num_scan, stage)
 
-        self.num_steps_per_env = stage.num_steps_per_env
-
-        # Track 评估时，平台下发的速度命令可能和训练时不一致（评估随机采样，
-        # 训练恒速直线）。强制覆盖 obs 命令槽位为训练时的恒速锚点，保证评估
-        # 时机器人在训练分布内行走。
-        # 默认 False：Stage3B 开门控后，评估时由门控接管命令，不再恒速覆盖。
         self.eval_command_override = None
-        if self.is_eval and stage.task_type == "track":
-            rl_nav_conf = usr_conf.get("rl_navigation", {})
-            if bool(rl_nav_conf.get("eval_command_override", False)):
-                cmd = rl_nav_conf.get("eval_command", [0.45, 0.0, 0.0])
+        self.eval_phase_command_enabled = False
+        self.eval_pre_maze_command = None
+        self.eval_slope_command = None
+        self.eval_stairs_command = None
+        self.eval_maze_command = None
+        self.eval_phase_maze_goal_dist_gate = 14.0
+        self.eval_rl_nav_conf = {}
+        if is_eval and stage.task_type == "track" and not self.is_lbc:
+            train_stage_conf = self._load_train_stage_conf(stage)
+            rl_nav_conf = train_stage_conf.get("rl_navigation", {}).copy()
+            rl_nav_conf.update(usr_conf.get("rl_navigation", {}))
+            self.eval_rl_nav_conf = rl_nav_conf.copy()
+            self.eval_phase_command_enabled = bool(
+                rl_nav_conf.get("phase_command_enabled", False)
+            )
+            self.eval_phase_maze_goal_dist_gate = float(
+                rl_nav_conf.get("phase_maze_goal_dist_gate", 14.0)
+            )
+            pre_range = rl_nav_conf.get("pre_maze_lin_vel_x", [0.75, 1.0])
+            slope_range = rl_nav_conf.get("slope_lin_vel_x", pre_range)
+            stairs_range = rl_nav_conf.get("stairs_lin_vel_x", pre_range)
+            maze_range = rl_nav_conf.get("maze_lin_vel_x", [0.45, 0.65])
+            if len(pre_range) == 2:
+                self.eval_pre_maze_command = torch.tensor(
+                    [0.5 * (float(pre_range[0]) + float(pre_range[1])), 0.0, 0.0],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            if len(slope_range) == 2:
+                self.eval_slope_command = torch.tensor(
+                    [0.5 * (float(slope_range[0]) + float(slope_range[1])), 0.0, 0.0],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            if len(stairs_range) == 2:
+                self.eval_stairs_command = torch.tensor(
+                    [0.5 * (float(stairs_range[0]) + float(stairs_range[1])), 0.0, 0.0],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            if len(maze_range) == 2:
+                self.eval_maze_command = torch.tensor(
+                    [0.5 * (float(maze_range[0]) + float(maze_range[1])), 0.0, 0.0],
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+            if bool(rl_nav_conf.get("eval_command_override", True)):
+                cmd = rl_nav_conf.get("eval_command", [0.55, 0.0, 0.0])
                 if len(cmd) == 3:
                     self.eval_command_override = torch.tensor(
                         cmd, device=self.device, dtype=torch.float32
                     )
                     self.logger.info(
-                        f"[eval] command override enabled: {cmd}"
+                        "[RLNavigation] Eval policy command obs override enabled: "
+                        f"{cmd}"
                     )
+
+        self.num_steps_per_env = stage.num_steps_per_env
         self.save_interval = stage.model_save_interval
 
         # LBC: 无 PPO storage 需要初始化
@@ -112,6 +215,69 @@ class Agent(BaseAgent):
             )
 
         super().__init__(agent_type, device, logger, monitor)
+
+    def _load_train_stage_conf(self, stage):
+        train_conf_file = (
+            f"agent_ppo/conf/train_env_conf_{stage.task_type}_{stage.name}.toml"
+        )
+        if not os.path.exists(train_conf_file):
+            return {}
+        try:
+            return _load_toml(train_conf_file)
+        except Exception as exc:
+            if self.logger is not None:
+                self.logger.warning(
+                    "[RLNavigation] Failed to load train stage config "
+                    f"from {train_conf_file}: {exc}"
+                )
+            return {}
+
+    def _apply_eval_command_to_obs(self, obs):
+        if obs is None or obs.shape[-1] < 9:
+            return obs
+        if (
+            self.eval_phase_command_enabled
+            and self.eval_pre_maze_command is not None
+            and self.eval_maze_command is not None
+            and obs.shape[-1] >= 304
+        ):
+            nav_obs = obs.clone()
+            goal_dist = torch.clamp(nav_obs[:, 303], 0.0, 1.0) * 20.0
+            maze_phase = goal_dist < self.eval_phase_maze_goal_dist_gate
+            pre_command = self.eval_pre_maze_command.to(
+                device=obs.device, dtype=obs.dtype
+            ).expand(obs.shape[0], -1)
+            if bool(self.eval_rl_nav_conf.get("terrain_phase_speed_enabled", False)):
+                terrain_id = _classify_pre_maze_terrain(nav_obs, self.eval_rl_nav_conf)
+                if terrain_id is not None:
+                    if self.eval_slope_command is not None:
+                        slope_command = self.eval_slope_command.to(
+                            device=obs.device, dtype=obs.dtype
+                        ).expand(obs.shape[0], -1)
+                        pre_command = torch.where(
+                            (terrain_id == 1).unsqueeze(1), slope_command, pre_command
+                        )
+                    if self.eval_stairs_command is not None:
+                        stairs_command = self.eval_stairs_command.to(
+                            device=obs.device, dtype=obs.dtype
+                        ).expand(obs.shape[0], -1)
+                        pre_command = torch.where(
+                            (terrain_id == 2).unsqueeze(1), stairs_command, pre_command
+                        )
+            maze_command = self.eval_maze_command.to(
+                device=obs.device, dtype=obs.dtype
+            ).expand(obs.shape[0], -1)
+            nav_obs[:, 6:9] = torch.where(
+                maze_phase.unsqueeze(1), maze_command, pre_command
+            )
+            return nav_obs
+        if self.eval_command_override is None:
+            return obs
+        nav_obs = obs.clone()
+        nav_obs[:, 6:9] = self.eval_command_override.to(
+            device=obs.device, dtype=obs.dtype
+        )
+        return nav_obs
 
     def _init_flat(self, num_proprio, num_scan, stage):
         """
@@ -131,7 +297,7 @@ class Agent(BaseAgent):
         encoder_hidden_dims = getattr(stage, "encoder_hidden_dims", [512, 256])
 
         # critic_obs 排布: [c_proprio | h_scan]
-        critic_proprio_dim = stage.num_critic_observations - num_scan - num_goal_obs
+        critic_proprio_dim = stage.num_critic_observations - num_scan  # 60
         scan_critic_start = critic_proprio_dim                         # 60
         scan_critic_end = scan_critic_start + num_scan                 # 316
 
@@ -173,20 +339,11 @@ class Agent(BaseAgent):
             device=self.device,
             logger=self.logger,
             monitor=self.monitor,
-            # PPO 核心参数全部从 stage 显式传入（计划 6.3：不让 AlgorithmPPO 隐式读取）
             learning_rate=stage.lr,
-            schedule=getattr(stage, "schedule", "adaptive"),
-            min_learning_rate=getattr(stage, "min_learning_rate", 1e-5),
-            max_learning_rate=getattr(stage, "max_learning_rate", 1e-2),
             clip_param=getattr(stage, "clip_param", 0.2),
-            gamma=getattr(stage, "gamma", 0.99),
-            lam=getattr(stage, "lam", 0.95),
-            value_loss_coef=getattr(stage, "value_loss_coef", 1.0),
             entropy_coef=getattr(stage, "entropy_coef", 0.01),
-            max_grad_norm=getattr(stage, "max_grad_norm", 1.0),
             desired_kl=getattr(stage, "desired_kl", 0.01),
-            min_normalized_std=getattr(stage, "min_normalized_std", None),
-            max_normalized_std=getattr(stage, "max_normalized_std", None),
+            schedule=getattr(stage, "schedule", "adaptive"),
             num_mini_batches=stage.num_mini_batches,
             num_learning_epochs=stage.num_learning_epochs,
         )
@@ -235,7 +392,11 @@ class Agent(BaseAgent):
         activation_map = {"elu": _nn.ELU, "relu": _nn.ReLU, "tanh": _nn.Tanh}
         Act = activation_map.get(stage.teacher_actor_activation, _nn.ELU)
 
-        actor_input_dim = stage.proprio_dim + stage.latent_dim
+        actor_input_dim = (
+            stage.proprio_dim
+            + stage.latent_dim
+            + getattr(stage, "num_goal_obs", 0)
+        )
         hidden = list(stage.teacher_actor_hidden_dims)
         layers = []
         prev = actor_input_dim
@@ -261,6 +422,7 @@ class Agent(BaseAgent):
             max_grad_norm=stage.max_grad_norm,
             proprio_dim=stage.proprio_dim,
             scan_dim=stage.scan_dim,
+            goal_dim=getattr(stage, "num_goal_obs", 0),
             depth_shape=(stage.depth_height, stage.depth_width, stage.depth_channels),
         )
 
@@ -276,17 +438,14 @@ class Agent(BaseAgent):
         with torch.no_grad():
             if self.is_lbc:
                 return self._exploit_lbc_loco(obs)
-            # Track 评估：覆盖 obs 命令槽位 [6:9] 为训练时的恒速直线锚点
-            if self.eval_command_override is not None:
-                obs = obs.clone()
-                obs[:, 6:9] = self.eval_command_override.expand(obs.shape[0], -1)
+            obs = self._apply_eval_command_to_obs(obs)
             actions = self.algorithm.actor_critic.act_inference(obs)
             return [ActData(action=actions)]
 
     def _exploit_lbc_loco(self, obs):
         """LBC Loco eval: 学生 VisionEncoder 闭环推理。
 
-        obs: flat tensor [B, proprio+scan+depth] = [B, 57901]
+        obs: standard [proprio+scan+depth], or Track [proprio+scan+goal+depth]
         Returns: [ActData(action=joint_actions[B, 12])]
         """
         obs_dict = self.algorithm._split_obs(obs)
@@ -299,7 +458,9 @@ class Agent(BaseAgent):
         )  # [B, latent_dim]
 
         # 2. 教师 Actor: proprio + student_latent → joint_actions
-        actor_input = torch.cat([obs_dict["proprio"], student_latent], dim=-1)
+        actor_input = self.algorithm._build_actor_input(
+            obs_dict["proprio"], student_latent, obs_dict.get("goal")
+        )
         joint_actions = self.teacher_actor(actor_input)  # [B, num_actions]
 
         return [ActData(action=joint_actions)]
@@ -331,6 +492,20 @@ class Agent(BaseAgent):
             )
         (obs, critic_obs) = list_obs_data
         with torch.no_grad():
+            if self.is_eval:
+                obs = self._apply_eval_command_to_obs(obs)
+            hidden_states = None
+            if getattr(self.algorithm.actor_critic, "is_recurrent", False):
+                current_hidden = self.algorithm.actor_critic.get_hidden_states()
+                if current_hidden is None or current_hidden[0].shape[1] != obs.shape[0]:
+                    self.algorithm.actor_critic._init_hidden_states(
+                        obs.shape[0], obs.device, obs.dtype
+                    )
+                    current_hidden = self.algorithm.actor_critic.get_hidden_states()
+                hidden_states = tuple(
+                    state.detach().clone() for state in current_hidden
+                )
+
             actions = self.algorithm.actor_critic.act(obs)
             values = self.algorithm.actor_critic.evaluate(critic_obs)
             log_probs = self.algorithm.actor_critic.get_actions_log_prob(actions)
@@ -344,30 +519,25 @@ class Agent(BaseAgent):
                 action_std,
                 obs.detach(),
                 critic_obs.detach(),
+                hidden_states,
             )
 
-    def save_model(self, path=None, id=None):
+    def save_model(self, path=None, id="1"):
         """
         Save model checkpoint.
-        保存 model checkpoint。
+        保存模型 checkpoint。
 
-        ID 分配（计划 3.3）：扫描同前缀全局最大 ID 并 +1，保证全局递增、不覆盖历史。
-        若显式传入 id 且大于扫描值，则用传入值（兼容平台预分配 id）。
+        Path is driven by stage.ckpt_name:
+          - LocomotionConfig  -> model.ckpt-{id}.pkl
+          - LBCLocoConfig     -> model.ckpt-lbc-loco-{id}.pkl
+                                  plus model.ckpt-{id}.pkl platform alias
         """
-        ckpt_name = getattr(Config.CURRENT, "ckpt_name", "") or ""
-
-        # 计划 3.3：扫描同前缀全局最大 ID，递增分配
-        scanned = self._max_global_id(path) if path else 0
-        if id is not None and str(id).isdigit():
-            next_id = max(scanned + 1, int(id))
-        else:
-            next_id = scanned + 1
-        id = str(next_id)
-
+        path = self._resolve_checkpoint_dir(path, create=True)
+        ckpt_name = getattr(self.stage, "ckpt_name", "") or ""
         if ckpt_name:
-            model_file_path = f"{path}/{ckpt_name}-{id}.pkl"
+            model_file_path = os.path.join(path, f"{ckpt_name}-{str(id)}.pkl")
         else:
-            model_file_path = f"{path}/model.ckpt-{id}.pkl"
+            model_file_path = os.path.join(path, f"model.ckpt-{str(id)}.pkl")
 
         if self.is_lbc:
             # LBC saves via algorithm.save which writes the full LBC dict
@@ -378,82 +548,39 @@ class Agent(BaseAgent):
                 iteration=self.algorithm.current_iteration,
             )
             self.logger.info(f"[{self.algorithm_name}] save {model_file_path} successfully")
+            platform_alias = os.path.join(path, f"model.ckpt-{str(id)}.pkl")
+            if os.path.abspath(platform_alias) != os.path.abspath(model_file_path):
+                self.algorithm.save(
+                    platform_alias,
+                    format_tag=self.algorithm_name,
+                    iteration=self.algorithm.current_iteration,
+                )
+                self.logger.info(
+                    f"[{self.algorithm_name}] save platform alias "
+                    f"{platform_alias} successfully"
+                )
         else:
-            self._atomic_save(self.model.state_dict(), model_file_path, id)
-            self.logger.info(f"save model {model_file_path} successfully")
-
-        self._save_standard_eval_alias(path, id, model_file_path)
+            torch.save(self.model.state_dict(), model_file_path)
+            file_size = os.path.getsize(model_file_path)
+            self.logger.info(
+                f"save model {model_file_path} successfully, size={file_size} bytes"
+            )
 
         # Side model: 训练 lbc_loco 时同时落一份 locomotion 形态的 ckpt。
         # 将冻结的 teacher_encoder + teacher_actor 重组为 encoder.*/actor.* 命名，
         # 使产物目录内保留一份可独立部署 / 供下阶段拆分教师的 locomotion ckpt。
         self._save_side_locomotion(path, id)
 
-    def _max_global_id(self, path):
-        """扫描目录下所有 model.ckpt-*.* 文件的数字 ID，返回全局最大值（计划 3.3）。
-
-        用平台同款正则提取 ID，跨所有前缀（nav/locomotion/lbc-loco）统一取最大，
-        保证不同阶段之间 ID 不冲突。
-        """
-        if not path or not os.path.isdir(path):
-            return 0
-        id_re = re.compile(r"model\.ckpt-[a-z]*-*([0-9][0-9]*)\..*$")
-        best = 0
-        try:
-            for fname in os.listdir(path):
-                if not fname.startswith("model.ckpt-") or not fname.endswith(".pkl"):
-                    continue
-                m = id_re.match(fname)
-                if m:
-                    best = max(best, int(m.group(1)))
-        except OSError:
-            pass
-        return best
-
-    def _atomic_save(self, state_dict, final_path, id):
-        """原子保存（计划 3.7）：临时文件 → 回读校验 → os.replace。
-
-        临时文件名不以 model.ckpt- 开头，避免被探活误识别为半成品模型。
-        """
-        path_dir = os.path.dirname(final_path)
-        tmp_path = f"{path_dir}/.tmp-save-{id}.pkl"
-        torch.save(state_dict, tmp_path)
-        try:
-            _check = torch.load(tmp_path, map_location="cpu", weights_only=False)
-            if not isinstance(_check, dict):
-                raise RuntimeError("checkpoint round-trip failed: not a dict")
-        except Exception:
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-            raise
-        os.replace(tmp_path, final_path)
-
-    def _save_standard_eval_alias(self, path, id, main_model_path):
-        """为自定义 standard PPO 阶段额外保存默认评估兼容文件。
-
-        自定义 standard PPO 训练阶段主 checkpoint 保持 ckpt_name 指定的命名，
-        便于训练保存、预训练拷贝和探活。同时额外落一份 model.ckpt-locomotion-{id}.pkl，
-        兼容平台默认 standard 评估链路按 locomotion 名称取模型的行为。
-        """
-        if self.is_lbc:
-            return
-
-        stage = Config.CURRENT
-        if getattr(stage, "task_type", "") != "standard":
-            return
-        if getattr(stage, "algorithm", "") != "ppo":
-            return
-        if getattr(stage, "name", "") == "locomotion":
-            return
-
-        alias_path = f"{path}/model.ckpt-locomotion-{str(id)}.pkl"
-        if alias_path == main_model_path:
-            return
-
-        self._atomic_save(self.model.state_dict(), alias_path, f"alias-{id}")
-        self.logger.info(f"save standard eval alias {alias_path} successfully")
+    @staticmethod
+    def _resolve_checkpoint_dir(path, create=False):
+        """Resolve the framework checkpoint directory with a local fallback."""
+        checkpoint_dir = path or os.environ.get("KAIWU_MODEL_CKPT_DIR")
+        if not checkpoint_dir:
+            checkpoint_dir = os.path.join(os.path.dirname(__file__), "ckpt")
+        checkpoint_dir = os.path.abspath(checkpoint_dir)
+        if create:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+        return checkpoint_dir
 
     def _save_side_locomotion(self, path, id):
         """保存 lbc_loco 教师为 locomotion 形态的 side ckpt。
@@ -467,15 +594,20 @@ class Agent(BaseAgent):
         if not (hasattr(self, "teacher_encoder") and hasattr(self, "teacher_actor")):
             return
 
-        loco_path = f"{path}/model.ckpt-locomotion-{str(id)}.pkl"
+        if getattr(self.stage, "task_type", "standard") == "track":
+            teacher_name = "model.ckpt-track-nav"
+        else:
+            teacher_name = "model.ckpt-locomotion"
+        loco_path = f"{path}/{teacher_name}-{str(id)}.pkl"
         loco_state = {}
         for k, v in self.teacher_encoder.state_dict().items():
-            loco_state[f"encoder.{k}"] = v
+            encoder_key = k.removeprefix("mlp.")
+            loco_state[f"encoder.{encoder_key}"] = v
         for k, v in self.teacher_actor.state_dict().items():
             loco_state[f"actor.{k}"] = v
-        self._atomic_save(loco_state, loco_path, f"side-{id}")
+        torch.save(loco_state, loco_path)
         self.logger.info(
-            f"save side: loco teacher (encoder.*/actor.*) {loco_path} successfully"
+            f"save side teacher (encoder.*/actor.*) {loco_path} successfully"
         )
 
     def load_model(self, path=None, id="1"):
@@ -488,77 +620,72 @@ class Agent(BaseAgent):
                              否则 fallback 到 model.ckpt-locomotion-{id}.pkl 拆分教师。
         LBC Loco (eval)    : 只加载 vision_encoder + teacher_actor（模拟真机视角）。
         """
+        path = self._resolve_checkpoint_dir(path, create=False)
         if self.is_lbc:
             self._load_lbc_loco(path, id)
             return
-        try:
-            self._load_flat(path, id)
-        except FileNotFoundError as exc:
-            # 续训阶段必须有预训练模型，禁止随机初始化
-            self.logger.error(
-                f"[Checkpoint] required preload checkpoint missing: "
-                f"path={path}, id={id}"
-            )
-            raise RuntimeError(
-                "Stage continuation requires the specified checkpoint; "
-                "random initialization is forbidden."
-            ) from exc
+        self._load_flat(path, id)
 
     def _load_flat(self, path, id):
-        """Load single-model checkpoint.
-
-        加载顺序（按优先级）:
-          1. 精确 id:   {ckpt_name}-{id}.pkl（平台 preload 指定 id，续训优先）
-          2. 同前缀最新: 目录里 ckpt_name 前缀的最新文件（id 对不上时兜底）
-          3. standard 迁移: model.ckpt-locomotion-{id}.pkl（首次从 standard 起步）
-          4. 默认兜底:  model.ckpt-{id}.pkl
-        """
-        ckpt_name = getattr(Config.CURRENT, "ckpt_name", "") or ""
-
+        """Load single-model checkpoint."""
+        ckpt_name = getattr(self.stage, "ckpt_name", "") or ""
+        checkpoint_id = str(id)
+        candidate_names = []
         if ckpt_name:
-            exact_path = f"{path}/{ckpt_name}-{str(id)}.pkl"
-            # 1. 精确 ID 优先（续训时必须加载指定 checkpoint）
-            if os.path.exists(exact_path):
-                model_file_path = exact_path
-                self.logger.info(
-                    f"[Checkpoint] exact requested checkpoint selected: {model_file_path}"
-                )
-            else:
-                # 2. 精确 ID 不存在，寻找同前缀最新
-                latest = self._find_latest_by_prefix(path, ckpt_name)
-                if latest is not None:
-                    model_file_path = latest
-                    self.logger.warning(
-                        f"[Checkpoint] requested id={id} not found, "
-                        f"fallback to latest: {model_file_path}"
-                    )
-                else:
-                    model_file_path = exact_path
-        else:
-            model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
+            candidate_names.append(f"{ckpt_name}-{checkpoint_id}.pkl")
 
-        if not os.path.exists(model_file_path):
-            # 3/4. 兜底：standard locomotion 产物 / 默认命名
-            aliases = [
-                f"{path}/model.ckpt-locomotion-{str(id)}.pkl",
-                f"{path}/model.ckpt-{str(id)}.pkl",
-            ]
-            loco_latest = self._find_latest_by_prefix(path, "model.ckpt-locomotion")
-            if loco_latest is not None:
-                aliases.insert(0, loco_latest)
-            found = next((a for a in aliases if a != model_file_path and os.path.exists(a)), None)
-            if found is None:
-                raise FileNotFoundError(
-                    f"No flat checkpoint found: {model_file_path}"
+        if getattr(self.stage, "task_type", "standard") == "track":
+            candidate_names.extend(
+                [
+                    f"model.ckpt-nav-{checkpoint_id}.pkl",
+                    f"model.ckpt-track-nav-{checkpoint_id}.pkl",
+                    f"model.ckpt-{checkpoint_id}.pkl",
+                    f"model.ckpt-locomotion-{checkpoint_id}.pkl",
+                ]
+            )
+        else:
+            candidate_names.extend(
+                [
+                    f"model.ckpt-{checkpoint_id}.pkl",
+                    f"model.ckpt-locomotion-{checkpoint_id}.pkl",
+                ]
+            )
+
+        # Preserve order while removing duplicate aliases.
+        candidate_paths = []
+        for name in candidate_names:
+            candidate = os.path.join(path, name)
+            if candidate not in candidate_paths:
+                candidate_paths.append(candidate)
+
+        model_file_path = next(
+            (candidate for candidate in candidate_paths if os.path.isfile(candidate)),
+            None,
+        )
+        if model_file_path is None:
+            available = []
+            if os.path.isdir(path):
+                available = sorted(
+                    name for name in os.listdir(path) if name.endswith(".pkl")
                 )
-            model_file_path = found
-            self.logger.info(f"flat ckpt fallback to: {model_file_path}")
+            raise FileNotFoundError(
+                "No flat checkpoint found. "
+                f"Tried: {candidate_paths}. Available pkl files: {available}"
+            )
         if self.cur_model_name == model_file_path:
             self.logger.info(f"current model is {model_file_path}, so skip load model")
             return
 
         pretrained = torch.load(model_file_path, map_location=self.device)
         current_state = self.model.state_dict()
+        if not isinstance(pretrained, dict) or not any(
+            key in pretrained for key in current_state
+        ):
+            raise ValueError(
+                f"Checkpoint is not a flat {self.stage.name} policy: "
+                f"{model_file_path}. Do not preload an LBC student checkpoint "
+                "for PPO safety fine-tuning."
+            )
 
         if self._ckpt_exact_match(pretrained, current_state):
             self.model.load_state_dict(pretrained)
@@ -566,7 +693,75 @@ class Agent(BaseAgent):
         else:
             self._load_model_partial(self.model, pretrained, model_file_path)
 
+        self._enforce_action_std_bounds()
+        self._install_action_anchor_policy()
         self.cur_model_name = model_file_path
+
+    def _install_action_anchor_policy(self):
+        coef = float(getattr(self.stage, "action_anchor_coef", 0.0))
+        if coef <= 0.0 or not hasattr(self, "algorithm"):
+            return
+
+        reference_model = copy.deepcopy(self.model).to(self.device)
+        self.algorithm.set_reference_policy(reference_model, action_anchor_coef=coef)
+        if self.logger is not None:
+            self.logger.info(
+                f"[PPO] fixed pretrained-policy anchor enabled, coef={coef}, "
+                f"ema={getattr(self.stage, 'action_anchor_ema', 0.0)}"
+            )
+
+    def _enforce_action_std_bounds(self):
+        min_std_cfg = getattr(self.stage, "min_normalized_std", None)
+        max_std_cfg = getattr(self.stage, "max_normalized_std", None)
+        if min_std_cfg is None and max_std_cfg is None:
+            return
+
+        with torch.no_grad():
+            if hasattr(self.model, "std"):
+                std = torch.nan_to_num(
+                    self.model.std.data,
+                    nan=1.0,
+                    posinf=1.0e6,
+                    neginf=0.0,
+                )
+                if min_std_cfg is not None:
+                    min_std = torch.tensor(
+                        min_std_cfg, device=self.device, dtype=std.dtype
+                    )
+                    if min_std.shape == std.shape:
+                        std = torch.maximum(std, min_std)
+                if max_std_cfg is not None:
+                    max_std = torch.tensor(
+                        max_std_cfg, device=self.device, dtype=std.dtype
+                    )
+                    if max_std.shape == std.shape:
+                        std = torch.minimum(std, max_std)
+                self.model.std.data.copy_(std)
+            elif hasattr(self.model, "log_std"):
+                log_std = torch.nan_to_num(
+                    self.model.log_std.data,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                if min_std_cfg is not None:
+                    min_std = torch.tensor(
+                        min_std_cfg, device=self.device, dtype=log_std.dtype
+                    )
+                    if min_std.shape == log_std.shape:
+                        log_std = torch.maximum(log_std, torch.log(min_std))
+                if max_std_cfg is not None:
+                    max_std = torch.tensor(
+                        max_std_cfg, device=self.device, dtype=log_std.dtype
+                    )
+                    if max_std.shape == log_std.shape:
+                        log_std = torch.minimum(log_std, torch.log(max_std))
+                self.model.log_std.data.copy_(log_std)
+
+            self.logger.info(
+                f"[PPO] action std bounds enforced: "
+                f"min={min_std_cfg}, max={max_std_cfg}"
+            )
 
     def _load_lbc_loco(self, path, id):
         """LBC Loco 模型加载，按 is_eval 分发训练期 / eval 两条路径。
@@ -581,20 +776,42 @@ class Agent(BaseAgent):
             P2 (首训): model.ckpt-locomotion-{id}.pkl → 按前缀拆分教师
             miss: FileNotFoundError
         """
-        main_path = f"{path}/model.ckpt-lbc-loco-{str(id)}.pkl"
-        loco_path = f"{path}/model.ckpt-locomotion-{str(id)}.pkl"
+        ckpt_name = getattr(self.stage, "ckpt_name", "model.ckpt-lbc-loco")
+        main_path = f"{path}/{ckpt_name}-{str(id)}.pkl"
+        alias_path = f"{path}/model.ckpt-{str(id)}.pkl"
+        teacher_paths = [
+            alias_path,
+            f"{path}/model.ckpt-nav-{str(id)}.pkl",
+            f"{path}/model.ckpt-track-nav-{str(id)}.pkl",
+            f"{path}/model.ckpt-locomotion-{str(id)}.pkl",
+        ]
+
+        def _is_lbc_checkpoint(candidate):
+            if not os.path.exists(candidate):
+                return False
+            checkpoint = torch.load(
+                candidate, weights_only=False, map_location=self.device
+            )
+            return (
+                isinstance(checkpoint, dict)
+                and checkpoint.get("format") == self.algorithm_name
+            )
 
         # Eval 路径：模拟真机视角
         is_eval = getattr(self, "is_eval", False)
         if is_eval:
-            if not os.path.exists(main_path):
+            vision_path = main_path if os.path.exists(main_path) else None
+            if vision_path is None and _is_lbc_checkpoint(alias_path):
+                vision_path = alias_path
+            if vision_path is None:
                 raise FileNotFoundError(
-                    f"[LBC-Loco eval] Required vision ckpt not found: {main_path}. "
+                    f"[LBC-Loco eval] Required vision ckpt not found; tried "
+                    f"{main_path} and {alias_path}. "
                     f"Eval mode simulates real-robot deployment and cannot fall back to "
                     f"teacher-only ckpt."
                 )
-            self._load_lbc_loco_for_eval(main_path)
-            self.cur_model_name = main_path
+            self._load_lbc_loco_for_eval(vision_path)
+            self.cur_model_name = vision_path
             return
 
         # 训练期路径 P1: 续训 main ckpt
@@ -611,19 +828,41 @@ class Agent(BaseAgent):
             )
             return
 
-        # 训练期路径 P2: locomotion ckpt
-        if os.path.exists(loco_path):
-            self.algorithm.load_teacher_from_locomotion_ckpt(loco_path)
-            self.cur_model_name = loco_path
+        if _is_lbc_checkpoint(alias_path):
+            self.algorithm.load(
+                alias_path,
+                expected_format=self.algorithm_name,
+                load_optimizer=True,
+            )
+            self.cur_model_name = alias_path
             self.logger.info(
-                f"[LBC-Loco] Teacher loaded by splitting locomotion ckpt {loco_path}; "
+                f"[LBC-Loco] Loaded platform-alias student ckpt {alias_path} "
+                f"(iter={self.algorithm.current_iteration})"
+            )
+            return
+
+        # 训练期路径 P2: locomotion ckpt
+        teacher_path = next(
+            (
+                candidate
+                for candidate in teacher_paths
+                if os.path.exists(candidate) and not _is_lbc_checkpoint(candidate)
+            ),
+            None,
+        )
+        if teacher_path is not None:
+            self.algorithm.load_teacher_from_locomotion_ckpt(teacher_path)
+            self.cur_model_name = teacher_path
+            self.logger.info(
+                f"[LBC-Loco] Teacher loaded by splitting flat ckpt {teacher_path}; "
                 f"student randomly initialized."
             )
             return
 
         raise FileNotFoundError(
             f"[LBC-Loco] No ckpt found in {path}/: "
-            f"tried {main_path} (resume) and {loco_path} (first-train teacher)."
+            f"tried {main_path}/{alias_path} (resume) and "
+            f"{teacher_paths} (first-train teacher)."
         )
 
     def _load_lbc_loco_for_eval(self, vision_path):
@@ -637,6 +876,13 @@ class Agent(BaseAgent):
             raise ValueError(
                 f"Ckpt format mismatch: expected '{self.algorithm_name}', got '{got}' "
                 f"at {vision_path}."
+            )
+        checkpoint_goal_dim = int(ckpt.get("goal_dim", 0))
+        expected_goal_dim = int(getattr(self.stage, "num_goal_obs", 0))
+        if checkpoint_goal_dim != expected_goal_dim:
+            raise ValueError(
+                f"LBC checkpoint goal_dim mismatch: expected {expected_goal_dim}, "
+                f"got {checkpoint_goal_dim} at {vision_path}"
             )
 
         # 学生 VisionEncoder：真机推理主角
@@ -657,43 +903,6 @@ class Agent(BaseAgent):
             f"[LBC-Loco eval] Loaded student + teacher_actor from {vision_path} "
             f"(teacher_encoder NOT loaded — simulates real-robot view)"
         )
-
-    @staticmethod
-    def _find_latest_by_prefix(path, ckpt_name):
-        """在目录里按前缀找最新模型文件，ID 提取复用平台探活正则。
-
-        与平台探活命令口径一致：
-            find ... -name "model.ckpt-*.*" | sed 's/.*model.ckpt-[a-z]*-*\\([0-9]*\\)\\..*/\\1/'
-        ckpt_name 形如 "model.ckpt-nav" / "model.ckpt-locomotion"。
-        返回最新文件的完整路径，无匹配返回 None。
-        """
-        if not path or not os.path.isdir(path):
-            return None
-        prefix = ckpt_name.split("model.ckpt-", 1)[-1] if "model.ckpt-" in ckpt_name else ckpt_name
-        id_re = re.compile(r"model\.ckpt-[a-z]*-*([0-9][0-9]*)\..*$")
-        best_id, best_file = -1, None
-        try:
-            for fname in os.listdir(path):
-                # 只匹配 .pkl 主模型，跳过临时文件/sidecar（不以 model.ckpt- 开头的不算）
-                if not fname.startswith("model.ckpt-") or not fname.endswith(".pkl"):
-                    continue
-                # 前缀过滤：nav 前缀不应匹配到 locomotion 文件
-                tag = fname[len("model.ckpt-"):]
-                if "-" in tag:
-                    file_prefix = tag.rsplit("-", 1)[0]
-                else:
-                    file_prefix = ""
-                if file_prefix != prefix:
-                    continue
-                m = id_re.match(fname)
-                if not m:
-                    continue
-                cid = int(m.group(1))
-                if cid > best_id:
-                    best_id, best_file = cid, os.path.join(path, fname)
-        except OSError:
-            return None
-        return best_file
 
     @staticmethod
     def _ckpt_exact_match(pretrained: dict, current_state: dict) -> bool:

@@ -38,8 +38,6 @@ class AlgorithmPPO:
         value_loss_coef: float = 1.0,
         entropy_coef: float = 0.01,
         learning_rate: float = 1e-3,
-        min_learning_rate: float = 1e-5,
-        max_learning_rate: float = 1e-2,
         max_grad_norm: float = 1.0,
         use_clipped_value_loss: bool = True,
         normalize_value_loss: bool = True,
@@ -76,10 +74,6 @@ class AlgorithmPPO:
             entropy_coef: 熵奖励系数
             learning_rate: Initial learning rate
             learning_rate: 初始学习率
-            min_learning_rate: Lower bound for adaptive learning rate
-            min_learning_rate: 自适应学习率下限
-            max_learning_rate: Upper bound for adaptive learning rate
-            max_learning_rate: 自适应学习率上限
             max_grad_norm: Max gradient norm for clipping
             max_grad_norm: 梯度裁剪最大范数
             use_clipped_value_loss: Whether to clip value loss
@@ -109,8 +103,6 @@ class AlgorithmPPO:
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
         self.learning_rate = learning_rate
-        self.min_learning_rate = float(min_learning_rate)
-        self.max_learning_rate = float(max_learning_rate)
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
         self.normalize_value_loss = normalize_value_loss
@@ -119,11 +111,16 @@ class AlgorithmPPO:
         self.desired_kl = desired_kl
         self.schedule = schedule
 
-        # Minimum std clamp (prevents std from going negative / too small)
-        # 标准差下限（防止标准差变为负值或过小）
+        # Std clamp keeps exploration useful but bounded. Without the upper
+        # bound a high entropy run can keep inflating std and destroy gait.
+        # 标准差上下限：保留探索，但避免高熵继续训练把步态扰乱。
         from agent_ppo.conf.conf import Config
 
-        self.min_std = torch.tensor(Config.CURRENT.min_normalized_std, device=device)
+        min_std_cfg = getattr(Config.CURRENT, "min_normalized_std", None)
+        max_std_cfg = getattr(Config.CURRENT, "max_normalized_std", None)
+        self.min_std = torch.tensor(min_std_cfg, device=device) if min_std_cfg is not None else None
+        self.max_std = torch.tensor(max_std_cfg, device=device) if max_std_cfg is not None else None
+        self.action_anchor_ema = float(getattr(Config.CURRENT, "action_anchor_ema", 0.0))
 
         # Training state
         # 训练状态
@@ -133,6 +130,17 @@ class AlgorithmPPO:
         # Storage (to be initialized)
         # 存储（待初始化）
         self.storage = None
+        self.reference_actor_critic = None
+        self.action_anchor_coef = 0.0
+
+    def set_reference_policy(self, reference_model: nn.Module, action_anchor_coef: float = 0.0):
+        """Freeze the preloaded policy and use it as a cumulative-drift anchor."""
+        self.reference_actor_critic = reference_model
+        self.action_anchor_coef = float(action_anchor_coef)
+        if self.reference_actor_critic is not None:
+            self.reference_actor_critic.eval()
+            for param in self.reference_actor_critic.parameters():
+                param.requires_grad_(False)
 
     def init_storage(
         self,
@@ -234,10 +242,21 @@ class AlgorithmPPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy_loss = 0
+        mean_action_anchor_loss = 0
+        num_updates = 0
 
         # Get mini-batch generator
         # 获取mini-batch生成器
-        generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        is_recurrent_model = getattr(self.actor_critic, "is_recurrent", False)
+        if is_recurrent_model:
+            if getattr(self.storage, "saved_hidden_states_a", None) is None:
+                raise RuntimeError("Recurrent PPO requires hidden states in rollout storage.")
+            generator = self.storage.recurrent_mini_batch_generator(
+                self.num_mini_batches,
+                self.num_learning_epochs,
+            )
+        else:
+            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Training loop over mini-batches
         # mini-batch训练循环
@@ -262,7 +281,11 @@ class AlgorithmPPO:
 
             # Forward pass through actor-critic
             # 前向传播计算actor-critic
-            self.actor_critic.update_distribution(obs_batch)
+            recurrent_batch = obs_batch.dim() == 3
+            if recurrent_batch:
+                self.actor_critic.update_distribution(obs_batch, hidden_states=hid_states_batch, masks=masks_batch)
+            else:
+                self.actor_critic.update_distribution(obs_batch)
 
             # Get action log probabilities
             # 获取动作对数概率
@@ -274,7 +297,12 @@ class AlgorithmPPO:
 
             # Get value estimates
             # 获取价值估计
-            value_batch = self.actor_critic.evaluate(critic_obs_batch)
+            if recurrent_batch:
+                value_batch = self.actor_critic.evaluate(
+                    critic_obs_batch.reshape(-1, critic_obs_batch.shape[-1])
+                ).view(critic_obs_batch.shape[0], critic_obs_batch.shape[1], 1)
+            else:
+                value_batch = self.actor_critic.evaluate(critic_obs_batch)
 
             # Get distribution parameters
             # 获取分布参数
@@ -291,10 +319,16 @@ class AlgorithmPPO:
                 actions_log_prob_batch, old_actions_log_prob_batch, advantages_batch
             )
             value_loss = self._compute_value_loss(value_batch, returns_batch, target_values_batch)
+            action_anchor_loss = self._compute_action_anchor_loss(obs_batch, mu_batch)
 
             # Combine losses
             # 组合损失
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
+            loss = (
+                surrogate_loss
+                + self.value_loss_coef * value_loss
+                - self.entropy_coef * entropy_batch.mean()
+                + self.action_anchor_coef * action_anchor_loss
+            )
 
             # NaN/Inf guard: skip this mini-batch update entirely if loss is invalid
             # NaN/Inf 防护：如果 loss 非法则跳过此 mini-batch 更新，避免坏梯度写入参数
@@ -331,41 +365,84 @@ class AlgorithmPPO:
 
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            self._blend_actor_towards_reference()
 
-            # Clamp action std: replace NaN/Inf, then enforce [min_std, 1e6]
-            # 清洗并夹住 std：替换 NaN/Inf，然后限制到 [min_std, 1e6]
+            # Clamp action std: replace NaN/Inf, then enforce configured bounds.
+            # 清洗并夹住 std：替换 NaN/Inf，然后限制到配置的上下限。
             if hasattr(self.actor_critic, "std") and self.min_std is not None:
-                max_std_t = torch.full_like(self.actor_critic.std.data, 1.0e6)
+                min_std_t = self.min_std
+                max_std_t = self.max_std
+                if min_std_t.shape != self.actor_critic.std.data.shape:
+                    min_std_t = torch.zeros_like(self.actor_critic.std.data)
+                if max_std_t is None or max_std_t.shape != self.actor_critic.std.data.shape:
+                    max_std_t = torch.full_like(self.actor_critic.std.data, 1.0e6)
                 safe_std = torch.nan_to_num(
                     self.actor_critic.std.data,
                     nan=1.0,
-                    posinf=1.0e6,
+                    posinf=float(torch.max(max_std_t).item()),
                     neginf=0.0,
                 )
-                self.actor_critic.std.data.copy_(torch.clamp(safe_std, min=self.min_std, max=max_std_t))
+                self.actor_critic.std.data.copy_(torch.clamp(safe_std, min=min_std_t, max=max_std_t))
 
             # Accumulate losses (use 0.0 for any remaining NaN as safety net)
             # 累加损失（对残留 NaN 兜底为 0.0）
             sl = surrogate_loss.item()
             vl = value_loss.item()
             el = entropy_batch.mean().item()
+            al = action_anchor_loss.item()
             mean_surrogate_loss += sl if not (sl != sl) else 0.0
             mean_value_loss += vl if not (vl != vl) else 0.0
             mean_entropy_loss += el if not (el != el) else 0.0
+            mean_action_anchor_loss += al if not (al != al) else 0.0
+            num_updates += 1
 
         # Average losses
         # 平均损失
-        num_updates = self.num_learning_epochs * self.num_mini_batches
+        num_updates = max(1, num_updates)
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy_loss /= num_updates
+        mean_action_anchor_loss /= num_updates
 
         # Report metrics
         # 上报指标
-        self._report_training_metrics(mean_surrogate_loss, mean_value_loss, mean_entropy_loss)
+        self._report_training_metrics(
+            mean_surrogate_loss,
+            mean_value_loss,
+            mean_entropy_loss,
+            mean_action_anchor_loss,
+        )
 
         self.train_step += 1
         return mean_surrogate_loss, mean_value_loss, mean_entropy_loss
+
+    def _compute_action_anchor_loss(
+        self,
+        obs_batch: torch.Tensor,
+        mu_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.reference_actor_critic is None or self.action_anchor_coef <= 0.0:
+            return mu_batch.new_tensor(0.0)
+
+        with torch.no_grad():
+            ref_mu = self.reference_actor_critic.act_inference(obs_batch)
+        return torch.mean(torch.square(mu_batch - ref_mu.detach()))
+
+    def _blend_actor_towards_reference(self):
+        if self.reference_actor_critic is None or self.action_anchor_ema <= 0.0:
+            return
+
+        alpha = min(max(self.action_anchor_ema, 0.0), 1.0)
+        ref_state = self.reference_actor_critic.state_dict()
+        with torch.no_grad():
+            for name, param in self.actor_critic.named_parameters():
+                if name not in ref_state:
+                    continue
+                if not (name.startswith("actor.") or name in ("std", "log_std")):
+                    continue
+                param.data.mul_(1.0 - alpha).add_(
+                    ref_state[name].to(param.device), alpha=alpha
+                )
 
     def _update_learning_rate(
         self,
@@ -392,15 +469,9 @@ class AlgorithmPPO:
             kl_mean = torch.mean(kl)
 
             if kl_mean > self.desired_kl * 2.0:
-                self.learning_rate = max(
-                    self.min_learning_rate,
-                    self.learning_rate / 1.5,
-                )
+                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
             elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                self.learning_rate = min(
-                    self.max_learning_rate,
-                    self.learning_rate * 1.5,
-                )
+                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.learning_rate
@@ -455,6 +526,7 @@ class AlgorithmPPO:
         mean_surrogate_loss: float,
         mean_value_loss: float,
         mean_entropy_loss: float,
+        mean_action_anchor_loss: float = 0.0,
     ):
         """
         Report training metrics to monitor
@@ -466,7 +538,13 @@ class AlgorithmPPO:
                 "policy_loss": mean_surrogate_loss,
                 "value_loss": mean_value_loss,
                 "entropy_loss": mean_entropy_loss,
-                "total_loss": mean_surrogate_loss + mean_value_loss + mean_entropy_loss,
+                "action_anchor_loss": mean_action_anchor_loss,
+                "total_loss": (
+                    mean_surrogate_loss
+                    + mean_value_loss
+                    + mean_entropy_loss
+                    + self.action_anchor_coef * mean_action_anchor_loss
+                ),
                 "learning_rate": self.learning_rate,
             }
             if self.monitor:

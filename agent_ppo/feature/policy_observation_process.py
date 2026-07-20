@@ -1,17 +1,11 @@
-#!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
-# Copyright © 1998 - 2026 Tencent. All Rights Reserved.
+# Copyright 漏 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
-"""Policy observation processor.
-
-Base policy observation is 301-D. Track stages append the same 3-D goal
-feature layout used by the J1 parent checkpoint, producing 304 dimensions.
-"""
+"""Policy observation processor."""
 
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.goal_features import build_track_goal_features
-from agent_ppo.feature.terrain_gate import apply_worker_gate_command
 from tools.base_env.observation_process import ObservationProcess
 
 
@@ -21,19 +15,17 @@ class PolicyObservationProcess(ObservationProcess):
 
     def _goal_features(self):
         feature_dim = getattr(Config.CURRENT, "num_goal_obs", 0)
-        if feature_dim <= 0:
-            return None
+        if hasattr(self, "goal_position_in_robot_frame"):
+            self.goal_position_in_robot_frame()
         return build_track_goal_features(self.env, feature_dim)
 
     def process(self):
         obs = self.default_observation()
         if obs.shape[-1] != self._BASE_OBS_DIM:
             raise ValueError(
-                f"Policy observation dim mismatch: expected base {self._BASE_OBS_DIM}, "
-                f"got {obs.shape[-1]}."
+                f"Policy observation dim mismatch: expected base {self._BASE_OBS_DIM}, got {obs.shape[-1]}."
             )
 
-        obs = apply_worker_gate_command(self.env, obs, "policy")
         goal_features = self._goal_features()
         if goal_features is not None:
             obs = self.concatenate_terms(obs, goal_features)

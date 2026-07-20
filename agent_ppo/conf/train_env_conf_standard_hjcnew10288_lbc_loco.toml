@@ -1,0 +1,96 @@
+# Standard depth-camera LBC distilled from hjcnew蒸馏1_10288.
+# Teacher contract: height encoder 256->512->256->32; actor 77->512->256->128->12.
+# This is deliberately a Standard locomotion stage: it has no goal observation,
+# navigation policy, or Track terrain. The teacher is used at fixed 0.7 m/s.
+
+[env]
+num_envs = 128
+episode_length_s = 25.0
+
+[env_conf]
+task_name = "Unitree-Go2-Velocity-Camera"
+seed = 0
+
+[terrain]
+mode = "standard"
+num_rows = 10
+num_cols = 20
+difficulty_range = [0.0, 1.0]
+curriculum = true
+max_init_terrain_level = 3
+
+[terrain.standard.pyramid_slope]
+proportion = 0.15
+
+[terrain.standard.pyramid_slope_inv]
+proportion = 0.20
+
+[terrain.standard.pyramid_stairs]
+proportion = 0.25
+
+[terrain.standard.pyramid_stairs_inv]
+proportion = 0.30
+
+[terrain.standard.maze]
+proportion = 0.10
+
+[domain_rand]
+enable_domain_rand = true
+randomize_friction = true
+friction_range = [0.3, 1.5]
+push_robots = true
+push_interval_s = 15
+max_push_vel_xy = 0.5
+
+[noise]
+add_noise = true
+
+[init_state]
+pos = [0.0, 0.0, 0.35]
+
+[commands]
+# Do not resample a frozen teacher outside its validated fixed-speed regime.
+resampling_time = [25.0, 25.0]
+
+[commands.limit]
+lin_vel_x = [0.7, 0.7]
+lin_vel_y = [0.0, 0.0]
+ang_vel_z = [0.0, 0.0]
+
+[commands.ranges]
+lin_vel_x = [0.7, 0.7]
+lin_vel_y = [0.0, 0.0]
+ang_vel_yaw = [0.0, 0.0]
+
+[hjcnew10288_lbc_loco]
+learning_rate = 5e-4
+max_iterations = 10000
+max_grad_norm = 1.0
+log_interval = 100
+# The first checkpoint is also emitted after iteration 1 by lbc_workflow for
+# platform liveness probing. Keep later artifacts frequent enough for recovery.
+save_interval = 250
+num_steps_per_env = 24
+bptt_steps = 8
+student_drive = true
+teacher_warmup_iterations = 300
+action_loss_weight = 0.2
+p_student_anneal_fraction = 0.5
+
+[depth_aug]
+enabled = true
+pixel_dropout_prob = 0.10
+gaussian_noise_scale = 0.02
+edge_dropout_prob = 0.10
+hole_patch_prob = 0.20
+hole_patch_size = [4, 16]
+hole_hold_steps = [2, 8]
+frame_hold_prob = 0.10
+frame_hold_steps = [1, 5]
+blur_kernel_size = 3
+roll_range_deg = 5.0
+pitch_shift_pix = 6
+
+[camera.depth_camera]
+offset_pos = [0.339871, 0.034697, 0.075010]
+offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
 # Copyright © 1998 - 2026 Tencent. All Rights Reserved.
@@ -51,7 +51,9 @@ class AlgorithmLBC:
         max_grad_norm: float = 1.0,
         proprio_dim: int = 45,
         scan_dim: int = 256,
+        goal_dim: int = 0,
         depth_shape: Tuple[int, int, int] = (180, 320, 1),
+        action_loss_weight: float = 0.0,
     ):
         self.device = device
         self.mode = "loco"
@@ -60,7 +62,13 @@ class AlgorithmLBC:
         self.learning_rate = learning_rate
         self.proprio_dim = proprio_dim
         self.scan_dim = scan_dim
+        self.goal_dim = goal_dim
         self.depth_shape = depth_shape  # (H, W, C)
+        self.action_loss_weight = float(action_loss_weight)
+        self.teacher_loaded = False
+        self.teacher_source = None
+        self._sequence_loss = None
+        self._sequence_steps = 0
 
         # Student: vision encoder (trainable)
         self.vision_encoder = vision_encoder.to(device)
@@ -91,11 +99,19 @@ class AlgorithmLBC:
             for p in module.parameters():
                 p.requires_grad = False
 
+    def assert_teacher_ready(self):
+        """Refuse to collect labels from randomly initialized teacher weights."""
+        if not self.teacher_loaded:
+            raise RuntimeError(
+                "[LBC] frozen teacher is not loaded. Provide a compatible locomotion "
+                "teacher checkpoint or resume an LBC checkpoint containing teacher weights."
+            )
+
     def _split_obs(self, obs) -> Dict[str, torch.Tensor]:
         """将 flat tensor obs 切分为 dict；dict 则直接返回。
 
         lbc_loco flat tensor layout:
-            [ proprio(proprio_dim) | height_scan(scan_dim) | depth(H*W*C) ]
+            [ proprio | height_scan | optional_goal | depth(H*W*C) ]
         """
         if isinstance(obs, dict):
             return obs
@@ -103,13 +119,27 @@ class AlgorithmLBC:
         H, W, C = self.depth_shape
         proprio = obs[:, : self.proprio_dim]
         height_scan = obs[:, self.proprio_dim : self.proprio_dim + self.scan_dim]
-        depth_flat = obs[:, self.proprio_dim + self.scan_dim :]
+        goal_start = self.proprio_dim + self.scan_dim
+        depth_start = goal_start + self.goal_dim
+        goal = obs[:, goal_start:depth_start] if self.goal_dim > 0 else None
+        depth_flat = obs[:, depth_start:]
         depth_image = depth_flat.view(-1, H, W, C)
         return {
             "proprio": proprio,
             "height_scan": height_scan,
+            "goal": goal,
             "depth_image": depth_image,
         }
+
+    def _teacher_actor_input(self, obs: Dict[str, torch.Tensor], latent: torch.Tensor) -> torch.Tensor:
+        parts = [obs["proprio"], latent]
+        if self.goal_dim > 0:
+            goal = obs.get("goal")
+            if goal is None or goal.shape[-1] != self.goal_dim:
+                got = None if goal is None else goal.shape[-1]
+                raise ValueError(f"LBC teacher expects goal_dim={self.goal_dim}, got {got}")
+            parts.append(goal)
+        return torch.cat(parts, dim=-1)
 
     def act_teacher(self, obs) -> torch.Tensor:
         """教师网络生成动作 (用于驱动环境)。
@@ -127,7 +157,7 @@ class AlgorithmLBC:
             # Teacher encoder: height_scan → latent
             teacher_latent = self.teacher_encoder(obs["height_scan"])
             # Concatenate proprio + latent
-            policy_input = torch.cat([obs["proprio"], teacher_latent], dim=-1)
+            policy_input = self._teacher_actor_input(obs, teacher_latent)
             # Actor generates actions
             actions = self.teacher_actor(policy_input)
         return actions
@@ -144,7 +174,7 @@ class AlgorithmLBC:
                 proprio=obs["proprio"],
                 masks=None,
             )
-            policy_input = torch.cat([obs["proprio"], student_latent], dim=-1)
+            policy_input = self._teacher_actor_input(obs, student_latent)
             actions = self.teacher_actor(policy_input)
         return actions
 
@@ -152,6 +182,7 @@ class AlgorithmLBC:
         self,
         obs,
         masks: torch.Tensor = None,
+        detach_hidden: bool = True,
     ) -> Dict[str, Any]:
         """Compute latent feature distillation loss.
         计算潜在特征蒸馏损失。
@@ -167,7 +198,7 @@ class AlgorithmLBC:
             loss_dict:
                 - "loss": 总损失（== mse_loss）
                 - "mse_loss": MSE 损失
-                - "l2_distance": L2 距离
+                - "distance": L2 距离
                 - "teacher_latent" / "student_latent": 用于调试
         """
         obs = self._split_obs(obs)
@@ -181,6 +212,7 @@ class AlgorithmLBC:
             depth_image=obs["depth_image"],
             proprio=obs["proprio"],
             masks=masks,
+            detach_hidden=detach_hidden,
         )
 
         # MSE loss
@@ -192,12 +224,25 @@ class AlgorithmLBC:
 
         # L2 distance (for monitoring)
         with torch.no_grad():
-            l2_distance = per_sample_sq.sqrt().mean()
+            distance = per_sample_sq.sqrt().mean()
+
+        # action-level distillation (方案B): student_latent -> teacher_actor -> action
+        # vs teacher_latent -> teacher_actor -> action. teacher_actor frozen but differentiable,
+        # gradient flows back to vision_encoder. 让 latent 优化动作贴合，不只 latent 贴合。
+        action_loss = torch.zeros((), device=self.device)
+        if self.action_loss_weight > 0.0:
+            with torch.no_grad():
+                teacher_action = self.teacher_actor(self._teacher_actor_input(obs, teacher_latent))
+            student_action = self.teacher_actor(self._teacher_actor_input(obs, student_latent))
+            action_loss = F.mse_loss(student_action, teacher_action)
+
+        total_loss = mse_loss + self.action_loss_weight * action_loss
 
         return {
-            "loss": mse_loss,
+            "loss": total_loss,
             "mse_loss": mse_loss,
-            "l2_distance": l2_distance,
+            "action_loss": action_loss,
+            "distance": distance,
             "teacher_latent": teacher_latent.detach(),
             "student_latent": student_latent.detach(),
         }
@@ -208,22 +253,13 @@ class AlgorithmLBC:
         masks: torch.Tensor = None,
     ) -> Dict[str, float]:
         """Perform one gradient update (loco distillation)."""
-        loss_dict = self.compute_latent_loss(obs, masks)
-        loss = loss_dict["loss"]
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        grad_norm = nn.utils.clip_grad_norm_(
-            self.vision_encoder.parameters(),
-            self.max_grad_norm,
-        )
-        self.optimizer.step()
-
-        self.total_steps += 1
+        self.begin_sequence()
+        loss_dict = self.accumulate(obs, masks)
+        grad_norm = self.finish_sequence()
         mse_val = loss_dict["mse_loss"].item()
-        l2_dist = loss_dict["l2_distance"].item()
-        self.mse_buffer.append(mse_val)
-
+        distance = loss_dict["distance"].item()
+        _al = loss_dict["action_loss"]
+        action_loss_val = float(_al.item()) if torch.is_tensor(_al) else float(_al)
         with torch.no_grad():
             t_lat = loss_dict["teacher_latent"]
             s_lat = loss_dict["student_latent"]
@@ -234,13 +270,63 @@ class AlgorithmLBC:
 
         return {
             "mse_loss": mse_val,
-            "l2_distance": l2_dist,
-            "grad_norm": grad_norm.item(),
+            "action_loss": action_loss_val,
+            "distance": distance,
+            "grad_norm": grad_norm,
             "cos_sim": cos_sim,
             "student_std": student_std,
             "teacher_std": teacher_std,
             "student_norm": student_norm,
+            "student_latent": s_lat,
         }
+
+    def begin_sequence(self):
+        """Start one truncated-BPTT segment without changing the env protocol."""
+        if self._sequence_steps:
+            raise RuntimeError("[LBC] finish the active TBPTT sequence before starting another")
+        self.optimizer.zero_grad(set_to_none=True)
+        self._sequence_loss = None
+        self._sequence_steps = 0
+
+    def accumulate(self, obs, masks: torch.Tensor = None) -> Dict[str, Any]:
+        """Accumulate a single env step into the active TBPTT graph."""
+        if self._sequence_loss is None and self._sequence_steps == 0:
+            # Keep the public API convenient for callers while preserving one
+            # optimizer update per completed sequence.
+            self.optimizer.zero_grad(set_to_none=True)
+        loss_dict = self.compute_latent_loss(obs, masks, detach_hidden=False)
+        self._sequence_loss = loss_dict["loss"] if self._sequence_loss is None else self._sequence_loss + loss_dict["loss"]
+        self._sequence_steps += 1
+
+        with torch.no_grad():
+            t_lat = loss_dict["teacher_latent"]
+            s_lat = loss_dict["student_latent"]
+            per_step = {
+                "mse_loss": loss_dict["mse_loss"].item(),
+                "action_loss": loss_dict["action_loss"].item(),
+                "distance": loss_dict["distance"].item(),
+                "cos_sim": F.cosine_similarity(s_lat, t_lat, dim=-1).mean().item(),
+                "student_std": s_lat.std(dim=0).mean().item(),
+                "teacher_std": t_lat.std(dim=0).mean().item(),
+                "student_norm": s_lat.norm(dim=-1).mean().item(),
+                "student_latent": s_lat,
+            }
+        self.mse_buffer.append(per_step["mse_loss"])
+        return per_step
+
+    def finish_sequence(self) -> float:
+        """Backpropagate the mean loss over the collected TBPTT segment."""
+        if self._sequence_steps <= 0 or self._sequence_loss is None:
+            raise RuntimeError("[LBC] cannot finish an empty TBPTT sequence")
+        (self._sequence_loss / self._sequence_steps).backward()
+        grad_norm = nn.utils.clip_grad_norm_(self.vision_encoder.parameters(), self.max_grad_norm)
+        self.optimizer.step()
+        if hasattr(self.vision_encoder, "detach_hidden_state"):
+            self.vision_encoder.detach_hidden_state()
+        self.total_steps += self._sequence_steps
+        self._sequence_loss = None
+        self._sequence_steps = 0
+        return float(grad_norm.item())
 
     def reset_student_hidden_states(self, dones: torch.Tensor):
         """Reset LSTM hidden states of student encoder (for terminated envs)。
@@ -261,13 +347,14 @@ class AlgorithmLBC:
         cur_episode_length: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """更新 episode 统计信息。"""
+        rewards = rewards.reshape(-1)
+        dones = dones.reshape(-1).bool()
         cur_reward_sum += rewards
         cur_episode_length += 1
-
-        done_ids = (dones > 0).nonzero(as_tuple=False)
+        done_ids = dones.nonzero(as_tuple=False).squeeze(-1)
         if done_ids.numel() > 0:
-            self.reward_buffer.extend(cur_reward_sum[done_ids][:, 0].cpu().numpy().tolist())
-            self.episode_length_buffer.extend(cur_episode_length[done_ids][:, 0].cpu().numpy().tolist())
+            self.reward_buffer.extend(cur_reward_sum[done_ids].cpu().tolist())
+            self.episode_length_buffer.extend(cur_episode_length[done_ids].cpu().tolist())
             cur_reward_sum[done_ids] = 0
             cur_episode_length[done_ids] = 0
 
@@ -312,10 +399,12 @@ class AlgorithmLBC:
             "vision_encoder_state_dict": self.vision_encoder.state_dict(),
             "teacher_encoder_state_dict": self.teacher_encoder.state_dict(),
             "teacher_actor_state_dict": self.teacher_actor.state_dict(),
+            "goal_dim": self.goal_dim,
             "optimizer_state_dict": self.optimizer.state_dict(),
             "current_iteration": self.current_iteration,
             "total_steps": self.total_steps,
             "learning_rate": self.learning_rate,
+            "teacher_source": self.teacher_source,
         }
         saved.update(kwargs)
 
@@ -338,15 +427,18 @@ class AlgorithmLBC:
                     f"Keys in ckpt: {sorted(ckpt.keys())}"
                 )
 
-        # 学生 VisionEncoder
-        if "vision_encoder_state_dict" in ckpt:
-            self.vision_encoder.load_state_dict(ckpt["vision_encoder_state_dict"])
+        required = ("vision_encoder_state_dict", "teacher_encoder_state_dict", "teacher_actor_state_dict")
+        missing = [key for key in required if key not in ckpt]
+        if missing:
+            raise KeyError(f"Incomplete LBC checkpoint {path}; missing {missing}")
+        self.vision_encoder.load_state_dict(ckpt["vision_encoder_state_dict"])
 
         # Loco 侧教师
-        if "teacher_encoder_state_dict" in ckpt:
-            self.teacher_encoder.load_state_dict(ckpt["teacher_encoder_state_dict"])
-        if "teacher_actor_state_dict" in ckpt:
-            self.teacher_actor.load_state_dict(ckpt["teacher_actor_state_dict"])
+        self.teacher_encoder.load_state_dict(ckpt["teacher_encoder_state_dict"])
+        self.teacher_actor.load_state_dict(ckpt["teacher_actor_state_dict"])
+        self.teacher_loaded = True
+        self.teacher_source = ckpt.get("teacher_source", path)
+        self._freeze_teacher()
 
         # Optimizer
         if load_optimizer and "optimizer_state_dict" in ckpt:
@@ -361,56 +453,45 @@ class AlgorithmLBC:
         if "total_steps" in ckpt:
             self.total_steps = ckpt["total_steps"]
 
-    def load_teacher_from_locomotion_ckpt(self, ckpt_path: str):
-        """从 locomotion ckpt (ActorCriticEncoder.state_dict()) 按前缀拆分加载教师。
+    def load_teacher_state_dict(self, full_state: dict, source: str = "<platform>"):
+        """Load frozen teacher encoder/actor from a platform-selected state dict."""
+        if isinstance(full_state, dict) and "model_state_dict" in full_state:
+            full_state = full_state["model_state_dict"]
+        if isinstance(full_state, dict) and "state_dict" in full_state:
+            full_state = full_state["state_dict"]
+        if not isinstance(full_state, dict):
+            raise ValueError(f"Unsupported teacher checkpoint from {source}: not a state dict")
 
-        locomotion ckpt 格式:
-            encoder.0.weight, encoder.2.weight, encoder.4.weight ...  → teacher_encoder.mlp
-            actor.0.weight,   actor.2.weight,   ...                    → teacher_actor
-            critic.*                                                   (丢弃)
-            log_std / std                                              (丢弃)
-
-        说明:
-            - ActorCriticEncoder.encoder 是 Sequential(Linear, ELU, Linear, ELU, Linear, L2Norm)，
-              与 DmEncoder.mlp 结构一致，去掉 "encoder." 前缀即可对齐。
-            - 教师 Actor 期望是 nn.Sequential(Linear, Act, Linear, Act, Linear, Act, Linear)，
-              ActorCritic.actor 的 key 形如 actor.0.weight ...，去掉 "actor." 前缀后能对齐。
-
-        Args:
-            ckpt_path: locomotion 模型文件路径（model.ckpt-locomotion-{id}.pkl）。
-        """
-        full_state = torch.load(ckpt_path, weights_only=False, map_location=self.device)
-
-        # 拆分 encoder 权重 → teacher_encoder.mlp
         encoder_state = {
             k.replace("encoder.", ""): v
             for k, v in full_state.items()
-            if k.startswith("encoder.")
+            if isinstance(k, str) and k.startswith("encoder.")
         }
         if not encoder_state:
             raise ValueError(
-                f"No 'encoder.*' keys found in {ckpt_path}; "
-                f"this does not look like a locomotion ActorCriticEncoder ckpt."
+                f"No 'encoder.*' keys found in {source}; "
+                f"this does not look like an ActorCriticEncoder teacher ckpt."
             )
-        # DmEncoder 用 self.mlp
         if hasattr(self.teacher_encoder, "mlp"):
             self.teacher_encoder.mlp.load_state_dict(encoder_state)
         else:
             self.teacher_encoder.load_state_dict(encoder_state)
 
-        # 拆分 actor 权重 → teacher_actor
         actor_state = {
             k.replace("actor.", ""): v
             for k, v in full_state.items()
-            if k.startswith("actor.")
+            if isinstance(k, str) and k.startswith("actor.")
         }
         if not actor_state:
             raise ValueError(
-                f"No 'actor.*' keys found in {ckpt_path}; ckpt structure unexpected."
+                f"No 'actor.*' keys found in {source}; ckpt structure unexpected."
             )
         self.teacher_actor.load_state_dict(actor_state)
-
-        # critic.* 和 log_std 按设计丢弃
-
-        # 确保教师冻结
         self._freeze_teacher()
+        self.teacher_loaded = True
+        self.teacher_source = source
+
+    def load_teacher_from_locomotion_ckpt(self, ckpt_path: str):
+        """Backward-compatible wrapper for platform-selected teacher files."""
+        full_state = torch.load(ckpt_path, weights_only=False, map_location=self.device)
+        self.load_teacher_state_dict(full_state, source=ckpt_path)

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
 ###########################################################################
 # Copyright © 1998 - 2026 Tencent. All Rights Reserved.
@@ -162,6 +162,12 @@ class ActorCritic(nn.Module):
         重置已终止episode的隐藏状态
         """
         pass
+
+    def get_hidden_states(self):
+        return None
+
+    def set_hidden_states(self, hidden_states):
+        self._hidden_states = None
 
     def forward(self):
         """

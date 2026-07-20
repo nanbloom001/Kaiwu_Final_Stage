@@ -1,3 +1,11 @@
+# =============================================================================
+# Track Nav Pure RL
+#
+# The policy controls all joint actions directly.  The velocity command is only
+# a locomotion anchor: "walk forward in the head/body direction".  Goal seeking,
+# wall avoidance, exploration, and maze solving are learned from reward.
+# =============================================================================
+
 [env]
 num_envs = 3072
 episode_length_s = 120.0
@@ -5,22 +13,24 @@ episode_length_s = 120.0
 [env_conf]
 seed = 0
 
-# 段1：温和起步配置（对应复赛 xtrack1）
-# - 先用单地形 open_entry_maze + track_length=1，专注训迷宫导航
-# - difficulty 收窄到 [0,0.6] + curriculum，降低起步难度
-# - 速度 [0.45,0.65] 温和前进
-# 段2/段3 会改回完整 track（track_length=5、5 种地形、满难度、提速到 [0.55,0.80]）
 [terrain]
 mode = "track"
 num_rows = 10
 num_cols = 10
-difficulty_range = [0.0, 0.6]
-curriculum = true
+difficulty_range = [0.0, 1.0]
+curriculum = false
 max_init_terrain_level = 0
 
+[terrain.level_mix]
+enabled = true
+levels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+weights = [0.14, 0.13, 0.11, 0.10, 0.10, 0.09, 0.09, 0.08, 0.08, 0.08]
+pool_size = 100
+
 [terrain.track]
-track_length = 1
-sub_terrains = ["open_entry_maze"]
+# Full track: slopes and stairs first, maze only at the final segment.
+track_length = 5
+sub_terrains = ["pyramid_slope", "pyramid_slope_inv", "pyramid_stairs", "pyramid_stairs_inv", "open_entry_maze"]
 
 [domain_rand]
 enable_domain_rand = true
@@ -36,16 +46,18 @@ add_noise = true
 [init_state]
 pos = [0.0, 0.0, 0.35]
 
+# Periodic forward command: keep the gait head-forward, but let RL learn yaw and
+# maze navigation from goal / wall rewards.
 [commands]
 resampling_time = [2.5, 4.0]
 
 [commands.limit]
-lin_vel_x = [0.0, 0.8]
+lin_vel_x = [0.0, 1.0]
 lin_vel_y = [-0.0, 0.0]
 ang_vel_z = [-1.2, 1.2]
 
 [commands.ranges]
-lin_vel_x = [0.45, 0.65]
+lin_vel_x = [0.55, 0.80]
 lin_vel_y = [0.0, 0.0]
 ang_vel_yaw = [0.0, 0.0]
 
@@ -53,80 +65,44 @@ ang_vel_yaw = [0.0, 0.0]
 enabled = false
 
 [rl_navigation]
-phase_command_enabled = false
-worker_phase_command_enabled = false
-gate_test_mode = "sticky"
-shadow_selected_gate = "sticky"
-terrain_sticky_source = "nan"
-gate_speed_advice_enabled = false
-gate_reward_metrics_enabled = false
-gate_diagnostics_enabled = false
-raw_terrain_gate_enabled = false
-suggested_speed_fallback = 0.62
+phase_command_enabled = true
 pre_maze_lin_vel_x = [0.82, 1.02]
 slope_lin_vel_x = [0.90, 1.10]
-stairs_lin_vel_x = [0.48, 0.60]
-maze_lin_vel_x = [0.55, 0.70]
-phase_maze_goal_dist_gate = 8.5
-phase_maze_distance_mode = "longitudinal"
-phase_maze_goal_longitudinal_min = -1.0
-phase_maze_confirm_steps = 3
-phase_maze_release_margin = 2.0
-phase_maze_sticky_until_done = true
-phase_command_resample_steps = 160
-terrain_phase_speed_enabled = false
-terrain_sticky_confirm_steps = 4
-terrain_sticky_flat_release_steps = 10
-terrain_sticky_slope_hold_steps = 30
-terrain_sticky_stairs_hold_steps = 50
-terrain_sticky_wall_hold_steps = 40
-terrain_flat_release_edge_max = 0.025
-terrain_flat_release_delta_max = 0.025
-terrain_flat_release_pitch_max = 0.10
-terrain_updown_full_delta = 0.12
-fused_gate_stair_edge_threshold = 0.040
-fused_gate_stair_locality_threshold = 0.30
-fused_gate_stair_smoothness_max = 0.45
-fused_gate_slope_edge_mean_min = 0.006
-fused_gate_slope_smoothness_min = 0.60
-fused_gate_slope_edge_max = 0.080
-fused_gate_wall_edge_threshold = 0.30
-fused_gate_direction_margin = 0.02
-nan_gate_body_y_start = 5
-nan_gate_body_y_end = 11
-nan_gate_x_start = 0
-nan_gate_x_end = 10
-nan_gate_stair_edge_threshold = 0.040
-nan_gate_stair_locality_threshold = 0.30
-nan_gate_stair_smoothness_max = 0.45
-nan_gate_slope_edge_mean_min = 0.006
-nan_gate_slope_smoothness_min = 0.60
-nan_gate_slope_edge_max = 0.070
-nan_gate_wall_edge_threshold = 0.30
-nan_gate_direction_margin = 0.02
-nav_gate_wall_edge_threshold = 0.30
-nav_wall_body_y_start = 3
-nav_wall_body_y_end = 10
-nav_wall_front_cols = 6
-nav_wall_side_width = 3
-nav_wall_height_threshold = 0.24
-nav_wall_temperature = 0.08
-nav_wall_score_threshold = 0.35
-nav_wall_floor_quantile = 0.20
-nav_wall_gate_in_maze_only = true
+stairs_lin_vel_x = [0.52, 0.68]
+maze_lin_vel_x = [0.60, 0.80]
+phase_maze_goal_dist_gate = 14.0
+phase_command_resample_steps = 96
+terrain_phase_speed_enabled = true
+terrain_row_start = 3
+terrain_row_end = 13
+terrain_front_cols = 8
+terrain_step_quantile = 0.85
+terrain_lateral_std_threshold = 0.18
+terrain_wall_height_threshold = -1.05
+terrain_slope_delta_threshold = 0.035
+terrain_stair_delta_threshold = 0.10
+terrain_stair_second_diff_threshold = 0.055
+terrain_slope_sign_consistency_threshold = 0.55
+
+# Eval adapter for wide platform command ranges such as:
+# lin_vel_x=[0.0,1.7], lin_vel_y=[-1,1], ang_vel_z=[-1.8,1.8].
+# The maze policy should not chase those random commands; it uses goal + scan
+# for navigation and sees this stable forward command as a gait anchor.
+eval_command_override = true
+eval_command = [0.62, 0.0, 0.0]
 
 # -----------------------------------------------------------------------------
 # Locomotion preservation: keep enough of the old walking objective so the
 # pretrained model does not forget stable gait while learning navigation.
 # -----------------------------------------------------------------------------
 [rewards.track_lin_vel_xy]
-weight = 1.08
+weight = 1.25
 [rewards.track_lin_vel_xy.params]
 std = 0.24
 command_name = "base_velocity"
 
 [rewards.command_speed_advantage]
-weight = 0.75
+weight = 0.90
 [rewards.command_speed_advantage.params]
 command_name = "base_velocity"
 deadband = 0.02
@@ -138,104 +114,63 @@ lag_penalty_scale = 1.0
 min_command = 0.10
 
 [rewards.track_ang_vel_z]
-weight = 0.045
+weight = 0.05
 [rewards.track_ang_vel_z.params]
 std = 0.35
 command_name = "base_velocity"
 
 [rewards.lin_vel_z]
-weight = -0.60
+weight = -0.80
 
 [rewards.ang_vel_xy]
-weight = -0.55
+weight = -0.75
 
 [rewards.joint_acc]
-weight = -4.5e-7
+weight = -7.5e-7
 
 [rewards.energy]
-weight = -4.8e-5
-
-[rewards.energy_score_formula]
-weight = 1.75
+weight = -2.35e-5
 
 [rewards.joint_torques]
-weight = -2.4e-5
+weight = -1.45e-4
 
 [rewards.dof_pos_limits]
 weight = -0.3
 
 [rewards.correct_base_height]
-weight = -0.30
+weight = -0.45
 [rewards.correct_base_height.params]
 target_height = 0.38
 
 [rewards.action_rate]
-weight = -0.014
+weight = -0.019
 
 [rewards.action_smoothness]
-weight = -0.014
+weight = -0.019
 
 [rewards.undesired_contacts]
-weight = -0.62
+weight = -0.3
 [rewards.undesired_contacts.params]
 threshold = 1
 
 [rewards.termination]
-weight = -9.0
-
-[rewards.speed_gate_flat]
-weight = 1.0e-9
-
-[rewards.speed_gate_slope]
-weight = 1.0e-9
-
-[rewards.speed_gate_stairs]
-weight = 1.0e-9
-
-[rewards.speed_gate_maze]
-weight = 1.0e-9
-
-[rewards.speed_gate_invalid]
-weight = 1.0e-9
-
-[rewards.speed_gate_sum]
-weight = 1.0e-9
-
-[rewards.speed_gate_valid]
-weight = 1.0e-9
-
-[rewards.speed_gate_target_vx]
-weight = 1.0e-9
-
-[rewards.speed_gate_worker_vx]
-weight = 1.0e-9
-
-[rewards.speed_gate_written]
-weight = 1.0e-9
-
-[rewards.speed_gate_nav_front]
-weight = 1.0e-9
-
-[rewards.speed_gate_nav_block]
-weight = 1.0e-9
-
-[rewards.speed_gate_hold_steps]
-weight = 1.0e-9
-
-[rewards.speed_gate_pending]
-weight = 1.0e-9
-
-[rewards.speed_gate_maze_confirm]
-weight = 1.0e-9
+weight = -5.0
 
 [rewards.flat_orientation]
-weight = -1.10
+weight = -1.65
+
+[rewards.tilt_limit]
+weight = -0.8
+
+[rewards.tilt_limit.params]
+max_roll_rad = 0.30
+max_pitch_rad = 0.55
 
 [rewards.pose_score_formula]
-weight = 2.70
+weight = 2.2
 
 [rewards.posture_stability]
-weight = -1.0
+weight = -1.5
 
 [rewards.hip_to_default]
 weight = -0.16
@@ -271,13 +206,13 @@ command_name = "base_velocity"
 threshold = 0.18
 
 [rewards.feet_slide]
-weight = -0.11
+weight = -0.16
 
 [rewards.feet_stumble]
 weight = -0.07
 
 [rewards.dof_vel]
-weight = -1.3e-4
+weight = -5.5e-4
 
 [rewards.base_lateral_vel]
 weight = -0.35
@@ -309,7 +244,7 @@ std = 0.08
 min_command = 0.10
 
 [rewards.score_guidance]
-weight = 0.30
+weight = 0.35
 [rewards.score_guidance.params]
 command_name = "base_velocity"
 min_command = 0.15
@@ -324,7 +259,7 @@ posture_weight = 0.30
 # 墙体相关奖励只在最后 maze 区域且扫描到连续墙时启用，避免把楼梯当墙绕开。
 # -----------------------------------------------------------------------------
 [rewards.forward_heading_velocity]
-weight = 0.74
+weight = 0.90
 [rewards.forward_heading_velocity.params]
 target_speed = 0.58
 max_reward = 1.0
@@ -335,12 +270,12 @@ weight = -2.5
 deadband = 0.03
 
 [rewards.goal_heading_alignment]
-weight = 0.95
+weight = 1.0
 [rewards.goal_heading_alignment.params]
 std = 0.75
 
 [rewards.goal_velocity_projection]
-weight = 2.30
+weight = 2.6
 [rewards.goal_velocity_projection.params]
 max_speed = 0.80
 
@@ -349,67 +284,26 @@ weight = -3.0
 [rewards.goal_backtrack_penalty.params]
 deadband = 0.02
 
-[rewards.near_goal_circling_penalty]
-weight = -3.2
-[rewards.near_goal_circling_penalty.params]
-near_dist = 4.6
-complete_dist = 0.6
-min_progress_speed = 0.10
-yaw_rate_threshold = 0.35
-lateral_speed_threshold = 0.14
-
-[rewards.near_goal_finish_drive]
-weight = 3.5
-[rewards.near_goal_finish_drive.params]
-near_dist = 4.6
-complete_dist = 0.6
-target_speed = 0.35
-yaw_rate_soft_limit = 0.35
-lateral_speed_soft_limit = 0.16
-
-[rewards.near_goal_retreat_penalty]
-weight = -4.5
-[rewards.near_goal_retreat_penalty.params]
-near_dist = 4.6
-complete_dist = 0.6
-retreat_deadband = 0.03
-target_speed = 0.25
-
-[rewards.goal_miss_penalty]
-weight = -4.0
-[rewards.goal_miss_penalty.params]
-near_dist = 4.6
-complete_dist = 0.6
-miss_margin = 0.12
-reset_dist = 5.0
-
 [rewards.approach_goal]
-weight = 12.5
+weight = 13.0
 
 [rewards.goal_distance]
-weight = 0.76
+weight = 0.8
 [rewards.goal_distance.params]
 scale = 8.0
 
+[rewards.reach_goal]
+weight = 30.0
+[rewards.reach_goal.params]
+threshold = 0.6
+
 [rewards.task_complete]
-weight = 285.0
+weight = 140.0
 [rewards.task_complete.params]
 threshold = 0.6
 
-[rewards.difficulty_pressure_complete]
-weight = 30.0
-[rewards.difficulty_pressure_complete.params]
-threshold = 0.6
-ema_decay = 0.995
-warmup_steps = 80
-min_std = 0.02
-std_scale = 2.0
-energy_weight = 0.6
-pressure_start = 0.55
-curve_power = 1.5
-
 [rewards.navigation_time]
-weight = -0.0070
+weight = -0.0065
 
 [rewards.maze_context_gate]
 weight = 0.0
@@ -418,22 +312,6 @@ goal_dist_gate = 14.0
 obstacle_threshold = -0.80
 temperature = 0.18
 front_cols = 10
-
-[rewards.maze_anticipatory_turn]
-weight = 0.35
-[rewards.maze_anticipatory_turn.params]
-obstacle_threshold = -0.72
-temperature = 0.18
-front_cols = 6
-body_y_start = 3
-body_y_end = 13
-side_width = 4.5
-wall_start = 0.28
-wall_full = 0.72
-target_yaw_rate = 0.75
-target_forward_speed = 0.75
-maze_goal_dist_gate = 14.0
-near_goal_disable_dist = 4.6
 
 [rewards.wall_collision]
 weight = -12.0
@@ -452,7 +330,7 @@ maze_goal_dist_gate = 14.0
 maze_gate_obstacle_threshold = -0.80
 
 [rewards.wall_stall_penalty]
-weight = -1.8
+weight = -1.2
 [rewards.wall_stall_penalty.params]
 obstacle_threshold = -0.70
 front_cols = 5
@@ -506,17 +384,7 @@ memory_size = 96
 goal_heading_std = 1.0
 
 [rewards.stuck_penalty]
-weight = -0.6
+weight = -1.8
 [rewards.stuck_penalty.params]
 min_command = 0.05
 still_speed = 0.12
-
-[rewards.long_non_foot_contact]
-weight = -8.0
-[rewards.long_non_foot_contact.params]
-force_threshold = 5.0
-duration_s = 1.0
-step_dt = 0.02
-max_penalty = 2.0
-maze_only = true
-maze_goal_dist_gate = 14.0
