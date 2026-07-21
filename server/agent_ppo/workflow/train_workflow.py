@@ -401,6 +401,18 @@ def _initialize_training_runtime_state(env, agent, logger):
 
     # Set model to training mode
 
+    # J9 fixed-schedule startup validation
+    _stage = stage
+    if getattr(_stage, "schedule", "adaptive") == "fixed":
+        _expected_lr = float(_stage.lr)
+        _algo_lr = agent.algorithm.learning_rate
+        if abs(_algo_lr - _expected_lr) > 1e-12:
+            raise RuntimeError(f"J9 LR mismatch: algorithm={_algo_lr}, expected={_expected_lr}")
+        for _pg in agent.algorithm.optimizer.param_groups:
+            if abs(_pg["lr"] - _expected_lr) > 1e-12:
+                raise RuntimeError(f"J9 LR mismatch: optimizer={_pg['lr']}, expected={_expected_lr}")
+        logger.info(f"[J9] Fixed-schedule validated: lr={_expected_lr}, schedule={_stage.schedule}")
+
     # Initialize buffers and statistics
     agent.algorithm.actor_critic.train()
     ep_infos = []

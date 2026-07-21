@@ -344,6 +344,8 @@ class Agent(BaseAgent):
             entropy_coef=getattr(stage, "entropy_coef", 0.01),
             desired_kl=getattr(stage, "desired_kl", 0.01),
             schedule=getattr(stage, "schedule", "adaptive"),
+            min_learning_rate=getattr(stage, "min_learning_rate", 1e-5),
+            max_learning_rate=getattr(stage, "max_learning_rate", 1e-2),
             num_mini_batches=stage.num_mini_batches,
             num_learning_epochs=stage.num_learning_epochs,
         )

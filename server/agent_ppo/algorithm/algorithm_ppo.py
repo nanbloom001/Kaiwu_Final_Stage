@@ -45,6 +45,8 @@ class AlgorithmPPO:
         num_learning_epochs: int = 5,
         desired_kl: float = 0.01,
         schedule: str = "adaptive",
+        min_learning_rate: float = 1e-5,
+        max_learning_rate: float = 1e-2,
         **kwargs,
     ):
         """
@@ -88,6 +90,10 @@ class AlgorithmPPO:
             desired_kl: 自适应学习率的目标KL散度
             schedule: Learning rate schedule ("adaptive" or "fixed")
             schedule: 学习率调度策略（"adaptive"或"fixed"）
+            min_learning_rate: Minimum allowed adaptive learning rate
+            min_learning_rate: 自适应学习率下限
+            max_learning_rate: Maximum allowed adaptive learning rate
+            max_learning_rate: 自适应学习率上限
         """
         self.device = device
         self.actor_critic = model
@@ -110,6 +116,9 @@ class AlgorithmPPO:
         self.num_learning_epochs = num_learning_epochs
         self.desired_kl = desired_kl
         self.schedule = schedule
+        self.min_learning_rate = min_learning_rate
+        self.max_learning_rate = max_learning_rate
+        self._initial_lr = learning_rate
 
         # Std clamp keeps exploration useful but bounded. Without the upper
         # bound a high entropy run can keep inflating std and destroy gait.
@@ -396,6 +405,15 @@ class AlgorithmPPO:
             mean_action_anchor_loss += al if not (al != al) else 0.0
             num_updates += 1
 
+        # J9 fixed-LR runtime contract: abort if fixed schedule is violated
+        if self.schedule == "fixed":
+            for _pg in self.optimizer.param_groups:
+                if abs(_pg["lr"] - self._initial_lr) > 1e-12:
+                    raise RuntimeError(
+                        f"Fixed PPO learning-rate contract violated: "
+                        f"expected lr={self._initial_lr}, got lr={_pg['lr']}"
+                    )
+
         # Average losses
         # 平均损失
         num_updates = max(1, num_updates)
@@ -469,9 +487,9 @@ class AlgorithmPPO:
             kl_mean = torch.mean(kl)
 
             if kl_mean > self.desired_kl * 2.0:
-                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                self.learning_rate = max(self.min_learning_rate, self.learning_rate / 1.5)
             elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                self.learning_rate = min(self.max_learning_rate, self.learning_rate * 1.5)
 
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.learning_rate
