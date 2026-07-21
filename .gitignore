@@ -3,3 +3,9 @@
 __pycache__/
 *.py[cod]
 kaiwu_ide_crack/
+
+# 迁移前保留在仓库根目录的本地工作副本。
+# 正式内容分别位于 archive/unitree_isaaclab_deploy/、archive/代码存档/ 和 shared/分析记录/。
+/unitree_isaaclab_deploy/
+/代码存档/
+/分析记录/
