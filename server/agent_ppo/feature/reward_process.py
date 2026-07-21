@@ -440,10 +440,10 @@ class RewardProcess(RewardProcessBase):
         hard_roll: float = 0.30,
         soft_pitch: float = 0.22,
         hard_pitch: float = 0.55,
-        soft_roll_rate: float = 0.60,
-        hard_roll_rate: float = 1.80,
-        soft_pitch_rate: float = 0.80,
-        hard_pitch_rate: float = 2.20,
+        soft_roll_rate: float = 0.50,
+        hard_roll_rate: float = 1.60,
+        soft_pitch_rate: float = 0.65,
+        hard_pitch_rate: float = 1.90,
         max_penalty: float = 2.0,
     ):
         """Penalize growing roll/pitch risk before a hard tilt limit is reached."""
@@ -473,8 +473,8 @@ class RewardProcess(RewardProcessBase):
         risk = (
             torch.square(roll_risk)
             + 0.8 * torch.square(pitch_risk)
-            + 0.25 * torch.square(roll_rate_risk)
-            + 0.20 * torch.square(pitch_rate_risk)
+            + 0.35 * torch.square(roll_rate_risk)
+            + 0.30 * torch.square(pitch_rate_risk)
         )
         return torch.clamp(
             torch.nan_to_num(risk, nan=0.0, posinf=max_penalty, neginf=0.0),
