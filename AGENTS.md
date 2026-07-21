@@ -40,3 +40,9 @@ git status --short --branch
 ## 每次推送前必须执行
 
 重新阅读 [`CONTRIBUTING.md` 的“推送前检查”](./CONTRIBUTING.md#推送前检查)，逐项执行其中的命令、同步判断和验证要求。发现远程分支发生意外变化、同名分支发生分叉、制品状态不明或接口无法原子更新时，应停止推送并向用户说明。
+
+## AI Agent 合并授权
+
+仓库所有者明确授权 AI Agent：PR 完成 [`CONTRIBUTING.md` 的“AI Agent 合并授权与合并前检查”](./CONTRIBUTING.md#ai-agent-合并授权与合并前检查) 后，可以直接合并进 `main`，无需再次请求人工确认，也不要求额外 reviewer approval。
+
+该授权只适用于已经审核的准确 PR head，不授权跳过分支保护、验证、制品检查或接口一致性检查。合并时必须使用 `--match-head-commit` 锁定已审核 SHA。PR head 或 `origin/main` 在检查后变化、PR 不为 `MERGEABLE/CLEAN`、存在未解决审查意见或失败检查、所需训练/部署证据缺失、变更范围不明时，必须停止合并并向用户报告。

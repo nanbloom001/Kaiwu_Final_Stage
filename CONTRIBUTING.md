@@ -200,6 +200,59 @@ PR 描述必须记录：
 
 普通小改动默认使用 **squash merge**，合入后删除短期分支。需要保留实验血缘、subtree 或仓库迁移历史时，才使用 **merge commit**。PR 合并后，其他仍在开发的分支必须重新同步 `main` 并验证。
 
+### AI Agent 合并授权与合并前检查
+
+仓库所有者明确授权 AI Agent：完成本节全部检查后，可以直接合并 PR 进入 `main`，无需为合并动作再次请求人工确认，也不要求额外 reviewer approval。此授权不等于允许直接 push `main`，所有改动仍必须通过 PR 和分支保护。
+
+合并前必须：
+
+1. 重新阅读 [`AGENTS.md`](./AGENTS.md) 和本节。
+2. 执行 `git fetch --all --prune`，直接核对最新 `origin/main`、远程功能分支和 PR head。
+3. 确认功能分支已经包含最新 `origin/main`；如果主线刚刚更新，先合并主线、解决冲突并重跑验证。
+4. 确认 PR head 正是刚刚审核和测试的 commit，没有未知的新提交或任务外文件。
+5. 确认 PR 状态为 `MERGEABLE/CLEAN`，没有失败检查、requested changes 或未解决的审查意见。
+6. 确认 PR 描述已经如实记录改动范围、验证证据、制品状态和回滚方法。
+7. 训练、部署或接口改动必须完成对应验证；缺少规则要求的长跑、preflight、真机或制品证据时不得以文档检查代替。
+8. 根据改动类型确认 squash merge 或 merge commit，并记录待合并的 `CANDIDATE_SHA`。
+
+普通短期分支使用带 head 锁定的 squash merge：
+
+```bash
+CANDIDATE_SHA=$(git rev-parse origin/<功能分支>)
+
+gh pr merge <PR编号> \
+  --repo nanbloom001/Kaiwu_Final_Stage \
+  --squash \
+  --match-head-commit "$CANDIDATE_SHA" \
+  --delete-branch
+```
+
+只有需要保留实验血缘、subtree 或迁移历史时，才将 `--squash` 改为 `--merge`。禁止使用 rebase merge。
+
+`--match-head-commit` 是强制安全锁：如果检查完成后 PR head 又被更新，GitHub 必须拒绝本次合并。AI Agent 不得去掉该参数绕过拒绝，而应重新 fetch、审核和测试。
+
+合并后立即执行：
+
+```bash
+git fetch --all --prune
+gh pr view <PR编号> \
+  --repo nanbloom001/Kaiwu_Final_Stage \
+  --json state,mergedAt,mergeCommit
+git log -1 --oneline origin/main
+```
+
+确认 PR 为 `MERGED`、远程 `main` 已更新，并检查短期远程分支是否按计划删除。由于 squash merge 会生成新的提交，不能用“原功能分支 tip 必须成为 `main` 祖先”判断 squash 是否成功，应以 PR 的 `mergeCommit` 和最终文件树为准。
+
+出现以下任一情况必须停止合并并向用户报告：
+
+- PR head、远程功能分支或 `origin/main` 在检查后发生变化；
+- PR 冲突、不可合并或 merge state 不是 `CLEAN`；
+- 测试失败、检查未完成或验证证据不足；
+- 有 requested changes、未解决审查意见或未知提交；
+- server 与 deploy 接口只更新了一端；
+- checkpoint、ONNX、运行库、二进制或 SHA256 状态不明；
+- 需要保留历史但合并方式尚未确认。
+
 ## 10. 实验、Changelog 与制品
 
 - 小调参写入独立 TOML、[`server/CHANGELOG.md`](./server/CHANGELOG.md) 和实验文档，不为每个参数建立永久分支。
