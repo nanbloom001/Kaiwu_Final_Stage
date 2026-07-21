@@ -2,25 +2,35 @@
 
 ## Goal
 
-Continue visual distillation from the hjcnew 10288 Standard teacher while
-preserving the existing 77-D teacher contract, model structure, and observation
-ordering. The stage expands command sampling to low-speed motion in every
-direction and applies the calibrated camera mount pose.
+Convert the legacy flat Standard 10288 policy into the current privileged
+`ActorCriticEncoder` contract. The 10288 Actor consumes all 301 policy
+observations directly and has no latent encoder, so it cannot be loaded by LBC
+visual distillation. This bridge first matches its 12-D raw actions.
 
 ## Runtime Contract
 
 - Stage: `StandardDistill1Config`
 - TOML: `agent_ppo/conf/train_env_conf_standard_standard_distill_1.toml`
-- Checkpoint: `model.ckpt-standard-<id>.pkl`
-- Parent: platform-selected hjcnew Standard teacher checkpoint 10288
-- Actor input: proprio 45 + latent 32 = 77
+- Algorithm: `behavior_distill`
+- Output checkpoint: `model.ckpt-locomotion-<id>.pkl`
+- Frozen teacher: platform-selected flat Standard checkpoint 10288
+- Teacher actor input: proprio 45 + height scan 256 = 301
+- Student actor input: proprio 45 + latent 32 = 77
 - Goal input: none
 
-The current sequence-aware LBC workflow is reused. The teacher encoder and
-actor stay frozen; only the vision encoder and LSTM are optimized. Training
-uses an 8-step sequence and a teacher/mixed/student DAgger schedule.
+The frozen teacher drives the environment and provides action labels. The
+student encoder and Actor are optimized with raw 12-D action MSE. This stage
+does not use a camera and does not train a `VisionEncoder`.
 
-## Camera Pose
+## Follow-Up Visual Stage
+
+Only after the bridge checkpoint passes action-agreement and closed-loop
+evaluation should `Config.CURRENT` be switched to
+`StandardVisualDistill1Config`. Its configuration is:
+
+`agent_ppo/conf/train_env_conf_standard_standard_visual_distill_1.toml`
+
+That follow-up stage carries the calibrated camera pose:
 
 ```toml
 [camera.depth_camera]
@@ -29,7 +39,8 @@ offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
 ```
 
 The quaternion corresponds to a pitch of approximately 21.22 degrees. These
-values are camera mount extrinsics, not optical intrinsics.
+values are camera mount extrinsics, not optical intrinsics. They intentionally
+do not affect the current height-scan behavior bridge.
 
 ## Curriculum And Commands
 
@@ -54,7 +65,8 @@ ang_vel_z = [-1.30, 1.30]
 
 ## Randomization Phases
 
-Phase 1 enables friction randomization, observation noise, and depth
-augmentation while keeping external pushes disabled. After selecting a stable
+Phase 1 enables friction randomization and observation noise while keeping
+external pushes disabled. There is no depth augmentation in the behavior
+bridge because this stage has no camera input. After selecting a stable
 checkpoint, continue from it with `push_robots = true`; retain the 15-second
 interval and 0.35 m/s maximum push speed for the first robustness run.

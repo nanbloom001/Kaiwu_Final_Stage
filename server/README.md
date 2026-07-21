@@ -19,8 +19,8 @@
 ## 活动基线
 
 - **起始基线**：`codex/st7-opt3`（提交 `9b0b3df`，ST7 Opt3 UWB goal noise）
-- **当前活动入口**：`StandardDistill1Config`（standard-distill-1），从 hjcnew 10288 Standard 教师进行全方向、低速度视觉蒸馏。
-- ST9-Opt3-D2 的动作感知、闭环 DAgger 与时序蒸馏实现继续保留；standard-distill-1 复用该实现，但保持 77-D Standard 教师接口且不含 goal 输入。
+- **当前活动入口**：`StandardDistill1Config`（standard-distill-1），将 301-D 扁平 Standard 10288 教师行为蒸馏到 77-D `ActorCriticEncoder`。
+- 后续 `StandardVisualDistill1Config` 才执行深度视觉蒸馏并使用新相机外参；ST9-Opt3-D2 的动作感知、闭环 DAgger 与时序实现继续保留。
 - TrackNav 保留 Opt3 基线 + J9 通用学习率接口修复 + Opt4 角速度保护；`navopt5debug` 与 `navopt5b` 作为独立可复现实验阶段保留，不是默认入口。
 - 含 ST7-Opt2B `dynamic_tilt_risk`、ST7-Opt3 `goal_noise`、行为蒸馏/LBC 机制（在 `codex/st7-opt2a` 并入主干）。
 

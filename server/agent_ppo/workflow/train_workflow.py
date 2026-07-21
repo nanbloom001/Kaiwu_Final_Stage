@@ -468,6 +468,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             envs, agents, logger=logger, monitor=monitor, *args, **kwargs
         )
 
+    if getattr(agent, "is_behavior_distill", False):
+        from agent_ppo.workflow.behavior_distill_workflow import (
+            workflow as behavior_distill_workflow,
+        )
+
+        return behavior_distill_workflow(
+            envs, agents, logger=logger, monitor=monitor, *args, **kwargs
+        )
+
     # Initialize training state
     (
         storage,

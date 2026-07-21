@@ -177,12 +177,15 @@ class Agent(BaseAgent):
         # 算法分发
         self.algorithm_name = getattr(stage, "algorithm", "ppo")
         self.is_lbc = self.algorithm_name == "lbc_loco"
+        self.is_behavior_distill = self.algorithm_name == "behavior_distill"
 
         if self.is_lbc:
             # LBC 阶段：创建学生 + 教师；不初始化 PPO storage
             self._init_lbc_loco(num_proprio, num_scan, env_conf, stage, usr_conf)
         else:
             self._init_flat(num_proprio, num_scan, stage)
+            if self.is_behavior_distill:
+                self._init_behavior_distill(stage, usr_conf)
 
         self.eval_command_override = None
         self.eval_phase_command_enabled = False
@@ -245,8 +248,8 @@ class Agent(BaseAgent):
         self.num_steps_per_env = stage.num_steps_per_env
         self.save_interval = stage.model_save_interval
 
-        # LBC: 无 PPO storage 需要初始化
-        if not self.is_lbc:
+        # Supervised distillation stages do not use PPO rollout storage.
+        if not (self.is_lbc or self.is_behavior_distill):
             # Initialize storage
             # 初始化存储
             self.algorithm.init_storage(
@@ -475,6 +478,41 @@ class Agent(BaseAgent):
         # 为与 PPO 路径下某些属性兼容，point self.model 到学生
         self.model = self.vision_encoder
 
+    def _init_behavior_distill(self, stage, usr_conf):
+        """Replace PPO with flat-teacher action distillation for this student."""
+        from agent_ppo.algorithm.algorithm_behavior_distill import (
+            AlgorithmBehaviorDistill,
+        )
+
+        distill_conf = usr_conf.get(stage.name, {}) if isinstance(usr_conf, dict) else {}
+        teacher_ckpt = distill_conf.get("teacher_ckpt")
+        learning_rate = float(distill_conf.get("learning_rate", stage.lr))
+        max_grad_norm = float(
+            distill_conf.get("max_grad_norm", stage.max_grad_norm)
+        )
+        action_loss_weight = float(distill_conf.get("action_loss_weight", 1.0))
+
+        self.algorithm = AlgorithmBehaviorDistill(
+            student=self.model,
+            teacher_ckpt=teacher_ckpt,
+            device=self.device,
+            learning_rate=learning_rate,
+            max_grad_norm=max_grad_norm,
+            action_loss_weight=action_loss_weight,
+            num_obs=stage.teacher_num_obs,
+            num_critic_obs=stage.teacher_num_critic_obs,
+            num_actions=stage.num_actions,
+            teacher_actor_hidden_dims=stage.teacher_actor_hidden_dims,
+            teacher_critic_hidden_dims=stage.teacher_critic_hidden_dims,
+            teacher_activation=stage.teacher_activation,
+            logger=self.logger,
+        )
+        self.optimizer = self.algorithm.optimizer
+        self.logger.info(
+            f"[BehaviorDistill] teacher={teacher_ckpt or '<platform preload>'}, "
+            f"student={self.model.__class__.__name__}"
+        )
+
     def exploit(self, list_obs_data):
         """
         Exploit learned policy for action selection in evaluation mode.
@@ -484,6 +522,8 @@ class Agent(BaseAgent):
         with torch.no_grad():
             if self.is_lbc:
                 return self._exploit_lbc_loco(obs)
+            if self.is_behavior_distill:
+                return [ActData(action=self.model.act_inference(obs))]
             obs = self._apply_eval_command_to_obs(obs)
             actions = self.algorithm.actor_critic.act_inference(obs)
             return [ActData(action=actions)]
@@ -517,7 +557,7 @@ class Agent(BaseAgent):
         LBC 阶段：训练在 lbc_workflow 中直接调用 algorithm.update(obs)，
                   不经 agent.learn；此处 no-op 作为安全保护。
         """
-        if self.is_lbc:
+        if self.is_lbc or self.is_behavior_distill:
             return None
         return self.algorithm.learn()
 
@@ -533,6 +573,11 @@ class Agent(BaseAgent):
             raise RuntimeError(
                 "agent.predict() is not used in LBC stage; lbc_workflow calls "
                 "algorithm.act_teacher/update directly."
+            )
+        if self.is_behavior_distill:
+            raise RuntimeError(
+                "agent.predict() is not used in behavior_distill stage; "
+                "behavior_distill_workflow owns teacher/student actions."
             )
         (obs, critic_obs) = list_obs_data
         with torch.no_grad():
@@ -668,7 +713,49 @@ class Agent(BaseAgent):
         if self.is_lbc:
             self._load_lbc_loco(path, id)
             return
+        if self.is_behavior_distill:
+            if self.is_eval:
+                self._load_flat(path, id)
+            else:
+                self._load_behavior_distill_teacher(path, id)
+            return
         self._load_flat(path, id)
+
+    def _load_behavior_distill_teacher(self, path, id):
+        """Strictly load the platform-selected legacy flat ActorCritic teacher."""
+        checkpoint_id = str(id)
+        preferred = [
+            os.path.join(path, f"model.ckpt-{checkpoint_id}.pkl"),
+            os.path.join(path, f"model.ckpt-locomotion-{checkpoint_id}.pkl"),
+        ]
+        candidates = _checkpoint_candidates(path, id, preferred_paths=preferred)
+        rejected = []
+        for candidate in candidates:
+            try:
+                checkpoint = torch.load(
+                    candidate, weights_only=False, map_location=self.device
+                )
+                if isinstance(checkpoint, dict) and checkpoint.get("format"):
+                    raise ValueError(
+                        f"packaged checkpoint format={checkpoint.get('format')}"
+                    )
+                self.algorithm.load_teacher_state_dict(
+                    checkpoint,
+                    source=candidate,
+                )
+            except Exception as exc:
+                rejected.append(f"{os.path.basename(candidate)}: {exc}")
+                continue
+            self.cur_model_name = candidate
+            self.logger.info(
+                f"[BehaviorDistill] loaded flat 301-D teacher {candidate}"
+            )
+            return
+
+        raise FileNotFoundError(
+            f"[BehaviorDistill] No compatible flat teacher for id={id} in {path}. "
+            f"Candidates={candidates}; rejected={rejected}."
+        )
 
     def _load_flat(self, path, id):
         """Load single-model checkpoint."""
