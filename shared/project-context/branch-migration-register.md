@@ -41,7 +41,7 @@
 | `origin/codex/st9-opt3-d1` | `5ea7ba9` | ST9 Opt3 D1 视觉蒸馏（活动路线） |
 | `origin/deploy/jetson-sim2real` | `b297b3f` | Jetson Sim2Real 四套部署树（独立历史根） |
 
-### 标签（7 个，已推送 origin）
+### 标签（8 个，已推送 origin）
 
 | 标签 | SHA | 说明 |
 |---|---|---|
@@ -51,6 +51,7 @@
 | `st7-opt3-server-baseline` | `9b0b3df` | Opt3 统一 server 基线（重大节点） |
 | `st7-opt5-hard-start-replay` | `b81cbf4` | Opt5 hard-start replay（重大节点/活动路线） |
 | `st7-opt5-debug-hard-start-diagnostics` | `9570780` | Opt5-debug 硬启动诊断（重大节点/活动子路线） |
+| `st7-opt5b-conservative-hard-start-replay` | `c603ed7` | Opt5B 保守困难段重放最终节点 |
 | `st9-opt3-d1-vision-distill` | `5ea7ba9` | ST9-D1 视觉蒸馏（重大节点/活动路线） |
 
 ## 分支迁移分类
@@ -71,8 +72,8 @@
 | `origin/codex/st7-opt3` | 中 | **统一基线** | **主线** | 已 tag；= server/ 基线；tip 在主干，可删分支 |
 | `origin/codex/st7-opt4-angular-rate` | 小 | 已移植 | ✅ 已移植 | 角速度阈值已移植到 server/；删前加 `archived/` tag |
 | `origin/codex/st7-opt5-hard-start-replay` | 中 | Opt5 稳定节点 | 历史节点 | 已 tag，且为保留的 Opt5-debug/Opt5B 分支祖先；删分支 |
-| `origin/codex/st7-opt5-debug` | 🔴 大 | Opt5 diagnostics + Opt5B | **活动路线** | **保留分支**；为 `c603ed7` 增加 Opt5B tag |
-| `origin/codex/st9-opt3-d1` | 🔴 大 | 独立视觉蒸馏路线 | **活动路线** | 已 tag；**保留分支** |
+| `origin/codex/st7-opt5-debug` | 🔴 大 | Opt5 diagnostics + Opt5B | ✅ 已迁移 | 模块、配置、测试和文档迁入 `server/`；tip 由 tag 保留，删除分支 |
+| `origin/codex/st9-opt3-d1` | 🔴 大 | 独立视觉蒸馏路线 | ✅ 已吸收 | D1 基础由 D2 吸收；补入 D1 配置/文档，tip 由 tag 保留，删除分支 |
 | `origin/deploy/jetson-sim2real` | - | 部署树 | subtree 导入 | `git subtree add --prefix=deploy`（保留第二父）；导入后删分支 |
 
 ## 安全删除判定（基于 ancestry，已 git merge-base 核实）
@@ -80,18 +81,22 @@
 - **tip 在合并后 `main` 上**：迁移分支、cyy、stage3j8、stage3j9、st7-opt1a、st7-opt2a、st7-opt2b、st7-opt3、deploy；验证 ancestry 后删分支。
 - **独立侧支**：stage3j5/j6/j7、timeout-diag、st7-opt4；先建立明确的 `archived/` annotated tag，再删分支。J5/J6/J7/timeout 是被淘汰或纯诊断实验，不合入活动代码。
 - **Opt5 稳定节点**：st7-opt5-hard-start-replay 已有 tag，且是保留的 st7-opt5-debug 分支祖先；删分支但保留节点。
-- **最终保留远程分支**：`main`、`codex/st7-opt5-debug`、`codex/st9-opt3-d1`。
+- **最终保留远程分支**：仅 `main`。Opt5B 与 D1 的源提交分别由
+  `st7-opt5b-conservative-hard-start-replay`、`st9-opt3-d1-vision-distill`
+  标签保留，活动代码统一位于 `main/server/`。
 
 ## 回滚说明
 
 - 原工作区始终在 `main`（`042a1f8`），未跟踪文件未动。
 - 迁移分支未推送前：`git worktree remove` 即放弃。
 - 合并后：只用 `git revert`；普通提交逆序 revert，deploy subtree 用 `git revert -m 1`。不用 reset/rebase/force-push。
-- 已删除分支均可从 `main`、保留实验分支或 annotated tag 恢复。
+- 已删除分支均可从 `main` 或 annotated tag 恢复。
 
 ## 阶段状态与收尾
 
 - **阶段 3 已完成**：deploy subtree 第二父为 `b297b3f`，四套 `ARTIFACTS.md` 已生成。
 - **阶段 4 已完成**：378413、分析报告、旧部署包已按 `archive/`/`shared/` 边界纳入。
-- **阶段 5 收尾**：PR 以 merge commit 合入 `main`；每次远程写操作前重新读取 heads/tags；创建保护 tag；启用 `main` 保护；最后将远程 heads 收敛为 3 个。
+- **阶段 5 收尾**：布局 PR 以 merge commit 合入 `main`；后续 D2 与遗留路线
+  通过短期 PR 合入；每次远程写操作前重新读取 heads/tags；创建保护 tag；
+  最后将远程 heads 收敛为 1 个（仅 `main`）。
 - 训练长跑和 Jetson 真机验证属于后续模型发布验收，不阻断仓库布局合并。

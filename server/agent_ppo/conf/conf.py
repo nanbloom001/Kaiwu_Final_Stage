@@ -178,6 +178,21 @@ class TrackNavConfig(LocomotionConfig):
     model_save_interval = 20
 
 
+class TrackNavOpt5DebugConfig(TrackNavConfig):
+    """ST7-Opt5 reset diagnostics; checkpoints from this stage are disposable."""
+
+    name = "navopt5debug"
+    parent_checkpoint = "ST7-Opt3 30min (evaluation 595729)"
+    model_save_interval = 1000
+
+
+class TrackNavOpt5BConfig(TrackNavConfig):
+    """ST7-Opt5B: conservative hard-segment replay from Opt3-30min."""
+
+    name = "navopt5b"
+    parent_checkpoint = "ST7-Opt3 30min (evaluation 595729)"
+
+
 class LBCLocoConfig(StageConfig):
     """
     Stage: lbc_loco — Vision distillation for locomotion (pure supervised).
@@ -341,6 +356,9 @@ class Config:
             )
 
         logger.info(f"Stage: {stage.name}, task_type: {task_type}, model: {stage.model_class}")
+        parent_checkpoint = getattr(stage, "parent_checkpoint", None)
+        if parent_checkpoint:
+            logger.info(f"Parent checkpoint required: {parent_checkpoint}")
 
         return usr_conf, usr_conf_file, is_eval, stage
 

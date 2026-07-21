@@ -19,7 +19,8 @@
 ## 活动基线
 
 - **起始基线**：`codex/st7-opt3`（提交 `9b0b3df`，ST7 Opt3 UWB goal noise）
-- **当前活动代码**：Opt3 基线 + J9 通用学习率接口修复 + Opt4 角速度保护；TrackNav 保持自适应 `1.5e-5`，未提升 J9 fixed 实验为默认配置。
+- **当前活动入口**：`TrackLBCLocoD2Config`（ST9-Opt3-D2），从 D1 视觉学生继续进行动作感知、闭环 DAgger 蒸馏。
+- TrackNav 保留 Opt3 基线 + J9 通用学习率接口修复 + Opt4 角速度保护；`navopt5debug` 与 `navopt5b` 作为独立可复现实验阶段保留，不是默认入口。
 - 含 ST7-Opt2B `dynamic_tilt_risk`、ST7-Opt3 `goal_noise`、行为蒸馏/LBC 机制（在 `codex/st7-opt2a` 并入主干）。
 
 ## 运行约定
