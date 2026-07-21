@@ -1,0 +1,9 @@
+# server/ standalone .gitignore
+# 当 server/ 作为独立项目根（如腾讯开悟上传）使用时的缓存忽略规则。
+# 仓库根 .gitignore 同样生效（本文件为 server/ 独立使用时兜底）。
+
+.DS_Store
+.nfs*
+__pycache__/
+*.py[cod]
+*.log
