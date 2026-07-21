@@ -28,6 +28,50 @@ from agent_ppo.algorithm.algorithm_ppo import AlgorithmPPO
 from tools.train_env_conf_validate import check_usr_conf
 
 
+def _checkpoint_id_from_name(filename):
+    """Extract the final numeric ID from a platform checkpoint filename."""
+    if not filename.startswith("model.ckpt-") or "." not in filename:
+        return None
+    stem = filename.rsplit(".", 1)[0]
+    checkpoint_id = stem.rsplit("-", 1)[-1]
+    return int(checkpoint_id) if checkpoint_id.isdigit() else None
+
+
+def _checkpoint_candidates(path, checkpoint_id, preferred_paths=()):
+    """Return existing checkpoint files for one platform-selected model ID.
+
+    Platform liveness accepts both unlabelled and labelled names, for example
+    model.ckpt-123.pkl and model.ckpt-locomotion-123.pth. Loading must follow
+    the same naming contract instead of assuming one hard-coded prefix.
+    """
+    candidates = []
+
+    def _append(candidate):
+        if os.path.isfile(candidate) and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in preferred_paths:
+        _append(candidate)
+
+    if not os.path.isdir(path):
+        return candidates
+
+    requested = str(checkpoint_id)
+    discovered = []
+    for filename in os.listdir(path):
+        parsed_id = _checkpoint_id_from_name(filename)
+        if parsed_id is None:
+            continue
+        if requested != "latest" and str(parsed_id) != requested:
+            continue
+        discovered.append((parsed_id, filename))
+
+    discovered.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    for _parsed_id, filename in discovered:
+        _append(os.path.join(path, filename))
+    return candidates
+
+
 def _obs_height_grid(obs, scan_start: int = 45, scan_size: int = 256):
     if obs is None or not hasattr(obs, "shape") or obs.shape[-1] < scan_start + scan_size:
         return None
@@ -785,28 +829,66 @@ class Agent(BaseAgent):
             f"{path}/model.ckpt-track-nav-{str(id)}.pkl",
             f"{path}/model.ckpt-locomotion-{str(id)}.pkl",
         ]
+        candidate_paths = _checkpoint_candidates(
+            path,
+            id,
+            preferred_paths=[main_path, *teacher_paths],
+        )
+        loaded_checkpoints = {}
+        rejected = []
 
-        def _is_lbc_checkpoint(candidate):
-            if not os.path.exists(candidate):
-                return False
-            checkpoint = torch.load(
-                candidate, weights_only=False, map_location=self.device
+        def _load_checkpoint(candidate):
+            if candidate not in loaded_checkpoints:
+                loaded_checkpoints[candidate] = torch.load(
+                    candidate, weights_only=False, map_location=self.device
+                )
+            return loaded_checkpoints[candidate]
+
+        def _lbc_compatibility(candidate):
+            try:
+                checkpoint = _load_checkpoint(candidate)
+            except Exception as exc:
+                return False, f"load failed: {exc}"
+            if not isinstance(checkpoint, dict):
+                return False, "checkpoint is not a dictionary"
+            if checkpoint.get("format") != self.algorithm_name:
+                return False, "not an LBC checkpoint"
+
+            checkpoint_goal_dim = int(checkpoint.get("goal_dim", 0))
+            expected_goal_dim = int(getattr(self.stage, "num_goal_obs", 0))
+            if checkpoint_goal_dim != expected_goal_dim:
+                return (
+                    False,
+                    f"goal_dim={checkpoint_goal_dim}, expected={expected_goal_dim}",
+                )
+
+            state_contracts = (
+                ("vision_encoder_state_dict", self.vision_encoder.state_dict()),
+                ("teacher_encoder_state_dict", self.teacher_encoder.state_dict()),
+                ("teacher_actor_state_dict", self.teacher_actor.state_dict()),
             )
-            return (
-                isinstance(checkpoint, dict)
-                and checkpoint.get("format") == self.algorithm_name
-            )
+            for key, expected_state in state_contracts:
+                state = checkpoint.get(key)
+                if not isinstance(state, dict):
+                    return False, f"missing {key}"
+                if not self._ckpt_exact_match(state, expected_state):
+                    return False, f"incompatible {key}"
+            return True, "compatible"
 
         # Eval 路径：模拟真机视角
         is_eval = getattr(self, "is_eval", False)
         if is_eval:
-            vision_path = main_path if os.path.exists(main_path) else None
-            if vision_path is None and _is_lbc_checkpoint(alias_path):
-                vision_path = alias_path
+            vision_path = None
+            for candidate in candidate_paths:
+                compatible, reason = _lbc_compatibility(candidate)
+                if compatible:
+                    vision_path = candidate
+                    break
+                rejected.append(f"{os.path.basename(candidate)}: {reason}")
             if vision_path is None:
                 raise FileNotFoundError(
-                    f"[LBC-Loco eval] Required vision ckpt not found; tried "
-                    f"{main_path} and {alias_path}. "
+                    f"[LBC-Loco eval] No compatible vision checkpoint for id={id}. "
+                    f"Candidates={candidate_paths}; rejected={rejected}. "
                     f"Eval mode simulates real-robot deployment and cannot fall back to "
                     f"teacher-only ckpt."
                 )
@@ -814,55 +896,55 @@ class Agent(BaseAgent):
             self.cur_model_name = vision_path
             return
 
-        # 训练期路径 P1: 续训 main ckpt
-        if os.path.exists(main_path):
+        # Training P1: resume any compatible Camera checkpoint carrying the
+        # selected ID, regardless of its alphabetic platform label.
+        for candidate in candidate_paths:
+            compatible, reason = _lbc_compatibility(candidate)
+            if not compatible:
+                if reason != "not an LBC checkpoint":
+                    rejected.append(f"{os.path.basename(candidate)}: {reason}")
+                continue
             self.algorithm.load(
-                main_path,
+                candidate,
                 expected_format=self.algorithm_name,
                 load_optimizer=True,
             )
-            self.cur_model_name = main_path
+            self.cur_model_name = candidate
             self.logger.info(
-                f"[LBC-Loco] Loaded main ckpt {main_path} "
+                f"[LBC-Loco] Loaded compatible Camera checkpoint {candidate} "
                 f"(iter={self.algorithm.current_iteration})"
             )
             return
 
-        if _is_lbc_checkpoint(alias_path):
-            self.algorithm.load(
-                alias_path,
-                expected_format=self.algorithm_name,
-                load_optimizer=True,
-            )
-            self.cur_model_name = alias_path
+        # Training P2: otherwise treat same-ID non-LBC files as flat teachers.
+        for candidate in candidate_paths:
+            try:
+                checkpoint = _load_checkpoint(candidate)
+            except Exception as exc:
+                rejected.append(
+                    f"{os.path.basename(candidate)}: load failed: {exc}"
+                )
+                continue
+            if isinstance(checkpoint, dict) and checkpoint.get("format") == self.algorithm_name:
+                continue
+            try:
+                self.algorithm.load_teacher_state_dict(
+                    checkpoint,
+                    source=candidate,
+                )
+            except Exception as exc:
+                rejected.append(f"{os.path.basename(candidate)}: {exc}")
+                continue
+            self.cur_model_name = candidate
             self.logger.info(
-                f"[LBC-Loco] Loaded platform-alias student ckpt {alias_path} "
-                f"(iter={self.algorithm.current_iteration})"
-            )
-            return
-
-        # 训练期路径 P2: locomotion ckpt
-        teacher_path = next(
-            (
-                candidate
-                for candidate in teacher_paths
-                if os.path.exists(candidate) and not _is_lbc_checkpoint(candidate)
-            ),
-            None,
-        )
-        if teacher_path is not None:
-            self.algorithm.load_teacher_from_locomotion_ckpt(teacher_path)
-            self.cur_model_name = teacher_path
-            self.logger.info(
-                f"[LBC-Loco] Teacher loaded by splitting flat ckpt {teacher_path}; "
+                f"[LBC-Loco] Teacher loaded by splitting flat ckpt {candidate}; "
                 f"student randomly initialized."
             )
             return
 
         raise FileNotFoundError(
-            f"[LBC-Loco] No ckpt found in {path}/: "
-            f"tried {main_path}/{alias_path} (resume) and "
-            f"{teacher_paths} (first-train teacher)."
+            f"[LBC-Loco] No compatible checkpoint for id={id} in {path}. "
+            f"Candidates={candidate_paths}; rejected={rejected}."
         )
 
     def _load_lbc_loco_for_eval(self, vision_path):
