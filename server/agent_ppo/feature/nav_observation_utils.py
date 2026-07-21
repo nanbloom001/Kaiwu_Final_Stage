@@ -13,15 +13,27 @@ import math
 import torch
 import torch.nn.functional as F
 
+from agent_ppo.feature.depth_block_dropout import DepthBlockDropoutAugmenter
+
 
 _DEPTH_AUGMENTATION = {"enabled": False}
+_DEPTH_BLOCK_DROPOUT = DepthBlockDropoutAugmenter({"enabled": False})
+_DEPTH_AUGMENTATION_CALLS = 0
 
 
-def configure_depth_augmentation(config=None, training: bool = False):
+def configure_depth_augmentation(
+    config=None,
+    block_dropout_config=None,
+    training: bool = False,
+):
     """Set LBC image-space augmentation from the stage TOML before env.reset()."""
-    global _DEPTH_AUGMENTATION
+    global _DEPTH_AUGMENTATION, _DEPTH_BLOCK_DROPOUT, _DEPTH_AUGMENTATION_CALLS
     _DEPTH_AUGMENTATION = dict(config or {})
     _DEPTH_AUGMENTATION["enabled"] = bool(_DEPTH_AUGMENTATION.get("enabled", False) and training)
+    block_config = dict(block_dropout_config or {})
+    block_config["enabled"] = bool(block_config.get("enabled", False) and training)
+    _DEPTH_BLOCK_DROPOUT = DepthBlockDropoutAugmenter(block_config)
+    _DEPTH_AUGMENTATION_CALLS = 0
 
 
 def _range_pair(value, default):
@@ -37,10 +49,10 @@ def depth_camera_image(env) -> torch.Tensor:
 
       - sensor_name          = "depth_camera"
       - max_depth            = 5.0     # D435i 实用量程
-      - pixel_dropout_prob   = 0.1     # 10% 像素置零，模拟空洞
+      - pixel_dropout_prob   = 0.05    # 5% 像素置零，模拟散点空洞
       - gaussian_noise_scale = 0.02    # 深度比例高斯噪声
-      - roll_range_deg       = 10.0    # roll 抖动 ±10°
-      - pitch_shift_pix      = 10      # pitch 抖动 ±10 px
+      - roll_range_deg       = 5.0     # roll 抖动 ±5°
+      - pitch_shift_pix      = 6       # pitch 抖动 ±6 px
 
     Augmentation pipeline（仅在 `env._is_training` 为真时启用，默认 True）:
       1. 归一化：clamp [0, max_depth] 后除以 max_depth → [0, 1]
@@ -48,11 +60,14 @@ def depth_camera_image(env) -> torch.Tensor:
       3. 高斯噪声：std = scale * normalized_depth（越远越嘈杂）
       4. Roll 抖动：绕图像中心随机旋转
       5. Pitch 抖动：随机纵向平移
+      6. 块状空洞：每个环境独立维护持续多帧的矩形无效区域
 
     Returns:
         torch.Tensor: shape (num_envs, H*W)，值域 [0, 1]。
                       D435i 配置 (180×320) 下为 (num_envs, 57600)。
     """
+
+    global _DEPTH_AUGMENTATION_CALLS
 
     # Hardware range remains fixed; only image-space corruption is randomized.
     sensor_name = "depth_camera"
@@ -78,18 +93,31 @@ def depth_camera_image(env) -> torch.Tensor:
 
     # 超出量程的像素置 0，匹配真实 D435i 行为（仿真器默认返回 max clip 值）。
     out_of_range = depth >= max_depth
+    depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
     depth = torch.clamp(depth, 0.0, max_depth)
     depth = depth / max_depth  # [0, 1]
     depth[out_of_range] = 0.0
+    valid_depth_ratio_before = float((depth > 0.0).float().mean().item())
 
     N, H, W = depth.shape
     training = bool(getattr(env, "_is_training", False) and aug.get("enabled", False))
+    random_dropout_ratio = 0.0
+    block_metrics = {
+        "depth_block_dropout_frame_ratio": 0.0,
+        "depth_block_dropout_area_ratio": 0.0,
+        "active_block_count": 0.0,
+        "block_persistence_mean": 0.0,
+    }
 
     if training:
         # --- Pixel dropout: 随机置零像素，模拟缺失深度 ---
         if pixel_dropout_prob > 0.0:
-            mask = torch.rand(N, H, W, device=depth.device) > pixel_dropout_prob
-            depth = depth * mask
+            valid_before_dropout = depth > 0.0
+            keep_mask = torch.rand(N, H, W, device=depth.device) > pixel_dropout_prob
+            random_dropout_ratio = float(
+                (valid_before_dropout & ~keep_mask).float().mean().item()
+            )
+            depth = depth * keep_mask
 
         # --- 深度比例高斯噪声 ---
         if gaussian_noise_scale > 0.0:
@@ -162,6 +190,11 @@ def depth_camera_image(env) -> torch.Tensor:
                 depth.unsqueeze(1), grid, mode="bilinear", padding_mode="zeros", align_corners=False
             ).squeeze(1)
 
+        # Stateful rectangular invalid-depth regions are applied in the real
+        # student input path after spatial transforms. Their physical mask area
+        # therefore matches the configured cap exactly.
+        depth, block_metrics = _DEPTH_BLOCK_DROPOUT.apply(depth, env)
+
         # Frame hold is applied after all spatial corruption, matching a delayed
         # depth stream rather than a stale clean render.
         hold_prob = float(aug.get("frame_hold_prob", 0.0))
@@ -173,5 +206,23 @@ def depth_camera_image(env) -> torch.Tensor:
         current = depth
         depth = torch.where(use_last.view(N, 1, 1), state["last_depth"], current)
         state["last_depth"] = torch.where(use_last.view(N, 1, 1), state["last_depth"], current).detach()
+
+    depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+    valid_depth_ratio_after = float((depth > 0.0).float().mean().item())
+    metrics = {
+        "depth_random_dropout_ratio": random_dropout_ratio,
+        "valid_depth_ratio_before": valid_depth_ratio_before,
+        "valid_depth_ratio_after": valid_depth_ratio_after,
+        **block_metrics,
+    }
+    env._depth_aug_metrics = metrics
+    _DEPTH_AUGMENTATION_CALLS += 1
+    if _DEPTH_AUGMENTATION_CALLS == 1 or _DEPTH_AUGMENTATION_CALLS % 500 == 0:
+        print(
+            "[DepthAug] "
+            f"step={_DEPTH_AUGMENTATION_CALLS}, "
+            + ", ".join(f"{key}={value:.6f}" for key, value in metrics.items()),
+            flush=True,
+        )
 
     return depth.reshape(N, -1)  # [N, H*W]

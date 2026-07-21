@@ -6,6 +6,30 @@ import math
 import torch
 
 
+class _SilentConfigLogger:
+    def info(self, _message):
+        pass
+
+    def warning(self, _message):
+        pass
+
+    def error(self, _message):
+        pass
+
+
+def resolve_goal_noise_config(env):
+    """Resolve the active train/eval goal-noise section without duplicating it."""
+    for source in (env, getattr(env, "unwrapped", None)):
+        usr_conf = getattr(source, "usr_conf", None)
+        if isinstance(usr_conf, dict):
+            return usr_conf.get("goal_noise", {})
+
+    from agent_ppo.conf.conf import Config
+
+    usr_conf, _, _, _ = Config.load_conf(_SilentConfigLogger())
+    return usr_conf.get("goal_noise", {})
+
+
 class GoalNoiseAugmenter:
     """Apply per-frame jitter and per-episode bias independently per env."""
 
@@ -79,6 +103,13 @@ class GoalNoiseAugmenter:
         )
         self.last_episode_length = None
         self._apply_count = 0
+        self.latest_metrics = {
+            "goal_noise_active_ratio": 0.0,
+            "goal_bearing_noise_abs_mean": 0.0,
+            "goal_distance_noise_abs_mean": 0.0,
+            "goal_bearing_bias_abs_mean": 0.0,
+            "goal_distance_bias_abs_mean": 0.0,
+        }
 
     def _non_negative(self, key, default):
         value = float(self.config.get(key, default))
@@ -166,14 +197,22 @@ class GoalNoiseAugmenter:
         distance_noise,
         active_mask,
     ):
-        if self._apply_count != 1 and self._apply_count % 500 != 0:
-            return
-
         active_ratio = float(active_mask.float().mean().item())
         bearing_noise_mean = self._active_abs_mean(bearing_noise, active_mask)
         distance_noise_mean = self._active_abs_mean(distance_noise, active_mask)
         bearing_bias_mean = self._active_abs_mean(self.bearing_bias, active_mask)
         distance_bias_mean = self._active_abs_mean(self.distance_bias, active_mask)
+        self.latest_metrics = {
+            "goal_noise_active_ratio": active_ratio,
+            "goal_bearing_noise_abs_mean": bearing_noise_mean,
+            "goal_distance_noise_abs_mean": distance_noise_mean,
+            "goal_bearing_bias_abs_mean": bearing_bias_mean,
+            "goal_distance_bias_abs_mean": distance_bias_mean,
+        }
+        self.env._goal_noise_metrics = dict(self.latest_metrics)
+
+        if self._apply_count != 1 and self._apply_count % 500 != 0:
+            return
         print(
             "[GoalNoise] "
             f"step={self._apply_count}, "
@@ -188,6 +227,7 @@ class GoalNoiseAugmenter:
     def apply(self, raw_goal_xy: torch.Tensor) -> torch.Tensor:
         """Return a geometrically consistent noisy goal in robot-frame meters."""
         if not self.enabled:
+            self.env._goal_noise_metrics = dict(self.latest_metrics)
             return raw_goal_xy
         if raw_goal_xy.ndim != 2 or raw_goal_xy.shape != (self.num_envs, 2):
             raise ValueError(
