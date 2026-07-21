@@ -460,9 +460,7 @@ class Agent(BaseAgent):
         )  # [B, latent_dim]
 
         # 2. 教师 Actor: proprio + student_latent → joint_actions
-        actor_input = self.algorithm._build_actor_input(
-            obs_dict["proprio"], student_latent, obs_dict.get("goal")
-        )
+        actor_input = self.algorithm._teacher_actor_input(obs_dict, student_latent)
         joint_actions = self.teacher_actor(actor_input)  # [B, num_actions]
 
         return [ActData(action=joint_actions)]

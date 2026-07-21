@@ -53,7 +53,11 @@ class AlgorithmLBC:
         scan_dim: int = 256,
         goal_dim: int = 0,
         depth_shape: Tuple[int, int, int] = (180, 320, 1),
+        latent_loss_weight: float = 1.0,
+        cosine_loss_weight: float = 0.0,
         action_loss_weight: float = 0.0,
+        latent_loss_type: str = "legacy_mse",
+        action_loss_type: str = "mse",
     ):
         self.device = device
         self.mode = "loco"
@@ -64,9 +68,15 @@ class AlgorithmLBC:
         self.scan_dim = scan_dim
         self.goal_dim = goal_dim
         self.depth_shape = depth_shape  # (H, W, C)
+        self.latent_loss_weight = float(latent_loss_weight)
+        self.cosine_loss_weight = float(cosine_loss_weight)
         self.action_loss_weight = float(action_loss_weight)
+        self.latent_loss_type = str(latent_loss_type)
+        self.action_loss_type = str(action_loss_type)
         self.teacher_loaded = False
         self.teacher_source = None
+        self.student_loaded = False
+        self.student_source = None
         self._sequence_loss = None
         self._sequence_steps = 0
 
@@ -106,6 +116,32 @@ class AlgorithmLBC:
                 "[LBC] frozen teacher is not loaded. Provide a compatible locomotion "
                 "teacher checkpoint or resume an LBC checkpoint containing teacher weights."
             )
+
+    def assert_student_ready(self):
+        """Require a complete visual-student checkpoint for continuation stages."""
+        if not self.student_loaded:
+            raise RuntimeError(
+                "[LBC] this stage requires a resumed visual student checkpoint. "
+                "The selected checkpoint only initialized the teacher or no checkpoint "
+                "was loaded. Select the ST9-Opt3-D1 visual student checkpoint."
+            )
+
+    @staticmethod
+    def _per_sample_regression(
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        loss_type: str,
+    ) -> torch.Tensor:
+        """Return one equally weighted regression loss per environment."""
+        if loss_type == "legacy_mse":
+            return (prediction - target).pow(2).sum(dim=-1)
+        if loss_type == "smooth_l1":
+            element_loss = F.smooth_l1_loss(prediction, target, reduction="none")
+        elif loss_type == "mse":
+            element_loss = F.mse_loss(prediction, target, reduction="none")
+        else:
+            raise ValueError(f"Unsupported LBC regression loss type: {loss_type}")
+        return element_loss.mean(dim=-1)
 
     def _split_obs(self, obs) -> Dict[str, torch.Tensor]:
         """将 flat tensor obs 切分为 dict；dict 则直接返回。
@@ -196,10 +232,11 @@ class AlgorithmLBC:
 
         Returns:
             loss_dict:
-                - "loss": 总损失（== mse_loss）
-                - "mse_loss": MSE 损失
+                - "loss": 加权总损失
+                - "latent_loss" / "cosine_loss" / "action_loss": 未加权分量
+                - "mse_loss": 兼容历史监控的 latent 平方距离
                 - "distance": L2 距离
-                - "teacher_latent" / "student_latent": 用于调试
+                - teacher/student latent 与 12 维原始 Actor 动作
         """
         obs = self._split_obs(obs)
 
@@ -215,12 +252,18 @@ class AlgorithmLBC:
             detach_hidden=detach_hidden,
         )
 
-        # MSE loss
-        # 不用默认的 reduction='mean'（会同时按 batch 和 dim 取均值，
-        # 导致 loss 数值被 latent_dim 稀释 32 倍，难以观察）。
-        # 改为：先在 dim 维 sum，再在 batch 维 mean，等价于"逐样本平方距离的均值"。
+        # Keep the legacy squared-distance metric for checkpoint comparisons,
+        # while allowing continuation stages to train with SmoothL1.
         per_sample_sq = (student_latent - teacher_latent).pow(2).sum(dim=-1)  # [B]
         mse_loss = per_sample_sq.mean()
+        latent_loss = self._per_sample_regression(
+            student_latent,
+            teacher_latent,
+            self.latent_loss_type,
+        ).mean()
+        cosine_loss = (
+            1.0 - F.cosine_similarity(student_latent, teacher_latent, dim=-1)
+        ).mean()
 
         # L2 distance (for monitoring)
         with torch.no_grad():
@@ -229,22 +272,36 @@ class AlgorithmLBC:
         # action-level distillation (方案B): student_latent -> teacher_actor -> action
         # vs teacher_latent -> teacher_actor -> action. teacher_actor frozen but differentiable,
         # gradient flows back to vision_encoder. 让 latent 优化动作贴合，不只 latent 贴合。
-        action_loss = torch.zeros((), device=self.device)
-        if self.action_loss_weight > 0.0:
-            with torch.no_grad():
-                teacher_action = self.teacher_actor(self._teacher_actor_input(obs, teacher_latent))
-            student_action = self.teacher_actor(self._teacher_actor_input(obs, student_latent))
-            action_loss = F.mse_loss(student_action, teacher_action)
+        with torch.no_grad():
+            teacher_action = self.teacher_actor(
+                self._teacher_actor_input(obs, teacher_latent)
+            )
+        student_action = self.teacher_actor(
+            self._teacher_actor_input(obs, student_latent)
+        )
+        action_loss = self._per_sample_regression(
+            student_action,
+            teacher_action,
+            self.action_loss_type,
+        ).mean()
 
-        total_loss = mse_loss + self.action_loss_weight * action_loss
+        total_loss = (
+            self.latent_loss_weight * latent_loss
+            + self.cosine_loss_weight * cosine_loss
+            + self.action_loss_weight * action_loss
+        )
 
         return {
             "loss": total_loss,
+            "latent_loss": latent_loss,
+            "cosine_loss": cosine_loss,
             "mse_loss": mse_loss,
             "action_loss": action_loss,
             "distance": distance,
             "teacher_latent": teacher_latent.detach(),
             "student_latent": student_latent.detach(),
+            "teacher_action": teacher_action.detach(),
+            "student_action": student_action.detach(),
         }
 
     def update(
@@ -269,6 +326,9 @@ class AlgorithmLBC:
             student_norm = s_lat.norm(dim=-1).mean().item()
 
         return {
+            "latent_loss": loss_dict["latent_loss"].item(),
+            "cosine_loss": loss_dict["cosine_loss"].item(),
+            "total_loss": loss_dict["loss"].item(),
             "mse_loss": mse_val,
             "action_loss": action_loss_val,
             "distance": distance,
@@ -278,6 +338,8 @@ class AlgorithmLBC:
             "teacher_std": teacher_std,
             "student_norm": student_norm,
             "student_latent": s_lat,
+            "teacher_action": loss_dict["teacher_action"],
+            "student_action": loss_dict["student_action"],
         }
 
     def begin_sequence(self):
@@ -302,6 +364,9 @@ class AlgorithmLBC:
             t_lat = loss_dict["teacher_latent"]
             s_lat = loss_dict["student_latent"]
             per_step = {
+                "latent_loss": loss_dict["latent_loss"].item(),
+                "cosine_loss": loss_dict["cosine_loss"].item(),
+                "total_loss": loss_dict["loss"].item(),
                 "mse_loss": loss_dict["mse_loss"].item(),
                 "action_loss": loss_dict["action_loss"].item(),
                 "distance": loss_dict["distance"].item(),
@@ -310,6 +375,8 @@ class AlgorithmLBC:
                 "teacher_std": t_lat.std(dim=0).mean().item(),
                 "student_norm": s_lat.norm(dim=-1).mean().item(),
                 "student_latent": s_lat,
+                "teacher_action": loss_dict["teacher_action"],
+                "student_action": loss_dict["student_action"],
             }
         self.mse_buffer.append(per_step["mse_loss"])
         return per_step
@@ -405,6 +472,7 @@ class AlgorithmLBC:
             "total_steps": self.total_steps,
             "learning_rate": self.learning_rate,
             "teacher_source": self.teacher_source,
+            "student_source": self.student_source,
         }
         saved.update(kwargs)
 
@@ -432,6 +500,8 @@ class AlgorithmLBC:
         if missing:
             raise KeyError(f"Incomplete LBC checkpoint {path}; missing {missing}")
         self.vision_encoder.load_state_dict(ckpt["vision_encoder_state_dict"])
+        self.student_loaded = True
+        self.student_source = path
 
         # Loco 侧教师
         self.teacher_encoder.load_state_dict(ckpt["teacher_encoder_state_dict"])

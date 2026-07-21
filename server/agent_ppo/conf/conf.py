@@ -248,6 +248,17 @@ class TrackLBCLocoConfig(LBCLocoConfig):
     num_goal_obs = 3
 
 
+class TrackLBCLocoD2Config(TrackLBCLocoConfig):
+    """ST9-Opt3-D2 action-aware, closed-loop visual distillation.
+
+    Parent checkpoint: ST9-Opt3-D1 visual student. The architecture and output
+    checkpoint label remain compatible with the existing Track LBC model.
+    """
+
+    name = "track_lbc_loco_d2"
+    parent_checkpoint = "ST9-Opt3-D1 visual student"
+
+
 class Config:
     """
     Unified config entry point.
@@ -269,7 +280,7 @@ class Config:
     # 训练和评估均显式使用该阶段，避免环境名称误改模型结构。
     # T2 continues the previous TrackNav checkpoint with a reference-13-style
     # full-track stabilization setup, capped at 0.8 m/s.
-    CURRENT = TrackNavConfig
+    CURRENT = TrackLBCLocoD2Config
 
     @staticmethod
     def load_conf(logger):
