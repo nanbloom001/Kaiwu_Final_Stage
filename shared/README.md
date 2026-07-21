@@ -19,3 +19,4 @@
 
 - [`project-context/repository-layout.md`](./project-context/repository-layout.md)：四层目录结构说明。
 - [`project-context/branch-migration-register.md`](./project-context/branch-migration-register.md)：旧分支源 SHA 锚点 + 迁移分类登记（回滚锚点）。
+- [`分析记录/版本训练演进与改动规模详解.md`](./分析记录/版本训练演进与改动规模详解.md)：复赛、决赛、蒸馏/Sim2Real 与导航训练分支的版本演进记录。
