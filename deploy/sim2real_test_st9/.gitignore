@@ -1,0 +1,27 @@
+# Experiment outputs and large model artifacts
+/logs/
+/models/*
+!/models/model.ckpt-vision-378413.pkl
+/deploy_loco_backups
+
+# Runtime-generated policy data
+/runtime/unitree_rl_lab_test/logs/loco/logs/
+
+# Build outputs and bundled binary dependencies
+**/build/
+/runtime/unitree_rl_lab_test/deploy/thirdparty/
+*.a
+*.o
+*.so
+*.so.*
+
+# Python and editor caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+/Testing/
+
+# Timestamp backups are kept on disk outside Git history
+*.before_*
+*.backup_*

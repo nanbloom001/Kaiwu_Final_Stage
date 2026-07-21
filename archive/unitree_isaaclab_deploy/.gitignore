@@ -1,0 +1,13 @@
+# git-lfs pointer files excluded (real LFS objects not in local copy).
+# 133-byte placeholders. Fetch real objects via 'git lfs pull' in source repo if needed.
+# Detected pointer files:
+deploy_loco/runtime/unitree_rl_lab_test/deploy/thirdparty/onnxruntime-linux-aarch64-1.19.2/lib/libonnxruntime_providers_shared.so
+deploy_loco/runtime/unitree_rl_lab_test/deploy/thirdparty/onnxruntime-linux-aarch64-1.19.2/lib/libonnxruntime.so.1.19.2
+deploy_loco/runtime/unitree_rl_lab_test/deploy/thirdparty/onnxruntime-linux-aarch64-1.19.2/lib/libonnxruntime.so.1
+deploy_loco/runtime/unitree_rl_lab_test/deploy/thirdparty/onnxruntime-linux-aarch64-1.19.2/lib/libonnxruntime.so
+deploy_loco/runtime/unitree_rl_lab_test/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/dance_102/G1_Take_102.bvh_60hz.csv
+deploy_loco/runtime/unitree_rl_lab_test/source/unitree_rl_lab/unitree_rl_lab/tasks/mimic/robots/g1_29dof/gangnanm_style/G1_gangnam_style_V01.bvh_60hz.csv
+deploy_loco/models/model.ckpt-lbc-loco-637427.pkl
+camera_calibration/depth_sample_raw_m.npy
+camera_calibration/depth_sample_model_320x180.npy
+camera_calibration/chessboard_9x6_25mm_A4.pdf

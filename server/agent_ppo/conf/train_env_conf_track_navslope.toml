@@ -1,0 +1,211 @@
+[env]
+num_envs = 3072
+episode_length_s = 120.0
+
+[env_conf]
+seed = 0
+
+# Stage 2.5: Nav Slope — 坡地过渡（坡+反坡+迷宫，无楼梯）
+# 从 navbase 单段迷宫过渡到多段赛道，先只加坡/反坡，不含楼梯。
+# 速度不提速，保持 navbase 的 [0.45,0.65]。
+# 预训练来源：navbase 产物。
+[terrain]
+mode = "track"
+num_rows = 10
+num_cols = 10
+difficulty_range = [0.0, 0.6]
+curriculum = true
+max_init_terrain_level = 0
+
+[terrain.track]
+track_length = 3
+sub_terrains = ["pyramid_slope", "pyramid_slope_inv", "open_entry_maze"]
+
+[domain_rand]
+enable_domain_rand = true
+randomize_friction = true
+friction_range = [0.45, 1.4]
+push_robots = false
+push_interval_s = 15
+max_push_vel_xy = 0.5
+
+[noise]
+add_noise = true
+
+[init_state]
+pos = [0.0, 0.0, 0.35]
+
+[commands]
+resampling_time = [2.5, 4.0]
+
+[commands.limit]
+lin_vel_x = [0.0, 0.8]
+lin_vel_y = [-0.0, 0.0]
+ang_vel_z = [-1.2, 1.2]
+
+[commands.ranges]
+lin_vel_x = [0.45, 0.65]
+lin_vel_y = [0.0, 0.0]
+ang_vel_yaw = [0.0, 0.0]
+
+[navigation]
+enabled = false
+
+[rl_navigation]
+phase_command_enabled = false
+worker_phase_command_enabled = false
+gate_speed_advice_enabled = false
+gate_reward_metrics_enabled = false
+eval_command_override = true
+eval_command = [0.45, 0.0, 0.0]
+
+# =============================================================================
+# 第一组：基础运动保持
+# =============================================================================
+[rewards.track_lin_vel_xy]
+weight = 1.08
+[rewards.track_lin_vel_xy.params]
+std = 0.24
+command_name = "base_velocity"
+
+[rewards.track_ang_vel_z]
+weight = 0.045
+[rewards.track_ang_vel_z.params]
+std = 0.35
+command_name = "base_velocity"
+
+[rewards.lin_vel_z]
+weight = -0.60
+
+[rewards.ang_vel_xy]
+weight = -0.55
+
+[rewards.joint_acc]
+weight = -4.5e-7
+
+[rewards.joint_torques]
+weight = -2.8e-5
+
+[rewards.dof_vel]
+weight = -1.3e-4
+
+[rewards.dof_pos_limits]
+weight = -0.3
+
+[rewards.action_rate]
+weight = -0.018
+
+[rewards.action_smoothness]
+weight = -0.018
+
+[rewards.flat_orientation]
+weight = -1.10
+
+[rewards.correct_base_height]
+weight = -0.30
+[rewards.correct_base_height.params]
+target_height = 0.38
+
+[rewards.posture_stability]
+weight = -1.0
+
+[rewards.undesired_contacts]
+weight = -0.62
+[rewards.undesired_contacts.params]
+threshold = 1
+
+[rewards.long_non_foot_contact]
+weight = -8.0
+[rewards.long_non_foot_contact.params]
+force_threshold = 5.0
+duration_s = 1.0
+step_dt = 0.02
+max_penalty = 2.0
+maze_only = false
+maze_goal_dist_gate = 14.0
+
+[rewards.termination]
+weight = -9.0
+
+# =============================================================================
+# 第二组：足端和楼梯（降权版，避免干扰起步）
+# =============================================================================
+[rewards.feet_air_time]
+weight = 0.2
+[rewards.feet_air_time.params]
+command_name = "base_velocity"
+threshold = 0.18
+
+[rewards.feet_clearance]
+weight = 0.05
+[rewards.feet_clearance.params]
+command_name = "base_velocity"
+target_height = 0.09
+std = 0.05
+terrain_height_scale = 0.60
+max_terrain_extra_height = 0.08
+speed_height_scale = 0.01
+body_y_start = 5
+body_y_end = 11
+near_x_start = 2
+near_x_end = 10
+delta_quantile = 0.85
+
+[rewards.feet_slide]
+weight = -0.1
+
+[rewards.feet_stumble]
+weight = -0.05
+
+# air_time_variance_penalty 降到 -0.1（坡地足端周期变化大，避免误伤）
+[rewards.air_time_variance_penalty]
+weight = -0.1
+
+[rewards.hip_to_default]
+weight = -0.16
+
+[rewards.joint_position_penalty]
+weight = -0.11
+[rewards.joint_position_penalty.params]
+stand_still_scale = 2.0
+cmd_threshold = 0.10
+ang_cmd_threshold = 0.20
+
+# =============================================================================
+# 第三组：目标推进
+# =============================================================================
+[rewards.goal_heading_alignment]
+weight = 0.95
+[rewards.goal_heading_alignment.params]
+std = 0.75
+
+[rewards.goal_velocity_projection]
+weight = 2.30
+[rewards.goal_velocity_projection.params]
+max_speed = 0.80
+
+[rewards.goal_backtrack_penalty]
+weight = -3.0
+[rewards.goal_backtrack_penalty.params]
+deadband = 0.02
+
+[rewards.approach_goal]
+weight = 12.5
+
+[rewards.goal_distance]
+weight = 0.76
+[rewards.goal_distance.params]
+scale = 8.0
+
+[rewards.task_complete]
+weight = 285.0
+[rewards.task_complete.params]
+threshold = 0.6
+
+[rewards.navigation_time]
+weight = -0.0070
+
+[rewards.backward_penalty]
+weight = -2.5
+[rewards.backward_penalty.params]
+deadband = 0.03

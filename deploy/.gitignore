@@ -1,0 +1,98 @@
+# =============================================================================
+# .gitignore — Kaiwu sim2real 部署仓库
+# 策略: 只传源码 + 配置 + 文档, 不传 build 产物/大模型/第三方库
+# =============================================================================
+
+# ── 构建产物 (CMake/build) ────────────────────────────────────────────
+**/build/
+**/build_*/
+**/Testing/
+**/CMakeFiles/
+**/cmake_install.cmake
+**/CTestTestfile.cmake
+**/DartConfiguration.tcl
+**/CMakeCache.txt
+**/Makefile
+**/*.o
+**/*.obj
+**/*.a
+**/*.so
+**/*.so.*
+**/*.dylib
+**/*.lib
+**/*.dll
+**/compile_commands.json
+
+# 编译输出的 binary
+**/go2_loco_ctrl
+**/go2_loco_ctrl.before_*
+**/go2_loco_ctrl.st7_*
+**/go2_loco_ctrl.st9_*
+**/test_uwb_goal
+
+# ── 模型 / ONNX (大文件, 比赛产物) ──────────────────────────────────
+# 默认全部忽略, 如确需团队共享, 用 Git LFS 单独管理
+**/models/*.pkl
+**/models/*.pth
+**/models/*.pt
+**/models/*.onnx
+**/models/*.engine
+**/models/*.uff
+**/exported/policy.onnx
+**/exported/*.onnx
+**/exported/policy.*.onnx.bak
+**/logs/loco/exported/*.onnx
+**/logs/loco/exported/*.bak
+**/policy.onnx
+
+# ── 第三方库 (onnxruntime 等, 大且可重新下载) ──────────────────────
+**/thirdparty/onnxruntime-linux-*/
+**/thirdparty/**/libonnxruntime*.so*
+**/thirdparty/**/*.a
+
+# ── 备份 (deploy_loco_backups, history tar) ─────────────────────────
+**/deploy_loco_backups/
+**/*.bak
+**/*.backup
+**/*.before_*
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+
+# ── 日志 / 测试录像 (大且无意义) ─────────────────────────────────────
+# logs/<时间戳>_loco_*/ 里大日志文件忽略, 但保留目录结构和摘要
+**/logs/2026*_loco_*/console.log
+**/logs/2026*_loco_*/realsense.txt
+**/logs/2026*_loco_*/visloco_diag_*.csv
+**/logs/loco/logs/visloco_diag_*.csv
+**/logs/depth_capture/*.png
+**/logs/depth_capture/*.npy
+**/logs/depth_capture/*.csv
+
+# ── ROS 自动生成的临时文件 ──────────────────────────────────────────
+**/ros/**/__pycache__/
+
+# ── IDE / 编辑器 ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── 临时/系统文件 ────────────────────────────────────────────────────
+*.tmp
+*.log
+*.tmp.*
+.cache/
+
+# ── ZCode 工具临时目录 ──────────────────────────────────────────────
+.agents/
+.codex/
+
+# ── 本地脚本 (run_st7.sh 等, 只本机用) ─────────────────────────────
+run_st7.sh
+run_st9.sh
+
+# ── SNAPSHOT (本地状态文件) ──────────────────────────────────────────
+SNAPSHOT_SHA256.txt

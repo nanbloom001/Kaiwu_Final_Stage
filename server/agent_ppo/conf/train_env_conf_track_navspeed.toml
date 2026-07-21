@@ -1,0 +1,210 @@
+[env]
+num_envs = 3072
+episode_length_s = 120.0
+
+[env_conf]
+seed = 0
+
+# Stage 3C: Nav Speed — 小幅提速，优化时间分（对应复赛 xtrack6）
+# 完成率已满，只做小幅提速提升 time_score
+# 不改难度/门控逻辑/奖励，从 Stage3B-best 精确续训
+[terrain]
+mode = "track"
+num_rows = 10
+num_cols = 10
+difficulty_range = [0.0, 1.0]
+curriculum = false
+max_init_terrain_level = 0
+
+# level_mix: 控制难度采样分布，50%集中在Level4-6，26%保留低难度防空洞，24%高难度
+[terrain.level_mix]
+enabled = true
+levels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+weights = [0.04, 0.05, 0.07, 0.10, 0.14, 0.18, 0.18, 0.12, 0.07, 0.05]
+pool_size = 100
+
+[terrain.track]
+track_length = 5
+sub_terrains = ["pyramid_slope", "pyramid_slope_inv", "pyramid_stairs", "pyramid_stairs_inv", "open_entry_maze"]
+
+[domain_rand]
+enable_domain_rand = true
+randomize_friction = true
+friction_range = [0.45, 1.4]
+push_robots = false
+push_interval_s = 15
+max_push_vel_xy = 0.5
+
+[noise]
+add_noise = true
+
+[init_state]
+pos = [0.0, 0.0, 0.35]
+
+# 速度不变，保持 Stage3A 低速
+[commands]
+resampling_time = [2.5, 4.0]
+
+[commands.limit]
+lin_vel_x = [0.0, 0.8]
+lin_vel_y = [-0.0, 0.0]
+ang_vel_z = [-1.2, 1.2]
+
+[commands.ranges]
+lin_vel_x = [0.45, 0.65]
+lin_vel_y = [0.0, 0.0]
+ang_vel_yaw = [0.0, 0.0]
+
+[navigation]
+enabled = false
+
+# Stage3B: 开启地形速度门控（sticky gate + 分地形降速）
+[rl_navigation]
+
+# 开启 phase command 与 worker 侧地形门控
+phase_command_enabled = true
+worker_phase_command_enabled = true
+gate_speed_advice_enabled = true
+
+# 只上报门控监控，不把门控指标作为奖励
+gate_reward_metrics_enabled = true
+gate_diagnostics_enabled = false
+
+# 使用带滞回的 sticky gate，避免坡/楼梯边界频繁跳变
+gate_test_mode = "sticky"
+shadow_selected_gate = "sticky"
+terrain_sticky_source = "nan"
+raw_terrain_gate_enabled = true
+
+# height scan 无法识别时的保守速度
+suggested_speed_fallback = 0.50
+
+# Stage3C: 小幅提速（保持完成率前提下提升时间分）
+pre_maze_lin_vel_x = [0.60, 0.70]
+slope_lin_vel_x = [0.52, 0.62]
+stairs_lin_vel_x = [0.42, 0.52]
+maze_lin_vel_x = [0.50, 0.60]
+
+# 允许根据坡/楼梯类型切换速度
+terrain_phase_speed_enabled = true
+phase_command_resample_steps = 160
+
+# 迷宫阶段判断
+phase_maze_goal_dist_gate = 14.0
+phase_maze_distance_mode = "longitudinal"
+phase_maze_goal_longitudinal_min = -1.0
+phase_maze_confirm_steps = 3
+phase_maze_release_margin = 2.0
+phase_maze_sticky_until_done = true
+
+# 地形类型需要连续确认，避免单帧误判
+terrain_sticky_confirm_steps = 4
+terrain_sticky_flat_release_steps = 10
+terrain_sticky_slope_hold_steps = 30
+terrain_sticky_stairs_hold_steps = 50
+terrain_sticky_wall_hold_steps = 40
+
+# 回到平地的释放阈值
+terrain_flat_release_edge_max = 0.025
+terrain_flat_release_delta_max = 0.025
+terrain_flat_release_pitch_max = 0.10
+
+# 坡和楼梯方向判断
+terrain_updown_full_delta = 0.12
+
+# Nan height-scan gate
+nan_gate_body_y_start = 5
+nan_gate_body_y_end = 11
+nan_gate_x_start = 0
+nan_gate_x_end = 10
+
+nan_gate_stair_edge_threshold = 0.040
+nan_gate_stair_locality_threshold = 0.30
+nan_gate_stair_smoothness_max = 0.45
+
+nan_gate_slope_edge_mean_min = 0.006
+nan_gate_slope_smoothness_min = 0.60
+nan_gate_slope_edge_max = 0.070
+
+nan_gate_wall_edge_threshold = 0.30
+nan_gate_direction_margin = 0.02
+
+# =============================================================================
+# reward 完全不变，和 Stage3A 一致（运控保持12 + 基础导航7 = 19项）
+# =============================================================================
+[rewards.track_lin_vel_xy]
+weight = 1.08
+[rewards.track_lin_vel_xy.params]
+std = 0.24
+command_name = "base_velocity"
+
+[rewards.track_ang_vel_z]
+weight = 0.045
+[rewards.track_ang_vel_z.params]
+std = 0.35
+command_name = "base_velocity"
+
+[rewards.lin_vel_z]
+weight = -0.60
+
+[rewards.ang_vel_xy]
+weight = -0.55
+
+[rewards.flat_orientation]
+weight = -1.10
+
+[rewards.correct_base_height]
+weight = -0.30
+[rewards.correct_base_height.params]
+target_height = 0.38
+
+[rewards.posture_stability]
+weight = -1.0
+
+[rewards.action_rate]
+weight = -0.018
+
+[rewards.action_smoothness]
+weight = -0.018
+
+[rewards.joint_torques]
+weight = -2.8e-5
+
+[rewards.undesired_contacts]
+weight = -0.62
+[rewards.undesired_contacts.params]
+threshold = 1
+
+[rewards.termination]
+weight = -9.0
+
+[rewards.goal_heading_alignment]
+weight = 0.95
+[rewards.goal_heading_alignment.params]
+std = 0.75
+
+[rewards.goal_velocity_projection]
+weight = 2.30
+[rewards.goal_velocity_projection.params]
+max_speed = 0.80
+
+[rewards.goal_backtrack_penalty]
+weight = -3.0
+[rewards.goal_backtrack_penalty.params]
+deadband = 0.02
+
+[rewards.approach_goal]
+weight = 12.5
+
+[rewards.task_complete]
+weight = 285.0
+[rewards.task_complete.params]
+threshold = 0.6
+
+[rewards.navigation_time]
+weight = -0.0070
+
+[rewards.backward_penalty]
+weight = -2.5
+[rewards.backward_penalty.params]
+deadband = 0.03

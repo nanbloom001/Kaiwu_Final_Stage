@@ -1,0 +1,822 @@
+# ========================================
+# Git LFS .gitattributes - 通用完整版本
+# 支持大小写敏感的操作系统
+# ========================================
+
+# ========================================
+# 视频文件 (Video Files)
+# ========================================
+# oggtheora
+*.[oO][gG][gG][tT][hH][eE][oO][rR][aA] filter=lfs diff=lfs merge=lfs -text
+# m2t
+*.[mM]2[tT] filter=lfs diff=lfs merge=lfs -text
+# mts
+*.[mM][tT][sS] filter=lfs diff=lfs merge=lfs -text
+# mp4
+*.[mM][pP]4 filter=lfs diff=lfs merge=lfs -text
+# avi
+*.[aA][vV][iI] filter=lfs diff=lfs merge=lfs -text
+# mkv
+*.[mM][kK][vV] filter=lfs diff=lfs merge=lfs -text
+# wmv
+*.[wW][mM][vV] filter=lfs diff=lfs merge=lfs -text
+# asf
+*.[aA][sS][fF] filter=lfs diff=lfs merge=lfs -text
+# asx
+*.[aA][sS][xX] filter=lfs diff=lfs merge=lfs -text
+# rm
+*.[rR][mM] filter=lfs diff=lfs merge=lfs -text
+# rmvb
+*.[rR][mM][vV][bB] filter=lfs diff=lfs merge=lfs -text
+# 3gp
+*.3[gG][pP] filter=lfs diff=lfs merge=lfs -text
+# 3gpp
+*.3[gG][pP][pP] filter=lfs diff=lfs merge=lfs -text
+# 3gpp2
+*.3[gG][pP][pP]2 filter=lfs diff=lfs merge=lfs -text
+# 3g2
+*.3[gG]2 filter=lfs diff=lfs merge=lfs -text
+# mov
+*.[mM][oO][vV] filter=lfs diff=lfs merge=lfs -text
+# m4v
+*.[mM]4[vV] filter=lfs diff=lfs merge=lfs -text
+# dat
+*.[dD][aA][tT] filter=lfs diff=lfs merge=lfs -text
+# vob
+*.[vV][oO][bB] filter=lfs diff=lfs merge=lfs -text
+# dv
+*.[dD][vV] filter=lfs diff=lfs merge=lfs -text
+# mpeg
+*.[mM][pP][eE][gG] filter=lfs diff=lfs merge=lfs -text
+# mpg
+*.[mM][pP][gG] filter=lfs diff=lfs merge=lfs -text
+# mpe
+*.[mM][pP][eE] filter=lfs diff=lfs merge=lfs -text
+# m2v
+*.[mM]2[vV] filter=lfs diff=lfs merge=lfs -text
+# webm
+*.[wW][eE][bB][mM] filter=lfs diff=lfs merge=lfs -text
+# flv
+*.[fF][lL][vV] filter=lfs diff=lfs merge=lfs -text
+# swf
+*.[sS][wW][fF] filter=lfs diff=lfs merge=lfs -text
+# avc
+*.[aA][vV][cC] filter=lfs diff=lfs merge=lfs -text
+# arf
+*.[aA][rR][fF] filter=lfs diff=lfs merge=lfs -text
+# vcr
+*.[vV][cC][rR] filter=lfs diff=lfs merge=lfs -text
+# ogv
+*.[oO][gG][vV] filter=lfs diff=lfs merge=lfs -text
+# ts
+*.[tT][sS] filter=lfs diff=lfs merge=lfs -text
+# wm
+*.[wW][mM] filter=lfs diff=lfs merge=lfs -text
+# fla
+*.[fF][lL][aA] filter=lfs diff=lfs merge=lfs -text
+# f4v
+*.[fF]4[vV] filter=lfs diff=lfs merge=lfs -text
+# h264
+*.[hH]264 filter=lfs diff=lfs merge=lfs -text
+# m2ts
+*.[mM]2[tT][sS] filter=lfs diff=lfs merge=lfs -text
+# qt
+*.[qQ][tT] filter=lfs diff=lfs merge=lfs -text
+# tod
+*.[tT][oO][dD] filter=lfs diff=lfs merge=lfs -text
+# yuv
+*.[yY][uU][vV] filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# 音频文件 (Audio Files)
+# ========================================
+# ape
+*.[aA][pP][eE] filter=lfs diff=lfs merge=lfs -text
+# wav
+*.[wW][aA][vV] filter=lfs diff=lfs merge=lfs -text
+# m4a
+*.[mM]4[aA] filter=lfs diff=lfs merge=lfs -text
+# mp3
+*.[mM][pP]3 filter=lfs diff=lfs merge=lfs -text
+# flac
+*.[fF][lL][aA][cC] filter=lfs diff=lfs merge=lfs -text
+# aif
+*.[aA][iI][fF] filter=lfs diff=lfs merge=lfs -text
+# aiff
+*.[aA][iI][fF][fF] filter=lfs diff=lfs merge=lfs -text
+# aac
+*.[aA][aA][cC] filter=lfs diff=lfs merge=lfs -text
+# cpa
+*.[cC][pP][aA] filter=lfs diff=lfs merge=lfs -text
+# swa
+*.[sS][wW][aA] filter=lfs diff=lfs merge=lfs -text
+# sesx
+*.[sS][eE][sS][xX] filter=lfs diff=lfs merge=lfs -text
+# ses
+*.[sS][eE][sS] filter=lfs diff=lfs merge=lfs -text
+# bnk, Wwise audio
+*.[bB][nN][kK] filter=lfs diff=lfs merge=lfs -text
+# wem, Wwise
+*.[wW][eE][mM] filter=lfs diff=lfs merge=lfs -text
+# pca
+*.[pP][cC][aA] filter=lfs diff=lfs merge=lfs -text
+# wv
+*.[wW][vV] filter=lfs diff=lfs merge=lfs -text
+# ogg
+*.[oO][gG][gG] filter=lfs diff=lfs merge=lfs -text
+# opus
+*.[oO][pP][uU][sS] filter=lfs diff=lfs merge=lfs -text
+# wma
+*.[wW][mM][aA] filter=lfs diff=lfs merge=lfs -text
+# tta
+*.[tT][tT][aA] filter=lfs diff=lfs merge=lfs -text
+# xm
+*.[xX][mM] filter=lfs diff=lfs merge=lfs -text
+# s3m
+*.[sS]3[mM] filter=lfs diff=lfs merge=lfs -text
+# it
+*.[iI][tT] filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# 库文件和可执行文件 (Library & Executable Files)
+# ========================================
+# a
+*.[aA] filter=lfs diff=lfs merge=lfs -text
+# o
+*.[oO] filter=lfs diff=lfs merge=lfs -text
+# so
+*.[sS][oO] filter=lfs diff=lfs merge=lfs -text
+# so.[0-9]*
+*.[sS][oO].[0-9]* filter=lfs diff=lfs merge=lfs -text
+# lib
+*.[lL][iI][bB] filter=lfs diff=lfs merge=lfs -text
+# dll
+*.[dD][lL][lL] filter=lfs diff=lfs merge=lfs -text
+# lbr
+*.[lL][bB][rR] filter=lfs diff=lfs merge=lfs -text
+# tlb
+*.[tT][lL][bB] filter=lfs diff=lfs merge=lfs -text
+# cab
+*.[cC][aA][bB] filter=lfs diff=lfs merge=lfs -text
+# dylib
+*.[dD][yY][lL][iI][bB] filter=lfs diff=lfs merge=lfs -text
+# dsym
+*.[dD][sS][yY][mM] filter=lfs diff=lfs merge=lfs -text
+# app
+*.[aA][pP][pP] filter=lfs diff=lfs merge=lfs -text
+# ipa
+*.[iI][pP][aA] filter=lfs diff=lfs merge=lfs -text
+# dmg
+*.[dD][mM][gG] filter=lfs diff=lfs merge=lfs -text
+# exe
+*.[eE][xX][eE] filter=lfs diff=lfs merge=lfs -text
+# pdb
+*.[pP][dD][bB] filter=lfs diff=lfs merge=lfs -text
+# dbg
+*.[dD][bB][gG] filter=lfs diff=lfs merge=lfs -text
+# run
+*.[rR][uU][nN] filter=lfs diff=lfs merge=lfs -text
+# pyd
+*.[pP][yY][dD] filter=lfs diff=lfs merge=lfs -text
+# pyc
+*.[pP][yY][cC] filter=lfs diff=lfs merge=lfs -text
+# nupkg, NuGet package
+*.[nN][uU][pP][kK][gG] filter=lfs diff=lfs merge=lfs -text
+# pch
+*.[pP][cC][hH] filter=lfs diff=lfs merge=lfs -text
+# ilk
+*.[iI][lL][kK] filter=lfs diff=lfs merge=lfs -text
+# debug
+*.[dD][eE][bB][uU][gG] filter=lfs diff=lfs merge=lfs -text
+# obj
+*.[oO][bB][jJ] filter=lfs diff=lfs merge=lfs -text
+# stub
+*.[sS][tT][uU][bB] filter=lfs diff=lfs merge=lfs -text
+# ddp
+*.[dD][dD][pP] filter=lfs diff=lfs merge=lfs -text
+# sym
+*.[sS][yY][mM] filter=lfs diff=lfs merge=lfs -text
+# lld
+*.[lL][lL][dD] filter=lfs diff=lfs merge=lfs -text
+# res
+*.[rR][eE][sS] filter=lfs diff=lfs merge=lfs -text
+# locres
+*.[lL][oO][cC][rR][eE][sS] filter=lfs diff=lfs merge=lfs -text
+# aar
+*.[aA][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# udd
+*.[uU][dD][dD] filter=lfs diff=lfs merge=lfs -text
+# mdb
+*.[mM][dD][bB] filter=lfs diff=lfs merge=lfs -text
+# ddc
+*.[dD][dD][cC] filter=lfs diff=lfs merge=lfs -text
+# udn
+*.[uU][dD][nN] filter=lfs diff=lfs merge=lfs -text
+# h5
+*.[hH]5 filter=lfs diff=lfs merge=lfs -text
+# hprof
+*.[hH][pP][rR][oO][fF] filter=lfs diff=lfs merge=lfs -text
+# jar
+*.[jJ][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# icu
+*.[iI][cC][uU] filter=lfs diff=lfs merge=lfs -text
+# asar
+*.[aA][sS][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# tnnmodel
+*.[tT][nN][nN][mM][oO][dD][eE][lL] filter=lfs diff=lfs merge=lfs -text
+# xnet
+*.[xX][nN][eE][tT] filter=lfs diff=lfs merge=lfs -text
+# scn
+*.[sS][cC][nN] filter=lfs diff=lfs merge=lfs eol=lf -text
+
+
+# ========================================
+# 压缩包 (Archive Files)
+# ========================================
+# =Archiving only=
+# ar
+*.[aA][rR] filter=lfs diff=lfs merge=lfs -text
+# cpio
+*.[cC][pP][iI][oO] filter=lfs diff=lfs merge=lfs -text
+# shar
+*.[sS][hH][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# tar
+*.[tT][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# lbr
+*.[lL][bB][rR] filter=lfs diff=lfs merge=lfs -text
+
+# =Compression only=
+# Brotli
+*.[bB][rR][oO][tT][lL][iI] filter=lfs diff=lfs merge=lfs -text
+# zip
+*.[zZ][iI][pP] filter=lfs diff=lfs merge=lfs -text
+# bzip2
+*.[bB][zZ][iI][pP]2 filter=lfs diff=lfs merge=lfs -text
+# compress
+*.[cC][oO][mM][pP][rR][eE][sS][sS] filter=lfs diff=lfs merge=lfs -text
+# gzip
+*.[gG][zZ][iI][pP] filter=lfs diff=lfs merge=lfs -text
+# zopfli
+*.[zZ][oO][pP][fF][lL][iI] filter=lfs diff=lfs merge=lfs -text
+# LZMA
+*.[lL][zZ][mM][aA] filter=lfs diff=lfs merge=lfs -text
+# LZ4
+*.[lL][zZ]4 filter=lfs diff=lfs merge=lfs -text
+# lzip
+*.[lL][zZ][iI][pP] filter=lfs diff=lfs merge=lfs -text
+# lzop
+*.[lL][zZ][oO][pP] filter=lfs diff=lfs merge=lfs -text
+# SQ
+*.[sS][qQ] filter=lfs diff=lfs merge=lfs -text
+# xz
+*.[xX][zZ] filter=lfs diff=lfs merge=lfs -text
+# Zstandard
+*.[zZ][sS][tT][aA][nN][dD][aA][rR][dD] filter=lfs diff=lfs merge=lfs -text
+
+# =Archiving and compression=
+# 7z
+*.7[zZ] filter=lfs diff=lfs merge=lfs -text
+# ace
+*.[aA][cC][eE] filter=lfs diff=lfs merge=lfs -text
+# arc
+*.[aA][rR][cC] filter=lfs diff=lfs merge=lfs -text
+# arj
+*.[aA][rR][jJ] filter=lfs diff=lfs merge=lfs -text
+# b1
+*.[bB]1 filter=lfs diff=lfs merge=lfs -text
+# cabinet
+*.[cC][aA][bB][iI][nN][eE][tT] filter=lfs diff=lfs merge=lfs -text
+# cfs
+*.[cC][fF][sS] filter=lfs diff=lfs merge=lfs -text
+# cpt
+*.[cC][pP][tT] filter=lfs diff=lfs merge=lfs -text
+# dar
+*.[dD][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# dgca
+*.[dD][gG][cC][aA] filter=lfs diff=lfs merge=lfs -text
+# dmg
+*.[dD][mM][gG] filter=lfs diff=lfs merge=lfs -text
+# egg
+*.[eE][gG][gG] filter=lfs diff=lfs merge=lfs -text
+# kgb
+*.[kK][gG][bB] filter=lfs diff=lfs merge=lfs -text
+# lha
+*.[lL][hH][aA] filter=lfs diff=lfs merge=lfs -text
+# lzx
+*.[lL][zZ][xX] filter=lfs diff=lfs merge=lfs -text
+# mpq
+*.[mM][pP][qQ] filter=lfs diff=lfs merge=lfs -text
+# pea
+*.[pP][eE][aA] filter=lfs diff=lfs merge=lfs -text
+# rar
+*.[rR][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# rzip
+*.[rR][zZ][iI][pP] filter=lfs diff=lfs merge=lfs -text
+# sit
+*.[sS][iI][tT] filter=lfs diff=lfs merge=lfs -text
+# sitx
+*.[sS][iI][tT][xX] filter=lfs diff=lfs merge=lfs -text
+# sqx
+*.[sS][qQ][xX] filter=lfs diff=lfs merge=lfs -text
+# uda
+*.[uU][dD][aA] filter=lfs diff=lfs merge=lfs -text
+# xar
+*.[xX][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# zoo
+*.[zZ][oO][oO] filter=lfs diff=lfs merge=lfs -text
+# zpaq
+*.[zZ][pP][aA][qQ] filter=lfs diff=lfs merge=lfs -text
+
+# =Software packaging and distribution=
+# apk
+*.[aA][pP][kK] filter=lfs diff=lfs merge=lfs -text
+# appx
+*.[aA][pP][pP][xX] filter=lfs diff=lfs merge=lfs -text
+# deb
+*.[dD][eE][bB] filter=lfs diff=lfs merge=lfs -text
+# rpm
+*.[rR][pP][mM] filter=lfs diff=lfs merge=lfs -text
+# msi
+*.[mM][sS][iI] filter=lfs diff=lfs merge=lfs -text
+# ipa
+*.[iI][pP][aA] filter=lfs diff=lfs merge=lfs -text
+# jar
+*.[jJ][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# war
+*.[wW][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# ear
+*.[eE][aA][rR] filter=lfs diff=lfs merge=lfs -text
+# xap
+*.[xX][aA][pP] filter=lfs diff=lfs merge=lfs -text
+# xbap
+*.[xX][bB][aA][pP] filter=lfs diff=lfs merge=lfs -text
+# hap
+*.[hH][aA][pP] filter=lfs diff=lfs merge=lfs -text
+# app
+*.[aA][pP][pP] filter=lfs diff=lfs merge=lfs -text
+# gz
+*.[gG][zZ] filter=lfs diff=lfs merge=lfs -text
+# tgz
+*.[tT][gG][zZ] filter=lfs diff=lfs merge=lfs -text
+# bz2
+*.[bB][zZ]2 filter=lfs diff=lfs merge=lfs -text
+# z
+*.[zZ] filter=lfs diff=lfs merge=lfs -text
+# pak
+*.[pP][aA][kK] filter=lfs diff=lfs merge=lfs -text
+# archive
+*.[aA][rR][cC][hH][iI][vV][eE] filter=lfs diff=lfs merge=lfs -text
+# vsix
+*.[vV][sS][iI][xX] filter=lfs diff=lfs merge=lfs -text
+# pet
+*.[vP][eE][tT] filter=lfs diff=lfs merge=lfs -text
+# class
+*.[cC][lL][aA][sS][sS] filter=lfs diff=lfs merge=lfs -text
+# zst
+*.[zZ][sS][tT] filter=lfs diff=lfs merge=lfs -text
+# dragon
+*.[dD][rR][aA][gG][oO][nN] filter=lfs diff=lfs merge=lfs -text
+# jsa
+*.[jJ][sS][aA] filter=lfs diff=lfs merge=lfs -text
+# wasm
+*.[wW][aA][sS][mM] filter=lfs diff=lfs merge=lfs -text
+# db
+*.[dD][bB] filter=lfs diff=lfs merge=lfs -text
+
+
+# 跟踪所有分卷压缩包（如 .part1.rar, .part2.rar, .zip.001, .zip.002 等）
+*.[zZ][iI][pP].*+([0-9]) filter=lfs diff=lfs merge=lfs -text
+
+# 跟踪常见的分割文件模式（如 .split.001, .seg1, .chunk_001 等）
+*.[sS][eE][gG]+([0-9]) filter=lfs diff=lfs merge=lfs -text
+*.[cC][hH][uU][nN][kK]_+([0-9]) filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# 磁盘镜像 (Disk Images)
+# ========================================
+# iso
+*.[iI][sS][oO] filter=lfs diff=lfs merge=lfs -text
+# bin
+*.[bB][iI][nN] filter=lfs diff=lfs merge=lfs -text
+# pbin
+*.[pP][bB][iI][nN] filter=lfs diff=lfs merge=lfs -text
+# xbin
+*.[xX][bB][iI][nN] filter=lfs diff=lfs merge=lfs -text
+# cue
+*.[cC][uU][eE] filter=lfs diff=lfs merge=lfs -text
+# raw
+*.[rR][aA][wW] filter=lfs diff=lfs merge=lfs -text
+# bytes
+*.[bB][yY][tT][eE][sS] filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# Adobe 文件 (Adobe Files)
+# ========================================
+# Photoshop
+# psd
+*.[pP][sS][dD] filter=lfs diff=lfs merge=lfs -text
+# Illustrator
+# ai
+*.[aA][iI] filter=lfs diff=lfs merge=lfs -text
+# eps
+*.[eE][pP][sS] filter=lfs diff=lfs merge=lfs -text
+# pdf
+*.[pP][dD][fF] filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# 原始图片 (Raw Images)
+# ========================================
+# cr2
+*.[cC][rR]2 filter=lfs diff=lfs merge=lfs -text
+# crw
+*.[cC][rR][wW] filter=lfs diff=lfs merge=lfs -text
+# nef
+*.[nN][eE][fF] filter=lfs diff=lfs merge=lfs -text
+# nrw
+*.[nN][rR][wW] filter=lfs diff=lfs merge=lfs -text
+# sr2
+*.[sS][rR]2 filter=lfs diff=lfs merge=lfs -text
+# dng
+*.[dD][nN][gG] filter=lfs diff=lfs merge=lfs -text
+# arw
+*.[aA][rR][wW] filter=lfs diff=lfs merge=lfs -text
+# ort
+*.[oO][rR][fF] filter=lfs diff=lfs merge=lfs -text
+# fbx
+*.[fF][bB][xX] filter=lfs diff=lfs merge=lfs -text
+# 3ds
+*.3[dD][sS] filter=lfs diff=lfs merge=lfs -text
+# xcf
+*.[xX][cC][fF] filter=lfs diff=lfs merge=lfs -text
+# hdr
+*.[hH][dD][rR] filter=lfs diff=lfs merge=lfs -text
+# duf
+*.[dD][uU][fF] filter=lfs diff=lfs merge=lfs -text
+# mb, maya
+*.[mM][bB] filter=lfs diff=lfs merge=lfs -text
+# osm，地理数据
+*.[oO][sS][mM] filter=lfs diff=lfs merge=lfs -text
+# hip, houdini
+*.[hH][iI][pP] filter=lfs diff=lfs merge=lfs -text
+# cdr
+*.[cC][dD][rR] filter=lfs diff=lfs merge=lfs -text
+# raw
+*.[rR][aA][wW] filter=lfs diff=lfs merge=lfs -text
+# dae
+*.[dD][aA][eE] filter=lfs diff=lfs merge=lfs -text
+# hda, houdini
+*.[hH][dD][aA] filter=lfs diff=lfs merge=lfs -text
+# geo, houdini
+*.[gG][eE][oO] filter=lfs diff=lfs merge=lfs -text
+# bgeo, houdini
+*.[bB][gG][eE][oO] filter=lfs diff=lfs merge=lfs -text
+# ma, 3dmax
+*.[mM][aA] filter=lfs diff=lfs merge=lfs -text
+# max, 3dmax
+*.[mM][aA][xX] filter=lfs diff=lfs merge=lfs -text
+# 3dm, 3d模型
+*.3[dD][mM] filter=lfs diff=lfs merge=lfs -text
+# blend
+*.[bB][lL][eE][nN][dD] filter=lfs diff=lfs merge=lfs -text
+# c4d
+*.[cC]4[dD] filter=lfs diff=lfs merge=lfs -text
+# collada
+*.[cC][oO][lL][lL][aA][dD][aA] filter=lfs diff=lfs merge=lfs -text
+# dxf
+*.[dD][xX][fF] filter=lfs diff=lfs merge=lfs -text
+# jas
+*.[jJ][aA][sS] filter=lfs diff=lfs merge=lfs -text
+# lws
+*.[lL][wW][sS] filter=lfs diff=lfs merge=lfs -text
+# lxo
+*.[lL][xX][oO] filter=lfs diff=lfs merge=lfs -text
+# ply
+*.[pP][lL][yY] filter=lfs diff=lfs merge=lfs -text
+# skp
+*.[sS][kK][pP] filter=lfs diff=lfs merge=lfs -text
+# stl
+*.[sS][tT][lL] filter=lfs diff=lfs merge=lfs -text
+# ztl
+*.[zZ][tT][lL] filter=lfs diff=lfs merge=lfs -text
+# it
+*.[iI][tT] filter=lfs diff=lfs merge=lfs -text
+# mod
+*.[mM][oO][dD] filter=lfs diff=lfs merge=lfs -text
+# ogg
+*.[oO][gG][gG] filter=lfs diff=lfs merge=lfs -text
+# s3m
+*.[sS]3[mM] filter=lfs diff=lfs merge=lfs -text
+# xm
+*.[xX][mM] filter=lfs diff=lfs merge=lfs -text
+# glb
+*.[gG][lL][bB] filter=lfs diff=lfs merge=lfs -text
+# gltf
+*.[gG][lL][tT][fF] filter=lfs diff=lfs merge=lfs -text
+# off
+*.[oO][fF][fF] filter=lfs diff=lfs merge=lfs -text
+# wrl
+*.[wW][rR][lL] filter=lfs diff=lfs merge=lfs -text
+# 3mf
+*.3[mM][fF] filter=lfs diff=lfs merge=lfs -text
+# amf
+*.[aA][mM][fF] filter=lfs diff=lfs merge=lfs -text
+# ifc
+*.[iI][fF][cC] filter=lfs diff=lfs merge=lfs -text
+# brep
+*.[bB][rR][eE][pP] filter=lfs diff=lfs merge=lfs -text
+# step
+*.[sS][tT][eE][pP] filter=lfs diff=lfs merge=lfs -text
+# fcstd
+*.[fF][cC][sS][tT][dD] filter=lfs diff=lfs merge=lfs -text
+# bim
+*.[bB][iI][mM] filter=lfs diff=lfs merge=lfs -text
+# prj
+*.[pP][rR][jJ] filter=lfs diff=lfs merge=lfs -text
+# dwg
+*.[dD][wW][gG] filter=lfs diff=lfs merge=lfs -text
+# flt
+*.[fF][lL][tT] filter=lfs diff=lfs merge=lfs -text
+# htr
+*.[hH][tT][rR] filter=lfs diff=lfs merge=lfs -text
+# iges
+*.[iI][gG][eE][sS] filter=lfs diff=lfs merge=lfs -text
+# igs
+*.[iI][gG][sS] filter=lfs diff=lfs merge=lfs -text
+# ige
+*.[iI][gG][eE] filter=lfs diff=lfs merge=lfs -text
+# ipt
+*.[iI][pP][tT] filter=lfs diff=lfs merge=lfs -text
+# iam
+*.[iI][aA][mM] filter=lfs diff=lfs merge=lfs -text
+# lp
+*.[lL][pP] filter=lfs diff=lfs merge=lfs -text
+# ls
+*.[lL][sS] filter=lfs diff=lfs merge=lfs -text
+# shp
+*.[sS][hH][pP] filter=lfs diff=lfs merge=lfs -text
+# aep
+*.[aA][eE][pP] filter=lfs diff=lfs merge=lfs -text
+# psb
+*.[pP][sS][bB] filter=lfs diff=lfs merge=lfs -text
+# edx
+*.[eE][dD][xX] filter=lfs diff=lfs merge=lfs -text
+# cds
+*.[cC][dD][sS] filter=lfs diff=lfs merge=lfs -text
+# exr
+*.[eE][xX][rR] filter=lfs diff=lfs merge=lfs -text
+# bc
+*.[bB][cC] filter=lfs diff=lfs merge=lfs -text
+# map
+*.[mM][aA][pP] filter=lfs diff=lfs merge=lfs -text
+# nrm
+*.[nN][rR][mM] filter=lfs diff=lfs merge=lfs -text
+# obj
+*.[oO][bB][jJ] filter=lfs diff=lfs merge=lfs -text
+# obj_w
+*.[oO][bB][jJ]_[wW] filter=lfs diff=lfs merge=lfs -text
+# tga
+*.[tT][gG][aA] filter=lfs diff=lfs merge=lfs -text
+# webp
+*.[wW][eE][bB][pP] filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# 图像文件 (Image Files)
+# ========================================
+# jpg
+*.[jJ][pP][gG] filter=lfs diff=lfs merge=lfs -text
+# jpeg
+*.[jJ][pP][eE][gG] filter=lfs diff=lfs merge=lfs -text
+# tiff
+*.[tT][iI][fF][fF] filter=lfs diff=lfs merge=lfs -text
+# gif
+*.[gG][iI][fF] filter=lfs diff=lfs merge=lfs -text
+# svg
+*.[sS][vV][gG] filter=lfs diff=lfs merge=lfs -text
+# svgz
+*.[sS][vV][gG][zZ] filter=lfs diff=lfs merge=lfs -text
+# bmp
+*.[bB][mM][pP] filter=lfs diff=lfs merge=lfs -text
+# png
+*.[pP][nN][gG] filter=lfs diff=lfs merge=lfs -text
+# tif
+*.[tT][iI][fF] filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# 文档文件 (Document Files)
+# ========================================
+# Microsoft Excel
+# xls
+*.[xX][lL][sS] filter=lfs diff=lfs merge=lfs -text
+# xlsx
+*.[xX][lL][sS][xX] filter=lfs diff=lfs merge=lfs -text
+# xslsm
+*.[xX][sS][lL][sS][mM] filter=lfs diff=lfs merge=lfs -text
+# xlt
+*.[xX][lL][tT] filter=lfs diff=lfs merge=lfs -text
+# xltx
+*.[xX][lL][tT][xX] filter=lfs diff=lfs merge=lfs -text
+# xltm
+*.[xX][lL][tT][mM] filter=lfs diff=lfs merge=lfs -text
+# csv
+*.[cC][sS][vV] filter=lfs diff=lfs merge=lfs -text
+# sum
+*.[sS][uU][mM] filter=lfs diff=lfs merge=lfs -text
+# ldata
+*.[lL][dD][aA][tT][aA] filter=lfs diff=lfs merge=lfs -text
+# tdt
+*.[tT][dD][tT] filter=lfs diff=lfs merge=lfs -text
+
+# Microsoft PowerPoint
+# ppt
+*.[pP][pP][tT] filter=lfs diff=lfs merge=lfs -text
+# pptx
+*.[pP][pP][tT][xX] filter=lfs diff=lfs merge=lfs -text
+# pps
+*.[pP][pP][sS] filter=lfs diff=lfs merge=lfs -text
+# ppsx
+*.[pP][pP][sS][xX] filter=lfs diff=lfs merge=lfs -text
+# ppsm
+*.[pP][pP][sS][mM] filter=lfs diff=lfs merge=lfs -text
+# pptm
+*.[pP][pP][tT][mM] filter=lfs diff=lfs merge=lfs -text
+# pot
+*.[pP][oO][tT] filter=lfs diff=lfs merge=lfs -text
+# potm
+*.[pP][oO][tT][mM] filter=lfs diff=lfs merge=lfs -text
+
+# Microsoft Word
+# doc
+*.[dD][oO][cC] filter=lfs diff=lfs merge=lfs -text
+# docx
+*.[dD][oO][cC][xX] filter=lfs diff=lfs merge=lfs -text
+# docm
+*.[dD][oO][cC][mM] filter=lfs diff=lfs merge=lfs -text
+# dot
+*.[dD][oO][tT] filter=lfs diff=lfs merge=lfs -text
+# dotx
+*.[dD][oO][tT][xX] filter=lfs diff=lfs merge=lfs -text
+# dotm
+*.[dD][oO][tT][mM] filter=lfs diff=lfs merge=lfs -text
+
+# Apple
+# key
+*.[kK][eE][yY] filter=lfs diff=lfs merge=lfs -text
+# pages
+*.[pP][aA][gG][eE][sS] filter=lfs diff=lfs merge=lfs -text
+# numbers
+*.[nN][uU][mM][bB][eE][rR][sS] filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# 电子书 (E-books)
+# ========================================
+# chm
+*.[cC][hH][mM] filter=lfs diff=lfs merge=lfs -text
+# mobi
+*.[mM][oO][bB][iI] filter=lfs diff=lfs merge=lfs -text
+# epub
+*.[eE][pP][uU][bB] filter=lfs diff=lfs merge=lfs -text
+# azw
+*.[aA][zZ][wW] filter=lfs diff=lfs merge=lfs -text
+# azw3
+*.[aA][zZ][wW]3 filter=lfs diff=lfs merge=lfs -text
+# iba
+*.[iI][bB][aA] filter=lfs diff=lfs merge=lfs -text
+# lrs
+*.[lL][rR][sS] filter=lfs diff=lfs merge=lfs -text
+# lrf
+*.[lL][rR][fF] filter=lfs diff=lfs merge=lfs -text
+# lrx
+*.[lL][rR][xX] filter=lfs diff=lfs merge=lfs -text
+# djvu
+*.[dD][jJ][vV][uU] filter=lfs diff=lfs merge=lfs -text
+# lit
+*.[lL][iI][tT] filter=lfs diff=lfs merge=lfs -text
+# rft
+*.[rR][fF][tT] filter=lfs diff=lfs merge=lfs -text
+# cbr
+*.[cC][bB][rR] filter=lfs diff=lfs merge=lfs -text
+# cbz
+*.[cC][bB][zZ] filter=lfs diff=lfs merge=lfs -text
+# cb7
+*.[cC][bB]7 filter=lfs diff=lfs merge=lfs -text
+# cbt
+*.[cC][bB][tT] filter=lfs diff=lfs merge=lfs -text
+# cba
+*.[cC][bB][aA] filter=lfs diff=lfs merge=lfs -text
+# pdb
+*.[pP][dD][bB] filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# 字体文件 (Font Files)
+# ========================================
+# ttf
+*.[tT][tT][fF] filter=lfs diff=lfs merge=lfs -text
+# otf
+*.[oO][tT][fF] filter=lfs diff=lfs merge=lfs -text
+# woff
+*.[wW][oO][fF][fF] filter=lfs diff=lfs merge=lfs -text
+# woff2
+*.[wW][oO][fF][fF]2 filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# 翻译文件 (Translation Files)
+# ========================================
+# po
+*.[pP][oO] filter=lfs diff=lfs merge=lfs -text
+
+# ========================================
+# 大文本文件 (Large Text Files)
+# ========================================
+# pb
+*.[pP][bB] filter=lfs diff=lfs merge=lfs -text
+# pdb
+*.[pP][dD][bB] filter=lfs diff=lfs merge=lfs -text
+# res
+*.[rR][eE][sS] filter=lfs diff=lfs merge=lfs -text
+# dict
+*.[dD][iI][cC][tT] filter=lfs diff=lfs merge=lfs -text
+# pem
+*.[pP][eE][mM] filter=lfs diff=lfs merge=lfs -text
+
+
+# ========================================
+# 游戏引擎文件 (Game Engine Files)
+# ========================================
+# Unreal Engine
+# uasset
+*.[uU][aA][sS][sS][eE][tT] filter=lfs diff=lfs merge=lfs -text
+# umap
+*.[uU][mM][aA][pP] filter=lfs diff=lfs merge=lfs -text
+# locres
+*.[lL][oO][cC][rR][eE][sS] filter=lfs diff=lfs merge=lfs -text
+# uexp
+*.[uU][eE][xX][pP] filter=lfs diff=lfs merge=lfs -text
+
+# Unity
+# cubemap
+*.[cC][uU][bB][eE][mM][aA][pP] filter=lfs diff=lfs merge=lfs -text
+# unitypackage
+*.[uU][nN][iI][tT][yY][pP][aA][cC][kK][aA][gG][eE] filter=lfs diff=lfs merge=lfs -text
+# bundle
+*.[bB][uU][nN][dD][lL][eE] filter=lfs diff=lfs merge=lfs -text
+# cubemap，unity 贴图
+*.[cC][uU][bB][eE][mM][aA][pP] filter=lfs diff=lfs merge=lfs -text
+# navmesh、navmesh_c，unity
+*.[nN][aA][vV][mM][eE][sS][hH] filter=lfs diff=lfs merge=lfs -text
+*.[nN][aA][vV][mM][eE][sS][hH]_[cC] filter=lfs diff=lfs merge=lfs -text
+LightingData.asset filter=lfs diff=lfs merge=lfs -text
+
+# Unity YAML
+# unity
+*.[uU][nN][iI][tT][yY] filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+# prefab
+*.[pP][rR][eE][fF][aA][bB] filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+# asset
+*.[aA][sS][sS][eE][tT] filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+# meta
+*.[mM][eE][tT][aA] filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+# controller
+*.[cC][oO][nN][tT][rR][oO][lL][lL][eE][rR] filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+# mat
+*.[mM][aA][tT] filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+# anim 在unity场景是非二进制文件，在其他地方是二进制文件，这里需要根据实际需求开启
+# *.[aA][nN][iI][mM] filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+*.[aA][nN][iI][mM] filter=lfs diff=lfs merge=lfs -text
+
+# "physic" for 3D but "physics" for 2D
+*.physicMaterial2D filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+*.physicMaterial filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+*.physicsMaterial2D filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+*.physicsMaterial filter=lfs diff=lfs merge=unityyamlmerge eol=lf -text
+
+# ========================================
+# 地图和路径文件 (Map & Path Files)
+# ========================================
+# path
+*.[pP][aA][tT][hH] filter=lfs diff=lfs merge=lfs -text
+# route
+*.[rR][oO][uU][tT][eE] filter=lfs diff=lfs merge=lfs -text
+# gpx
+*.[gG][pP][xX] filter=lfs diff=lfs merge=lfs -text
+# waypoint
+*.[wW][aA][yY][pP][oO][iI][nN][tT] filter=lfs diff=lfs merge=lfs -text
+# waypointvolume
+*.[wW][aA][yY][pP][oO][iI][nN][tT][vV][oO][lL][uU][mM][eE] filter=lfs diff=lfs merge=lfs -text
+# convexvolume
+*.[cC][oO][nN][vV][eE][xX][vV][oO][lL][uU][mM][eE] filter=lfs diff=lfs merge=lfs -text
+# offmesh
+*.[oO][fF][fF][mM][eE][sS][hH] filter=lfs diff=lfs merge=lfs -text
+# header
+*.[hH][eE][aA][dD][eE][rR] filter=lfs diff=lfs merge=lfs -text
+
+# aoc
+*.[aA][oO][cC] filter=lfs diff=lfs merge=lfs -text
+# ao
+*.[aA][oO] filter=lfs diff=lfs merge=lfs -text
+# auto generated by UGit 
+*.so filter=lfs diff=lfs merge=binary -text
+*.so.1 filter=lfs diff=lfs merge=binary -text
+*.pkl filter=lfs diff=lfs merge=binary -text
+*.npy filter=lfs diff=lfs merge=binary -text
+*.pdf filter=lfs diff=lfs merge=binary -text
+
