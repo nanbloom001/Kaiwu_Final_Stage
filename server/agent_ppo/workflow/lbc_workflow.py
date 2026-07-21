@@ -100,13 +100,14 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
     stage = agent.stage
     algorithm = agent.algorithm
+    log_prefix = f"[LBC:{stage.name}]"
 
     usr_conf, usr_conf_file, is_eval, _stage = Config.load_conf(logger)
     section = stage.name
     lbc_conf = usr_conf.get(section, {}) if isinstance(usr_conf, dict) else {}
-    logger.info(f"[ST9-Opt3-D2] workflow={os.path.abspath(__file__)}")
+    logger.info(f"{log_prefix} workflow={os.path.abspath(__file__)}")
     logger.info(
-        f"[ST9-Opt3-D2] stage={stage.__name__}, config={usr_conf_file}, "
+        f"{log_prefix} stage={stage.__name__}, config={usr_conf_file}, "
         f"task_type={stage.task_type}"
     )
 
@@ -180,7 +181,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         )
     initial_teacher_state = _snapshot_teacher(algorithm)
     logger.info(
-        f"[ST9-Opt3-D2] teacher_checkpoint={algorithm.teacher_source}, "
+        f"{log_prefix} teacher_checkpoint={algorithm.teacher_source}, "
         f"student_checkpoint={algorithm.student_source}, "
         f"teacher_encoder_frozen={teacher_encoder_frozen}, "
         f"teacher_actor_frozen={teacher_actor_frozen}, "
@@ -195,9 +196,9 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         usr_conf.get("depth_block_dropout", {}),
         training=not is_eval,
     )
-    logger.info(f"[ST9-Opt3-D2] goal_noise={usr_conf.get('goal_noise', {})}")
+    logger.info(f"{log_prefix} goal_noise={usr_conf.get('goal_noise', {})}")
     logger.info(
-        f"[ST9-Opt3-D2] depth_aug={usr_conf.get('depth_aug', {})}, "
+        f"{log_prefix} depth_aug={usr_conf.get('depth_aug', {})}, "
         f"depth_block_dropout={usr_conf.get('depth_block_dropout', {})}"
     )
 
@@ -247,7 +248,11 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     expected_shapes = {
         "proprio": (agent.num_envs, stage.proprio_dim),
         "height_scan": (agent.num_envs, stage.scan_dim),
-        "goal": (agent.num_envs, getattr(stage, "num_goal_obs", 0)),
+        "goal": (
+            (agent.num_envs, stage.num_goal_obs)
+            if getattr(stage, "num_goal_obs", 0) > 0
+            else None
+        ),
         "depth_image": (
             agent.num_envs,
             stage.depth_height,
@@ -260,7 +265,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         if actual != expected:
             raise ValueError(f"[LBC] {key} shape mismatch: expected {expected}, got {actual}.")
     logger.info(
-        f"[ST9-Opt3-D2] shapes={shape_summary}, latent={stage.latent_dim}, "
+        f"{log_prefix} shapes={shape_summary}, latent={stage.latent_dim}, "
         f"action={stage.num_actions}"
     )
 
@@ -332,7 +337,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 )
                 if not loss_scale_logged:
                     logger.info(
-                        "[ST9-Opt3-D2 LossScale] "
+                        f"{log_prefix} LossScale "
                         f"latent_unweighted={step_metrics['latent_loss']:.8f}, "
                         f"cosine_unweighted={step_metrics['cosine_loss']:.8f}, "
                         f"action_unweighted={step_metrics['action_loss']:.8f}, "
@@ -436,7 +441,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 f"total_steps={algorithm.total_steps}  iter_time={dt:.2f}s"
             )
             logger.info(
-                "[ST9-Opt3-D2 Sensors] "
+                f"{log_prefix} Sensors "
                 + ", ".join(f"{key}={value:.6f}" for key, value in sensor_metrics.items())
             )
             if monitor is not None:
@@ -488,7 +493,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     agent.save_model(id=str(max_iterations))
     teacher_max_abs_diff = _teacher_max_abs_diff(algorithm, initial_teacher_state)
     logger.info(
-        f"[ST9-Opt3-D2] teacher_parameter_max_abs_diff={teacher_max_abs_diff:.9g}"
+        f"{log_prefix} teacher_parameter_max_abs_diff={teacher_max_abs_diff:.9g}"
     )
     if teacher_max_abs_diff != 0.0:
         raise RuntimeError(

@@ -13,8 +13,8 @@ def _add_line_panel(monitor, display_name, panel_name, metric_name):
     )
 
 
-def _build_lbc_monitor():
-    monitor = MonitorConfigBuilder().title("ST9_Opt3_D2")
+def _build_lbc_monitor(title="LBC_Loco"):
+    monitor = MonitorConfigBuilder().title(title)
     groups = (
         (
             "蒸馏",
@@ -89,7 +89,12 @@ def build_monitor():
 
     algorithm = getattr(Config.CURRENT, "algorithm", "ppo")
     if algorithm == "lbc_loco":
-        return _build_lbc_monitor()
+        title = (
+            "Standard_Distill_1"
+            if Config.CURRENT.name == "standard_distill_1"
+            else "ST9_Opt3_D2"
+        )
+        return _build_lbc_monitor(title)
     if algorithm == "behavior_distill":
         return _build_behavior_distill_monitor()
 

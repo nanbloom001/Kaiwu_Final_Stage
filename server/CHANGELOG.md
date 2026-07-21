@@ -4,15 +4,15 @@
 
 ## [未发布]
 
-- **[standard-distill-1]** 接通 301-D 扁平 Standard 10288 教师到 77-D
-  `ActorCriticEncoder` 的行为蒸馏桥接阶段，并设为当前入口。训练命令覆盖
-  低速前后、横移和双向转动，开启 Standard 地形课程、摩擦随机化和观测
-  噪声；第一阶段关闭外部 push。桥接模型验收后再进入独立的
-  `StandardVisualDistill1Config`，其相机安装外参为
+- **[standard-distill-1]** 根据平台实际 preload 契约与决赛文档，将当前入口
+  修正为 77-D `ActorCriticEncoder` 教师的直接视觉 LBC。教师 checkpoint
+  包含 `encoder.* / actor.* / critic_encoder.* / critic.*`，LBC 只拆分前两组；
+  301-D 旧模型桥接保留为非活动 `StandardRefDistillConfig`。训练命令覆盖
+  低速前后、横移和双向转动，开启 Standard 地形课程、摩擦随机化、观测
+  噪声和深度增强，第一阶段关闭外部 push。相机安装外参为
   `offset_pos=[0.339871,0.034697,0.075010]`、
-  `offset_rot=[0.982631,-0.007085,0.184337,-0.020153]`。新增行为蒸馏的
-  Stage/Agent/workflow/checkpoint 分发，不再把没有 `encoder.*` 的 10288
-  错当成 LBC latent 教师。
+  `offset_rot=[0.982631,-0.007085,0.184337,-0.020153]`。模型同时保存
+  `model.ckpt-standard-<id>.pkl` 与探活兼容别名 `model.ckpt-<id>.pkl`。
 - **[checkpoint 兼容修复]** LBC 预加载按平台探活规则识别同一 ID 的带标签
   文件名与任意扩展名，例如 `model.ckpt-hjcnew-10288.pkl`。若候选是结构兼容
   的 Camera/LBC checkpoint，则恢复学生继续蒸馏；否则按平面教师拆分。

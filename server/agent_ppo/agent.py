@@ -618,8 +618,11 @@ class Agent(BaseAgent):
 
         Path is driven by stage.ckpt_name:
           - LocomotionConfig  -> model.ckpt-{id}.pkl
-          - LBCLocoConfig     -> model.ckpt-lbc-loco-{id}.pkl
+          - LBCLocoConfig     -> stage-specific single-label checkpoint
                                   plus model.ckpt-{id}.pkl platform alias
+
+        Active StandardDistill1 emits model.ckpt-standard-{id}.pkl. Both that
+        file and the unlabelled alias satisfy the platform liveness probe.
         """
         path = self._resolve_checkpoint_dir(path, create=True)
         ckpt_name = getattr(self.stage, "ckpt_name", "") or ""
