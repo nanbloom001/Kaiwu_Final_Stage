@@ -19,9 +19,14 @@
 ## 快速开始
 
 1. 训练：进入 `server/`，以 `server/` 为工作目录运行（腾讯开悟容器内执行 `server/train_test.py`）。
-2. 真机部署：见 `deploy/<tree>/ARTIFACTS.md`（需人工补齐 ST7/standard 缺失的 checkpoint/ONNX 制品）。
+2. 真机部署：默认稳定入口为 `deploy/sim2real_test_loco`，部署前必须核对其 [`ARTIFACTS.md`](./deploy/sim2real_test_loco/ARTIFACTS.md)；其他实验路线的可用性以各自 `ARTIFACTS.md` 为准。
 3. 接口契约：见 [`shared/interfaces/server-deploy-contract.md`](./shared/interfaces/server-deploy-contract.md)。
 4. 分支迁移与源 SHA 锚点：见 [`shared/project-context/branch-migration-register.md`](./shared/project-context/branch-migration-register.md)。
+5. 协作与版本管理：所有贡献者阅读 [`CONTRIBUTING.md`](./CONTRIBUTING.md)；AI Agent 还必须先阅读 [`AGENTS.md`](./AGENTS.md)。
+
+## 协作与版本管理
+
+`main` 采用“验证通过即合并”的事件驱动更新方式，始终代表最新稳定版本，不用于存放半成品。任何开发都应从最新 `main` 创建功能分支，并通过 PR 合入；训练与部署接口变化必须在一个 PR 中原子更新两端及共享契约。完整的同步、提交、实验、Tag、制品和回滚规则见 [`CONTRIBUTING.md`](./CONTRIBUTING.md)。
 
 ## 仓库布局背景
 

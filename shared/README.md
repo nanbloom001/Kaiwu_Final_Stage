@@ -17,6 +17,8 @@
 
 ## 项目背景
 
+- [`../AGENTS.md`](../AGENTS.md)：AI Agent 开始任务和推送前必须遵守的仓库入口规则。
+- [`../CONTRIBUTING.md`](../CONTRIBUTING.md)：面向成员与 AI Agent 的完整协作、同步、提交、PR、Tag、制品和回滚规范。
 - [`project-context/repository-layout.md`](./project-context/repository-layout.md)：四层目录结构说明。
 - [`project-context/branch-migration-register.md`](./project-context/branch-migration-register.md)：旧分支源 SHA 锚点 + 迁移分类登记（回滚锚点）。
 - [`分析记录/版本训练演进与改动规模详解.md`](./分析记录/版本训练演进与改动规模详解.md)：复赛、决赛、蒸馏/Sim2Real 与导航训练分支的版本演进记录。
