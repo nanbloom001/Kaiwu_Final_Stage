@@ -1,0 +1,45 @@
+# 自动生成 by .claude/skills/model2onnx/scripts/generate_deploy_yaml.py
+# 与 02_MODELS/onnx/policy_lbc_nav_614124.onnx 配套；
+# 与 02_MODELS/checkpoints/model.ckpt-lbc-nav-614124.pkl 同源；
+# 不要单独换其中一份。
+
+joint_ids_map: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
+step_dt: 0.02
+stiffness: [25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0]
+damping:   [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+default_joint_pos: [0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5]
+
+actions:
+  JointPositionAction:
+    scale: 0.25
+    offset: [0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5]
+    clip: [-100.0, 100.0]
+
+proprio_scales:
+  ang_vel: 0.2
+  projected_gravity: 1.0
+  vel_cmd: 1.0
+  joint_pos_rel: 1.0
+  joint_vel_rel: 0.05
+  last_action: 1.0
+proprio_clip: [-100.0, 100.0]
+
+cmd_ranges:
+  ranges:
+    lin_vel_x: [-0.2, 0.5]
+    lin_vel_y: [-0.15, 0.15]
+    ang_vel_yaw: [-1.0, 1.0]
+  limit:
+    lin_vel_x: [-0.5, 1.2]
+    lin_vel_y: [-0.4, 0.4]
+    ang_vel_z: [-1.5, 1.5]
+  resampling_time_s: [10.0, 10.0]
+
+meta:
+  source_ckpt: "02_MODELS/checkpoints/model.ckpt-lbc-nav-614124.pkl"
+  source_ckpt_format: "lbc_nav"
+  paired_onnx: "02_MODELS/onnx/policy_lbc_nav_614124.onnx"
+  paired_onnx_sha256: "3f0c0e9a11cfad3bb3b9893bd441b7e450fb47df423a4fbfd7bc840d787a172a"
+  notes:
+    - "与 05_JETSON_DEPLOYMENT/active_overlay/logs/vision_nav/params/deploy.yaml 存在 1 项差异，详见日志"
+    - "lbc_nav iter=14999 steps=360000；活动限幅 vx[-0.20,0.30] vy[-0.15,0.15] wz[-0.40,0.40] 已烘进 ONNX，与训练 cmd_ranges 不同。ang_vel scale=0.2 与训练一致（active_overlay 仍为 0.25，仅 catalog 用本 yaml 时不冲突）。"
