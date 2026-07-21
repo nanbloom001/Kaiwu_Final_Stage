@@ -12,6 +12,10 @@
   `offset_rot=[0.982631,-0.007085,0.184337,-0.020153]`，评估时从当前阶段
   TOML 注入相同外参。复用现有动作蒸馏、DAgger 和序列训练代码，网络与
   checkpoint 接口不变。
+- **[checkpoint 兼容修复]** LBC 预加载按平台探活规则识别同一 ID 的带标签
+  文件名与任意扩展名，例如 `model.ckpt-hjcnew-10288.pkl`。若候选是结构兼容
+  的 Camera/LBC checkpoint，则恢复学生继续蒸馏；否则按平面教师拆分。
+  `goal_dim` 和三组 state dict 必须与当前阶段完全一致，不兼容模型仍会拒绝。
 - **[遗留路线收敛]** 将 `codex/st7-opt5-debug` 的 Opt5/Opt5-debug/Opt5B
   困难段出生模块、独立 TOML、监控、契约测试和实验文档迁入 `server/`；
   `Config.CURRENT` 保持 ST9-Opt3-D2，不启用 hard-start。补入 ST9-Opt3-D1
