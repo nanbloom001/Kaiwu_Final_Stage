@@ -11,7 +11,6 @@ from agent_ppo.feature.goal_features import (
     encode_track_goal,
 )
 from agent_ppo.feature.goal_noise import GoalNoiseAugmenter
-from agent_ppo.feature.hard_start_replay import install_hard_start_replay_event
 from tools.base_env.observation_process import ObservationProcess
 
 
@@ -29,29 +28,6 @@ class _SilentConfigLogger:
 class PolicyObservationProcess(ObservationProcess):
     target_group = "policy"
     _BASE_OBS_DIM = 301
-
-    class _BridgeProxy:
-        def __init__(self, bridge, hard_start_config):
-            self._bridge = bridge
-            self._hard_start_config = hard_start_config
-
-        def __getattr__(self, name):
-            return getattr(self._bridge, name)
-
-        def override_group_in_env_cfg(self, env_cfg):
-            install_hard_start_replay_event(env_cfg, self._hard_start_config)
-            return self._bridge.override_group_in_env_cfg(env_cfg)
-
-    def create_bridge(self):
-        """Install the training reset hook while env_cfg is still mutable."""
-        bridge = super().create_bridge()
-        try:
-            usr_conf, _, is_eval, _ = Config.load_conf(_SilentConfigLogger())
-            hard_start_config = {} if is_eval else usr_conf.get("hard_start_replay", {})
-        except Exception:
-            # A reset sampler must never leak into evaluation on config failure.
-            hard_start_config = {}
-        return self._BridgeProxy(bridge, hard_start_config)
 
     def _goal_noise_config(self):
         for source in (self.env, getattr(self.env, "unwrapped", None)):

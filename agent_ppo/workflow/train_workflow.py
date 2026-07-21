@@ -422,6 +422,14 @@ def _initialize_training_runtime_state(env, agent, logger):
     obs, critic_obs = data
     if critic_obs is None:
         critic_obs = obs
+    _install_hard_start_runtime(env, usr_conf, logger)
+    obs, critic_obs = _refresh_hard_start_observations(
+        env,
+        usr_conf,
+        obs,
+        critic_obs,
+        logger,
+    )
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
     logger.info(f"obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
@@ -915,6 +923,8 @@ def _resolve_wrapped_isaac_env(env):
             "_isaac_env",
             "sim_env",
             "_sim_env",
+            "gym_env",
+            "_gym_env",
             "task",
             "_task",
         ):
@@ -1242,6 +1252,64 @@ def _validate_hard_start_runtime(env, usr_conf, logger):
         f"weights={config.get('hard_weights')}, "
         f"segments={config.get('hard_segments')}"
     )
+
+
+def _install_hard_start_runtime(env, usr_conf, logger):
+    config = usr_conf.get("hard_start_replay", {})
+    if not bool(config.get("enabled", False)):
+        return
+    isaac_env = _resolve_wrapped_isaac_env(env)
+    if isaac_env is None:
+        raise RuntimeError(
+            "hard_start_replay is enabled but the Isaac Lab env cannot be resolved"
+        )
+    from agent_ppo.feature.hard_start_replay import (
+        install_hard_start_replay_runtime,
+    )
+
+    if not install_hard_start_replay_runtime(isaac_env, config):
+        raise RuntimeError("hard_start_replay runtime hook was not installed")
+    logger.warning("[Opt5HardStart] live reset_base hook installed and initialized")
+
+
+def _refresh_hard_start_observations(env, usr_conf, obs, critic_obs, logger):
+    """Recompute observations after the one-time initial hard-start placement."""
+    config = usr_conf.get("hard_start_replay", {})
+    if not bool(config.get("enabled", False)):
+        return obs, critic_obs
+    isaac_env = _resolve_wrapped_isaac_env(env)
+    observation_manager = getattr(isaac_env, "observation_manager", None)
+    compute = getattr(observation_manager, "compute", None)
+    if not callable(compute):
+        logger.warning(
+            "[Opt5HardStart] observation refresh unavailable; first step uses reset obs"
+        )
+        return obs, critic_obs
+    try:
+        groups = compute()
+        if not isinstance(groups, dict):
+            raise TypeError(f"unexpected observation payload: {type(groups).__name__}")
+        fresh_obs = groups.get("policy")
+        fresh_critic_obs = groups.get("critic", fresh_obs)
+        if not torch.is_tensor(fresh_obs) or fresh_obs.shape != obs.shape:
+            raise ValueError(
+                "policy observation shape changed after hard-start reset: "
+                f"expected={tuple(obs.shape)}, actual={getattr(fresh_obs, 'shape', None)}"
+            )
+        if not torch.is_tensor(fresh_critic_obs) or fresh_critic_obs.shape != critic_obs.shape:
+            raise ValueError(
+                "critic observation shape changed after hard-start reset: "
+                f"expected={tuple(critic_obs.shape)}, "
+                f"actual={getattr(fresh_critic_obs, 'shape', None)}"
+            )
+        logger.warning("[Opt5HardStart] observations refreshed after initial placement")
+        return fresh_obs, fresh_critic_obs
+    except Exception as exc:
+        logger.warning(
+            "[Opt5HardStart] observation refresh failed; first step uses reset obs: "
+            f"{exc}"
+        )
+        return obs, critic_obs
 
 
 def _estimate_physics_metrics_from_critic_obs(critic_obs):

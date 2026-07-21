@@ -24,10 +24,13 @@ entry-speed perturbation. Full-track environments reuse the platform's exact
 evaluation-start reset path. The policy observation and network do not receive
 a segment label.
 
-The hook is installed in the Isaac Lab reset event before the environment is
-constructed. It first executes the platform reset function, preserving the
-existing difficulty sampling, then changes only the root pose/velocity and
-track row. Evaluation does not install the hook.
+After the outer environment factory returns, the workflow installs the hook
+directly into the live Isaac Lab EventManager and immediately applies the
+wrapped `reset_base` once to all environments. It first executes the platform
+reset function, preserving the existing difficulty sampling, then changes only
+the root pose/velocity and track row. Policy and critic observations are
+recomputed after this initial placement. Evaluation does not use this training
+workflow hook.
 
 ## Diagnostics
 
@@ -60,6 +63,13 @@ Local static checks cover Python compilation, TOML parsing, monitor-key length,
 and an exact Opt3 configuration comparison. The local Python environment does
 not contain PyTorch, so the tensor reset unit test must run in the platform
 Isaac/PyTorch environment before the 60-90 minute job.
+
+## 2026-07-21 Startup Fix
+
+- Split four-indicator `stat` panels into two-indicator panels to satisfy the
+  platform monitor validator.
+- Move reset-hook installation from the observation bridge to the live
+  EventManager because the former did not initialize the runtime reset state.
 
 ## Training And Evaluation
 

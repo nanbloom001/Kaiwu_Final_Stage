@@ -9,6 +9,7 @@ before a configured track segment.  Evaluation never installs this hook.
 
 from __future__ import annotations
 
+import copy
 import functools
 import inspect
 import math
@@ -241,17 +242,9 @@ def _record_start_assignments(env, env_ids, kinds):
     state["start_counts"] += torch.bincount(kinds, minlength=len(START_NAMES))
 
 
-def install_hard_start_replay_event(env_cfg, config: dict) -> bool:
-    """Wrap ``env_cfg.events.reset_base`` once; return whether it was enabled."""
-    if not bool(config.get("enabled", False)):
-        return False
-    events = getattr(env_cfg, "events", None)
-    reset_term = getattr(events, "reset_base", None)
-    original = getattr(reset_term, "func", None)
-    if original is None:
-        raise RuntimeError("Cannot install hard-start replay: reset_base event is missing")
+def _build_reset_wrapper(original, config: dict):
     if getattr(original, "_is_hard_start_replay_wrapper", False):
-        return True
+        return original
 
     @functools.wraps(original)
     def wrapped(*args: Any, **kwargs: Any):
@@ -303,7 +296,54 @@ def install_hard_start_replay_event(env_cfg, config: dict) -> bool:
         return result
 
     wrapped._is_hard_start_replay_wrapper = True
-    reset_term.func = wrapped
+    return wrapped
+
+
+def install_hard_start_replay_event(env_cfg, config: dict) -> bool:
+    """Wrap ``env_cfg.events.reset_base`` before EventManager construction."""
+    if not bool(config.get("enabled", False)):
+        return False
+    events = getattr(env_cfg, "events", None)
+    reset_term = getattr(events, "reset_base", None)
+    original = getattr(reset_term, "func", None)
+    if original is None:
+        raise RuntimeError("Cannot install hard-start replay: reset_base event is missing")
+    reset_term.func = _build_reset_wrapper(original, config)
     # Keep a copy on cfg for startup diagnostics without changing the public API.
     env_cfg._hard_start_replay_config = dict(config)
+    return True
+
+
+def install_hard_start_replay_runtime(
+    env,
+    config: dict,
+    apply_initial_reset: bool = True,
+) -> bool:
+    """Replace the live reset term and optionally initialize all environments."""
+    if not bool(config.get("enabled", False)):
+        return False
+    event_manager = getattr(env, "event_manager", None)
+    if event_manager is None:
+        raise RuntimeError("Cannot install hard-start replay: EventManager is unavailable")
+    if not hasattr(event_manager, "get_term_cfg") or not hasattr(
+        event_manager, "set_term_cfg"
+    ):
+        raise RuntimeError(
+            "Cannot install hard-start replay: EventManager term API is unavailable"
+        )
+
+    try:
+        reset_term = copy.copy(event_manager.get_term_cfg("reset_base"))
+    except Exception as exc:
+        raise RuntimeError(
+            "Cannot install hard-start replay: live reset_base term is missing"
+        ) from exc
+    original = getattr(reset_term, "func", None)
+    if original is None:
+        raise RuntimeError("Cannot install hard-start replay: reset_base func is missing")
+    reset_term.func = _build_reset_wrapper(original, config)
+    event_manager.set_term_cfg("reset_base", reset_term)
+    if apply_initial_reset:
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+        reset_term.func(env, env_ids, **dict(getattr(reset_term, "params", {}) or {}))
     return True
