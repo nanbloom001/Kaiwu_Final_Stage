@@ -1174,20 +1174,24 @@ def _record_hard_start_outcomes(
 
 
 def _hard_start_monitor_metrics(env):
-    """Return cumulative reset/outcome metrics for dashboard reporting."""
+    """Best-effort mirror of worker metrics for same-process environments."""
     from agent_ppo.feature.hard_start_replay import START_NAMES
 
     isaac_env = _resolve_wrapped_isaac_env(env)
     state = getattr(isaac_env, "_hard_start_replay_state", None)
     if state is None:
         return {}
-    kinds = state["start_kind"]
     starts = state["start_counts"].float()
     episodes = state["episode_counts"].float()
     successes = state["success_counts"].float()
+    total = torch.clamp(starts.sum(), min=1.0)
     metrics = {
-        "full_track_ratio": (kinds == 0).float().mean().item(),
-        "hard_start_ratio": (kinds > 0).float().mean().item(),
+        "full_track_ratio": (starts[0] / total).item(),
+        "hard_start_ratio": (starts[1:].sum() / total).item(),
+        "early_bad_total": state["early_bad_counts"].sum().item(),
+        "early_base_total": state["early_base_counts"].sum().item(),
+        "early_term_total": state["early_term_counts"].sum().item(),
+        "surface_query_fail": float(state["surface_query_failures"]),
     }
     for index, name in enumerate(START_NAMES[1:], start=1):
         monitor_name = {
@@ -1201,22 +1205,14 @@ def _hard_start_monitor_metrics(env):
             successes[index] / torch.clamp(episodes[index], min=1.0)
         ).item()
 
-    segment_aliases = {
-        "pyramid_stairs_inv": "stairs_down",
-        "pyramid_slope_inv": "slope_down",
-        "open_entry_maze": "maze_entry",
-        "pyramid_stairs": "stairs_up",
-    }
-    for reason in ("bad_orientation", "base_contact", "timeout"):
-        reason_prefix = {
-            "bad_orientation": "bad",
-            "base_contact": "base",
-            "timeout": "timeout",
-        }[reason]
-        for segment, alias in segment_aliases.items():
-            metrics[f"{reason_prefix}_{alias}"] = float(
-                state["reason_counts"].get((reason, segment), 0)
-            )
+        metrics[f"bad_{name}"] = state["bad_counts"][index].item()
+        metrics[f"base_{name}"] = state["base_counts"][index].item()
+        metrics[f"timeout_{name}"] = state["timeout_counts"][index].item()
+    clearance_count = state["spawn_clearance_count"][1:].sum().float()
+    metrics["spawn_clearance"] = (
+        state["spawn_clearance_sum"][1:].sum()
+        / torch.clamp(clearance_count, min=1.0)
+    ).item()
     return metrics
 
 
@@ -1814,7 +1810,6 @@ def collect_rollout_batch(
                 logger.info(f"clipped_action:{command_actions}")
 
             # Advance the simulator with the sampled actions.
-            hard_start_snapshot = _capture_hard_start_pre_step_state(env, usr_conf)
             data = env.step(command_actions)
             (
                 frame_no,
@@ -1857,16 +1852,6 @@ def collect_rollout_batch(
             if nav_controller is not None:
                 nav_controller.reset(dones=dones)
             _reset_finished_phase_command_state(env, dones)
-            _record_hard_start_outcomes(
-                env,
-                usr_conf,
-                dones,
-                terminated,
-                truncated,
-                hard_start_snapshot,
-                logger,
-            )
-
             # Update episode statistics (always, regardless of decimation)
             _refresh_completed_episode_buffers(
                 dones,

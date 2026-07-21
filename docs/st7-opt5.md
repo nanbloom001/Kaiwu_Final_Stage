@@ -1,5 +1,9 @@
 # ST7-Opt5: L9 Hard-Segment Replay
 
+> Status: paused. Do not continue training these checkpoints. Run
+> `ST7-Opt5-Debug` and satisfy the checks in
+> [st7-opt5-debug.md](./st7-opt5-debug.md) before preparing Opt5B.
+
 ## Baseline
 
 - Code parent: ST7-Opt3 (`9b0b3df`).

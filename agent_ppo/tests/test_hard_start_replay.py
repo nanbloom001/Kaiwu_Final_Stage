@@ -31,6 +31,8 @@ CONFIG = {
     ],
     "approach_offset_m": [0.5, 1.2],
     "entry_speeds_mps": [0.0, 0.60, 1.00, 0.70, 0.60],
+    "entry_speed_jitter_mps": 0.0,
+    "track_ground_z": 0.7,
 }
 
 
@@ -78,6 +80,20 @@ class _FakeEventManager:
         if name != "reset_base":
             raise ValueError(name)
         return self.reset_term
+
+
+class _FakeTerminationManager:
+    def __init__(self, num_envs):
+        self.active_terms = ["goal_reached", "bad_orientation", "base_contact"]
+        self.terminated = torch.zeros(num_envs, dtype=torch.bool)
+        self.time_outs = torch.zeros(num_envs, dtype=torch.bool)
+        self.terms = {
+            name: torch.zeros(num_envs, dtype=torch.bool)
+            for name in self.active_terms
+        }
+
+    def get_term(self, name):
+        return self.terms[name]
 
 
 class HardStartReplayTest(unittest.TestCase):
@@ -130,6 +146,18 @@ class HardStartReplayTest(unittest.TestCase):
         self.assertTrue(torch.isfinite(env.scene.robot.pose[1]).all())
         self.assertTrue(torch.isfinite(env.scene.robot.velocity[1]).all())
 
+        hard_env_ids, hard_velocity = env.scene.robot.velocity
+        hard_rows = env.scene.terrain.terrain_levels[hard_env_ids]
+        actual_speed = torch.linalg.norm(hard_velocity[:, :2], dim=1)
+        expected_speed = torch.tensor(CONFIG["entry_speeds_mps"])[hard_rows]
+        self.assertTrue(torch.allclose(actual_speed, expected_speed))
+
+        # The fake environment has no Warp mesh, so non-debug mode uses the
+        # explicit fallback. Debug mode sets require_surface_query=true and
+        # must never reach this fallback silently on the platform.
+        _, hard_pose = env.scene.robot.pose
+        self.assertTrue(torch.allclose(hard_pose[:, 2], torch.full_like(hard_pose[:, 2], 1.05)))
+
     def test_eval_reset_keeps_original_behavior(self):
         env = self._make_env(num_envs=16)
         env._is_eval = True
@@ -137,6 +165,33 @@ class HardStartReplayTest(unittest.TestCase):
         install_hard_start_replay_event(cfg, CONFIG)
         cfg.events.reset_base.func(env, torch.arange(16), {}, {})
         self.assertFalse(hasattr(env, "_hard_start_replay_state"))
+
+    def test_worker_side_outcome_and_early_failure_counts(self):
+        env = self._make_env(num_envs=32)
+        cfg = self._make_cfg()
+        install_hard_start_replay_event(cfg, CONFIG)
+        env.event_manager = _FakeEventManager(cfg.events.reset_base)
+        initialize_hard_start_replay(env)
+
+        env.termination_manager = _FakeTerminationManager(env.num_envs)
+        env.episode_length_buf = torch.full((env.num_envs,), 50, dtype=torch.long)
+        env.termination_manager.terminated[:3] = True
+        env.termination_manager.time_outs[3] = True
+        env.termination_manager.terms["goal_reached"][0] = True
+        env.termination_manager.terms["bad_orientation"][1] = True
+        env.termination_manager.terms["base_contact"][2] = True
+        env.episode_length_buf[:4] = torch.tensor([10, 10, 25, 5])
+
+        cfg.events.reset_base.func(env, torch.arange(4), {}, {})
+        state = env._hard_start_replay_state
+        self.assertEqual(int(state["episode_counts"].sum().item()), 4)
+        self.assertEqual(int(state["success_counts"].sum().item()), 1)
+        self.assertEqual(int(state["bad_counts"].sum().item()), 1)
+        self.assertEqual(int(state["base_counts"].sum().item()), 1)
+        self.assertEqual(int(state["timeout_counts"].sum().item()), 1)
+        self.assertEqual(int(state["early_bad_counts"].sum().item()), 1)
+        self.assertEqual(int(state["early_base_counts"].sum().item()), 0)
+        self.assertEqual(int(state["early_term_counts"].sum().item()), 1)
 
 if __name__ == "__main__":
     unittest.main()
