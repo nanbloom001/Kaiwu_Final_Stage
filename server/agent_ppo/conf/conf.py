@@ -166,10 +166,7 @@ class TrackNavConfig(LocomotionConfig):
     name = "nav"
     task_type = "track"
     num_goal_obs = 3
-    lr = 1e-5
-    schedule = "fixed"
-    min_learning_rate = 1e-5
-    max_learning_rate = 1e-5
+    lr = 1.5e-5
     num_learning_epochs = 3
     num_mini_batches = 4
     num_steps_per_env = 48

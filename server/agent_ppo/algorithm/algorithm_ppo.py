@@ -246,6 +246,9 @@ class AlgorithmPPO:
             tuple: (mean_surrogate_loss, mean_value_loss, mean_entropy_loss)
             返回值：(平均替代损失, 平均价值损失, 平均熵损失)
         """
+        # J9 fixed-LR runtime contract: validate before any update
+        self._validate_fixed_lr()
+
         # Initialize loss accumulators
         # 初始化损失累加器
         mean_value_loss = 0
@@ -405,14 +408,8 @@ class AlgorithmPPO:
             mean_action_anchor_loss += al if not (al != al) else 0.0
             num_updates += 1
 
-        # J9 fixed-LR runtime contract: abort if fixed schedule is violated
-        if self.schedule == "fixed":
-            for _pg in self.optimizer.param_groups:
-                if abs(_pg["lr"] - self._initial_lr) > 1e-12:
-                    raise RuntimeError(
-                        f"Fixed PPO learning-rate contract violated: "
-                        f"expected lr={self._initial_lr}, got lr={_pg['lr']}"
-                    )
+        # J9 fixed-LR runtime contract: validate again after all updates
+        self._validate_fixed_lr()
 
         # Average losses
         # 平均损失
@@ -460,6 +457,22 @@ class AlgorithmPPO:
                     continue
                 param.data.mul_(1.0 - alpha).add_(
                     ref_state[name].to(param.device), alpha=alpha
+                )
+
+    def _validate_fixed_lr(self):
+        """Abort if fixed-LR contract is violated. Checks both algorithm LR and every optimizer param_group."""
+        if self.schedule != "fixed":
+            return
+        if abs(self.learning_rate - self._initial_lr) > 1e-12:
+            raise RuntimeError(
+                f"Fixed PPO learning-rate contract violated: "
+                f"algorithm lr={self.learning_rate}, expected={self._initial_lr}"
+            )
+        for _pg in self.optimizer.param_groups:
+            if abs(_pg["lr"] - self._initial_lr) > 1e-12:
+                raise RuntimeError(
+                    f"Fixed PPO learning-rate contract violated: "
+                    f"optimizer lr={_pg['lr']}, expected={self._initial_lr}"
                 )
 
     def _update_learning_rate(

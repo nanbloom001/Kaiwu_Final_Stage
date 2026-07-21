@@ -87,3 +87,35 @@ def test_adaptive_bounds_use_configured_min_max():
     algo._update_learning_rate(mu, sigma, mu, old_sigma2)
     assert algo.learning_rate == pytest.approx(1e-2)
     assert algo.optimizer.param_groups[0]["lr"] == pytest.approx(1e-2)
+
+
+def test_update_learning_rate_noop_for_fixed():
+    algo = _make_algo(schedule="fixed", learning_rate=1e-5)
+    mu = torch.zeros(8, 2)
+    sigma = torch.ones(8, 2)
+    old_sigma = torch.full((8, 2), 2.0)
+    algo._update_learning_rate(mu, sigma, mu, old_sigma)
+    assert algo.learning_rate == pytest.approx(1e-5)
+    assert algo.optimizer.param_groups[0]["lr"] == pytest.approx(1e-5)
+
+
+def test_validate_fixed_lr_raises_on_algorithm_lr_drift():
+    algo = _make_algo(schedule="fixed", learning_rate=1e-5)
+    algo.learning_rate = 9e-6
+    with pytest.raises(RuntimeError, match="algorithm lr="):
+        algo._validate_fixed_lr()
+
+
+def test_validate_fixed_lr_raises_on_optimizer_lr_drift():
+    algo = _make_algo(schedule="fixed", learning_rate=1e-5)
+    algo.optimizer.param_groups[0]["lr"] = 9e-6
+    with pytest.raises(RuntimeError, match="optimizer lr="):
+        algo._validate_fixed_lr()
+
+
+def test_validate_fixed_lr_passes_when_consistent():
+    algo = _make_algo(schedule="fixed", learning_rate=1e-5)
+    algo._validate_fixed_lr()  # should not raise
+    assert algo.learning_rate == pytest.approx(1e-5)
+    for pg in algo.optimizer.param_groups:
+        assert pg["lr"] == pytest.approx(1e-5)
