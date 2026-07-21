@@ -24,28 +24,30 @@ entry-speed perturbation. Full-track environments reuse the platform's exact
 evaluation-start reset path. The policy observation and network do not receive
 a segment label.
 
-After the outer environment factory returns, the workflow installs the hook
-directly into the live Isaac Lab EventManager and immediately applies the
-wrapped `reset_base` once to all environments. It first executes the platform
-reset function, preserving the existing difficulty sampling, then changes only
-the root pose/velocity and track row. Policy and critic observations are
-recomputed after this initial placement. Evaluation does not use this training
-workflow hook.
+The policy observation bridge installs the reset hook into `env_cfg` before
+Isaac Lab constructs its EventManager. The wrapped callback first executes the
+platform reset function, preserving the existing difficulty sampling, then
+changes only the root pose/velocity and track row. The initial policy and
+critic observation callbacks run in the Isaac worker process and invoke the
+wrapped term once if construction has not already fired it. The operation is
+idempotent, so either observation-group order produces a consistent pair. This
+keeps installation and initialization on the same side of Kaiwu's process
+boundary. Evaluation never installs this hook.
 
 ## Diagnostics
 
-Every abnormal termination reports a structured `[Opt5Failure]` line with:
+The startup log prints `[Opt5HardStart]` with all five initial reset counts.
+The dashboard reports full/hard ratios and the four cumulative hard-start
+counts. These values cross the worker boundary through Isaac Lab `extras`,
+rather than by attempting to unwrap the Kaiwu environment proxy. Internal
+metric keys are shortened to at most 20 characters to satisfy the platform
+monitor schema; their Chinese panel names retain the full meaning.
 
-- env id and difficulty level;
-- current segment and normalized track progress;
-- all fired termination terms;
-- roll, pitch, roll rate and pitch rate;
-- base-contact flag, goal distance and planar speed.
-
-The dashboard reports full/hard ratios, per-start counts, per-start success
-rates, and bad-orientation/base-contact/timeout counts by hard segment.
-Internal metric keys are shortened to at most 20 characters to satisfy the
-platform monitor schema; their Chinese panel names retain the full meaning.
+The existing workflow-side segment success/failure collectors remain
+best-effort because the platform does not expose the real Isaac environment
+through its cross-process proxy. Do not use an empty segment outcome panel as
+evidence that no failures occurred; use the platform termination logs for the
+first smoke run.
 
 ## Startup Checks
 
@@ -68,8 +70,10 @@ Isaac/PyTorch environment before the 60-90 minute job.
 
 - Split four-indicator `stat` panels into two-indicator panels to satisfy the
   platform monitor validator.
-- Move reset-hook installation from the observation bridge to the live
-  EventManager because the former did not initialize the runtime reset state.
+- Install the reset hook before EventManager construction; the workflow proxy
+  does not expose the underlying Isaac Lab environment for live installation.
+- Initialize the first reset batch from the policy observation callback inside
+  the Isaac worker; module globals cannot cross the Kaiwu environment proxy.
 
 ## Training And Evaluation
 

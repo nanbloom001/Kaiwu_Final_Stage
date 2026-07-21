@@ -6,8 +6,9 @@ import torch
 from agent_ppo.feature.hard_start_replay import (
     START_NAMES,
     _segment_rows,
+    initialize_hard_start_replay,
+    is_hard_start_hook_configured,
     install_hard_start_replay_event,
-    install_hard_start_replay_runtime,
 )
 
 
@@ -78,11 +79,6 @@ class _FakeEventManager:
             raise ValueError(name)
         return self.reset_term
 
-    def set_term_cfg(self, name, cfg):
-        if name != "reset_base":
-            raise ValueError(name)
-        self.reset_term = cfg
-
 
 class HardStartReplayTest(unittest.TestCase):
     def _make_env(self, num_envs=20000):
@@ -112,8 +108,9 @@ class HardStartReplayTest(unittest.TestCase):
         env = self._make_env()
         cfg = self._make_cfg()
         self.assertTrue(install_hard_start_replay_event(cfg, CONFIG))
-        env_ids = torch.arange(env.num_envs)
-        cfg.events.reset_base.func(env, env_ids, {}, {})
+        self.assertTrue(is_hard_start_hook_configured())
+        env.event_manager = _FakeEventManager(cfg.events.reset_base)
+        self.assertTrue(initialize_hard_start_replay(env))
 
         state = env._hard_start_replay_state
         kinds = state["start_kind"]
@@ -140,18 +137,6 @@ class HardStartReplayTest(unittest.TestCase):
         install_hard_start_replay_event(cfg, CONFIG)
         cfg.events.reset_base.func(env, torch.arange(16), {}, {})
         self.assertFalse(hasattr(env, "_hard_start_replay_state"))
-
-    def test_runtime_event_manager_install(self):
-        torch.manual_seed(11)
-        env = self._make_env(num_envs=64)
-        cfg = self._make_cfg()
-        env.event_manager = _FakeEventManager(cfg.events.reset_base)
-
-        self.assertTrue(install_hard_start_replay_runtime(env, CONFIG))
-
-        self.assertTrue(hasattr(env, "_hard_start_replay_state"))
-        self.assertEqual(env._hard_start_replay_state["start_kind"].numel(), 64)
-
 
 if __name__ == "__main__":
     unittest.main()

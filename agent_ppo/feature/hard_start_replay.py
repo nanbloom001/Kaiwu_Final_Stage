@@ -9,7 +9,6 @@ before a configured track segment.  Evaluation never installs this hook.
 
 from __future__ import annotations
 
-import copy
 import functools
 import inspect
 import math
@@ -25,6 +24,24 @@ START_NAMES = (
     "maze_entry",
     "stairs_up",
 )
+
+
+_HARD_START_HOOK_CONFIGURED = False
+
+
+def is_hard_start_hook_configured() -> bool:
+    return _HARD_START_HOOK_CONFIGURED
+
+
+def _log_initialized_state_once(env, state) -> None:
+    if bool(getattr(env, "_hard_start_replay_startup_logged", False)):
+        return
+    counts = state["start_counts"].detach().cpu().tolist()
+    print(
+        "[Opt5HardStart] initialized in Isaac worker: "
+        f"start_counts={dict(zip(START_NAMES, counts))}"
+    )
+    env._hard_start_replay_startup_logged = True
 
 
 def _normalized_weights(values: list[float], expected: int) -> torch.Tensor:
@@ -301,6 +318,7 @@ def _build_reset_wrapper(original, config: dict):
 
 def install_hard_start_replay_event(env_cfg, config: dict) -> bool:
     """Wrap ``env_cfg.events.reset_base`` before EventManager construction."""
+    global _HARD_START_HOOK_CONFIGURED
     if not bool(config.get("enabled", False)):
         return False
     events = getattr(env_cfg, "events", None)
@@ -311,39 +329,59 @@ def install_hard_start_replay_event(env_cfg, config: dict) -> bool:
     reset_term.func = _build_reset_wrapper(original, config)
     # Keep a copy on cfg for startup diagnostics without changing the public API.
     env_cfg._hard_start_replay_config = dict(config)
+    _HARD_START_HOOK_CONFIGURED = True
     return True
 
 
-def install_hard_start_replay_runtime(
-    env,
-    config: dict,
-    apply_initial_reset: bool = True,
-) -> bool:
-    """Replace the live reset term and optionally initialize all environments."""
-    if not bool(config.get("enabled", False)):
+def initialize_hard_start_replay(env) -> bool:
+    """Initialize the first hard-start batch inside the Isaac worker process."""
+    if not _HARD_START_HOOK_CONFIGURED or bool(getattr(env, "_is_eval", False)):
         return False
+    state = getattr(env, "_hard_start_replay_state", None)
+    if state is not None:
+        _log_initialized_state_once(env, state)
+        return False
+
     event_manager = getattr(env, "event_manager", None)
-    if event_manager is None:
-        raise RuntimeError("Cannot install hard-start replay: EventManager is unavailable")
-    if not hasattr(event_manager, "get_term_cfg") or not hasattr(
-        event_manager, "set_term_cfg"
-    ):
+    get_term_cfg = getattr(event_manager, "get_term_cfg", None)
+    if not callable(get_term_cfg):
+        raise RuntimeError("Cannot initialize hard starts: EventManager is unavailable")
+    try:
+        reset_term = get_term_cfg("reset_base")
+    except Exception as exc:
+        raise RuntimeError("Cannot initialize hard starts: reset_base is missing") from exc
+    reset_func = getattr(reset_term, "func", None)
+    if not getattr(reset_func, "_is_hard_start_replay_wrapper", False):
         raise RuntimeError(
-            "Cannot install hard-start replay: EventManager term API is unavailable"
+            "Cannot initialize hard starts: reset_base wrapper was not preserved"
         )
 
-    try:
-        reset_term = copy.copy(event_manager.get_term_cfg("reset_base"))
-    except Exception as exc:
-        raise RuntimeError(
-            "Cannot install hard-start replay: live reset_base term is missing"
-        ) from exc
-    original = getattr(reset_term, "func", None)
-    if original is None:
-        raise RuntimeError("Cannot install hard-start replay: reset_base func is missing")
-    reset_term.func = _build_reset_wrapper(original, config)
-    event_manager.set_term_cfg("reset_base", reset_term)
-    if apply_initial_reset:
-        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
-        reset_term.func(env, env_ids, **dict(getattr(reset_term, "params", {}) or {}))
+    env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    reset_func(
+        env,
+        env_ids,
+        **dict(getattr(reset_term, "params", {}) or {}),
+    )
+    state = getattr(env, "_hard_start_replay_state", None)
+    if state is None:
+        raise RuntimeError("Cannot initialize hard starts: reset state was not created")
+    _log_initialized_state_once(env, state)
     return True
+
+
+def publish_hard_start_metrics(env) -> None:
+    """Publish reset-distribution metrics through Isaac Lab step extras."""
+    state = getattr(env, "_hard_start_replay_state", None)
+    extras = getattr(env, "extras", None)
+    if state is None or not isinstance(extras, dict):
+        return
+    kinds = state["start_kind"]
+    starts = state["start_counts"]
+    extras["hard_start_metrics"] = {
+        "full_track_ratio": (kinds == 0).float().mean().item(),
+        "hard_start_ratio": (kinds > 0).float().mean().item(),
+        "stairs_down_starts": starts[1].item(),
+        "slope_down_starts": starts[2].item(),
+        "maze_entry_starts": starts[3].item(),
+        "stairs_up_starts": starts[4].item(),
+    }
