@@ -186,6 +186,13 @@ class TrackNavOpt5DebugConfig(TrackNavConfig):
     model_save_interval = 1000
 
 
+class TrackNavOpt5BConfig(TrackNavConfig):
+    """ST7-Opt5B: conservative hard-segment replay from Opt3-30min."""
+
+    name = "navopt5b"
+    parent_checkpoint = "ST7-Opt3 30min (evaluation 595729)"
+
+
 class LBCLocoConfig(StageConfig):
     """
     Stage: lbc_loco — Vision distillation for locomotion (pure supervised).
@@ -277,7 +284,7 @@ class Config:
     # 训练和评估均显式使用该阶段，避免环境名称误改模型结构。
     # T2 continues the previous TrackNav checkpoint with a reference-13-style
     # full-track stabilization setup, capped at 0.8 m/s.
-    CURRENT = TrackNavOpt5DebugConfig
+    CURRENT = TrackNavOpt5BConfig
 
     @staticmethod
     def load_conf(logger):

@@ -1,8 +1,8 @@
 # ST7-Opt5: L9 Hard-Segment Replay
 
-> Status: paused. Do not continue training these checkpoints. Run
-> `ST7-Opt5-Debug` and satisfy the checks in
-> [st7-opt5-debug.md](./st7-opt5-debug.md) before preparing Opt5B.
+> Status: superseded. Do not continue the 50/50 replay checkpoints. The reset
+> audit is documented in [st7-opt5-debug.md](./st7-opt5-debug.md); the current
+> conservative stage is [st7-opt5b.md](./st7-opt5b.md).
 
 ## Baseline
 
