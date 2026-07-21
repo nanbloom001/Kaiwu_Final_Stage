@@ -926,6 +926,8 @@ def _resolve_wrapped_isaac_env(env):
             "_isaac_env",
             "sim_env",
             "_sim_env",
+            "gym_env",
+            "_gym_env",
             "task",
             "_task",
         ):
@@ -1002,6 +1004,44 @@ def _find_robot_asset_in_scene(isaac_env):
             return asset
 
     return None
+
+
+def _hard_start_monitor_metrics(env):
+    """Best-effort mirror of hard-start worker metrics."""
+    from agent_ppo.feature.hard_start_replay import START_NAMES
+
+    isaac_env = _resolve_wrapped_isaac_env(env)
+    state = getattr(isaac_env, "_hard_start_replay_state", None)
+    if state is None:
+        return {}
+
+    starts = state["start_counts"].float()
+    episodes = state["episode_counts"].float()
+    successes = state["success_counts"].float()
+    total = torch.clamp(starts.sum(), min=1.0)
+    metrics = {
+        "full_track_ratio": (starts[0] / total).item(),
+        "hard_start_ratio": (starts[1:].sum() / total).item(),
+        "early_bad_total": state["early_bad_counts"].sum().item(),
+        "early_base_total": state["early_base_counts"].sum().item(),
+        "early_term_total": state["early_term_counts"].sum().item(),
+        "surface_query_fail": float(state["surface_query_failures"]),
+    }
+    for index, name in enumerate(START_NAMES[1:], start=1):
+        metrics[f"{name}_starts"] = starts[index].item()
+        metrics[f"{name}_success"] = (
+            successes[index] / torch.clamp(episodes[index], min=1.0)
+        ).item()
+        metrics[f"bad_{name}"] = state["bad_counts"][index].item()
+        metrics[f"base_{name}"] = state["base_counts"][index].item()
+        metrics[f"timeout_{name}"] = state["timeout_counts"][index].item()
+
+    clearance_count = state["spawn_clearance_count"][1:].sum().float()
+    metrics["spawn_clearance"] = (
+        state["spawn_clearance_sum"][1:].sum()
+        / torch.clamp(clearance_count, min=1.0)
+    ).item()
+    return metrics
 
 
 def _estimate_physics_metrics_from_critic_obs(critic_obs):
@@ -1536,6 +1576,7 @@ def collect_rollout_batch(
     transition = RolloutStorage.Transition()
     obs, critic_obs = last_obs, last_critic_obs
     nav_metric_values = defaultdict(list)
+    hard_start_info_metrics = {}
 
     # TODO: for hierarchical training, handle the mismatch between env action and
     # PPO storage action on your own.
@@ -1599,6 +1640,15 @@ def collect_rollout_batch(
             # Advance the simulator with the sampled actions.
             data = env.step(command_actions)
             frame_no, obs, critic_obs, rewards, dones, infos = _unpack_env_step_result(data, episode, logger)
+            info_metrics = (
+                infos.get("hard_start_metrics", {})
+                if isinstance(infos, dict)
+                else {}
+            )
+            if isinstance(info_metrics, dict):
+                for key, value in info_metrics.items():
+                    if isinstance(value, (int, float)):
+                        hard_start_info_metrics[key] = float(value)
 
             # Keep all tensors on the learner device before storing transitions.
             obs, critic_obs, rewards, dones = _move_step_tensors_to_device(
@@ -1676,5 +1726,7 @@ def collect_rollout_batch(
     # Append a physics snapshot (averaged across all envs).
     # Wrapped in try/except inside _sample_runtime_physics_metrics, so always safe.
     storage_stats.update(_sample_runtime_physics_metrics(env, logger, critic_obs=critic_obs))
+    storage_stats.update(_hard_start_monitor_metrics(env))
+    storage_stats.update(hard_start_info_metrics)
 
     return last_obs, critic_obs, storage_stats

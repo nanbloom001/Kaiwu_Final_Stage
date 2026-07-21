@@ -6,6 +6,10 @@
 
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature.goal_features import build_track_goal_features
+from agent_ppo.feature.hard_start_replay import (
+    initialize_hard_start_replay,
+    publish_hard_start_metrics,
+)
 from tools.base_env.observation_process import ObservationProcess
 
 
@@ -20,6 +24,10 @@ class CriticObservationProcess(ObservationProcess):
         return build_track_goal_features(self.env, feature_dim)
 
     def process(self):
+        # Keep the initial policy and critic observations consistent regardless
+        # of the order in which the observation manager evaluates groups.
+        initialize_hard_start_replay(self.env)
+        publish_hard_start_metrics(self.env)
         obs = self.default_observation()
         if obs.shape[-1] != self._BASE_OBS_DIM:
             raise ValueError(

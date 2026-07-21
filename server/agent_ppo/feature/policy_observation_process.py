@@ -14,12 +14,47 @@ from agent_ppo.feature.goal_noise import (
     GoalNoiseAugmenter,
     resolve_goal_noise_config,
 )
+from agent_ppo.feature.hard_start_replay import (
+    initialize_hard_start_replay,
+    install_hard_start_replay_event,
+    publish_hard_start_metrics,
+)
 from tools.base_env.observation_process import ObservationProcess
+
+
+class _SilentConfigLogger:
+    def info(self, _message):
+        pass
+
+    def warning(self, _message):
+        pass
+
+    def error(self, _message):
+        pass
 
 
 class PolicyObservationProcess(ObservationProcess):
     target_group = "policy"
     _BASE_OBS_DIM = 301
+
+    class _BridgeProxy:
+        def __init__(self, bridge, hard_start_config):
+            self._bridge = bridge
+            self._hard_start_config = hard_start_config
+
+        def __getattr__(self, name):
+            return getattr(self._bridge, name)
+
+        def override_group_in_env_cfg(self, env_cfg):
+            install_hard_start_replay_event(env_cfg, self._hard_start_config)
+            return self._bridge.override_group_in_env_cfg(env_cfg)
+
+    def create_bridge(self):
+        """Install the training-only reset hook before gym creates the env."""
+        bridge = super().create_bridge()
+        usr_conf, _, is_eval, _ = Config.load_conf(_SilentConfigLogger())
+        hard_start_config = {} if is_eval else usr_conf.get("hard_start_replay", {})
+        return self._BridgeProxy(bridge, hard_start_config)
 
     def _goal_features(self):
         feature_dim = getattr(Config.CURRENT, "num_goal_obs", 0)
@@ -38,6 +73,9 @@ class PolicyObservationProcess(ObservationProcess):
         return encode_track_goal(actor_raw_goal)
 
     def process(self):
+        # This runs in the Isaac worker, where the concrete environment exists.
+        initialize_hard_start_replay(self.env)
+        publish_hard_start_metrics(self.env)
         obs = self.default_observation()
         if obs.shape[-1] != self._BASE_OBS_DIM:
             raise ValueError(
