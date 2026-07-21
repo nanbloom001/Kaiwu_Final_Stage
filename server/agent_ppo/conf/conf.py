@@ -255,11 +255,11 @@ class LBCLocoConfig(StageConfig):
 
 
 class HJCNew10288LBCLocoConfig(LBCLocoConfig):
-    """Legacy visual-stage label for a bridged 10288 teacher.
+    """Legacy visual-stage label for an encoder-based Standard teacher.
 
-    Raw checkpoint 10288 is a 301-D flat ActorCritic and is not compatible with
-    this stage. Run StandardDistill1 first and preload its 77-D
-    ActorCriticEncoder output instead.
+    Compatibility is determined from checkpoint keys and tensor shapes, not
+    from the numeric ID. A checkpoint with encoder.* and a 77-D Actor is valid;
+    a legacy 301-D flat checkpoint is not.
     """
 
     name = "hjcnew10288_lbc_loco"
@@ -268,17 +268,16 @@ class HJCNew10288LBCLocoConfig(LBCLocoConfig):
     num_goal_obs = 0
 
 
-class StandardDistill1Config(LocomotionConfig):
-    """Bridge flat Standard 10288 into the 77-D privileged LBC contract.
+class StandardRefDistillConfig(LocomotionConfig):
+    """Optional bridge for a legacy 301-D flat Standard teacher.
 
-    The frozen teacher is the legacy ActorCritic with a 301-D actor input. The
-    student is the current ActorCriticEncoder. Only action behavior is distilled
-    in this stage; depth-camera distillation starts after this bridge succeeds.
+    This is not the active 10288 path. Use it only when checkpoint inspection
+    proves that the selected teacher has no encoder.* keys.
     """
 
-    name = "standard_distill_1"
+    name = "standard_ref_distill"
     algorithm = "behavior_distill"
-    parent_checkpoint = "flat Standard ActorCritic checkpoint 10288"
+    parent_checkpoint = "legacy flat Standard ActorCritic checkpoint"
     ckpt_name = "model.ckpt-locomotion"
 
     lr = 3e-4
@@ -295,13 +294,18 @@ class StandardDistill1Config(LocomotionConfig):
     teacher_activation = "elu"
 
 
-class StandardVisualDistill1Config(LBCLocoConfig):
-    """Depth-camera LBC stage after the behavior-distilled bridge teacher."""
+class StandardDistill1Config(LBCLocoConfig):
+    """Depth-camera LBC from the platform-selected Standard 10288 teacher.
 
-    name = "standard_visual_distill_1"
+    Platform inspection shows an ActorCriticEncoder checkpoint with
+    encoder.*, actor.*, critic_encoder.* and critic.* keys. LBC consumes only
+    encoder.* and actor.*; critic-side keys are intentionally ignored.
+    """
+
+    name = "standard_distill_1"
     task_type = "standard"
     num_goal_obs = 0
-    parent_checkpoint = "accepted StandardDistill1 ActorCriticEncoder checkpoint"
+    parent_checkpoint = "platform Standard ActorCriticEncoder checkpoint 10288"
     ckpt_name = "model.ckpt-standard"
 
 

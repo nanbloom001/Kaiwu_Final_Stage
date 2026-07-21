@@ -1,13 +1,13 @@
-# standard-distill-1: behavior-distillation bridge from flat Standard 10288.
-# Frozen teacher: ActorCritic, actor input proprio45 + height_scan256 = 301.
-# Student: ActorCriticEncoder, actor input proprio45 + latent32 = 77.
+# standard-distill-1: depth-camera LBC from the platform Standard 10288 teacher.
+# Teacher checkpoint contract: encoder.* + actor.* (77-D actor input).
+# Commands include low-speed forward/backward, lateral, and yaw samples.
 
 [env]
-num_envs = 1024
+num_envs = 128
 episode_length_s = 25.0
 
 [env_conf]
-task_name = "Unitree-Go2-Velocity"
+task_name = "Unitree-Go2-Velocity-Camera"
 seed = 0
 
 [terrain]
@@ -37,8 +37,7 @@ proportion = 0.10
 enable_domain_rand = true
 randomize_friction = true
 friction_range = [0.3, 1.5]
-# Phase 1 learns the new camera geometry and command distribution without
-# external pushes. Enable pushes only in a later robustness continuation.
+# Enable pushes only in a later robustness continuation.
 push_robots = false
 push_interval_s = 15
 max_push_vel_xy = 0.35
@@ -53,9 +52,9 @@ pos = [0.0, 0.0, 0.35]
 resampling_time = [5.0, 10.0]
 
 [commands.limit]
-lin_vel_x = [-0.20, 0.65]
-lin_vel_y = [-0.15, 0.15]
-ang_vel_z = [-1.30, 1.30]
+lin_vel_x = [-0.15, 0.30]
+lin_vel_y = [-0.10, 0.10]
+ang_vel_z = [-0.60, 0.60]
 
 [commands.ranges]
 lin_vel_x = [-0.15, 0.30]
@@ -63,15 +62,40 @@ lin_vel_y = [-0.10, 0.10]
 ang_vel_yaw = [-0.60, 0.60]
 
 [standard_distill_1]
-learning_rate = 3e-4
-max_iterations = 5000
+learning_rate = 5e-4
+lr_min = 1e-5
+max_iterations = 10000
 max_grad_norm = 1.0
-log_interval = 50
-save_interval = 500
+log_interval = 100
+save_interval = 250
 num_steps_per_env = 24
-action_loss_weight = 1.0
+sequence_length = 8
 
-# Keep teacher-driven states in the first bridge run. Closed-loop student
-# recovery is a separate follow-up after action agreement is validated.
-student_drive = false
-teacher_warmup_iterations = 0
+# Start teacher-driven, then gradually expose the student to its own states.
+student_drive = true
+student_drive_phase_fractions = [0.03, 0.47, 0.50]
+student_drive_ratios = [0.00, 0.50, 1.00]
+
+latent_loss_type = "legacy_mse"
+action_loss_type = "mse"
+latent_loss_weight = 1.0
+cosine_loss_weight = 0.0
+action_loss_weight = 0.2
+
+[depth_aug]
+enabled = true
+pixel_dropout_prob = 0.10
+gaussian_noise_scale = 0.02
+edge_dropout_prob = 0.10
+hole_patch_prob = 0.20
+hole_patch_size = [4, 16]
+hole_hold_steps = [2, 8]
+frame_hold_prob = 0.10
+frame_hold_steps = [1, 5]
+blur_kernel_size = 3
+roll_range_deg = 5.0
+pitch_shift_pix = 6
+
+[camera.depth_camera]
+offset_pos = [0.339871, 0.034697, 0.075010]
+offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]

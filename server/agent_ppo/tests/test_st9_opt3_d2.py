@@ -110,6 +110,42 @@ def test_d2_requires_visual_student_resume():
     algorithm.assert_student_ready()
 
 
+def test_encoder_teacher_checkpoint_ignores_critic_side_keys():
+    algorithm = _make_algorithm()
+    source_encoder = nn.Sequential(nn.Linear(5, 4), nn.Tanh())
+    source_actor = nn.Linear(3 + 4 + 2, 12)
+    checkpoint = {
+        **{
+            f"encoder.{key}": value.clone()
+            for key, value in source_encoder.state_dict().items()
+        },
+        **{
+            f"actor.{key}": value.clone()
+            for key, value in source_actor.state_dict().items()
+        },
+        "critic_encoder.0.weight": torch.randn(4, 5),
+        "critic.0.weight": torch.randn(1, 9),
+        "log_std": torch.zeros(12),
+    }
+
+    algorithm.load_teacher_state_dict(
+        checkpoint,
+        source="model.ckpt-locomotion-10288.pkl",
+    )
+
+    assert algorithm.teacher_loaded is True
+    assert algorithm.teacher_source.endswith("model.ckpt-locomotion-10288.pkl")
+    for key, value in source_encoder.state_dict().items():
+        assert torch.equal(algorithm.teacher_encoder.state_dict()[key], value)
+    for key, value in source_actor.state_dict().items():
+        assert torch.equal(algorithm.teacher_actor.state_dict()[key], value)
+    assert all(
+        not parameter.requires_grad
+        for module in (algorithm.teacher_encoder, algorithm.teacher_actor)
+        for parameter in module.parameters()
+    )
+
+
 def test_invalid_dagger_schedule_is_rejected():
     with pytest.raises(ValueError, match="sum to 1.0"):
         _student_drive_probability(0.0, [0.2, 0.2], [0.5, 1.0])

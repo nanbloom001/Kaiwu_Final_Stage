@@ -2,35 +2,47 @@
 
 ## Goal
 
-Convert the legacy flat Standard 10288 policy into the current privileged
-`ActorCriticEncoder` contract. The 10288 Actor consumes all 301 policy
-observations directly and has no latent encoder, so it cannot be loaded by LBC
-visual distillation. This bridge first matches its 12-D raw actions.
+Distill the platform-selected Standard checkpoint 10288 from privileged
+height scan to the calibrated depth camera while preserving its locomotion
+Actor contract.
+
+The platform preload log proves that this checkpoint is already an
+`ActorCriticEncoder`: it contains `encoder.*`, `actor.*`, `critic_encoder.*`
+and `critic.*`; the Actor and Critic first layers use the 77-D and 92-D final
+contracts. This matches the final-round task specification. It must therefore
+enter LBC directly, not the optional 301-D legacy behavior bridge.
 
 ## Runtime Contract
 
 - Stage: `StandardDistill1Config`
 - TOML: `agent_ppo/conf/train_env_conf_standard_standard_distill_1.toml`
-- Algorithm: `behavior_distill`
-- Output checkpoint: `model.ckpt-locomotion-<id>.pkl`
-- Frozen teacher: platform-selected flat Standard checkpoint 10288
-- Teacher actor input: proprio 45 + height scan 256 = 301
-- Student actor input: proprio 45 + latent 32 = 77
+- Algorithm: `lbc_loco`
+- Environment: `Unitree-Go2-Velocity-Camera`
+- Frozen teacher: platform Standard `ActorCriticEncoder` checkpoint 10288
+- Teacher encoder: height scan 256 -> latent 32
+- Teacher Actor: proprio 45 + latent 32 = 77 -> action 12
+- Student: depth 180x320 + proprio 45 -> CNN/LSTM -> latent 32
 - Goal input: none
 
-The frozen teacher drives the environment and provides action labels. The
-student encoder and Actor are optimized with raw 12-D action MSE. This stage
-does not use a camera and does not train a `VisionEncoder`.
+LBC loads only `encoder.*` and `actor.*`. The teacher checkpoint's
+`critic_encoder.*`, `critic.*` and exploration standard deviation are not part
+of deployment and are intentionally ignored.
 
-## Follow-Up Visual Stage
+## Checkpoint Naming
 
-Only after the bridge checkpoint passes action-agreement and closed-loop
-evaluation should `Config.CURRENT` be switched to
-`StandardVisualDistill1Config`. Its configuration is:
+The main output is:
 
-`agent_ppo/conf/train_env_conf_standard_standard_visual_distill_1.toml`
+`model.ckpt-standard-<id>.pkl`
 
-That follow-up stage carries the calibrated camera pose:
+The save path also emits the platform alias:
+
+`model.ckpt-<id>.pkl`
+
+Both satisfy platform liveness discovery for `model.ckpt-*.*`. Loading extracts
+the trailing numeric ID and accepts labelled names such as
+`model.ckpt-locomotion-10288.pkl` without using the label to infer structure.
+
+## Camera Pose
 
 ```toml
 [camera.depth_camera]
@@ -39,13 +51,12 @@ offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
 ```
 
 The quaternion corresponds to a pitch of approximately 21.22 degrees. These
-values are camera mount extrinsics, not optical intrinsics. They intentionally
-do not affect the current height-scan behavior bridge.
+are camera mount extrinsics, not optical intrinsics.
 
 ## Curriculum And Commands
 
-Standard terrain curriculum starts at level 3. The initial command range spans
-zero so backward, lateral, yaw, and near-stationary samples are present:
+Standard terrain curriculum starts at level 3. The sampling range includes
+backward, lateral, yaw, and near-stationary commands:
 
 ```toml
 [commands.ranges]
@@ -54,19 +65,13 @@ lin_vel_y = [-0.10, 0.10]
 ang_vel_yaw = [-0.60, 0.60]
 ```
 
-The configured safety envelope is:
-
-```toml
-[commands.limit]
-lin_vel_x = [-0.20, 0.65]
-lin_vel_y = [-0.15, 0.15]
-ang_vel_z = [-1.30, 1.30]
-```
+`commands.limit` is deliberately identical to these ranges. This keeps the
+frozen teacher inside the same command distribution throughout distillation;
+the ranges still include backward, lateral, yaw, near-zero, and low-speed
+samples.
 
 ## Randomization Phases
 
-Phase 1 enables friction randomization and observation noise while keeping
-external pushes disabled. There is no depth augmentation in the behavior
-bridge because this stage has no camera input. After selecting a stable
-checkpoint, continue from it with `push_robots = true`; retain the 15-second
-interval and 0.35 m/s maximum push speed for the first robustness run.
+The first visual run enables friction randomization, observation noise, and
+depth augmentation while external pushes remain disabled. Enable pushes only
+in a later robustness continuation from a validated visual checkpoint.
