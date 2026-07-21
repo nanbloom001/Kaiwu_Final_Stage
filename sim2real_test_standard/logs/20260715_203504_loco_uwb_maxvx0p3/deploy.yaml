@@ -1,0 +1,42 @@
+# deploy.yaml - standard 模型 model.ckpt-hjcnew-20288.pkl (lbc_loco, 77维无goal)
+# 参数来源: Isaac Lab Go2 标准配置 (与训练日志 log-591723 一致)
+# 此模型无goal(goal_dim=0), teacher_actor输入77维
+
+joint_ids_map: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
+step_dt: 0.02
+stiffness: [25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0]
+damping: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+default_joint_pos: [0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5]
+
+actions:
+  JointPositionAction:
+    scale: 0.25
+    offset: [0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5]
+    clip: [-100.0, 100.0]
+
+proprio_scales:
+  ang_vel: 0.25
+  projected_gravity: 1.0
+  vel_cmd: 1.0
+  joint_pos_rel: 1.0
+  joint_vel_rel: 0.05
+  last_action: 1.0
+proprio_clip: [-100.0, 100.0]
+
+cmd_ranges:
+  ranges:
+    lin_vel_x: [0.0, 0.5]
+    lin_vel_y: [-0.3, 0.3]
+    ang_vel_yaw: [-1.0, 1.0]
+  limit:
+    lin_vel_x: [-2.0, 2.0]
+    lin_vel_y: [-1.5, 1.5]
+    ang_vel_z: [-1.5, 1.5]
+  resampling_time_s: [10.0, 10.0]
+
+meta:
+  source_ckpt: "model.ckpt-hjcnew-20288.pkl"
+  source_ckpt_format: "lbc_loco"
+  paired_onnx: "policy.onnx"
+  notes:
+    - "standard模型, 77维无goal, 0.7速度下还可以"

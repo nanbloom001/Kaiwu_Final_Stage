@@ -1,0 +1,92 @@
+FSM:
+  _: # enabled fsms
+    Passive:
+      id: 1
+    FixStand:
+      id: 2
+    # Velocity 需要 logs/rsl_rl/unitree_go2_velocity 策略目录；本机没有，先禁用
+    # Velocity:
+    #   id: 3
+    #   type: RLBase
+    VisionLoco:
+      id: 4
+      type: VisionLoco
+  Passive:
+    transitions:
+      FixStand: LT + A.on_pressed
+    mode: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    kd: [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+  FixStand:
+    transitions:
+      Passive: LT + B.on_pressed
+      VisionLoco: LT + X.on_pressed
+    kp: [60, 80, 80, 60, 80, 80, 60, 80, 80, 60, 80, 80]
+    kd: [5, 4, 4, 5, 4, 4, 5, 4, 4, 5, 4, 4]
+    ts: [0, 1, 2]
+    qs: [
+      [],
+      [0.0, 1.36, -2.65, 0.0, 1.36, -2.65, 0.0, 1.36, -2.65, 0.0, 1.36, -2.65],
+      [0., 0.8, -1.5, 0., 0.8, -1.5, 0., 0.8, -1.5, 0., 0.8, -1.5],
+    ]
+  Velocity:
+    transitions:
+      Passive: LT + B.on_pressed
+    policy_dir: ../../../logs/rsl_rl/unitree_go2_velocity
+  VisionLoco:
+    transitions:
+      Passive: LT + B.on_pressed
+    # 放 <policy_dir>/exported/policy.onnx + <policy_dir>/params/deploy.yaml
+    # loco 阶段 ONNX 由 export_loco_onnx.py 生成（8 入 8 出，nav 端口占位）。
+    policy_dir: ../../../logs/loco
+    # 深度源: realsense（D435i 直连）或 constant（仅用于链路检查）。
+    # loco 阶段仍需 depth：depth → cnn → loco_lstm → loco_latent → teacher_actor。
+    depth:
+      source: realsense
+      constant_value: 0.6
+    # goal(4): [local_x/10, local_y/10, planar_distance/20, reserved].
+    # Actor80 uses the first 3 values; current fixed virtual goal is 1 m straight ahead.
+    goal: [0.1, 0.0, 0.05, 0.0]
+
+    # loco 阶段命令来源：
+    #   fixed: 固定速度基础运控（loco 阶段默认）；
+    #   uwb  : UWB 更新 goal；goal_driven=true 时速度观测使用固定 cruise_cmd；
+    #   nav  : loco 阶段无 learned nav actor（模型无 nav 分支），选 nav 等价零速度，
+    #          仅保留分支以复用 State；正式 loco 测试请用 fixed / uwb。
+    command_source: uwb
+    fixed_cmd: [0.7, 0.0, 0.0]   # vx, vy, wz (楼梯测试, 和训练速度一致)
+    uwb:
+      topic: rt/uwbstate
+      sport_state_topic: rt/sportmodestate
+      max_vx: 0.30
+      max_vy: 0.00
+      max_wz: 0.20
+      yaw_kp: 0.40
+      # stop_distance 加大: 避免越过目标正下方时 UWB 方位角 ±π 歧义。
+      # slow_distance 同步加大, 保持减速区间; cruise_cmd[0] 减小到 0.35 防止 overshoot。
+      stop_distance: 0.70
+      slow_distance: 1.50
+      stop_hysteresis: 0.15  # 进入 0.70m 停；重新超过 0.85m 才恢复
+      stop_once: false  # 首次到站后不锁存，goal 继续由 UWB 更新
+      goal_driven: true   # proprio[6:9] 填训练巡航锚点，导航方向完全交给模型 goal
+      # cruise_cmd = 训练 commands.ranges 的速度命令锚点：
+      #   lin_vel_x=[0.50,0.64] → 取下界 0.5；lin_vel_y=0；ang_vel_yaw=0
+      # 模型从 goal[3] 自己决定转向，C++ 不再用 UWB beta 算 wz
+      cruise_cmd: [0.50, 0.0, 0.0]
+      turn_in_place_angle: 1.0472  # 60 deg
+      stale_timeout: 0.50
+      hold_timeout: 1.50  # 0.5~1.5s 保持滤波目标并线性减速；之后硬清零
+      buffer_seconds: 3.0   # 6→3, 配合更小的 median_window
+      median_window: 0.20   # 0.45→0.20, 减小 median 滞后
+      filter_tau: 0.10      # 0.25→0.10, EMA 更跟手 (合计延迟从 0.7s 降到 0.3s)
+      cmd_slew_rate: [0.30, 0.30, 1.00]  # 每秒最大 vx/vy/wz 变化量
+      # lowcmd 模式会关闭 SportModeState；用静止 UWB tag 的相对位姿差分估计实际 vx/vy。
+      # 仅用于日志，不参与 fixed/nav 命令生成。测试期间不要移动 tag。
+      diagnostic_feedback: true
+      velocity_filter_alpha: 0.20
+
+    # 每次进入 VisionLoco 都在 logs/loco/logs/ 创建一份逐帧 CSV。
+    logging:
+      enabled: true
+      flush_every: 50
+      max_consecutive_errors: 5
+      max_raw_action_abs: 20.0

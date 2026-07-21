@@ -1,0 +1,121 @@
+FSM:
+  _: # enabled fsms
+    Passive:
+      id: 1
+    FixStand:
+      id: 2
+    # Velocity 需要 logs/rsl_rl/unitree_go2_velocity 策略目录；本机没有，先禁用
+    # Velocity:
+    #   id: 3
+    #   type: RLBase
+    VisionLoco:
+      id: 4
+      type: VisionLoco
+  Passive:
+    transitions:
+      FixStand: LT + A.on_pressed
+    mode: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    kd: [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+  FixStand:
+    transitions:
+      Passive: LT + B.on_pressed
+      VisionLoco: LT + X.on_pressed
+    kp: [60, 80, 80, 60, 80, 80, 60, 80, 80, 60, 80, 80]
+    kd: [5, 4, 4, 5, 4, 4, 5, 4, 4, 5, 4, 4]
+    ts: [0, 1, 2]
+    qs: [
+      [],
+      [0.0, 1.36, -2.65, 0.0, 1.36, -2.65, 0.0, 1.36, -2.65, 0.0, 1.36, -2.65],
+      [0., 0.8, -1.5, 0., 0.8, -1.5, 0., 0.8, -1.5, 0., 0.8, -1.5],
+    ]
+  Velocity:
+    transitions:
+      Passive: LT + B.on_pressed
+    policy_dir: ../../../logs/rsl_rl/unitree_go2_velocity
+  VisionLoco:
+    transitions:
+      Passive: LT + B.on_pressed
+    # 放 <policy_dir>/exported/policy.onnx + <policy_dir>/params/deploy.yaml
+    # loco 阶段 ONNX 由 export_loco_onnx.py 生成（8 入 8 出，nav 端口占位）。
+    policy_dir: ../../../logs/loco
+    # 深度源: realsense（D435i 直连）或 constant（仅用于链路检查）。
+    # loco 阶段仍需 depth：depth → cnn → loco_lstm → loco_latent → teacher_actor。
+    depth:
+      source: realsense
+      constant_value: 0.6
+      # ── SDK 后处理滤波 (学长建议 A/B/C 对照, 训练侧无任何 SDK 滤波) ─────────────
+      #   学长明确不引入: hole_filling (填薄障碍边缘)、decimation (丢细节)
+      #   A/B/C 对照测试结论 (2026-07-20):
+      #     A (none)            → 直撞, 中央<0.5m 占 51.5%, 中央<0.2m 占 21.5%
+      #     B (light_spatial)   → ★ 绕开避障, 中央<0.5m 占 14.5%, 中央<0.2m 占 5.6%
+      #     C (spatial+temporal)→ 未测 (用户在 B 已满足要求后选择 B 作为最终配置)
+      #   原理: spatial 平滑深度散点噪声 → CNN 能稳定提取障碍特征 → 模型用关节
+      #         动作 (不经过 wz) 触发避障步态。注意: 模型避障在训练时已学会,
+      #         不是靠 wz 转向命令实现的。
+      filters:
+        # ★ 正式部署配置: light_spatial (B 组验证有效)
+        mode: light_spatial
+        # spatial 参数 — SDK 默认附近的轻量值, A/B/C 测试均用此组
+        spatial_magnitude: 2          # [1..5 整数] SDK 默认 2
+        spatial_smooth_alpha: 0.5     # [0.25..1.0] SDK 默认 0.5; 越大越平滑
+        spatial_smooth_delta: 20      # [1..50] SDK 默认 20; edge-preserving 阈值
+        # temporal (mode=C 时生效, 当前未启用)
+        temporal_alpha: 0.25          # [0..1] SDK 默认 0.4
+        temporal_delta: 20            # [1..100] SDK 默认 20
+        # 注意: hole_filling 全程强制关 (代码 set HolesFill=0), 配置不暴露
+    # goal(4): [local_x/10, local_y/10, planar_distance/20, reserved].
+    # Actor80 uses the first 3 values; current fixed virtual goal is 1 m straight ahead.
+    goal: [0.1, 0.0, 0.05, 0.0]
+
+    # loco 阶段命令来源：
+    #   fixed: 固定速度基础运控（loco 阶段默认）；
+    #   uwb  : UWB 更新 goal；goal_driven=true 时速度观测使用固定 cruise_cmd；
+    #   nav  : loco 阶段无 learned nav actor（模型无 nav 分支），选 nav 等价零速度，
+    #          仅保留分支以复用 State；正式 loco 测试请用 fixed / uwb。
+    # st7 部署: 起始用 fixed 测基本行为, 验证后再切 uwb 测跟踪
+    command_source: fixed
+    # st7 训练 commands.ranges.lin_vel_x=[0.55,0.80], eval_command=[0.62,0,0]
+    # fixed_cmd vx=0.62 是训练中位数, 在训练分布内
+    fixed_cmd: [0.62, 0.0, 0.0]   # fixed 模式: vx,vy,wz
+    # 注意: st7/st9 同架构同训练流程, 训练参数 (PD/joint_map/action scale) 完全一致.
+    # 差异只在: st7 训练时 goal 加了噪声 (p=0.75), 额外学过 depth_block_dropout.
+    # 所以 UWB 模式 st7 应该对真机噪声更鲁棒.
+    uwb:
+      topic: rt/uwbstate
+      sport_state_topic: rt/sportmodestate
+      # st9 训练 lbc_real_sensor_augmentation.uwb_command 参数 (部署必须严格一致)：
+      # 训练时 obs[6:9] = _uwb_command(goal) 的输出, 部署时 C++ 用同一组参数算 velocity
+      # command 注入 proprio[6:9], 实现训练-部署分布对齐。
+      max_vx: 0.30              # uwb_command.max_vx
+      max_vy: 0.00              # uwb_command.max_vy
+      max_wz: 0.40              # uwb_command.max_wz
+      yaw_kp: 0.80              # uwb_command.yaw_kp
+      stop_distance: 0.35       # uwb_command.stop_distance
+      slow_distance: 1.00       # uwb_command.slow_distance
+      stop_hysteresis: 0.15     # 进入 0.35m 停；重新超过 0.50m 才恢复
+      stop_once: false          # 不锁存, goal 持续由 UWB 更新
+      # cmd_vx_mode: A/B/C 对照测试开关 (训练分布核查后新增)
+      #   c_wz    : 旧行为 (C++ 算 vx + wz=yaw_kp*beta) — 训练分布外
+      #   goal_03 : cmd_wz=0, cmd_vx=0.30 (关闭 C++ 转向, 安全速度)
+      #   goal_08 : cmd_wz=0, cmd_vx=0.80 (完全匹配训练 commands.ranges)
+      # 训练分布核查: st9 训练时 proprio[6:9]=[0.8,0,0] 恒定 (cmd_wz 恒零),
+      # goal 来自 track 终点 (无噪声)。新模式让部署贴近训练分布。
+      cmd_vx_mode: goal_08
+      goal_driven: false        # cmd_vx_mode=c_wz 时生效; 新模式忽略此字段
+      cruise_cmd: [0.80, 0.0, 0.0]   # 仅 goal_driven=true 时用; 占位
+      turn_in_place_angle: 1.0472   # uwb_command.turn_in_place_angle_rad (60 deg)
+      stale_timeout: 0.50
+      hold_timeout: 1.50
+      buffer_seconds: 3.0       # 不影响计算 (median+EMA 已移除)
+      median_window: 0.20       # 不影响计算 (保留兼容)
+      filter_tau: 0.10          # 不影响计算 (保留兼容)
+      cmd_slew_rate: [0.30, 0.30, 1.00]
+      diagnostic_feedback: true
+      velocity_filter_alpha: 0.20
+
+    # 每次进入 VisionLoco 都在 logs/loco/logs/ 创建一份逐帧 CSV。
+    logging:
+      enabled: true
+      flush_every: 50
+      max_consecutive_errors: 5
+      max_raw_action_abs: 20.0
