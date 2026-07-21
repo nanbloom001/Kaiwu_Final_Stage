@@ -62,6 +62,26 @@ jump_enabled = false
 stale_enabled = false
 dropout_enabled = false
 
+# =============================================================================
+# ST7-Opt5: keep half of the episodes on the full track and replay difficult
+# transitions with the other half. This is training-only and is never installed
+# for platform evaluation.
+# =============================================================================
+[hard_start_replay]
+enabled = true
+full_track_ratio = 0.50
+hard_weights = [0.45, 0.25, 0.20, 0.10]
+track_sequence = ["pyramid_slope", "pyramid_slope_inv", "pyramid_stairs", "pyramid_stairs_inv", "open_entry_maze"]
+hard_segments = ["pyramid_stairs_inv", "pyramid_slope_inv", "open_entry_maze", "pyramid_stairs"]
+approach_offset_m = [0.5, 1.2]
+track_ground_z = 0.0
+lateral_offset_m = [0.05, 0.08]
+yaw_offset_deg = [3.0, 5.0]
+roll_pitch_offset_max_rad = 0.025
+entry_speeds_mps = [0.0, 0.60, 1.00, 0.70, 0.60]
+entry_speed_jitter_mps = 0.04
+max_failure_logs_per_step = 64
+
 [init_state]
 pos = [0.0, 0.0, 0.35]
 

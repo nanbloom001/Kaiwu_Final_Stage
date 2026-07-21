@@ -425,6 +425,7 @@ def _initialize_training_runtime_state(env, agent, logger):
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
     logger.info(f"obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
+    _validate_hard_start_runtime(env, usr_conf, logger)
 
     # Raw reward keys are mapped to compact dashboard names at report time.
     reward_keys = list(_R1_REWARD_KEYS)
@@ -714,7 +715,7 @@ def _unpack_env_step_result(data, episode, logger):
         raise Exception(f"episode {episode}, obs is None after processing!")
 
     dones = torch.logical_or(terminated, truncated)
-    return frame_no, obs, critic_obs, rewards, dones, infos
+    return frame_no, obs, critic_obs, rewards, dones, infos, terminated, truncated
 
 
 def _move_step_tensors_to_device(obs, critic_obs, rewards, dones, device):
@@ -990,6 +991,257 @@ def _find_robot_asset_in_scene(isaac_env):
             return asset
 
     return None
+
+
+def _quat_to_roll_pitch(quat):
+    """Extract roll/pitch from WXYZ root quaternions."""
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    roll = torch.atan2(
+        2.0 * (w * x + y * z),
+        1.0 - 2.0 * (x * x + y * y),
+    )
+    pitch = torch.asin(torch.clamp(2.0 * (w * y - z * x), -1.0, 1.0))
+    return roll, pitch
+
+
+def _capture_hard_start_pre_step_state(env, usr_conf):
+    """Capture terminal diagnostics before Isaac Lab auto-resets done envs."""
+    if not bool(usr_conf.get("hard_start_replay", {}).get("enabled", False)):
+        return None
+    isaac_env = _resolve_wrapped_isaac_env(env)
+    robot = _find_robot_asset_in_scene(isaac_env)
+    state = getattr(isaac_env, "_hard_start_replay_state", None)
+    if isaac_env is None or robot is None or state is None:
+        return None
+
+    terrain = isaac_env.scene.terrain
+    origins = getattr(terrain, "terrain_origins", None)
+    difficulty = getattr(terrain, "terrain_types", None)
+    if not (torch.is_tensor(origins) and torch.is_tensor(difficulty)):
+        return None
+
+    root_pos = robot.data.root_pos_w.detach()
+    root_quat = robot.data.root_quat_w.detach()
+    roll, pitch = _quat_to_roll_pitch(root_quat)
+    cols = difficulty.long().clamp(0, origins.shape[1] - 1)
+    row_origins = origins[:, cols, :2].permute(1, 0, 2)
+    segment_index = torch.argmin(
+        torch.linalg.norm(row_origins - root_pos[:, None, :2], dim=2),
+        dim=1,
+    )
+
+    first_origin = origins[0, cols, :2]
+    second_origin = origins[min(1, origins.shape[0] - 1), cols, :2]
+    direction = second_origin - first_origin
+    segment_length = torch.linalg.norm(direction, dim=1).clamp(min=1.0)
+    direction = direction / segment_length.unsqueeze(1)
+    track_start = first_origin - 0.5 * segment_length.unsqueeze(1) * direction
+    goal_positions = getattr(isaac_env, "goal_positions", None)
+    if torch.is_tensor(goal_positions):
+        goal_xy = goal_positions[:, :2]
+        goal_distance = torch.linalg.norm(goal_xy - root_pos[:, :2], dim=1)
+        track_length = torch.sum((goal_xy - track_start) * direction, dim=1).clamp(min=1.0)
+    else:
+        last_origin = origins[-1, cols, :2]
+        goal_xy = last_origin + 0.5 * segment_length.unsqueeze(1) * direction
+        goal_distance = torch.linalg.norm(goal_xy - root_pos[:, :2], dim=1)
+        track_length = (segment_length * origins.shape[0]).clamp(min=1.0)
+    progress = torch.sum((root_pos[:, :2] - track_start) * direction, dim=1) / track_length
+
+    return {
+        "start_kind": state["start_kind"].detach().clone(),
+        "difficulty": difficulty.detach().clone(),
+        "segment_index": segment_index.detach().clone(),
+        "progress": torch.clamp(progress, 0.0, 1.0).detach().clone(),
+        "roll": roll.detach().clone(),
+        "pitch": pitch.detach().clone(),
+        "roll_rate": robot.data.root_ang_vel_b[:, 0].detach().clone(),
+        "pitch_rate": robot.data.root_ang_vel_b[:, 1].detach().clone(),
+        "goal_distance": goal_distance.detach().clone(),
+        "speed": torch.linalg.norm(robot.data.root_lin_vel_b[:, :2], dim=1).detach().clone(),
+    }
+
+
+def _termination_term_masks(isaac_env, device):
+    term_mgr = getattr(isaac_env, "termination_manager", None)
+    if term_mgr is None:
+        return {}
+    active_terms = getattr(term_mgr, "active_terms", None)
+    if active_terms is None:
+        active_terms = getattr(term_mgr, "_term_names", [])
+    masks = {}
+    for term_name in active_terms:
+        try:
+            value = term_mgr.get_term(term_name)
+        except Exception:
+            continue
+        if value is not None:
+            masks[str(term_name)] = torch.as_tensor(value, device=device).bool().view(-1)
+    return masks
+
+
+def _record_hard_start_outcomes(
+    env,
+    usr_conf,
+    dones,
+    terminated,
+    truncated,
+    snapshot,
+    logger,
+):
+    """Update per-start statistics and print structured abnormal diagnostics."""
+    if snapshot is None or not dones.bool().any():
+        return
+    from agent_ppo.feature.hard_start_replay import START_NAMES
+
+    isaac_env = _resolve_wrapped_isaac_env(env)
+    state = getattr(isaac_env, "_hard_start_replay_state", None)
+    if isaac_env is None or state is None:
+        return
+    device = snapshot["start_kind"].device
+    done_mask = dones.to(device=device).bool().view(-1)
+    terminated = terminated.to(device=device).bool().view(-1)
+    truncated = truncated.to(device=device).bool().view(-1)
+    term_masks = _termination_term_masks(isaac_env, device)
+    goal_mask = term_masks.get("goal_reached", torch.zeros_like(done_mask))
+
+    previous_kinds = snapshot["start_kind"][done_mask].long()
+    state["episode_counts"] += torch.bincount(previous_kinds, minlength=len(START_NAMES))
+    if goal_mask.any():
+        state["success_counts"] += torch.bincount(
+            snapshot["start_kind"][done_mask & goal_mask].long(),
+            minlength=len(START_NAMES),
+        )
+
+    sequence = usr_conf.get("hard_start_replay", {}).get(
+        "track_sequence",
+        usr_conf.get("terrain", {}).get("track", {}).get("sub_terrains", []),
+    )
+    segment_aliases = {
+        "pyramid_stairs_inv": "stairs_down",
+        "pyramid_slope_inv": "slope_down",
+        "open_entry_maze": "maze_entry",
+        "pyramid_stairs": "stairs_up",
+    }
+    max_logs = int(
+        usr_conf.get("hard_start_replay", {}).get("max_failure_logs_per_step", 64)
+    )
+    abnormal_ids = torch.where(done_mask & ~goal_mask & ~truncated)[0]
+    for log_index, env_id_tensor in enumerate(abnormal_ids):
+        env_id = int(env_id_tensor.item())
+        segment_id = int(snapshot["segment_index"][env_id].item())
+        raw_segment = (
+            sequence[segment_id]
+            if 0 <= segment_id < len(sequence)
+            else f"row_{segment_id}"
+        )
+        segment = segment_aliases.get(raw_segment, raw_segment)
+        fired = [name for name, mask in term_masks.items() if bool(mask[env_id].item())]
+        reason = "+".join(fired) if fired else ("terminated" if terminated[env_id] else "unknown")
+        for reason_name in fired or [reason]:
+            key = (reason_name, raw_segment)
+            state["reason_counts"][key] = state["reason_counts"].get(key, 0) + 1
+        if log_index < max_logs:
+            logger.warning(
+                "[Opt5Failure] "
+                f"env={env_id}, level={int(snapshot['difficulty'][env_id].item())}, "
+                f"segment={segment}, progress={snapshot['progress'][env_id].item():.3f}, "
+                f"reason={reason}, roll={snapshot['roll'][env_id].item():.3f}, "
+                f"pitch={snapshot['pitch'][env_id].item():.3f}, "
+                f"roll_rate={snapshot['roll_rate'][env_id].item():.3f}, "
+                f"pitch_rate={snapshot['pitch_rate'][env_id].item():.3f}, "
+                f"base_contact={'base_contact' in fired}, "
+                f"goal_dist={snapshot['goal_distance'][env_id].item():.3f}, "
+                f"speed={snapshot['speed'][env_id].item():.3f}"
+            )
+    if abnormal_ids.numel() > max_logs:
+        logger.warning(
+            f"[Opt5Failure] suppressed {abnormal_ids.numel() - max_logs} "
+            "additional failures from this simulator step"
+        )
+
+    timeout_ids = torch.where(done_mask & truncated)[0]
+    for env_id_tensor in timeout_ids:
+        env_id = int(env_id_tensor.item())
+        segment_id = int(snapshot["segment_index"][env_id].item())
+        raw_segment = (
+            sequence[segment_id]
+            if 0 <= segment_id < len(sequence)
+            else f"row_{segment_id}"
+        )
+        key = ("timeout", raw_segment)
+        state["reason_counts"][key] = state["reason_counts"].get(key, 0) + 1
+
+
+def _hard_start_monitor_metrics(env):
+    """Return cumulative reset/outcome metrics for dashboard reporting."""
+    from agent_ppo.feature.hard_start_replay import START_NAMES
+
+    isaac_env = _resolve_wrapped_isaac_env(env)
+    state = getattr(isaac_env, "_hard_start_replay_state", None)
+    if state is None:
+        return {}
+    kinds = state["start_kind"]
+    starts = state["start_counts"].float()
+    episodes = state["episode_counts"].float()
+    successes = state["success_counts"].float()
+    metrics = {
+        "full_track_ratio": (kinds == 0).float().mean().item(),
+        "hard_start_ratio": (kinds > 0).float().mean().item(),
+    }
+    for index, name in enumerate(START_NAMES[1:], start=1):
+        monitor_name = {
+            "stairs_down": "stairs_down",
+            "slope_down": "slope_down",
+            "maze_entry": "maze_entry",
+            "stairs_up": "stairs_up",
+        }[name]
+        metrics[f"{monitor_name}_starts"] = starts[index].item()
+        metrics[f"{monitor_name}_success"] = (
+            successes[index] / torch.clamp(episodes[index], min=1.0)
+        ).item()
+
+    segment_aliases = {
+        "pyramid_stairs_inv": "stairs_down",
+        "pyramid_slope_inv": "slope_down",
+        "open_entry_maze": "maze_entry",
+        "pyramid_stairs": "stairs_up",
+    }
+    for reason in ("bad_orientation", "base_contact", "timeout"):
+        reason_prefix = {
+            "bad_orientation": "bad",
+            "base_contact": "base",
+            "timeout": "timeout",
+        }[reason]
+        for segment, alias in segment_aliases.items():
+            metrics[f"{reason_prefix}_{alias}"] = float(
+                state["reason_counts"].get((reason, segment), 0)
+            )
+    return metrics
+
+
+def _validate_hard_start_runtime(env, usr_conf, logger):
+    from agent_ppo.feature.hard_start_replay import START_NAMES
+
+    config = usr_conf.get("hard_start_replay", {})
+    if not bool(config.get("enabled", False)):
+        return
+    isaac_env = _resolve_wrapped_isaac_env(env)
+    state = getattr(isaac_env, "_hard_start_replay_state", None)
+    if state is None:
+        raise RuntimeError(
+            "hard_start_replay is enabled but the reset hook did not initialize"
+        )
+    metrics = _hard_start_monitor_metrics(env)
+    start_counts = state["start_counts"].detach().cpu().tolist()
+    logger.warning(
+        "[Opt5HardStart] enabled: "
+        f"full_ratio={metrics.get('full_track_ratio', 0.0):.3f}, "
+        f"hard_ratio={metrics.get('hard_start_ratio', 0.0):.3f}, "
+        f"start_counts={dict(zip(START_NAMES, start_counts))}, "
+        f"weights={config.get('hard_weights')}, "
+        f"segments={config.get('hard_segments')}"
+    )
 
 
 def _estimate_physics_metrics_from_critic_obs(critic_obs):
@@ -1585,8 +1837,18 @@ def collect_rollout_batch(
                 logger.info(f"clipped_action:{command_actions}")
 
             # Advance the simulator with the sampled actions.
+            hard_start_snapshot = _capture_hard_start_pre_step_state(env, usr_conf)
             data = env.step(command_actions)
-            frame_no, obs, critic_obs, rewards, dones, infos = _unpack_env_step_result(data, episode, logger)
+            (
+                frame_no,
+                obs,
+                critic_obs,
+                rewards,
+                dones,
+                infos,
+                terminated,
+                truncated,
+            ) = _unpack_env_step_result(data, episode, logger)
 
             # Keep all tensors on the learner device before storing transitions.
             obs, critic_obs, rewards, dones = _move_step_tensors_to_device(
@@ -1609,6 +1871,15 @@ def collect_rollout_batch(
             if nav_controller is not None:
                 nav_controller.reset(dones=dones)
             _reset_finished_phase_command_state(env, dones)
+            _record_hard_start_outcomes(
+                env,
+                usr_conf,
+                dones,
+                terminated,
+                truncated,
+                hard_start_snapshot,
+                logger,
+            )
 
             # Update episode statistics (always, regardless of decimation)
             _refresh_completed_episode_buffers(
@@ -1664,5 +1935,6 @@ def collect_rollout_batch(
     # Append a physics snapshot (averaged across all envs).
     # Wrapped in try/except inside _sample_runtime_physics_metrics, so always safe.
     storage_stats.update(_sample_runtime_physics_metrics(env, logger, critic_obs=critic_obs))
+    storage_stats.update(_hard_start_monitor_metrics(env))
 
     return last_obs, critic_obs, storage_stats
