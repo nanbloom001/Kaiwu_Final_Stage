@@ -1,7 +1,7 @@
 # Kaiwu_Final_Stage 仓库迁移 - 交接状态（供审查）
 
 > 生成：2026-07-21。本文件自包含，供另一 AI / 审查者接手审查与完成剩余工作。
-> 源规约：本仓库 `分析记录/版本训练演进与改动规模详解.md` 与本目录 `branch-migration-register.md`、`repository-layout.md`。
+> 源规约：本仓库 `shared/分析记录/版本训练演进与改动规模详解.md` 与本目录 `branch-migration-register.md`、`repository-layout.md`。分支实时 SHA 以 `git ls-remote origin` 为准，本文件不把自身提交 SHA 当作长期状态字段。
 
 ## 1. 项目与目标
 
@@ -11,7 +11,7 @@
 
 ## 2. 已完成工作（阶段 0-4 + 5a + 静态验证）
 
-迁移分支 `codex/repository-layout-migration`，从 `codex/st7-opt3` 起步，共 11 提交（已推送 origin）：
+迁移分支 `codex/repository-layout-migration` 从 `codex/st7-opt3` 起步。以下是关键实现提交；后续文档维护提交不再写死为“当前 HEAD”：
 
 | 提交 | 内容 |
 |---|---|
@@ -25,49 +25,54 @@
 | `3331d23` | archive 纳入 `track蒸馏3_378413`（真机部署 ckpt，SHA256 `37429c1e…5a1288`，10.6MB 真文件） |
 | `0694877` | shared 纳入 07-11/07-12 分析报告 4 份 |
 | `b507be9` | archive 纳入 `unitree_isaaclab_deploy`（10 个 git-lfs pointer 文件经 `.gitignore` 排除，134 真实文件保留） |
+| `8dd7d70` | 新增本交接文件，记录阶段 5 审查入口 |
 
 **7 个 tag 已推送 origin**：`stage3i2-nogate-safe-60m`(d777c1f)、`stage3j4-neargoal-rejected`(d372dce)、`st7-opt2a-baseline-rewrite`(09d88e7)、`st7-opt3-server-baseline`(9b0b3df)、`st7-opt5-hard-start-replay`(b81cbf4)、`st7-opt5-debug-hard-start-diagnostics`(9570780)、`st9-opt3-d1-vision-distill`(5ea7ba9)
 
 **PR**：https://github.com/nanbloom001/Kaiwu_Final_Stage/pull/1 （**draft**，未合并）
 
-**静态验证（已执行，全过）**：
+**静态验证基线**：
 - `bash -n` 部署脚本 22/22 通过
-- `py_compile` 全量 236 个 .py，0 错误
-- TOML 解析 43/43 通过
-- markdown 相对链接 17 个，0 断链
+- `py_compile` 当前受 Git 跟踪的 512 个 `.py`，0 错误
+- `server/` TOML 解析 43/43 通过（全仓 99/99 也已解析通过）
+- 迁移新建/维护的 14 份 Markdown 中，相对链接 17 个，0 断链；导入的历史文档不纳入该 scoped gate
 - `server/` 无运行时引用 `shared/`/`archive/`；`deploy/` 无运行时引用 `server/`（subtree 独立性确认）
-- ⚠️ `git diff --check` 报告的 whitespace 全部是**迁移内容原有**（server 代码、deploy C++ runtime、archive 旧包因 `git mv`/subtree/import 在 diff 中表现为新增行而暴露），**非迁移引入**；迁移作者实际编辑的文件（J9/Opt4 值改动、README、ARTIFACTS）干净。是否清理这些原有 whitespace 为可选（清理会改动被保留内容）。
+- ⚠️ 全量 `git diff --check 9b0b3df..HEAD` 会报告迁入的历史 whitespace，因此不记为“全过”；验收以迁移作者实际编辑文件的 scoped `git diff --check` 为准，历史内容不在本次格式化范围内。
+- 本机没有安装 `pytest`，J9 单测文件已静态审查但不能宣称本机执行通过；需在训练环境补跑。
 
 ## 3. 当前状态
 
-- **迁移分支**：`codex/repository-layout-migration` @ `b507be9`，已推送 origin，与 origin 同步
-- **结构**：`server/`(108 文件) / `shared/`(41) / `archive/`(444) / `deploy/`(439) + 根 README+.gitignore
+- **迁移分支**：`codex/repository-layout-migration`；实时 tip 以 PR #1 head 和 `git ls-remote` 为准
+- **结构**：`server/`(108 文件) / `shared/`(42) / `archive/`(444) / `deploy/`(439) + 根 README+.gitignore
 - **worktree**：`/Users/nanbloom001/codespace/fwwb-migration`（迁移分支）；主仓 `/Users/nanbloom001/codespace/fwwb-Final` 保持在 `main`，未跟踪文件未动
 - **基线**：`server/` = ST7-Opt3 + J9 接口修复（latent，TrackNav 保自适应 1.5e-5）+ Opt4 角速度调整
 
 ## 4. 关键决策与注意事项
 
-1. **J9 仅移植通用接口**（非整实验提升）：`TrackNavConfig` 保持 Opt3 自适应 `lr=1.5e-5`（无 schedule/min/max 字段）；接口修复 latent（PPO 构造器不再静默忽略 schedule/bounds）。J9 固定学习率实验以 `server/conf/train_env_conf_track_navj9.toml` 作记录。理由：register 写"TOML 仅作记录"、Plan 写"默认保持原行为"，未经验证的实验不应自动进基线。**如本意是要 TrackNav 用固定 1e-5，请告知**。
+1. **J9 仅移植通用接口**（非整实验提升）：`TrackNavConfig` 保持 Opt3 自适应 `lr=1.5e-5`（无 schedule/min/max 字段）；接口修复 latent（PPO 构造器不再静默忽略 schedule/bounds）。验收分两套：活动 Opt3/Opt4 验证 adaptive 学习率在配置边界内更新；fixed `1e-5` 由 `test_j9_fixed_lr.py` 直接构造算法验证。当前主线没有启用 `TrackNavStage3J9Config`，需要复现实验时从历史提交恢复或显式新增阶段，不能把 `train_env_conf_track_navj9.toml` 单独视为可运行入口。
 2. **deploy 用 merge commit 导入**：第二父 = `b297b3f`（部署独立历史根），已验证。四套目录并列不去重（两份 378413 ckpt Git 自动复用 blob）。
 3. **LFS pointer 排除**：`archive/unitree_isaaclab_deploy/` 有 10 个 git-lfs pointer（ONNX Runtime .so、`model.ckpt-lbc-loco-637427.pkl`、mimic CSV、npy、标定 PDF），真实对象不在本地，经 `.gitignore` 排除（Plan 禁止把 pointer 登记为可用 ckpt）。需真实对象则在源仓 `git lfs pull`。
 4. **ST7/standard deploy 缺 checkpoint**：`sim2real_test_st7` 缺 `model.ckpt-track-lbc-loco-28608.pkl`；`sim2real_test_standard` 缺 `model.ckpt-hjcnew-20288.pkl`。各 `ARTIFACTS.md` 已标"待提供"。补齐前 deploy 这两套只能源码静态验收。
 5. **合并要求**：PR #1 合入 main **必须用 merge commit，禁 squash/rebase**（squash 会使 J8/J9/Opt1A/Opt2B 等 trunk SHA 在分支删除后失去保护；rebase 改写 SHA 并破坏 deploy subtree 拓扑）。建议合入后启用 main 分支保护。
 
-## 5. 剩余工作（gate + 命令）
+6. **分支收敛**：最终远程只保留 `main`、`codex/st7-opt5-debug`、`codex/st9-opt3-d1`。`st7-opt5-debug` 当前 tip `c603ed7` 已包含原 Opt5、diagnostics 和新增 Opt5B；原 Opt5 稳定节点由 tag 保留。
+7. **淘汰实验边界**：J5/J6/J7/timeout 只创建 `archived/` tag 后删除分支，不把其互斥配置合入活动 server 代码。
 
-### 5b. review PR + 合入 main（需人工 review）
-1. review https://github.com/nanbloom001/Kaiwu_Final_Stage/pull/1
-2. 合入：**merge commit**（PR 页面选 "Create a merge commit"，勿 squash/rebase）
-3. 启用 main 分支保护（GitHub Settings → Branches → main：require PR review + 禁 force-push）
-4. 验证远程 main 含 `b507be9`、`9b0b3df`、`b297b3f`
+## 5. 剩余工作（远程安全闸门）
 
-### 5c. 验证（需 Isaac Lab 训练环境 + Jetson + Go2，本机无法执行）
-1. 在腾讯开悟容器内执行 `server/train_test.py` 短 smoke test；确认 Opt3 goal_noise、Opt2B dynamic_tilt_risk、Opt4 angular-rate 实际注册
-2. 跑一个训练周期（30-60min），观察 J9 `_validate_fixed_lr` 日志、学习率恒定、L9 完成率
-3. Jetson 上一次 Sim2Real 部署验证（`deploy/sim2real_test_loco/`，378413 ckpt 已入库）：构建 binary -> 部署 ONNX Runtime -> `run_loco_stage_test.sh --check` -> 正式 run
+### 5b. PR 合入 main
+1. 每次写远程前执行 `git fetch --all --prune` 与 `git ls-remote --heads --tags origin`，并与预期 SHA 对照。
+2. PR #1 使用 **merge commit**，通过 `--match-head-commit` 锁定已经审查的 head；禁 squash/rebase。
+3. 合并后验证新 `main` 同时包含迁移 head、`9b0b3df` 和 deploy subtree 节点 `b297b3f`，且 main tree 与 PR head 一致。
+4. 启用 main 分支保护：要求 PR、禁 force-push、禁删除、允许 merge commit；目前不要求 CI status checks。
 
-### 6. 删散落分支（须 5c 验证通过后）
-按 `shared/project-context/branch-migration-register.md` 的"安全删除判定"：
+### 5c. 模型发布验证（仓库布局合并后执行）
+1. 活动 Opt3/Opt4：确认 adaptive 学习率按 KL 更新且不越过配置上下界；不要期待 `_validate_fixed_lr()` 恒定日志。
+2. J9 fixed 接口：在具备 PyTorch/pytest 的环境执行 `test_j9_fixed_lr.py`，验证算法 LR 和所有 optimizer 参数组始终为 `1e-5`；主线当前没有启用 navj9 stage class。
+3. 腾讯开悟训练 smoke、30-60 分钟训练和 Jetson Sim2Real 属于后续模型发布验收，不阻断仓库布局 PR。
+
+### 5d. 删除散落分支
+按 `shared/project-context/branch-migration-register.md` 的“安全删除判定”，仅在 main 合入、保护 tag 推送且远程 SHA 再次匹配后执行：
 
 **先打 archived tag 再删（独立侧支，删前必须 tag 否则 gc 丢失）**：
 ```bash
@@ -76,22 +81,24 @@ git tag -a archived/stage3j6-termination b2891e4 -m "archived: J6 termination (s
 git tag -a archived/stage3j7-rough-energy 1acc731 -m "archived: J7 rough-energy (superseded)"
 git tag -a archived/timeout-bootstrap-diag 13a1b19 -m "archived: timeout diagnostic (no model promotion)"
 git tag -a archived/st7-opt4-angular-rate 5f8764d -m "archived: Opt4 (ported to server/)"
-git push origin --tags
+git push origin archived/stage3j5-p14 archived/stage3j6-termination archived/stage3j7-rough-energy archived/timeout-bootstrap-diag archived/st7-opt4-angular-rate
 # 然后删分支
 git push origin --delete codex/stage3j5-p14 codex/stage3j6-termination codex/stage3j7-rough-energy timeout-bootstrap-diag codex/st7-opt4-angular-rate
 ```
 
-**tip 在主干上（迁移/main 已保护，直接删零损失）**：
+**tip 在 main 上（合并后验证 ancestry，再删除）**：
 ```bash
 git push origin --delete cyy codex/stage3j8-hard-level-replay codex/stage3j9-fixed-learning-rate codex/st7-opt1a-speed-wall-stall codex/st7-opt2a-tilt-limit codex/st7-opt2b-dynamic-stability codex/st7-opt3
 # deploy 已 subtree 导入，历史作为第二父保留，可删：
-git push origin --delete deploy/jetson-sim2real
+git push origin --delete deploy/jetson-sim2real codex/repository-layout-migration
 ```
 
-**必须保留分支（活动实验路线，其 tip 不被 main 保护）**：
-- `codex/st7-opt5-hard-start-replay`（已 tag，保留）
-- `codex/st7-opt5-debug`（已 tag，保留）
-- `codex/st9-opt3-d1`（已 tag，保留）
+**Opt5 稳定节点**：`codex/st7-opt5-hard-start-replay` 的 tip 已有 tag 且是活动 Opt5-debug/Opt5B 分支祖先，验证后删除该分支。
+
+**最终保留分支**：
+- `main`
+- `codex/st7-opt5-debug`（`c603ed7`，另建 Opt5B tag）
+- `codex/st9-opt3-d1`（`5ea7ba9`）
 
 ## 6. 给审查 AI 的指引
 
@@ -107,7 +114,7 @@ git push origin --delete deploy/jetson-sim2real
 - `shared/project-context/branch-migration-register.md`（源 SHA 锚点 + 分支分类 + 安全删除判定）
 - `shared/project-context/repository-layout.md`（四层结构 + 重命名显示说明）
 - `server/CHANGELOG.md`（J9/Opt4 移植记录 + 接口-only 决策）
-- `分析记录/版本训练演进与改动规模详解.md`（各版本训练演进与改动规模）
+- `shared/分析记录/版本训练演进与改动规模详解.md`（各版本训练演进与改动规模）
 - `shared/interfaces/server-deploy-contract.md`（stub，待人工填充 server↔deploy 契约）
 
 **回滚**：迁移在独立 worktree/分支完成，未合入 main 前可 `git worktree remove /Users/nanbloom001/codespace/fwwb-migration` 放弃；合入后用 `git revert`（deploy subtree 用 `git revert -m 1`），禁 reset/rebase/force-push。

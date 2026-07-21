@@ -8,7 +8,7 @@
 Kaiwu_Final_Stage/
 ├── README.md
 ├── .gitignore              # 仓库级规则
-├── server/                 # 训练运行时（活动基线 = ST7-Opt3）
+├── server/                 # 训练运行时（Opt3 基线 + J9 接口 + Opt4）
 │   ├── README.md
 │   ├── CHANGELOG.md
 │   ├── .gitignore          # server 独立使用时的缓存规则
@@ -55,7 +55,7 @@ Kaiwu_Final_Stage/
 
 - 迁移日期：2026-07-21
 - 迁移分支：`codex/repository-layout-migration`（起点 `codex/st7-opt3` = `9b0b3df`）
-- 迁移方式：独立 worktree，`git mv` 整体移动，不重写历史、不删除旧分支、不 force-push。
+- 迁移方式：独立 worktree，`git mv` 整体移动，不重写历史、不 force-push；合入后只删除已被 `main`、保留实验分支或 annotated tag 保护的远程分支。
 - 回滚：每个阶段单独提交；合并后只用 `git revert`（subtree 合并用 `git revert -m 1`）。
 
 ## 路径移动后的适配验证

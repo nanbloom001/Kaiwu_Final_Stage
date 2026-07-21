@@ -18,8 +18,9 @@
 
 ## 活动基线
 
-- **基线**：`codex/st7-opt3`（提交 `9b0b3df`，ST7 Opt3 UWB goal noise）
-- 含 ST7-Opt2B `dynamic_tilt_risk`、ST7-Opt3 `goal_noise`、行为蒸馏/LBC 机制（在 `codex/st7-opt2a` 并入主干）
+- **起始基线**：`codex/st7-opt3`（提交 `9b0b3df`，ST7 Opt3 UWB goal noise）
+- **当前活动代码**：Opt3 基线 + J9 通用学习率接口修复 + Opt4 角速度保护；TrackNav 保持自适应 `1.5e-5`，未提升 J9 fixed 实验为默认配置。
+- 含 ST7-Opt2B `dynamic_tilt_risk`、ST7-Opt3 `goal_noise`、行为蒸馏/LBC 机制（在 `codex/st7-opt2a` 并入主干）。
 
 ## 运行约定
 

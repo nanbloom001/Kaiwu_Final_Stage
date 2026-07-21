@@ -14,8 +14,9 @@
 - **ST7-Opt3**（`9b0b3df`，2026-07-20）：UWB goal noise。Actor 接收几何一致的 UWB 式 goal 噪声（75% 环境的 bearing/distance jitter + per-episode bias），Critic/奖励/完成检查继续用干净真值。父 = ST7-Opt2B（`595693`）。
 - 含 ST7-Opt2B `dynamic_tilt_risk`（连续倾斜风险惩罚）、行为蒸馏/LBC 机制（`codex/st7-opt2a` 并入）。
 
-## 待补（后续阶段，未执行）
+## 仓库迁移状态
 
-- 阶段 3：`git subtree add --prefix=deploy` 导入部署树 + 四套 `ARTIFACTS.md`。
-- 阶段 4：纳入未跟踪资料（378413/分析报告/旧部署包）+ 凭证/license 扫描。
-- 阶段 5：PR 合入 main（merge commit，非 squash/rebase）+ main 保护 + 验证（训练周期 + Jetson 部署）。
+- 阶段 3 已完成：`deploy/` 通过保留第二父的 subtree merge 导入，四套目录均有 `ARTIFACTS.md`。
+- 阶段 4 已完成：378413、分析报告和旧部署包分别纳入 `archive/` 与 `shared/`。
+- 阶段 5：通过 PR merge commit 合入 `main`，随后按分支登记执行带远程 SHA 复核的分支收敛。
+- 训练长跑与 Jetson 真机验证属于后续模型发布验收，不作为本次仓库布局合并的阻断条件。
