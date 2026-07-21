@@ -4,6 +4,14 @@
 
 ## [未发布]
 
+- **[standard-distill-1]** 新增基于 hjcnew 10288 Standard 教师的 77-D
+  视觉蒸馏阶段，并设为当前入口。训练命令覆盖低速前后、横移和双向转动，
+  开启 Standard 地形课程、摩擦随机化、观测噪声和深度增强；第一阶段关闭
+  外部 push，后续可从最佳 checkpoint 单独开启。相机安装外参更新为
+  `offset_pos=[0.339871,0.034697,0.075010]`、
+  `offset_rot=[0.982631,-0.007085,0.184337,-0.020153]`，评估时从当前阶段
+  TOML 注入相同外参。复用现有动作蒸馏、DAgger 和序列训练代码，网络与
+  checkpoint 接口不变。
 - **[遗留路线收敛]** 将 `codex/st7-opt5-debug` 的 Opt5/Opt5-debug/Opt5B
   困难段出生模块、独立 TOML、监控、契约测试和实验文档迁入 `server/`；
   `Config.CURRENT` 保持 ST9-Opt3-D2，不启用 hard-start。补入 ST9-Opt3-D1

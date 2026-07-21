@@ -254,6 +254,31 @@ class LBCLocoConfig(StageConfig):
     teacher_actor_activation = "elu"
 
 
+class HJCNew10288LBCLocoConfig(LBCLocoConfig):
+    """Standard depth LBC compatible with the hjcnew 10288 teacher.
+
+    The teacher actor consumes proprio45 + latent32 = 77 inputs. It must not
+    be routed through the goal-aware Track LBC contract.
+    """
+
+    name = "hjcnew10288_lbc_loco"
+    task_type = "standard"
+    ckpt_name = "model.ckpt-hjcnew"
+    num_goal_obs = 0
+
+
+class StandardDistill1Config(HJCNew10288LBCLocoConfig):
+    """All-direction Standard visual distillation with calibrated camera pose.
+
+    Parent teacher: hjcnew distilled checkpoint 10288. Network dimensions and
+    observation ordering remain identical to the 77-D Standard teacher.
+    """
+
+    name = "standard_distill_1"
+    parent_checkpoint = "hjcnew Standard teacher checkpoint 10288"
+    ckpt_name = "model.ckpt-standard"
+
+
 class TrackLBCLocoConfig(LBCLocoConfig):
     """Depth-camera distillation for the UWB-guided TrackNav teacher."""
 
@@ -293,9 +318,9 @@ class Config:
 
     # Explicit stage selector for both training and evaluation.
     # 训练和评估均显式使用该阶段，避免环境名称误改模型结构。
-    # T2 continues the previous TrackNav checkpoint with a reference-13-style
-    # full-track stabilization setup, capped at 0.8 m/s.
-    CURRENT = TrackLBCLocoD2Config
+    # standard-distill-1 is the active platform training stage. Other stages
+    # remain reproducible through their independent TOML files.
+    CURRENT = StandardDistill1Config
 
     @staticmethod
     def load_conf(logger):
@@ -354,6 +379,32 @@ class Config:
                 f"[eval] Keep explicit stage '{stage.name}' for task "
                 f"'{task_name}' (terrain.mode='{mode}')"
             )
+
+            # The platform evaluation TOML does not necessarily carry the
+            # camera mount calibration. Keep the explicitly selected model
+            # stage and inject its training-time camera section so evaluation
+            # uses the same geometry as visual distillation.
+            train_toml = (
+                f"agent_ppo/conf/train_env_conf_{task_type}_{stage.name}.toml"
+            )
+            if os.path.exists(train_toml):
+                try:
+                    train_conf = _load_toml(train_toml)
+                    camera_conf = train_conf.get("camera")
+                    if camera_conf:
+                        existing = usr_conf.get("camera")
+                        usr_conf["camera"] = (
+                            _deep_merge(existing, camera_conf)
+                            if isinstance(existing, dict)
+                            else camera_conf
+                        )
+                        logger.info(
+                            f"[eval] Injected [camera] override from {train_toml}"
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        f"[eval] Failed to inject [camera] from {train_toml}: {exc}"
+                    )
 
         logger.info(f"Stage: {stage.name}, task_type: {task_type}, model: {stage.model_class}")
         parent_checkpoint = getattr(stage, "parent_checkpoint", None)
