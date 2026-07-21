@@ -64,12 +64,34 @@ def _build_lbc_monitor():
     return monitor.build()
 
 
+def _build_behavior_distill_monitor():
+    monitor = MonitorConfigBuilder().title("Standard_Distill_1")
+    monitor.add_group(group_name="行为蒸馏", group_name_en="behavior_distill")
+    panels = (
+        ("动作均方差", "action_mse", "action_mse"),
+        ("动作距离", "action_l2", "action_l2"),
+        ("动作余弦", "action_cos", "action_cos"),
+        ("教师动作幅值", "teacher_abs", "teacher_abs"),
+        ("学生动作幅值", "student_abs", "student_abs"),
+        ("梯度范数", "grad_norm", "grad_norm"),
+        ("训练轮次", "iteration", "iteration"),
+        ("累计步数", "total_steps", "total_steps"),
+    )
+    for display_name, panel_name, metric_name in panels:
+        _add_line_panel(monitor, display_name, panel_name, metric_name)
+    monitor.end_group()
+    return monitor.build()
+
+
 def build_monitor():
     """Build panels whose display and metric names stay within 20 characters."""
     from agent_ppo.conf.conf import Config
 
-    if getattr(Config.CURRENT, "algorithm", "ppo") == "lbc_loco":
+    algorithm = getattr(Config.CURRENT, "algorithm", "ppo")
+    if algorithm == "lbc_loco":
         return _build_lbc_monitor()
+    if algorithm == "behavior_distill":
+        return _build_behavior_distill_monitor()
 
     monitor = MonitorConfigBuilder()
     return (

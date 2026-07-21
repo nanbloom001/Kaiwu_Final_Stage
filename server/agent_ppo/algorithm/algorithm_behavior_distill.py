@@ -63,6 +63,7 @@ class AlgorithmBehaviorDistill:
             activation=teacher_activation,
         ).to(device)
         self.teacher_loaded = False
+        self.teacher_source = None
         if teacher_ckpt:
             self._load_teacher(teacher_ckpt)
         self._freeze_teacher()
@@ -79,13 +80,30 @@ class AlgorithmBehaviorDistill:
     def load_teacher_state_dict(self, ckpt: dict, source: str = "<preload>") -> None:
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             ckpt = ckpt["model_state_dict"]
-        missing, unexpected = self.teacher.load_state_dict(ckpt, strict=False)
-        if missing:
-            raise KeyError(f"Flat standard teacher missing keys: {missing}")
-        # Some reference checkpoints include optimizer/training extras. They are ignored.
-        if self.logger is not None and unexpected:
-            self.logger.info(f"[BehaviorDistill] ignored unexpected teacher keys: {unexpected}")
+        if not isinstance(ckpt, dict):
+            raise TypeError(
+                f"Flat standard teacher must be a state-dict, got {type(ckpt).__name__}"
+            )
+
+        expected = self.teacher.state_dict()
+        missing = sorted(set(expected) - set(ckpt))
+        unexpected = sorted(set(ckpt) - set(expected))
+        mismatched = sorted(
+            key
+            for key in set(expected) & set(ckpt)
+            if not hasattr(ckpt[key], "shape")
+            or tuple(ckpt[key].shape) != tuple(expected[key].shape)
+        )
+        if missing or unexpected or mismatched:
+            raise ValueError(
+                "Flat standard teacher contract mismatch: "
+                f"missing={missing}, unexpected={unexpected}, "
+                f"shape_mismatch={mismatched}"
+            )
+
+        self.teacher.load_state_dict(ckpt, strict=True)
         self.teacher_loaded = True
+        self.teacher_source = source
         if self.logger is not None:
             self.logger.info(f"[BehaviorDistill] loaded flat standard teacher from {source}")
 

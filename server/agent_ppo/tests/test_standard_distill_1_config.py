@@ -16,7 +16,11 @@ except ModuleNotFoundError:  # pragma: no cover
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from agent_ppo.conf.conf import Config, StandardDistill1Config
+from agent_ppo.conf.conf import (
+    Config,
+    StandardDistill1Config,
+    StandardVisualDistill1Config,
+)
 from agent_ppo.agent import _checkpoint_candidates, _checkpoint_id_from_name
 
 
@@ -28,6 +32,14 @@ CONFIG_PATH = os.path.abspath(
         "train_env_conf_standard_standard_distill_1.toml",
     )
 )
+VISUAL_CONFIG_PATH = os.path.abspath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "conf",
+        "train_env_conf_standard_standard_visual_distill_1.toml",
+    )
+)
 
 
 def _load_config():
@@ -35,13 +47,14 @@ def _load_config():
         return tomllib.load(config_file)
 
 
-def test_active_stage_preserves_standard_teacher_contract():
+def test_active_stage_is_flat_to_encoder_behavior_bridge():
     assert Config.CURRENT is StandardDistill1Config
     assert StandardDistill1Config.task_type == "standard"
-    assert StandardDistill1Config.algorithm == "lbc_loco"
+    assert StandardDistill1Config.algorithm == "behavior_distill"
     assert StandardDistill1Config.num_goal_obs == 0
-    assert StandardDistill1Config.proprio_dim + StandardDistill1Config.latent_dim == 77
-    assert StandardDistill1Config.ckpt_name == "model.ckpt-standard"
+    assert StandardDistill1Config.teacher_num_obs == 301
+    assert StandardDistill1Config.num_proprio_obs + StandardDistill1Config.latent_dim == 77
+    assert StandardDistill1Config.ckpt_name == "model.ckpt-locomotion"
 
 
 def test_all_direction_low_speed_curriculum_and_push_phase():
@@ -60,7 +73,8 @@ def test_all_direction_low_speed_curriculum_and_push_phase():
 
 
 def test_camera_and_sequence_distillation_contract():
-    config = _load_config()
+    with open(VISUAL_CONFIG_PATH, "rb") as config_file:
+        config = tomllib.load(config_file)
     camera = config["camera"]["depth_camera"]
     quaternion = camera["offset_rot"]
     norm = math.sqrt(sum(component * component for component in quaternion))
@@ -69,11 +83,22 @@ def test_camera_and_sequence_distillation_contract():
     assert quaternion == [0.982631, -0.007085, 0.184337, -0.020153]
     assert norm == pytest.approx(1.0, abs=1e-6)
 
-    stage = config["standard_distill_1"]
+    stage = config["standard_visual_distill_1"]
     assert stage["sequence_length"] == 8
     assert stage["student_drive_phase_fractions"] == [0.03, 0.47, 0.50]
     assert stage["student_drive_ratios"] == [0.0, 0.5, 1.0]
     assert stage["action_loss_weight"] == 0.2
+    assert StandardVisualDistill1Config.algorithm == "lbc_loco"
+    assert StandardVisualDistill1Config.num_goal_obs == 0
+
+
+def test_behavior_bridge_uses_flat_teacher_and_teacher_driven_states():
+    config = _load_config()
+    assert config["env_conf"]["task_name"] == "Unitree-Go2-Velocity"
+    assert "camera" not in config
+    stage = config["standard_distill_1"]
+    assert stage["action_loss_weight"] == 1.0
+    assert stage["student_drive"] is False
 
 
 def test_platform_checkpoint_discovery_accepts_labels_and_extensions(tmp_path):

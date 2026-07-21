@@ -1,13 +1,13 @@
-# standard-distill-1: Standard depth-camera LBC from the hjcnew 10288 teacher.
-# Teacher contract: height encoder 256->512->256->32; actor 77->512->256->128->12.
-# Commands include low-speed forward/backward, lateral, and yaw samples.
+# standard-distill-1: behavior-distillation bridge from flat Standard 10288.
+# Frozen teacher: ActorCritic, actor input proprio45 + height_scan256 = 301.
+# Student: ActorCriticEncoder, actor input proprio45 + latent32 = 77.
 
 [env]
-num_envs = 128
+num_envs = 1024
 episode_length_s = 25.0
 
 [env_conf]
-task_name = "Unitree-Go2-Velocity-Camera"
+task_name = "Unitree-Go2-Velocity"
 seed = 0
 
 [terrain]
@@ -63,43 +63,15 @@ lin_vel_y = [-0.10, 0.10]
 ang_vel_yaw = [-0.60, 0.60]
 
 [standard_distill_1]
-learning_rate = 5e-4
-lr_min = 1e-5
-max_iterations = 10000
+learning_rate = 3e-4
+max_iterations = 5000
 max_grad_norm = 1.0
-log_interval = 100
-save_interval = 250
+log_interval = 50
+save_interval = 500
 num_steps_per_env = 24
-sequence_length = 8
+action_loss_weight = 1.0
 
-# Closed-loop distillation uses the current sequence-aware DAgger workflow.
-# The first 3% is teacher-driven, followed by mixed and fully student-driven
-# phases. This replaces the legacy warmup/linear-anneal keys that the current
-# workflow no longer consumes.
-student_drive = true
-student_drive_phase_fractions = [0.03, 0.47, 0.50]
-student_drive_ratios = [0.00, 0.50, 1.00]
-
-latent_loss_type = "legacy_mse"
-action_loss_type = "mse"
-latent_loss_weight = 1.0
-cosine_loss_weight = 0.0
-action_loss_weight = 0.2
-
-[depth_aug]
-enabled = true
-pixel_dropout_prob = 0.10
-gaussian_noise_scale = 0.02
-edge_dropout_prob = 0.10
-hole_patch_prob = 0.20
-hole_patch_size = [4, 16]
-hole_hold_steps = [2, 8]
-frame_hold_prob = 0.10
-frame_hold_steps = [1, 5]
-blur_kernel_size = 3
-roll_range_deg = 5.0
-pitch_shift_pix = 6
-
-[camera.depth_camera]
-offset_pos = [0.339871, 0.034697, 0.075010]
-offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
+# Keep teacher-driven states in the first bridge run. Closed-loop student
+# recovery is a separate follow-up after action agreement is validated.
+student_drive = false
+teacher_warmup_iterations = 0

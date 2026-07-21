@@ -255,10 +255,11 @@ class LBCLocoConfig(StageConfig):
 
 
 class HJCNew10288LBCLocoConfig(LBCLocoConfig):
-    """Standard depth LBC compatible with the hjcnew 10288 teacher.
+    """Legacy visual-stage label for a bridged 10288 teacher.
 
-    The teacher actor consumes proprio45 + latent32 = 77 inputs. It must not
-    be routed through the goal-aware Track LBC contract.
+    Raw checkpoint 10288 is a 301-D flat ActorCritic and is not compatible with
+    this stage. Run StandardDistill1 first and preload its 77-D
+    ActorCriticEncoder output instead.
     """
 
     name = "hjcnew10288_lbc_loco"
@@ -267,15 +268,40 @@ class HJCNew10288LBCLocoConfig(LBCLocoConfig):
     num_goal_obs = 0
 
 
-class StandardDistill1Config(HJCNew10288LBCLocoConfig):
-    """All-direction Standard visual distillation with calibrated camera pose.
+class StandardDistill1Config(LocomotionConfig):
+    """Bridge flat Standard 10288 into the 77-D privileged LBC contract.
 
-    Parent teacher: hjcnew distilled checkpoint 10288. Network dimensions and
-    observation ordering remain identical to the 77-D Standard teacher.
+    The frozen teacher is the legacy ActorCritic with a 301-D actor input. The
+    student is the current ActorCriticEncoder. Only action behavior is distilled
+    in this stage; depth-camera distillation starts after this bridge succeeds.
     """
 
     name = "standard_distill_1"
-    parent_checkpoint = "hjcnew Standard teacher checkpoint 10288"
+    algorithm = "behavior_distill"
+    parent_checkpoint = "flat Standard ActorCritic checkpoint 10288"
+    ckpt_name = "model.ckpt-locomotion"
+
+    lr = 3e-4
+    num_steps_per_env = 24
+    max_iterations = 5000
+    max_grad_norm = 1.0
+    log_interval = 50
+    model_save_interval = 500
+
+    teacher_num_obs = 301
+    teacher_num_critic_obs = 316
+    teacher_actor_hidden_dims = [512, 256, 128]
+    teacher_critic_hidden_dims = [512, 256, 128]
+    teacher_activation = "elu"
+
+
+class StandardVisualDistill1Config(LBCLocoConfig):
+    """Depth-camera LBC stage after the behavior-distilled bridge teacher."""
+
+    name = "standard_visual_distill_1"
+    task_type = "standard"
+    num_goal_obs = 0
+    parent_checkpoint = "accepted StandardDistill1 ActorCriticEncoder checkpoint"
     ckpt_name = "model.ckpt-standard"
 
 
