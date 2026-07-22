@@ -23,6 +23,7 @@ from collections import deque, defaultdict
 _R1_REWARD_KEYS = {
     "reward_track_lin_vel_xy": "rew_vx",
     "reward_track_ang_vel_z": "rew_yaw",
+    "reward_straight_heading": "rew_heading",
     "reward_flat_orientation": "rew_flat",
     "reward_undesired_contacts": "rew_contact",
     "reward_termination": "rew_term",
@@ -436,6 +437,8 @@ def _initialize_training_runtime_state(env, agent, logger):
         critic_obs = obs
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
+    if getattr(agent, "is_visual_ppo", False):
+        _update_straight_heading_reference(env, logger=logger)
     logger.info(f"obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
 
     # Raw reward keys are mapped to compact dashboard names at report time.
@@ -1013,6 +1016,33 @@ def _find_robot_asset_in_scene(isaac_env):
             return asset
 
     return None
+
+
+def _update_straight_heading_reference(env, dones=None, logger=None):
+    """Capture the post-reset world yaw used by straight_heading reward."""
+    isaac_env = _resolve_wrapped_isaac_env(env)
+    asset = _find_robot_asset_in_scene(isaac_env)
+    if isaac_env is None or asset is None or not hasattr(asset.data, "root_quat_w"):
+        if logger is not None and not getattr(env, "_heading_reference_error_logged", False):
+            env._heading_reference_error_logged = True
+            logger.warning("[StraightHeading] Cannot resolve robot yaw for reset reference")
+        return
+
+    quat = asset.data.root_quat_w
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    yaw = torch.atan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    ).detach()
+    reference = getattr(isaac_env, "_straight_heading_reference_yaw", None)
+    if reference is None or reference.shape != yaw.shape:
+        reference = yaw.clone()
+    elif dones is None:
+        reference.copy_(yaw)
+    else:
+        done_mask = dones.to(device=yaw.device).reshape(-1).bool()
+        reference[done_mask] = yaw[done_mask]
+    isaac_env._straight_heading_reference_yaw = reference
 
 
 def _hard_start_monitor_metrics(env):
@@ -1667,6 +1697,8 @@ def collect_rollout_batch(
                 dones,
                 agent.device,
             )
+            if getattr(agent, "is_visual_ppo", False):
+                _update_straight_heading_reference(env, dones=dones, logger=logger)
             timeout_bootstrap_values = _evaluate_timeout_bootstrap_values(
                 obs,
                 critic_obs,

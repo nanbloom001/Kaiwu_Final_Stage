@@ -326,6 +326,33 @@ class StandardDistill3ActionConfig(LBCLocoConfig):
     parent_checkpoint = "D2-40min visual student checkpoint"
 
 
+class StandardVisualPPO1HeadingConfig(LBCLocoConfig):
+    """STD-D4A: visual PPO heading fine-tune from the best D3A student."""
+
+    name = "standard_visual_ppo_1_heading"
+    task_type = "standard"
+    algorithm = "visual_ppo"
+    model_class = "VisualActorCritic"
+    ckpt_name = "model.ckpt-standard-visual-ppo-1-heading"
+    parent_checkpoint = "best D3A visual student checkpoint"
+
+    lr = 1.0e-4
+    schedule = "fixed"
+    min_learning_rate = 1.0e-4
+    max_learning_rate = 1.0e-4
+    num_steps_per_env = 8
+    num_learning_epochs = 2
+    num_mini_batches = 4
+    clip_param = 0.10
+    entropy_coef = 0.001
+    desired_kl = None
+    init_noise_std = 0.25
+    min_normalized_std = [0.05] * 12
+    max_normalized_std = [0.50] * 12
+    model_save_interval = 50
+    action_anchor_ema = 0.0
+
+
 class TrackLBCLocoConfig(LBCLocoConfig):
     """Depth-camera distillation for the UWB-guided TrackNav teacher."""
 
@@ -365,9 +392,9 @@ class Config:
 
     # Explicit stage selector for both training and evaluation.
     # 训练和评估均显式使用该阶段，避免环境名称误改模型结构。
-    # STD-D3A is the active platform training stage. D1 and D2 remain
-    # reproducible through their independent TOML files.
-    CURRENT = StandardDistill3ActionConfig
+    # STD-D4A is the active platform training stage. D1-D3 remain reproducible
+    # through their independent TOML files.
+    CURRENT = StandardVisualPPO1HeadingConfig
 
     @staticmethod
     def load_conf(logger):

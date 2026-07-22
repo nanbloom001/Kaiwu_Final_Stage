@@ -100,8 +100,13 @@ def build_monitor():
         return _build_behavior_distill_monitor()
 
     monitor = MonitorConfigBuilder()
+    ppo_title = (
+        "STD_D4A_Visual_PPO"
+        if algorithm == "visual_ppo"
+        else "Standard_PPO"
+    )
     return (
-        monitor.title("Standard_PPO")
+        monitor.title(ppo_title)
         .add_group(group_name="训练", group_name_en="train")
         .add_panel(name="回合步数", name_en="ep_steps", type="line")
             .add_metric(metrics_name="ep_steps", expr="avg(ep_steps{})")
@@ -130,6 +135,9 @@ def build_monitor():
         .add_panel(name="学习率", name_en="learning_rate", type="line")
             .add_metric(metrics_name="learning_rate", expr="avg(learning_rate{})")
             .end_panel()
+        .add_panel(name="动作锚定", name_en="anchor_coef", type="line")
+            .add_metric(metrics_name="action_anchor_coef", expr="avg(action_anchor_coef{})")
+            .end_panel()
         .end_group()
 
         .add_group(group_name="速度", group_name_en="speed")
@@ -147,6 +155,9 @@ def build_monitor():
             .end_panel()
         .add_panel(name="偏航奖励", name_en="rew_yaw", type="line")
             .add_metric(metrics_name="rew_yaw", expr="avg(rew_yaw{})")
+            .end_panel()
+        .add_panel(name="航向约束", name_en="rew_heading", type="line")
+            .add_metric(metrics_name="rew_heading", expr="avg(rew_heading{})")
             .end_panel()
         .add_panel(name="速度对照", name_en="vx_stat", type="stat")
             .add_metric(metrics_name="vx_cmd", expr="avg(vx_cmd{})")

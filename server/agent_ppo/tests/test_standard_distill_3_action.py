@@ -14,7 +14,6 @@ except ModuleNotFoundError:  # pragma: no cover
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from agent_ppo.conf.conf import (
-    Config,
     LBCLocoConfig,
     StandardDistill2StairConfig,
     StandardDistill3ActionConfig,
@@ -29,8 +28,7 @@ def _load(filename):
         return tomllib.load(config_file)
 
 
-def test_d3a_is_the_active_lbc_continuation_stage():
-    assert Config.CURRENT is StandardDistill3ActionConfig
+def test_d3a_remains_a_reproducible_lbc_continuation_stage():
     assert issubclass(StandardDistill3ActionConfig, LBCLocoConfig)
     assert StandardDistill3ActionConfig is not StandardDistill2StairConfig
     assert StandardDistill3ActionConfig.task_type == "standard"
@@ -111,4 +109,3 @@ def test_workflow_logs_the_verified_student_resume_source():
         source = workflow_file.read()
     assert "algorithm.assert_student_ready()" in source
     assert "resumed visual student checkpoint" in source
-

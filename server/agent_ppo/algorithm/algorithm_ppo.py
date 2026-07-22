@@ -141,11 +141,18 @@ class AlgorithmPPO:
         self.storage = None
         self.reference_actor_critic = None
         self.action_anchor_coef = 0.0
+        self.action_anchor_decay_updates = 0
 
-    def set_reference_policy(self, reference_model: nn.Module, action_anchor_coef: float = 0.0):
+    def set_reference_policy(
+        self,
+        reference_model: nn.Module,
+        action_anchor_coef: float = 0.0,
+        decay_updates: int = 0,
+    ):
         """Freeze the preloaded policy and use it as a cumulative-drift anchor."""
         self.reference_actor_critic = reference_model
         self.action_anchor_coef = float(action_anchor_coef)
+        self.action_anchor_decay_updates = max(int(decay_updates), 0)
         if self.reference_actor_critic is not None:
             self.reference_actor_critic.eval()
             for param in self.reference_actor_critic.parameters():
@@ -331,7 +338,13 @@ class AlgorithmPPO:
                 actions_log_prob_batch, old_actions_log_prob_batch, advantages_batch
             )
             value_loss = self._compute_value_loss(value_batch, returns_batch, target_values_batch)
-            action_anchor_loss = self._compute_action_anchor_loss(obs_batch, mu_batch)
+            action_anchor_loss = self._compute_action_anchor_loss(
+                obs_batch,
+                mu_batch,
+                hidden_states=hid_states_batch,
+                masks=masks_batch,
+            )
+            effective_anchor_coef = self._effective_action_anchor_coef()
 
             # Combine losses
             # 组合损失
@@ -339,7 +352,7 @@ class AlgorithmPPO:
                 surrogate_loss
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy_batch.mean()
-                + self.action_anchor_coef * action_anchor_loss
+                + effective_anchor_coef * action_anchor_loss
             )
 
             # NaN/Inf guard: skip this mini-batch update entirely if loss is invalid
@@ -435,13 +448,28 @@ class AlgorithmPPO:
         self,
         obs_batch: torch.Tensor,
         mu_batch: torch.Tensor,
+        hidden_states=None,
+        masks=None,
     ) -> torch.Tensor:
-        if self.reference_actor_critic is None or self.action_anchor_coef <= 0.0:
+        if self.reference_actor_critic is None or self._effective_action_anchor_coef() <= 0.0:
             return mu_batch.new_tensor(0.0)
 
         with torch.no_grad():
-            ref_mu = self.reference_actor_critic.act_inference(obs_batch)
+            if getattr(self.reference_actor_critic, "is_recurrent", False):
+                ref_mu = self.reference_actor_critic.act_inference(
+                    obs_batch,
+                    hidden_states=hidden_states,
+                    masks=masks,
+                )
+            else:
+                ref_mu = self.reference_actor_critic.act_inference(obs_batch)
         return torch.mean(torch.square(mu_batch - ref_mu.detach()))
+
+    def _effective_action_anchor_coef(self) -> float:
+        if self.action_anchor_decay_updates <= 0:
+            return self.action_anchor_coef
+        remaining = 1.0 - self.train_step / float(self.action_anchor_decay_updates)
+        return self.action_anchor_coef * max(0.0, remaining)
 
     def _blend_actor_towards_reference(self):
         if self.reference_actor_critic is None or self.action_anchor_ema <= 0.0:
@@ -574,9 +602,10 @@ class AlgorithmPPO:
                     mean_surrogate_loss
                     + mean_value_loss
                     + mean_entropy_loss
-                    + self.action_anchor_coef * mean_action_anchor_loss
+                    + self._effective_action_anchor_coef() * mean_action_anchor_loss
                 ),
                 "learning_rate": self.learning_rate,
+                "action_anchor_coef": self._effective_action_anchor_coef(),
             }
             if self.monitor:
                 self.monitor.put_data({os.getpid(): monitor_data})
