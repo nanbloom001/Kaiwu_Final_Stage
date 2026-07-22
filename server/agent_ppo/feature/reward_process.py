@@ -34,6 +34,15 @@ class RewardProcess(RewardProcessBase):
         pitch = torch.asin(sinp)
         return roll, pitch
 
+    @staticmethod
+    def _quat_to_yaw(quat: torch.Tensor) -> torch.Tensor:
+        """Extract world yaw from Isaac Lab WXYZ quaternions."""
+        w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+        return torch.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+
     # -----------------------------------------------------------------------
     # Locomotion quality rewards
     # -----------------------------------------------------------------------
@@ -76,6 +85,34 @@ class RewardProcess(RewardProcessBase):
         cmd = self._tracking_command(command_name)
         error = cmd[:, 2] - asset.data.root_ang_vel_b[:, 2]
         return torch.exp(-torch.square(error / max(std, 1e-6)))
+
+    def _reward_straight_heading(
+        self,
+        command_name: str = "base_velocity",
+        max_yaw_command: float = 0.10,
+        min_forward_command: float = 0.20,
+    ):
+        """Penalize yaw drift from each environment's reset heading.
+
+        A zero yaw-rate command alone does not correct an existing heading
+        offset. This term remains inactive while turning or standing still.
+        """
+        asset = self._get_robot_asset()
+        current_yaw = self._quat_to_yaw(asset.data.root_quat_w)
+        reference_yaw = getattr(self.env, "_straight_heading_reference_yaw", None)
+        if reference_yaw is None or reference_yaw.shape != current_yaw.shape:
+            reference_yaw = current_yaw.detach().clone()
+            self.env._straight_heading_reference_yaw = reference_yaw
+
+        heading_error = torch.atan2(
+            torch.sin(current_yaw - reference_yaw),
+            torch.cos(current_yaw - reference_yaw),
+        )
+        command = self._tracking_command(command_name)
+        straight_mask = (torch.abs(command[:, 2]) < max_yaw_command) & (
+            command[:, 0] > min_forward_command
+        )
+        return torch.square(heading_error) * straight_mask.float()
 
     def _reward_feet_air_time(self, command_name: str = "base_velocity", threshold: float = 0.5):
         """Reward long steps (feet air time above threshold when moving).

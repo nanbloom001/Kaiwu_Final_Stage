@@ -24,6 +24,7 @@ from kaiwudrl.interface.agent import BaseAgent
 from agent_ppo.feature.definition import ActData
 from agent_ppo.conf.conf import Config, _load_toml
 from agent_ppo.model.actor_critic_encoder import ActorCriticEncoder
+from agent_ppo.model.visual_actor_critic import VisualActorCritic
 from agent_ppo.algorithm.algorithm_ppo import AlgorithmPPO
 from tools.train_env_conf_validate import check_usr_conf
 
@@ -177,11 +178,18 @@ class Agent(BaseAgent):
         # 算法分发
         self.algorithm_name = getattr(stage, "algorithm", "ppo")
         self.is_lbc = self.algorithm_name == "lbc_loco"
+        self.is_visual_ppo = self.algorithm_name == "visual_ppo"
         self.is_behavior_distill = self.algorithm_name == "behavior_distill"
+
+        if self.is_visual_ppo:
+            depth_size = stage.depth_height * stage.depth_width * stage.depth_channels
+            self.num_obs += depth_size
 
         if self.is_lbc:
             # LBC 阶段：创建学生 + 教师；不初始化 PPO storage
             self._init_lbc_loco(num_proprio, num_scan, env_conf, stage, usr_conf)
+        elif self.is_visual_ppo:
+            self._init_visual_ppo(num_proprio, num_scan, stage, usr_conf)
         else:
             self._init_flat(num_proprio, num_scan, stage)
             if self.is_behavior_distill:
@@ -396,6 +404,76 @@ class Agent(BaseAgent):
             num_mini_batches=stage.num_mini_batches,
             num_learning_epochs=stage.num_learning_epochs,
         )
+
+    def _init_visual_ppo(self, num_proprio, num_scan, stage, usr_conf):
+        """Initialize recurrent depth Actor + privileged-state Critic PPO."""
+        self.visual_ppo_conf = usr_conf.get(stage.name, {})
+        if not self.is_eval:
+            self._validate_visual_ppo_training_config(usr_conf, stage)
+        self.model = VisualActorCritic(
+            num_proprio=num_proprio,
+            num_scan=num_scan,
+            depth_shape=(stage.depth_height, stage.depth_width, stage.depth_channels),
+            latent_dim=stage.latent_dim,
+            cnn_output_dim=stage.cnn_output_dim,
+            lstm_hidden_size=stage.lstm_hidden_size,
+            lstm_num_layers=stage.lstm_num_layers,
+            num_critic_obs=self.num_critic_obs,
+            num_actions=self.num_actions,
+            actor_hidden_dims=stage.actor_hidden_dims,
+            critic_hidden_dims=stage.critic_hidden_dims,
+            activation=stage.activation,
+            init_noise_std=getattr(stage, "init_noise_std", 0.25),
+        ).to(self.device)
+
+        self.optimizer = optim.Adam(self.model.parameters(), lr=stage.lr)
+        self.algorithm = AlgorithmPPO(
+            model=self.model,
+            optimizer=self.optimizer,
+            device=self.device,
+            logger=self.logger,
+            monitor=self.monitor,
+            learning_rate=stage.lr,
+            clip_param=getattr(stage, "clip_param", 0.2),
+            gamma=getattr(stage, "gamma", 0.99),
+            lam=getattr(stage, "lam", 0.95),
+            value_loss_coef=getattr(stage, "value_loss_coef", 1.0),
+            entropy_coef=getattr(stage, "entropy_coef", 0.01),
+            max_grad_norm=getattr(stage, "max_grad_norm", 1.0),
+            desired_kl=getattr(stage, "desired_kl", 0.01),
+            schedule=getattr(stage, "schedule", "adaptive"),
+            min_learning_rate=getattr(stage, "min_learning_rate", 1e-5),
+            max_learning_rate=getattr(stage, "max_learning_rate", 1e-2),
+            num_mini_batches=stage.num_mini_batches,
+            num_learning_epochs=stage.num_learning_epochs,
+        )
+        self.logger.info(
+            "[VisualPPO] Actor=depth+proprio (height scan ignored), "
+            f"Critic=privileged({self.num_critic_obs}), obs_dim={self.num_obs}, "
+            f"lr={stage.lr:.2e}"
+        )
+
+    def _validate_visual_ppo_training_config(self, usr_conf, stage):
+        """Fail before rollout if the D4A single-variable contract is broken."""
+        stage_conf = usr_conf.get(stage.name, {})
+        rewards = usr_conf.get("rewards", {})
+        required_zero_losses = ("latent_loss_weight", "latent_cosine_weight")
+        nonzero_losses = {
+            key: stage_conf.get(key)
+            for key in required_zero_losses
+            if float(stage_conf.get(key, 0.0)) != 0.0
+        }
+        if nonzero_losses:
+            raise ValueError(
+                f"[VisualPPO] Distillation losses must be disabled: {nonzero_losses}"
+            )
+        heading = rewards.get("straight_heading")
+        if not isinstance(heading, dict) or float(heading.get("weight", 0.0)) == 0.0:
+            raise ValueError(
+                "[VisualPPO] rewards.straight_heading must be active for D4A"
+            )
+        if bool(usr_conf.get("depth_aug", {}).get("enabled", False)):
+            raise ValueError("[VisualPPO] D4A requires depth_aug.enabled=false")
 
     def _init_lbc_loco(self, num_proprio, num_scan, env_conf, stage, usr_conf):
         """
@@ -631,6 +709,38 @@ class Agent(BaseAgent):
         else:
             model_file_path = os.path.join(path, f"model.ckpt-{str(id)}.pkl")
 
+        if self.is_visual_ppo:
+            reference_model = getattr(
+                self.algorithm, "reference_actor_critic", None
+            )
+            checkpoint = {
+                "format": "visual_ppo",
+                "stage": self.stage.name,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "train_step": self.algorithm.train_step,
+                "goal_dim": int(getattr(self.stage, "num_goal_obs", 0)),
+                "parent_checkpoint": getattr(self.stage, "parent_checkpoint", None),
+                "reference_model_state_dict": (
+                    reference_model.state_dict()
+                    if reference_model is not None
+                    else None
+                ),
+                "action_anchor_coef": float(self.algorithm.action_anchor_coef),
+                "action_anchor_decay_updates": int(
+                    self.algorithm.action_anchor_decay_updates
+                ),
+            }
+            torch.save(checkpoint, model_file_path)
+            self.logger.info(f"[VisualPPO] save {model_file_path} successfully")
+            platform_alias = os.path.join(path, f"model.ckpt-{str(id)}.pkl")
+            if os.path.abspath(platform_alias) != os.path.abspath(model_file_path):
+                torch.save(checkpoint, platform_alias)
+                self.logger.info(
+                    f"[VisualPPO] save platform alias {platform_alias} successfully"
+                )
+            return
+
         if self.is_lbc:
             # LBC saves via algorithm.save which writes the full LBC dict
             # (vision_encoder + teachers + optimizer + iter).
@@ -716,6 +826,9 @@ class Agent(BaseAgent):
         if self.is_lbc:
             self._load_lbc_loco(path, id)
             return
+        if self.is_visual_ppo:
+            self._load_visual_ppo(path, id)
+            return
         if self.is_behavior_distill:
             if self.is_eval:
                 self._load_flat(path, id)
@@ -723,6 +836,115 @@ class Agent(BaseAgent):
                 self._load_behavior_distill_teacher(path, id)
             return
         self._load_flat(path, id)
+
+    def _load_visual_ppo(self, path, id):
+        """Resume Visual PPO or initialize it strictly from a D3A LBC student."""
+        checkpoint_id = str(id)
+        ckpt_name = getattr(self.stage, "ckpt_name", "") or ""
+        preferred = [
+            os.path.join(path, f"{ckpt_name}-{checkpoint_id}.pkl"),
+            os.path.join(path, f"model.ckpt-{checkpoint_id}.pkl"),
+        ]
+        candidates = _checkpoint_candidates(path, id, preferred_paths=preferred)
+        rejected = []
+        for candidate in candidates:
+            try:
+                checkpoint = torch.load(
+                    candidate, weights_only=False, map_location=self.device
+                )
+            except Exception as exc:
+                rejected.append(f"{os.path.basename(candidate)}: load failed: {exc}")
+                continue
+
+            checkpoint_format = checkpoint.get("format") if isinstance(checkpoint, dict) else None
+            if checkpoint_format == "visual_ppo":
+                state = checkpoint.get("model_state_dict")
+                if not isinstance(state, dict) or not self._ckpt_exact_match(
+                    state, self.model.state_dict()
+                ):
+                    rejected.append(
+                        f"{os.path.basename(candidate)}: incompatible visual PPO model"
+                    )
+                    continue
+                reference_state = checkpoint.get("reference_model_state_dict")
+                if isinstance(reference_state, dict) and not self._ckpt_exact_match(
+                    reference_state, self.model.state_dict()
+                ):
+                    rejected.append(
+                        f"{os.path.basename(candidate)}: incompatible anchor model"
+                    )
+                    continue
+                self.model.load_state_dict(state)
+                if not self.is_eval and isinstance(
+                    checkpoint.get("optimizer_state_dict"), dict
+                ):
+                    self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                self.algorithm.train_step = int(checkpoint.get("train_step", 0))
+                if isinstance(reference_state, dict):
+                    reference_model = copy.deepcopy(self.model).to(self.device)
+                    reference_model.load_state_dict(reference_state)
+                    self.algorithm.set_reference_policy(
+                        reference_model,
+                        action_anchor_coef=float(
+                            checkpoint.get("action_anchor_coef", 0.0)
+                        ),
+                        decay_updates=int(
+                            checkpoint.get("action_anchor_decay_updates", 0)
+                        ),
+                    )
+                self._enforce_action_std_bounds()
+                self.model.reset()
+                self.cur_model_name = candidate
+                self.logger.info(
+                    f"[VisualPPO] resumed visual PPO checkpoint {candidate}, "
+                    f"train_step={self.algorithm.train_step}"
+                )
+                return
+
+            if checkpoint_format != "lbc_loco":
+                rejected.append(
+                    f"{os.path.basename(candidate)}: expected D3A lbc_loco or visual_ppo, "
+                    f"got {checkpoint_format!r}"
+                )
+                continue
+
+            vision_state = checkpoint.get("vision_encoder_state_dict")
+            actor_state = checkpoint.get("teacher_actor_state_dict")
+            if not isinstance(vision_state, dict) or not self._ckpt_exact_match(
+                vision_state, self.model.vision_encoder.state_dict()
+            ):
+                rejected.append(
+                    f"{os.path.basename(candidate)}: incompatible VisionEncoder"
+                )
+                continue
+            if not isinstance(actor_state, dict) or not self._ckpt_exact_match(
+                actor_state, self.model.actor.state_dict()
+            ):
+                rejected.append(f"{os.path.basename(candidate)}: incompatible Actor")
+                continue
+            if int(checkpoint.get("goal_dim", 0)) != int(
+                getattr(self.stage, "num_goal_obs", 0)
+            ):
+                rejected.append(f"{os.path.basename(candidate)}: incompatible goal_dim")
+                continue
+
+            self.model.vision_encoder.load_state_dict(vision_state)
+            self.model.actor.load_state_dict(actor_state)
+            self._enforce_action_std_bounds()
+            self.model.reset()
+            self.cur_model_name = candidate
+            self._install_action_anchor_policy()
+            self.logger.info(
+                f"[VisualPPO] initialized from D3A visual student checkpoint {candidate}; "
+                "VisionEncoder/LSTM/Actor restored, privileged Critic initialized for PPO"
+            )
+            return
+
+        raise FileNotFoundError(
+            f"[VisualPPO] No compatible D3A visual student for id={id} in {path}. "
+            f"Candidates={candidates}; rejected={rejected}. Do not select a teacher-only "
+            "or D2 checkpoint for this stage."
+        )
 
     def _load_behavior_distill_teacher(self, path, id):
         """Strictly load the platform-selected legacy flat ActorCritic teacher."""
@@ -832,15 +1054,27 @@ class Agent(BaseAgent):
         self.cur_model_name = model_file_path
 
     def _install_action_anchor_policy(self):
-        coef = float(getattr(self.stage, "action_anchor_coef", 0.0))
+        visual_conf = getattr(self, "visual_ppo_conf", {})
+        coef = float(
+            visual_conf.get(
+                "action_loss_weight",
+                getattr(self.stage, "action_anchor_coef", 0.0),
+            )
+        )
         if coef <= 0.0 or not hasattr(self, "algorithm"):
             return
 
+        decay_updates = int(visual_conf.get("action_loss_decay_updates", 0))
         reference_model = copy.deepcopy(self.model).to(self.device)
-        self.algorithm.set_reference_policy(reference_model, action_anchor_coef=coef)
+        self.algorithm.set_reference_policy(
+            reference_model,
+            action_anchor_coef=coef,
+            decay_updates=decay_updates,
+        )
         if self.logger is not None:
             self.logger.info(
                 f"[PPO] fixed pretrained-policy anchor enabled, coef={coef}, "
+                f"decay_updates={decay_updates}, "
                 f"ema={getattr(self.stage, 'action_anchor_ema', 0.0)}"
             )
 
