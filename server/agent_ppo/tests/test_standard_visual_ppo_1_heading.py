@@ -15,7 +15,7 @@ except ModuleNotFoundError:  # pragma: no cover
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from agent_ppo.conf.conf import Config, StandardVisualPPO1HeadingConfig
+from agent_ppo.conf.conf import StandardVisualPPO1HeadingConfig
 
 
 CONF_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "conf"))
@@ -27,9 +27,8 @@ def _load_config():
         return tomllib.load(config_file)
 
 
-def test_d4a_is_active_visual_ppo_stage():
+def test_d4a_remains_a_reproducible_visual_ppo_stage():
     stage = StandardVisualPPO1HeadingConfig
-    assert Config.CURRENT is stage
     assert stage.name == "standard_visual_ppo_1_heading"
     assert stage.algorithm == "visual_ppo"
     assert stage.model_class == "VisualActorCritic"
@@ -152,4 +151,3 @@ def test_visual_actor_ignores_privileged_scan_and_supports_sequences():
     assert output.shape == (3, batch, 12)
     output.square().mean().backward()
     assert any(parameter.grad is not None for parameter in model.vision_encoder.parameters())
-
