@@ -1067,7 +1067,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logs-settle-ms", type=int, default=4000)
     parser.add_argument("--zoom-out-steps", type=int, default=4)
     parser.add_argument("--zoom-settle-ms", type=int, default=6000)
-    parser.add_argument("--keep-har", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fail-on-empty-metrics", action="store_true")
     parser.add_argument(
         "--check",

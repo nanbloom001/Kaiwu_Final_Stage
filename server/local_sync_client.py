@@ -77,7 +77,6 @@ class CookieSelection:
 
     value: str
     source: str
-    cache_file: Path | None = None
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -273,7 +272,7 @@ def load_proxy_cookie(
         if cached_cookie:
             cookie = normalize_cookie_input(cached_cookie, cookie_name)
             print_cookie_feedback("cache", cookie, cookie_file)
-            return CookieSelection(cookie, "cache", cookie_file)
+            return CookieSelection(cookie, "cache")
 
     if not refresh_cookie and fallback_cookie.strip():
         cookie = normalize_cookie_input(fallback_cookie, cookie_name)
@@ -292,11 +291,7 @@ def load_proxy_cookie(
         cookie_file.parent.mkdir(parents=True, exist_ok=True)
         cookie_file.write_text(cookie, encoding="utf-8")
         print(f"Cookie saved to: {cookie_file}")
-    return CookieSelection(
-        cookie,
-        "prompt",
-        cookie_file if cookie and not no_save_cookie else None,
-    )
+    return CookieSelection(cookie, "prompt")
 
 
 def check_local_scope(root: Path, max_bytes: int) -> int:
