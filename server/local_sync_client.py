@@ -21,6 +21,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -68,6 +69,15 @@ USER_PROXY_COOKIE = "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3ODQyOTU0OD
 
 class TencentProxyAuthError(RuntimeError):
     """Raised when Tencent proxy rejects browser session Cookie."""
+
+
+@dataclass(frozen=True)
+class CookieSelection:
+    """Normalized Cookie plus the source used for safe invalidation."""
+
+    value: str
+    source: str
+    cache_file: Path | None = None
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -242,26 +252,36 @@ def print_cookie_feedback(source: str, cookie: str, cookie_file: Path | None = N
 
 
 def load_proxy_cookie(
-    proxy_cookie: str,
+    explicit_cookie: str,
+    fallback_cookie: str,
     cookie_file: Path,
     cookie_name: str,
     no_save_cookie: bool,
     no_cookie_prompt: bool,
-) -> str:
-    if proxy_cookie.strip():
-        cookie = normalize_cookie_input(proxy_cookie, cookie_name)
-        print_cookie_feedback("argument/env", cookie)
-        return cookie
+    refresh_cookie: bool = False,
+) -> CookieSelection:
+    if refresh_cookie and no_cookie_prompt:
+        raise ValueError("--refresh-cookie cannot be combined with --no-cookie-prompt")
 
-    if cookie_file.exists():
+    if not refresh_cookie and explicit_cookie.strip():
+        cookie = normalize_cookie_input(explicit_cookie, cookie_name)
+        print_cookie_feedback("argument/env", cookie)
+        return CookieSelection(cookie, "argument/env")
+
+    if not refresh_cookie and cookie_file.exists():
         cached_cookie = cookie_file.read_text(encoding="utf-8").strip()
         if cached_cookie:
             cookie = normalize_cookie_input(cached_cookie, cookie_name)
             print_cookie_feedback("cache", cookie, cookie_file)
-            return cookie
+            return CookieSelection(cookie, "cache", cookie_file)
+
+    if not refresh_cookie and fallback_cookie.strip():
+        cookie = normalize_cookie_input(fallback_cookie, cookie_name)
+        print_cookie_feedback("source fallback", cookie)
+        return CookieSelection(cookie, "source fallback")
 
     if no_cookie_prompt:
-        return ""
+        return CookieSelection("", "none")
 
     print("需要腾讯网页 IDE 的代理 Cookie。")
     print("你可以粘贴完整 Cookie，也可以只粘贴 kaiwu_token 的 Cookie Value。")
@@ -272,7 +292,37 @@ def load_proxy_cookie(
         cookie_file.parent.mkdir(parents=True, exist_ok=True)
         cookie_file.write_text(cookie, encoding="utf-8")
         print(f"Cookie saved to: {cookie_file}")
-    return cookie
+    return CookieSelection(
+        cookie,
+        "prompt",
+        cookie_file if cookie and not no_save_cookie else None,
+    )
+
+
+def check_local_scope(root: Path, max_bytes: int) -> int:
+    """Validate local sync scope without constructing a network client."""
+    if not root.is_dir():
+        print(f"local root is not a directory: {root}", file=sys.stderr)
+        return 2
+    existing_dirs = [name for name in SYNC_DIR_NAMES if (root / name).is_dir()]
+    missing_dirs = [name for name in SYNC_DIR_NAMES if name not in existing_dirs]
+    if not existing_dirs:
+        print(
+            f"no sync directories found under {root}; expected {SYNC_DIR_NAMES}",
+            file=sys.stderr,
+        )
+        return 2
+    files = collect_local_files(root, max_bytes)
+    total_bytes = sum(int(item["size"]) for item in files.values())
+    print(f"local root: {root}")
+    print(f"sync dirs: {', '.join(SYNC_DIR_NAMES)}")
+    print(f"present dirs: {', '.join(existing_dirs)}")
+    print(f"missing optional dirs: {', '.join(missing_dirs) if missing_dirs else 'none'}")
+    print(f"eligible files: {len(files)}")
+    print(f"eligible bytes: {total_bytes}")
+    for rel_path in sorted(files)[:20]:
+        print(f"  local: {rel_path} sha256={files[rel_path]['sha256']}")
+    return 0
 
 
 def sync_files(
@@ -287,12 +337,15 @@ def sync_files(
     print(f"remote root: {health.get('root')}")
 
     local_files = collect_local_files(root, max_bytes)
-    remote_files_all = client.get("/manifest").get("files", {}) if (skip_unchanged or delete_remote) else {}
+    inspect_manifest = skip_unchanged or delete_remote or dry_run
+    remote_files_all = (
+        client.get("/manifest").get("files", {}) if inspect_manifest else {}
+    )
     remote_files = {rel: meta for rel, meta in remote_files_all.items() if is_in_sync_scope(rel)}
     local_paths = set(local_files)
     remote_paths = set(remote_files)
 
-    if skip_unchanged:
+    if skip_unchanged or dry_run:
         changed = [
             rel
             for rel, item in local_files.items()
@@ -346,13 +399,30 @@ def main() -> int:
     parser.add_argument("--no-save-cookie", action="store_true", help="Do not save pasted Cookie")
     parser.add_argument("--clear-cookie", action="store_true", help="Delete cached Cookie and exit")
     parser.add_argument("--no-cookie-prompt", action="store_true", help="Do not prompt for Cookie when missing")
+    parser.add_argument(
+        "--refresh-cookie",
+        action="store_true",
+        help="Ignore explicit/cache/source Cookie and prompt for a fresh value",
+    )
     parser.add_argument("--root", default=".", help="Local project root")
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--max-bytes", type=int, default=32 * 1024 * 1024)
     parser.add_argument("--delete", action="store_true", help="Delete remote files absent locally")
     parser.add_argument("--skip-unchanged", action="store_true", help="Compare remote hashes and upload changed files only")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--check-local",
+        action="store_true",
+        help="Validate local sync scope without Cookie or network access",
+    )
     args = parser.parse_args()
+
+    root = Path(args.root).resolve()
+    if args.check_local:
+        if args.delete:
+            print("--check-local cannot be combined with --delete", file=sys.stderr)
+            return 2
+        return check_local_scope(root, args.max_bytes)
 
     if not args.token:
         print("missing token: pass --token or set IDE_SYNC_TOKEN", file=sys.stderr)
@@ -369,23 +439,43 @@ def main() -> int:
             print("Note: USER_PROXY_COOKIE is set in code; --clear-cookie does not modify source code.")
         return 0
 
-    root = Path(args.root).resolve()
-    proxy_cookie = load_proxy_cookie(
-        args.proxy_cookie or USER_PROXY_COOKIE,
-        cookie_file,
-        args.proxy_cookie_name,
-        args.no_save_cookie,
-        args.no_cookie_prompt,
+    try:
+        cookie_selection = load_proxy_cookie(
+            explicit_cookie=args.proxy_cookie,
+            fallback_cookie=USER_PROXY_COOKIE,
+            cookie_file=cookie_file,
+            cookie_name=args.proxy_cookie_name,
+            no_save_cookie=args.no_save_cookie,
+            no_cookie_prompt=args.no_cookie_prompt,
+            refresh_cookie=args.refresh_cookie,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    client = SyncClient(
+        normalize_base_url(args.url),
+        args.token,
+        args.timeout,
+        cookie_selection.value,
     )
-    client = SyncClient(normalize_base_url(args.url), args.token, args.timeout, proxy_cookie)
     try:
         sync_files(client, root, args.max_bytes, args.delete, args.dry_run, args.skip_unchanged)
     except TencentProxyAuthError as exc:
         print(str(exc), file=sys.stderr)
-        if cookie_file.exists():
+        print(
+            f"Rejected Cookie source: {cookie_selection.source}",
+            file=sys.stderr,
+        )
+        if cookie_selection.source == "cache" and cookie_file.exists():
             cookie_file.unlink()
-            print(f"Cached Cookie was rejected and has been deleted: {cookie_file}", file=sys.stderr)
-        print("请重新运行脚本并粘贴新的 Cookie。", file=sys.stderr)
+            print(
+                f"Cached Cookie was rejected and has been deleted: {cookie_file}",
+                file=sys.stderr,
+            )
+        print(
+            "请使用 --refresh-cookie 重新录入；非缓存来源不会删除现有缓存。",
+            file=sys.stderr,
+        )
         return 1
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
