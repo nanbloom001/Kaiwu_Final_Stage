@@ -17,7 +17,6 @@ except ModuleNotFoundError:  # pragma: no cover
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from agent_ppo.conf.conf import (
-    Config,
     StandardDistill1Config,
 )
 from agent_ppo.agent import _checkpoint_candidates, _checkpoint_id_from_name
@@ -38,8 +37,7 @@ def _load_config():
         return tomllib.load(config_file)
 
 
-def test_active_stage_is_standard_camera_lbc():
-    assert Config.CURRENT is StandardDistill1Config
+def test_standard_d1_baseline_is_standard_camera_lbc():
     assert StandardDistill1Config.task_type == "standard"
     assert StandardDistill1Config.algorithm == "lbc_loco"
     assert StandardDistill1Config.num_goal_obs == 0

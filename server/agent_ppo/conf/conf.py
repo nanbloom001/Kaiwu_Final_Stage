@@ -309,6 +309,13 @@ class StandardDistill1Config(LBCLocoConfig):
     ckpt_name = "model.ckpt-standard"
 
 
+class StandardDistill2StairConfig(StandardDistill1Config):
+    """STD-D2-Stair: stair-heavy visual continuation from Standard D1."""
+
+    name = "standard_distill_2_stair"
+    parent_checkpoint = "current accepted Standard visual student checkpoint"
+
+
 class TrackLBCLocoConfig(LBCLocoConfig):
     """Depth-camera distillation for the UWB-guided TrackNav teacher."""
 
@@ -348,9 +355,9 @@ class Config:
 
     # Explicit stage selector for both training and evaluation.
     # 训练和评估均显式使用该阶段，避免环境名称误改模型结构。
-    # standard-distill-1 is the active platform training stage. Other stages
+    # STD-D2-Stair is the active platform training stage. D1 and other stages
     # remain reproducible through their independent TOML files.
-    CURRENT = StandardDistill1Config
+    CURRENT = StandardDistill2StairConfig
 
     @staticmethod
     def load_conf(logger):

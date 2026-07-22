@@ -1,0 +1,101 @@
+# STD-D2-Stair: continue the current Standard visual student with a
+# stair-heavy data distribution. All model, loss, camera, augmentation,
+# command, randomization, and student-drive settings match standard-distill-1.
+
+[env]
+num_envs = 128
+episode_length_s = 25.0
+
+[env_conf]
+task_name = "Unitree-Go2-Velocity-Camera"
+seed = 0
+
+[terrain]
+mode = "standard"
+num_rows = 10
+num_cols = 20
+difficulty_range = [0.0, 1.0]
+curriculum = true
+max_init_terrain_level = 4
+
+[terrain.standard.pyramid_slope]
+proportion = 0.05
+
+[terrain.standard.pyramid_slope_inv]
+proportion = 0.05
+
+[terrain.standard.pyramid_stairs]
+proportion = 0.30
+
+[terrain.standard.pyramid_stairs_inv]
+proportion = 0.60
+
+[terrain.standard.maze]
+proportion = 0.0
+
+[domain_rand]
+enable_domain_rand = true
+randomize_friction = true
+friction_range = [0.3, 1.5]
+push_robots = false
+push_interval_s = 15
+max_push_vel_xy = 0.35
+
+[noise]
+add_noise = true
+
+[init_state]
+pos = [0.0, 0.0, 0.35]
+
+[commands]
+resampling_time = [5.0, 10.0]
+
+[commands.limit]
+lin_vel_x = [-0.15, 0.30]
+lin_vel_y = [-0.10, 0.10]
+ang_vel_z = [-0.60, 0.60]
+
+[commands.ranges]
+lin_vel_x = [-0.15, 0.30]
+lin_vel_y = [-0.10, 0.10]
+ang_vel_yaw = [-0.60, 0.60]
+
+[standard_distill_2_stair]
+learning_rate = 5e-4
+lr_min = 1e-5
+max_iterations = 10000
+max_grad_norm = 1.0
+log_interval = 100
+save_interval = 250
+num_steps_per_env = 24
+sequence_length = 8
+
+# This is a continuation experiment, never a fresh visual initialization.
+require_student_resume = true
+student_drive = true
+student_drive_phase_fractions = [0.03, 0.47, 0.50]
+student_drive_ratios = [0.00, 0.50, 1.00]
+
+latent_loss_type = "legacy_mse"
+action_loss_type = "mse"
+latent_loss_weight = 1.0
+cosine_loss_weight = 0.0
+action_loss_weight = 0.2
+
+[depth_aug]
+enabled = true
+pixel_dropout_prob = 0.10
+gaussian_noise_scale = 0.02
+edge_dropout_prob = 0.10
+hole_patch_prob = 0.20
+hole_patch_size = [4, 16]
+hole_hold_steps = [2, 8]
+frame_hold_prob = 0.10
+frame_hold_steps = [1, 5]
+blur_kernel_size = 3
+roll_range_deg = 5.0
+pitch_shift_pix = 6
+
+[camera.depth_camera]
+offset_pos = [0.339871, 0.034697, 0.075010]
+offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
