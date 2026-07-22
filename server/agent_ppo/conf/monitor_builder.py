@@ -92,6 +92,7 @@ def build_monitor():
         titles = {
             "standard_distill_1": "Standard_Distill_1",
             "standard_distill_2_stair": "STD_D2_Stair",
+            "standard_distill_3_action": "STD_D3_Action",
         }
         title = titles.get(Config.CURRENT.name, "ST9_Opt3_D2")
         return _build_lbc_monitor(title)

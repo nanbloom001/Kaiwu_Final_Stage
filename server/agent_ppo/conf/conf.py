@@ -316,6 +316,16 @@ class StandardDistill2StairConfig(StandardDistill1Config):
     parent_checkpoint = "current accepted Standard visual student checkpoint"
 
 
+class StandardDistill3ActionConfig(LBCLocoConfig):
+    """Continue from D2 and repair stair action imitation."""
+
+    name = "standard_distill_3_action"
+    task_type = "standard"
+    algorithm = "lbc_loco"
+    ckpt_name = "model.ckpt-standard-distill-3-action"
+    parent_checkpoint = "D2-40min visual student checkpoint"
+
+
 class TrackLBCLocoConfig(LBCLocoConfig):
     """Depth-camera distillation for the UWB-guided TrackNav teacher."""
 
@@ -355,9 +365,9 @@ class Config:
 
     # Explicit stage selector for both training and evaluation.
     # 训练和评估均显式使用该阶段，避免环境名称误改模型结构。
-    # STD-D2-Stair is the active platform training stage. D1 and other stages
-    # remain reproducible through their independent TOML files.
-    CURRENT = StandardDistill2StairConfig
+    # STD-D3A is the active platform training stage. D1 and D2 remain
+    # reproducible through their independent TOML files.
+    CURRENT = StandardDistill3ActionConfig
 
     @staticmethod
     def load_conf(logger):

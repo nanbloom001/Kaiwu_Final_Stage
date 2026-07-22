@@ -4,6 +4,12 @@
 
 ## [未发布]
 
+- **[STD-D3A]** 从 D2-40min 视觉学生继续 LBC，保持 D2 地形分布与相机外参，
+  将动作模仿权重从 `0.2` 提高到 `1.0`，关闭 student-drive，并以
+  `2e-4` 学习率在教师驱动的干净轨迹上修复楼梯动作对齐。训练命令按环境
+  覆盖 `0.45-0.70 m/s`，阶段内关闭 domain randomization、观测噪声和深度
+  增强。`require_student_resume=true` 继续阻止误加载教师或随机初始化学生；
+  输出描述性文件与 `model.ckpt-<id>.pkl` 探活别名。
 - **[STD-D2-Stair]** 从当前 Standard 视觉学生继续 LBC，只调整训练数据分布：
   `max_init_terrain_level=4`，上/下坡各 5%，上楼梯 30%，下楼梯 60%，
   maze 0%。网络、latent、LSTM、损失、相机外参、深度增强、命令、随机化和

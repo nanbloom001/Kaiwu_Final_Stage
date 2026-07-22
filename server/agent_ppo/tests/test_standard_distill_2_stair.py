@@ -14,7 +14,6 @@ except ModuleNotFoundError:  # pragma: no cover
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from agent_ppo.conf.conf import (
-    Config,
     StandardDistill1Config,
     StandardDistill2StairConfig,
 )
@@ -28,8 +27,7 @@ def _load(filename):
         return tomllib.load(config_file)
 
 
-def test_stair_stage_is_active_visual_continuation():
-    assert Config.CURRENT is StandardDistill2StairConfig
+def test_stair_stage_remains_a_reproducible_visual_continuation():
     assert issubclass(StandardDistill2StairConfig, StandardDistill1Config)
     assert StandardDistill2StairConfig.algorithm == "lbc_loco"
     assert StandardDistill2StairConfig.ckpt_name == "model.ckpt-standard"
