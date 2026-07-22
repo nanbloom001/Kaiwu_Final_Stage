@@ -353,6 +353,33 @@ class StandardVisualPPO1HeadingConfig(LBCLocoConfig):
     action_anchor_ema = 0.0
 
 
+class StandardVisualPPO2D5Config(StandardVisualPPO1HeadingConfig):
+    """STD-D5: conservative Visual PPO with scheduled D3 action anchoring."""
+
+    name = "standard_visual_ppo_2_d5"
+    ckpt_name = "model.ckpt-standard-visual-ppo-2-d5"
+    parent_checkpoint = "best D3A visual student checkpoint"
+
+    lr = 2.0e-5
+    schedule = "fixed"
+    min_learning_rate = 2.0e-5
+    max_learning_rate = 2.0e-5
+
+    action_anchor_coef = 1.0
+    action_anchor_ema = 0.0
+    action_anchor_schedule_enabled = True
+    action_anchor_schedule_total_steps = 1000
+    action_anchor_schedule_points = (
+        (0.00, 1.00),
+        (0.20, 1.00),
+        (0.40, 0.75),
+        (0.60, 0.50),
+        (0.80, 0.25),
+        (1.00, 0.10),
+    )
+    model_save_interval = 100
+
+
 class TrackLBCLocoConfig(LBCLocoConfig):
     """Depth-camera distillation for the UWB-guided TrackNav teacher."""
 
@@ -392,9 +419,9 @@ class Config:
 
     # Explicit stage selector for both training and evaluation.
     # 训练和评估均显式使用该阶段，避免环境名称误改模型结构。
-    # STD-D4A is the active platform training stage. D1-D3 remain reproducible
+    # STD-D5 is the active platform training stage. D1-D4 remain reproducible
     # through their independent TOML files.
-    CURRENT = StandardVisualPPO1HeadingConfig
+    CURRENT = StandardVisualPPO2D5Config
 
     @staticmethod
     def load_conf(logger):

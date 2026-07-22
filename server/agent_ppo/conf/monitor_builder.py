@@ -100,8 +100,12 @@ def build_monitor():
         return _build_behavior_distill_monitor()
 
     monitor = MonitorConfigBuilder()
+    visual_ppo_titles = {
+        "standard_visual_ppo_1_heading": "STD_D4A_Visual_PPO",
+        "standard_visual_ppo_2_d5": "STD_D5_Visual_PPO",
+    }
     ppo_title = (
-        "STD_D4A_Visual_PPO"
+        visual_ppo_titles.get(Config.CURRENT.name, "Visual_PPO")
         if algorithm == "visual_ppo"
         else "Standard_PPO"
     )
@@ -137,6 +141,21 @@ def build_monitor():
             .end_panel()
         .add_panel(name="动作锚定", name_en="anchor_coef", type="line")
             .add_metric(metrics_name="action_anchor_coef", expr="avg(action_anchor_coef{})")
+            .end_panel()
+        .add_panel(name="动作锚定误差", name_en="anchor_loss", type="line")
+            .add_metric(metrics_name="action_anchor_loss", expr="avg(action_anchor_loss{})")
+            .end_panel()
+        .add_panel(name="锚定加权损失", name_en="anchor_weighted", type="line")
+            .add_metric(
+                metrics_name="weighted_action_anchor_loss",
+                expr="avg(weighted_action_anchor_loss{})",
+            )
+            .end_panel()
+        .add_panel(name="锚定退火进度", name_en="anchor_progress", type="line")
+            .add_metric(
+                metrics_name="action_anchor_progress",
+                expr="avg(action_anchor_progress{})",
+            )
             .end_panel()
         .end_group()
 

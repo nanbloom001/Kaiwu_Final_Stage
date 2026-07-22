@@ -130,6 +130,25 @@ class AlgorithmPPO:
         self.min_std = torch.tensor(min_std_cfg, device=device) if min_std_cfg is not None else None
         self.max_std = torch.tensor(max_std_cfg, device=device) if max_std_cfg is not None else None
         self.action_anchor_ema = float(getattr(Config.CURRENT, "action_anchor_ema", 0.0))
+        self.action_anchor_schedule_enabled = bool(
+            getattr(Config.CURRENT, "action_anchor_schedule_enabled", False)
+        )
+        self.action_anchor_schedule_total_steps = int(
+            getattr(Config.CURRENT, "action_anchor_schedule_total_steps", 1)
+        )
+        raw_schedule_points = getattr(
+            Config.CURRENT,
+            "action_anchor_schedule_points",
+            ((0.0, 1.0), (1.0, 1.0)),
+        )
+        self.action_anchor_schedule_points = tuple(
+            (float(progress), float(coef))
+            for progress, coef in raw_schedule_points
+        )
+        self._validate_action_anchor_schedule()
+        self.action_anchor_initial_coef = 0.0
+        self.current_action_anchor_progress = 0.0
+        self._last_anchor_log_step = -1
 
         # Training state
         # 训练状态
@@ -149,14 +168,64 @@ class AlgorithmPPO:
         action_anchor_coef: float = 0.0,
         decay_updates: int = 0,
     ):
-        """Freeze the preloaded policy and use it as a cumulative-drift anchor."""
+        """Freeze the reference policy and retain the schedule's initial coefficient."""
         self.reference_actor_critic = reference_model
-        self.action_anchor_coef = float(action_anchor_coef)
+        initial_coef = float(action_anchor_coef)
+        self.action_anchor_initial_coef = initial_coef
+        self.action_anchor_coef = initial_coef
         self.action_anchor_decay_updates = max(int(decay_updates), 0)
         if self.reference_actor_critic is not None:
             self.reference_actor_critic.eval()
             for param in self.reference_actor_critic.parameters():
                 param.requires_grad_(False)
+
+    def _validate_action_anchor_schedule(self):
+        if self.action_anchor_schedule_total_steps <= 0:
+            raise ValueError("action_anchor_schedule_total_steps must be positive")
+        previous_progress = -1.0
+        for progress, coef in self.action_anchor_schedule_points:
+            if not 0.0 <= progress <= 1.0:
+                raise ValueError(
+                    f"action anchor schedule progress must be in [0, 1], got {progress}"
+                )
+            if progress <= previous_progress:
+                raise ValueError("action anchor schedule progress points must increase")
+            if coef < 0.0:
+                raise ValueError(
+                    f"action anchor schedule coefficient must be non-negative, got {coef}"
+                )
+            previous_progress = progress
+
+    def _get_action_anchor_progress(self) -> float:
+        total_steps = max(int(self.action_anchor_schedule_total_steps), 1)
+        progress = float(self.train_step) / float(total_steps)
+        return min(max(progress, 0.0), 1.0)
+
+    def _get_scheduled_action_anchor_coef(self) -> float:
+        """Linearly interpolate the action-anchor coefficient at train_step."""
+        if self.reference_actor_critic is None or self.action_anchor_initial_coef <= 0.0:
+            return 0.0
+        if not self.action_anchor_schedule_enabled:
+            return self.action_anchor_initial_coef
+
+        progress = self._get_action_anchor_progress()
+        self.current_action_anchor_progress = progress
+        points = self.action_anchor_schedule_points
+        if not points:
+            return self.action_anchor_initial_coef
+        if progress <= points[0][0]:
+            return float(points[0][1])
+
+        for index in range(1, len(points)):
+            left_progress, left_coef = points[index - 1]
+            right_progress, right_coef = points[index]
+            if progress <= right_progress:
+                interval = right_progress - left_progress
+                if interval <= 1.0e-8:
+                    return float(right_coef)
+                ratio = (progress - left_progress) / interval
+                return float(left_coef + ratio * (right_coef - left_coef))
+        return float(points[-1][1])
 
     def init_storage(
         self,
@@ -255,6 +324,20 @@ class AlgorithmPPO:
         """
         # J9 fixed-LR runtime contract: validate before any update
         self._validate_fixed_lr()
+        if self.action_anchor_schedule_enabled:
+            self.action_anchor_coef = self._get_scheduled_action_anchor_coef()
+            if (
+                self.logger is not None
+                and self.train_step != self._last_anchor_log_step
+                and (self.train_step == 0 or self.train_step % 50 == 0)
+            ):
+                self.logger.info(
+                    "[D5 Action Anchor Schedule] "
+                    f"step={self.train_step}/{self.action_anchor_schedule_total_steps}, "
+                    f"progress={self.current_action_anchor_progress:.3f}, "
+                    f"coef={self.action_anchor_coef:.4f}"
+                )
+                self._last_anchor_log_step = self.train_step
 
         # Initialize loss accumulators
         # 初始化损失累加器
@@ -466,6 +549,8 @@ class AlgorithmPPO:
         return torch.mean(torch.square(mu_batch - ref_mu.detach()))
 
     def _effective_action_anchor_coef(self) -> float:
+        if self.action_anchor_schedule_enabled:
+            return self.action_anchor_coef
         if self.action_anchor_decay_updates <= 0:
             return self.action_anchor_coef
         remaining = 1.0 - self.train_step / float(self.action_anchor_decay_updates)
@@ -593,19 +678,25 @@ class AlgorithmPPO:
         """
         now = time.time()
         if now - self.last_report_monitor_time >= 60:
+            effective_anchor_coef = self._effective_action_anchor_coef()
+            weighted_action_anchor_loss = (
+                effective_anchor_coef * mean_action_anchor_loss
+            )
             monitor_data = {
                 "policy_loss": mean_surrogate_loss,
                 "value_loss": mean_value_loss,
                 "entropy_loss": mean_entropy_loss,
                 "action_anchor_loss": mean_action_anchor_loss,
+                "action_anchor_coef": effective_anchor_coef,
+                "weighted_action_anchor_loss": weighted_action_anchor_loss,
+                "action_anchor_progress": self.current_action_anchor_progress,
                 "total_loss": (
                     mean_surrogate_loss
                     + mean_value_loss
                     + mean_entropy_loss
-                    + self._effective_action_anchor_coef() * mean_action_anchor_loss
+                    + weighted_action_anchor_loss
                 ),
                 "learning_rate": self.learning_rate,
-                "action_anchor_coef": self._effective_action_anchor_coef(),
             }
             if self.monitor:
                 self.monitor.put_data({os.getpid(): monitor_data})
