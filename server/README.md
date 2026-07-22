@@ -21,7 +21,9 @@
 - **当前功能分支入口**：`StandardBridgeR1Config`（`STD-BRIDGE-R1`），从原始
   Standard 10288 flat301 教师开始，用一次 5000-iteration 任务完成
   0/25/50/75/100% 逐环境 DAgger，产出不可部署的 Actor77 特权教师。
-- R1 严格锁定源教师 SHA、命令和地形分布，首轮关闭随机化/噪声/push；它不读取
+- R1 由操作者手动确认预训练教师身份，不做字节级 SHA 门禁；仍校验教师
+  key/shape、成功加载与冻结状态。命令和地形分布保持不变，首轮关闭随机化/
+  噪声/push；它不读取
   depth、不执行 PPO，也不修改 Goal/UWB/Track/部署端。
 - `StandardDistill1Config` 到 D5 继续作为已经尝试过的视觉路线保留；它们不是
   R1 的父 checkpoint。D1 需要 encoder-based bridge artifact，不能直接加载原始
@@ -30,8 +32,8 @@
   `privileged_loco_teacher_v1`；二者均不能交给当前部署导出器。
 - R1 的平台文件 ID 为 `10288 + current_iteration`：第一轮保存 `10289`，最终
   保存 `15288`。内部 DAgger iteration 仍为 `1--5000`；原有每 500 iteration
-  常规定时保存不变，这不是额外划分的“500 轮恢复阶段”；只有通过阶段
-  闸门才额外发布 `bridge`/`teacher` 特殊文件。
+  常规定时保存不变，这不是额外划分的“500 轮恢复阶段”；每个 DAgger 阶段
+  边界额外发布 `bridge`/`teacher` 候选，质量阈值只记录 warning，不会停训。
 - TrackNav 保留 Opt3 基线 + J9 通用学习率接口修复 + Opt4 角速度保护；`navopt5debug` 与 `navopt5b` 作为独立可复现实验阶段保留，不是默认入口。
 - 含 ST7-Opt2B `dynamic_tilt_risk`、ST7-Opt3 `goal_noise`、行为蒸馏/LBC 机制（在 `codex/st7-opt2a` 并入主干）。
 
@@ -51,7 +53,7 @@ Cookie 失效时用 `--refresh-cookie` 强制跳过缓存和旧兼容值重新�
 `--dry-run` 仍会连接腾讯代理并读取 `/health`、`/manifest`，但不写远程。
 当前在线状态必须标记为“待刷新 Cookie 验证”，不能由离线检查推断已经可同步。
 
-R1 的冻结计划和启动闸门见
+R1 的冻结计划、必要安全检查和质量告警见
 [`../shared/分析记录/2026-07-23_STD-BRIDGE-R1执行卡.md`](../shared/分析记录/2026-07-23_STD-BRIDGE-R1执行卡.md)。
 
 ## 变更记录

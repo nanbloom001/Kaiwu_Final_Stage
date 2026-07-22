@@ -212,8 +212,8 @@ class AlgorithmBehaviorDistill:
     def assert_teacher_ready(self) -> None:
         if not self.teacher_loaded:
             raise RuntimeError(
-                "[BehaviorDistill] strict 301-D teacher was not loaded. Select the "
-                "original Standard 10288 checkpoint before starting STD-BRIDGE-R1."
+                "[BehaviorDistill] no compatible 301-D teacher was loaded. Select "
+                "the intended pretrained Standard checkpoint before starting R1."
             )
         frozen = not self.teacher.training and all(
             not parameter.requires_grad for parameter in self.teacher.parameters()

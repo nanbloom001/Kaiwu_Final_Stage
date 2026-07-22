@@ -43,7 +43,7 @@ class StandardBridgeR1ConfigTests(unittest.TestCase):
         self.assertEqual(
             stage["student_drive_ratios"], [0.0, 0.25, 0.5, 0.75, 1.0]
         )
-        self.assertEqual(stage["gate_window_iterations"], 50)
+        self.assertEqual(stage["quality_window_iterations"], 50)
         self.assertEqual(stage["save_interval"], 500)
         self.assertEqual(stage["platform_model_id_base"], 10288)
         self.assertEqual(stage["initial_probe_save_iteration"], 1)
@@ -93,11 +93,11 @@ class StandardBridgeR1ConfigTests(unittest.TestCase):
             config["terrain"]["standard"], source["terrain"]["standard"]
         )
 
-    def test_source_hash_and_stage_selector_are_explicit(self):
+    def test_manual_teacher_identity_and_stage_selector_are_explicit(self):
         config = _config()
         self.assertEqual(
             config["standard_bridge_r1"]["expected_teacher_sha256"],
-            "d5999461f00c4634bdea0648e46baac9fba34e621eaa586fe26f64f68953eeed",
+            "",
         )
         conf_source = (ROOT / "agent_ppo" / "conf" / "conf.py").read_text(
             encoding="utf-8"
@@ -121,7 +121,6 @@ class StandardBridgeR1ConfigTests(unittest.TestCase):
             "model.ckpt-10289.pkl": 10289,
             "model.ckpt-bridge-11788.pkl": 11788,
             "model.ckpt-teacher-11788.pkl": 11788,
-            "model.ckpt-blocked-11788.pkl": 11788,
         }
         for filename, model_id in expected.items():
             self.assertEqual(checkpoint_id(filename), model_id)
@@ -136,6 +135,16 @@ class StandardBridgeR1ConfigTests(unittest.TestCase):
             checkpoint_id("model.ckpt-10289.pkl"),
             checkpoint_id("model.ckpt-10288.pkl"),
         )
+
+    def test_quality_checks_are_advisory(self):
+        workflow_source = (
+            ROOT / "agent_ppo" / "workflow" / "behavior_distill_workflow.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("quality_thresholds", workflow_source)
+        self.assertIn(
+            "continuing with the configured DAgger schedule", workflow_source
+        )
+        self.assertNotIn('checkpoint_label="blocked"', workflow_source)
 
     def test_behavior_evaluation_explicitly_uses_student_model(self):
         agent_source = (ROOT / "agent_ppo" / "agent.py").read_text(

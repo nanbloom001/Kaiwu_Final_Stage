@@ -42,8 +42,10 @@ training_status
 
 R1 文件名采用 `platform_model_id = 10288 + current_iteration`，确保平台探活不会
 把预训练教师 10288 误判为最新学生。R1 TOML 原有的常规定时 checkpoint 使用
-`model.ckpt-<platform_model_id>.pkl`；通过阶段闸门的完整桥接副本使用
-`model.ckpt-bridge-<platform_model_id>.pkl`；blocked 文件不得发布教师制品。
+`model.ckpt-<platform_model_id>.pkl`；每个 DAgger 阶段边界的完整桥接候选使用
+`model.ckpt-bridge-<platform_model_id>.pkl`，对应视觉教师候选使用
+`model.ckpt-teacher-<platform_model_id>.pkl`。质量阈值仅记录诊断 warning，
+不阻止保存或继续训练。
 
 该文件依赖仿真 `height_scan256`，`deployable=false`（语义上），部署端不得接受。
 旧 raw bridge checkpoint 只能作为显式 weight-only 输入，不能伪装成精确 resume。
@@ -64,9 +66,9 @@ deployable = false
 ```
 
 它是后续 Standard LBC 的冻结教师，不是 Jetson 制品。server LBC loader 兼容该
-封装与历史 `encoder.*`/`actor.*` raw 权重；新产物优先使用封装格式。如最新
-R1 checkpoint 已标记 `blocked`，LBC loader 不得在 `latest` 模式下静默回退到
-更旧的 teacher；需人工审核后显式选择已通过闸门的 teacher ID。
+封装与历史 `encoder.*`/`actor.*` raw 权重；新产物优先使用封装格式。阶段边界
+制品只是候选，进入视觉蒸馏前仍需人工比较质量诊断与固定评估结果，并显式记录
+选用的 teacher ID。
 
 ### 2.3 `lbc_loco`：可部署视觉策略候选
 
@@ -91,7 +93,9 @@ checkpoint，才允许进入现有 Standard exporter 的部署审查。至少需
 
 本轮只改 `server/` 的 flat301→Actor77 特权桥接及 loader 契约：
 
-- 源教师 SHA256：`d5999461f00c4634bdea0648e46baac9fba34e621eaa586fe26f64f68953eeed`；
+- 已审计的原始源教师 SHA256 为
+  `d5999461f00c4634bdea0648e46baac9fba34e621eaa586fe26f64f68953eeed`，但 R1 运行时不将它
+  作为字节级加载门禁；预训练教师身份由操作者确认；
 - 教师输入 301，学生输入仍含特权 scan，输出 action12；
 - 不接入 depth、Goal、UWB；
 - 不修改部署 exporter、ONNX、C++ 或 `deploy.yaml`；

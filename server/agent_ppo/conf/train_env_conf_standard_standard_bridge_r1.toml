@@ -239,7 +239,11 @@ ang_vel_yaw = [-0.3, 0.3]
 [standard_bridge_r1]
 # The platform should preload the original replay Standard checkpoint 10288.
 # A local teacher_ckpt may be supplied only for offline/platform debugging.
-expected_teacher_sha256 = "d5999461f00c4634bdea0648e46baac9fba34e621eaa586fe26f64f68953eeed"
+# Teacher identity is operator-verified for this run.  Keep this empty so a
+# platform repackage does not block rollout on a byte-for-byte SHA mismatch.
+# Key names, tensor shapes, successful loading and teacher freezing are still
+# validated before the first environment step.
+expected_teacher_sha256 = ""
 # Platform liveness chooses the largest numeric filename ID.  Continue from
 # the parent ID so every R1 artifact outranks model.ckpt-10288.pkl while the
 # checkpoint payload keeps the true 1..5000 current_iteration.
@@ -254,7 +258,7 @@ log_interval = 50
 save_interval = 500
 max_grad_norm = 1.0
 action_loss_weight = 1.0
-gate_window_iterations = 50
+quality_window_iterations = 50
 phase_end_iterations = [1500, 2250, 3000, 3750, 5000]
 student_drive_ratios = [0.0, 0.25, 0.50, 0.75, 1.0]
 
@@ -264,7 +268,7 @@ lin_vel_y = [-0.2, 0.2]
 ang_vel_z = [-0.3, 0.3]
 tolerance = 1e-5
 
-[standard_bridge_r1.gates]
+[standard_bridge_r1.quality_thresholds]
 minimum_action_cosine = 0.98
 maximum_normalized_action_mse = 0.10
 maximum_safety_takeover_rate = 0.10

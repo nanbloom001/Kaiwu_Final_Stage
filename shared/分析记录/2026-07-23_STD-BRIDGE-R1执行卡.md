@@ -26,13 +26,13 @@ R1 仍然读取仿真特权 `height_scan256`，不读取深度相机，因此不
 | 项目 | 冻结值 |
 |---|---|
 | 源文件 | `archive/代码存档/复赛_standard/ckpt/model.ckpt-10288.pkl` |
-| 源 SHA256 | `d5999461f00c4634bdea0648e46baac9fba34e621eaa586fe26f64f68953eeed` |
+| 源 SHA256（审计参考） | `d5999461f00c4634bdea0648e46baac9fba34e621eaa586fe26f64f68953eeed` |
 | 原始 key 类型 | raw `std`、`actor.*`、`critic.*`，无 `encoder.*` |
 | Actor 第一层 | `[512,301]` |
 | Critic 第一层 | `[512,316]` |
 | Actor 输出层 | `[12,128]` |
 | R1 配置 | `server/agent_ppo/conf/train_env_conf_standard_standard_bridge_r1.toml` |
-| 配置 SHA256 | `b7d8b5725d8f9c5976e1ccb3d7fd903a63198a56064a8468fea7553ea0da049e` |
+| 配置 SHA256 | `799699b37f12c1e6639a66d4a9cf665828a386d41ac8701ccb7c901f0c84269f` |
 
 旧本地 `archive/代码存档/hjcnew蒸馏1_10288/` 仅作为审计证据，不进入分支。
 其中 checkpoint `model.ckpt-locomotion-10288.pkl` 的 SHA256 为
@@ -56,7 +56,8 @@ Actor 第一层为 `[512,77]`；它是约 10 分钟桥接产物，不是原始�
 - 首轮关闭 domain randomization、摩擦随机化、观测噪声和外力推动；
 - 保留源奖励与速度课程表只为固定环境定义，R1 不使用 reward/PPO 更新。
 
-命令只要有一个环境越出冻结包络，任务立即失败，不生成 OOD 教师标签。
+命令观测超出记录包络时只打印一次 warning，对应环境行的训练权重置 0，
+不用 OOD 教师标签反向传播，也不中断整个任务。
 
 ## 4. 单任务 DAgger 调度
 
@@ -68,8 +69,8 @@ Actor 第一层为 `[512,77]`；它是约 10 分钟桥接产物，不是原始�
 | 3000--3749 | 75% |
 | 3750--4999 | 100% |
 
-driver mask 每个环境独立抽取。每阶段末使用两个连续 50-iteration 在线窗口，
-要求同时满足：
+driver mask 每个环境独立抽取。每阶段末使用两个连续 50-iteration 在线窗口
+生成质量诊断，阈值为：
 
 - action cosine `≥0.98`；
 - normalized action MSE `≤0.10`；
@@ -77,8 +78,8 @@ driver mask 每个环境独立抽取。每阶段末使用两个连续 50-iterati
 - 学生安全接管率 `≤10%`；
 - 硬终止率相对上一阶段增加不超过 1 个百分点。
 
-阶段失败时保存 `training_status="blocked"` 并正常结束。加载器拒绝自动恢复 blocked
-checkpoint，以免直接进入下一比例。阶段 0 通过后，动作安全阈值固定为
+阈值不满足时打印 warning、记入 checkpoint，仍按预定计划进入下一学生驱动比例。
+它们是人工评估依据，不是平台训练门禁。阶段 0 结束后，动作安全阈值固定为
 `max(0.25, 2 × P95_action_L2)`。
 
 每步样本权重：正常 `1.0`，教师安全接管 `0.25`，学生 NaN/Inf 或非 timeout
@@ -109,11 +110,12 @@ format = "behavior_distill_v2"
 schema_version = 1
 ```
 
-它包含学生、冻结教师副本、optimizer、iteration、DAgger 阶段、闸门历史、RNG、
+它包含学生、冻结教师副本、optimizer、iteration、DAgger 阶段、质量诊断历史
+（为兼容 schema 仍使用 `gate_history` 字段名）、RNG、
 源教师 SHA、配置 SHA、代码 commit 和 `training_status`，可做单文件精确恢复。
 旧 raw checkpoint 只允许显式 weight-only 导入。
 
-阶段闸门通过时额外发布：
+每个 DAgger 阶段边界都额外发布候选制品：
 
 ```text
 model.ckpt-bridge-<platform_model_id>.pkl   # 完整恢复 checkpoint
@@ -124,8 +126,8 @@ deployable = false
 critic_trained = false
 ```
 
-阶段闸门失败时只额外保存
-`model.ckpt-blocked-<platform_model_id>.pkl`，不得发布 `teacher` 文件。所有标签只用
+阈值超限的制品在 `source_training_status` 中记录 `phase_warning` 或
+`completed_with_warnings`，但不生成 `blocked` 文件，也不阻断保存。标签只用
 单个小写单词，确保平台的 `[a-z]*` 探活正则可识别。关键映射为：
 
 | current_iteration | platform_model_id |
@@ -138,9 +140,8 @@ critic_trained = false
 | 5000 | 15288 |
 
 后续 LBC loader 可严格读取该封装，也兼容历史 `encoder.*`/`actor.*` 权重。
-如果最新 R1 阶段已 `blocked`，使用 `latest` 启动 LBC 必须失败，不得自动
-回退到更旧 teacher；审核闸门结果后应显式选择某个
-`model.ckpt-teacher-<id>.pkl`。
+进入视觉蒸馏前，应根据诊断和固定评估结果显式记录选用的
+`model.ckpt-teacher-<id>.pkl`；文件存在不代表已自动晋级。
 部署端继续只接受 `format="lbc_loco"`；本轮不修改 exporter、ONNX 或 Jetson 代码。
 
 ## 6. 启动与恢复
@@ -153,17 +154,20 @@ cd server
 python train_test.py
 ```
 
-平台启动前必须在日志中看到：
+预训练教师由操作者手动确认。上表 SHA 只用于事后审计，不作为
+平台 rollout 启动门禁。启动日志应显示：
 
 - stage 为 `standard_bridge_r1`；
-- 教师 SHA 与本卡一致；
+- 教师已成功加载，日志中记录的来源与 SHA 仅作追溯；
 - 观测为 301，教师 Actor 输入 301，学生 Actor 输入 77；
 - `teacher_frozen=true` 且 optimizer 仅含学生 encoder+actor；
 - 配置 SHA 和代码 commit 已记录。
+- `learner_proxy` 的 sample 成功数可以保持 0；R1 在自定义 workflow 中直接
+  使用 `env.step` 更新，应看 `[BehaviorDistill] iter=...`、loss 和 checkpoint。
 
-恢复时只能选择 `behavior_distill_v2` 文件；文件名数字是平台 ID，不是内部
-iteration。配置 SHA 变化、教师 SHA 变化、
-阶段/iteration 不一致或 `training_status="blocked"` 都应在 rollout 前失败。
+恢复时只能选择结构兼容的 `behavior_distill_v2` 文件；文件名数字是平台 ID，
+不是内部 iteration。配置 SHA 变化、阶段/iteration 不一致或历史
+`training_status="blocked"` 只会 warning，阶段按 payload 的 `current_iteration` 重算。
 
 ## 7. 最终比较与放行
 
@@ -179,5 +183,5 @@ R1 学生评估必须 100% student-drive，不能误用 checkpoint 中的 flat �
 - 教师参数训练前后最大绝对差为 0；
 - side artifact 能被后续 LBC loader 严格加载。
 
-在线 DAgger 闸门通过不等于本节通过。没有平台视频、分地形指标和恢复证据时，
+在线 DAgger 质量阈值仅是诊断，不等于本节放行。没有平台视频、分地形指标和恢复证据时，
 状态只能写“静态就绪”或“诊断”，不得晋级视觉蒸馏。

@@ -3,11 +3,12 @@
 ###########################################################################
 # Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
-"""STD-BRIDGE-R1: guarded one-run behavior distillation workflow."""
+"""STD-BRIDGE-R1 one-run behavior distillation workflow."""
 
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import subprocess
 import time
@@ -170,35 +171,51 @@ def _window_average(rows: list[dict[str, float]]) -> dict[str, float]:
     return _mean_metrics(rows)
 
 
-def _evaluate_phase_gate(
+def _evaluate_phase_quality(
     recent_metrics: list[dict[str, float]],
-    gate_window_iterations: int,
-    gate_conf: dict[str, Any],
+    quality_window_iterations: int,
+    quality_conf: dict[str, Any],
     previous_hard_termination_rate: float | None,
 ) -> tuple[bool, dict[str, Any]]:
-    required = 2 * gate_window_iterations
+    required = 2 * quality_window_iterations
     if len(recent_metrics) < required:
         return False, {
             "reasons": [
-                f"need {required} gate iterations, only have {len(recent_metrics)}"
+                f"need {required} quality iterations, only have {len(recent_metrics)}"
             ],
             "windows": [],
         }
     selected = recent_metrics[-required:]
     windows = [
-        _window_average(selected[:gate_window_iterations]),
-        _window_average(selected[gate_window_iterations:]),
+        _window_average(selected[:quality_window_iterations]),
+        _window_average(selected[quality_window_iterations:]),
     ]
-    minimum_cosine = float(gate_conf.get("minimum_action_cosine", 0.98))
+    minimum_cosine = float(quality_conf.get("minimum_action_cosine", 0.98))
     maximum_normalized_mse = float(
-        gate_conf.get("maximum_normalized_action_mse", 0.10)
+        quality_conf.get("maximum_normalized_action_mse", 0.10)
     )
-    maximum_takeover = float(gate_conf.get("maximum_safety_takeover_rate", 0.10))
+    maximum_takeover = float(
+        quality_conf.get("maximum_safety_takeover_rate", 0.10)
+    )
     maximum_hard_delta = float(
-        gate_conf.get("maximum_hard_termination_delta", 0.01)
+        quality_conf.get("maximum_hard_termination_delta", 0.01)
     )
     reasons: list[str] = []
     for index, window in enumerate(windows, start=1):
+        for metric_name in (
+            "action_cos",
+            "normalized_action_mse",
+            "nonfinite_rate",
+            "teacher_ood_rate",
+            "safety_takeover_rate",
+            "hard_termination_rate",
+            "action_l2_p95",
+        ):
+            metric_value = window.get(metric_name)
+            if metric_value is None or not math.isfinite(float(metric_value)):
+                reasons.append(
+                    f"window{index} {metric_name} is not finite: {metric_value}"
+                )
         if window.get("action_cos", float("-inf")) < minimum_cosine:
             reasons.append(
                 f"window{index} action_cos={window.get('action_cos')} < {minimum_cosine}"
@@ -243,22 +260,23 @@ def _evaluate_phase_gate(
     }
 
 
-def _validate_resume_contract(algorithm, current_config_sha: str) -> None:
-    """Reject config drift and blocked-checkpoint auto-progression."""
+def _resume_warnings(algorithm, current_config_sha: str) -> list[str]:
+    """Describe non-fatal resume drift for operator visibility."""
+    warnings: list[str] = []
     if (
         algorithm.current_iteration > 0
         and algorithm.config_sha256 not in {"", "unknown", current_config_sha}
     ):
-        raise RuntimeError(
-            "Refusing to resume STD-BRIDGE-R1 with a changed config: "
+        warnings.append(
+            "resuming STD-BRIDGE-R1 with a changed config: "
             f"checkpoint={algorithm.config_sha256}, current={current_config_sha}"
         )
     if algorithm.training_status == "blocked":
-        raise RuntimeError(
-            "Refusing to auto-resume a blocked STD-BRIDGE-R1 checkpoint. "
-            "Review the failed gate and start an explicitly approved recovery run; "
-            "the next DAgger ratio will not be entered automatically."
+        warnings.append(
+            "resuming a legacy checkpoint marked training_status='blocked'; "
+            "the DAgger phase will be recomputed from current_iteration"
         )
+    return warnings
 
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
@@ -306,10 +324,12 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         )
     ]
     _validate_schedule(phase_end_iterations, phase_ratios, max_iterations)
-    gate_window_iterations = int(distill_conf.get("gate_window_iterations", 50))
-    if gate_window_iterations <= 0:
-        raise ValueError("gate_window_iterations must be positive")
-    gate_conf = distill_conf.get("gates", {})
+    quality_window_iterations = int(
+        distill_conf.get("quality_window_iterations", 50)
+    )
+    if quality_window_iterations <= 0:
+        raise ValueError("quality_window_iterations must be positive")
+    quality_conf = distill_conf.get("quality_thresholds", {})
     safety_conf = distill_conf.get("safety", {})
     command_guard = distill_conf.get("command_guard", {})
     minimum_safety_threshold = float(
@@ -329,9 +349,17 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         logger.info("[BehaviorDistill] loading selected teacher/resume checkpoint")
         agent.load_model(id="latest")
     algorithm.assert_teacher_ready()
+    logger.warning(
+        "[BehaviorDistill] this workflow updates the student directly from env.step; "
+        "the platform learner_proxy sample success counter may remain 0 during a "
+        "healthy R1 run. Use the BehaviorDistill iteration/loss logs and checkpoint "
+        "files to confirm progress."
+    )
 
     current_config_sha = _sha256_file(usr_conf_file)
-    _validate_resume_contract(algorithm, current_config_sha)
+    resume_warnings = _resume_warnings(algorithm, current_config_sha)
+    for warning in resume_warnings:
+        logger.warning(f"[BehaviorDistill] {warning}")
     algorithm.set_run_metadata(current_config_sha, _code_commit())
 
     start_iteration = int(algorithm.current_iteration)
@@ -341,14 +369,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         )
     expected_phase = _phase_for_iteration(start_iteration, phase_end_iterations)
     if algorithm.dagger_phase_index not in {expected_phase, 0} and start_iteration > 0:
-        raise RuntimeError(
-            "Checkpoint DAgger phase is inconsistent with iteration: "
+        logger.warning(
+            "[BehaviorDistill] checkpoint DAgger phase differs from iteration; "
+            "using the phase derived from current_iteration: "
             f"phase={algorithm.dagger_phase_index}, expected={expected_phase}, "
             f"iteration={start_iteration}"
         )
     algorithm.dagger_phase_index = expected_phase
     algorithm.training_status = "running"
-    max_recent = 2 * gate_window_iterations
+    max_recent = 2 * quality_window_iterations
     algorithm.recent_iteration_metrics = algorithm.recent_iteration_metrics[-max_recent:]
 
     logger.info(
@@ -368,7 +397,10 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     agent.model.train()
 
     loop_start = time.time()
-    blocked = False
+    quality_warning_seen = bool(resume_warnings) or any(
+        record.get("passed") is False for record in algorithm.gate_history
+    )
+    command_ood_warning_emitted = False
     last_saved_iteration: int | None = None
 
     def save_r1_checkpoint(
@@ -409,12 +441,14 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             for _step in range(num_steps_per_env):
                 teacher_ood = _command_ood_mask(obs, command_guard)
                 teacher_ood_rate = float(teacher_ood.float().mean().item())
-                if bool(teacher_ood.any().item()):
+                if bool(teacher_ood.any().item()) and not command_ood_warning_emitted:
                     offending = obs[teacher_ood, 6:9][:5].detach().cpu().tolist()
-                    raise RuntimeError(
-                        "Teacher command-domain violation. Refusing to label OOD "
-                        f"commands; examples={offending}, guard={command_guard}"
+                    logger.warning(
+                        "[BehaviorDistill] command observations exceeded the recorded "
+                        "teacher range; affected rows receive zero training weight and "
+                        f"the run continues. examples={offending}, guard={command_guard}"
                     )
+                    command_ood_warning_emitted = True
 
                 batch = algorithm.prepare_update(obs)
                 actions, selection = algorithm.select_driver_actions(
@@ -447,7 +481,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     sample_weights,
                 )
                 sample_weights = torch.where(
-                    ~batch["student_finite"] | hard_failure,
+                    ~batch["student_finite"] | hard_failure | teacher_ood,
                     torch.zeros_like(sample_weights),
                     sample_weights,
                 )
@@ -511,6 +545,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     f"mse={iteration_metrics.get('action_mse', 0):.6f} "
                     f"nmse={iteration_metrics.get('normalized_action_mse', 0):.6f} "
                     f"cos={iteration_metrics.get('action_cos', 0):.4f} "
+                    f"teacher_ood={iteration_metrics.get('teacher_ood_rate', 0):.4f} "
                     f"hard_term={iteration_metrics.get('hard_termination_rate', 0):.4f} "
                     f"teacher_diff={iteration_metrics['teacher_max_abs_diff']:.3e} "
                     f"env_steps={algorithm.total_steps} "
@@ -532,52 +567,56 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
             phase_end = phase_end_iterations[phase_index]
             if iter_id == phase_end:
-                gate_passed, gate_details = _evaluate_phase_gate(
+                quality_ok, quality_details = _evaluate_phase_quality(
                     algorithm.recent_iteration_metrics,
-                    gate_window_iterations,
-                    gate_conf,
+                    quality_window_iterations,
+                    quality_conf,
                     algorithm.previous_hard_termination_rate,
                 )
-                teacher_unchanged = algorithm.teacher_max_abs_diff() == 0.0
-                if not teacher_unchanged:
-                    gate_passed = False
-                    gate_details.setdefault("reasons", []).append(
-                        "frozen teacher parameters changed"
+                if algorithm.teacher_max_abs_diff() != 0.0:
+                    raise RuntimeError(
+                        "[BehaviorDistill] frozen teacher parameters changed during "
+                        f"training at iteration {iter_id}"
                     )
-                gate_record = {
+                quality_record = {
                     "phase_index": phase_index,
                     "phase_end_iteration": iter_id,
                     "platform_model_id": _platform_model_id(
                         iter_id, platform_model_id_base
                     ),
                     "student_drive_probability": student_probability,
-                    "passed": gate_passed,
-                    **gate_details,
+                    "passed": quality_ok,
+                    "diagnostic_only": True,
+                    **quality_details,
                 }
-                algorithm.gate_history.append(gate_record)
-                if not gate_passed:
-                    algorithm.training_status = "blocked"
-                    blocked = True
-                    logger.error(
-                        "[BehaviorDistill] phase gate blocked progression: "
-                        f"{gate_record}"
+                # Keep the historical checkpoint key for schema compatibility;
+                # these records are diagnostics and never block DAgger progression.
+                algorithm.gate_history.append(quality_record)
+                if quality_ok:
+                    logger.info(
+                        "[BehaviorDistill] phase quality within thresholds: "
+                        f"{quality_record}"
                     )
-                    save_r1_checkpoint(
-                        iter_id,
-                        checkpoint_label="blocked",
-                        publish_privileged_teacher=False,
-                        release_status="blocked",
+                else:
+                    quality_warning_seen = True
+                    logger.warning(
+                        "[BehaviorDistill] phase quality outside advisory thresholds; "
+                        "continuing with the configured DAgger schedule. Review before "
+                        f"promoting the artifact: {quality_record}"
                     )
-                    last_saved_iteration = iter_id
-                    break
 
-                algorithm.previous_hard_termination_rate = float(
-                    gate_details["hard_termination_rate"]
+                hard_termination_rate = quality_details.get(
+                    "hard_termination_rate"
                 )
+                if hard_termination_rate is not None:
+                    algorithm.previous_hard_termination_rate = float(
+                        hard_termination_rate
+                    )
                 if phase_index == 0:
                     algorithm.safety_threshold = max(
                         minimum_safety_threshold,
-                        threshold_multiplier * float(gate_details["action_l2_p95"]),
+                        threshold_multiplier
+                        * float(quality_details.get("action_l2_p95", 0.0)),
                     )
                     logger.info(
                         "[BehaviorDistill] calibrated safety threshold="
@@ -586,13 +625,21 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 if phase_index + 1 < len(phase_ratios):
                     algorithm.dagger_phase_index = phase_index + 1
                     algorithm.dagger_phase_iteration = 0
+                    algorithm.training_status = (
+                        "running_with_warnings"
+                        if quality_warning_seen
+                        else "running"
+                    )
                 else:
-                    algorithm.training_status = "completed"
-                logger.info(f"[BehaviorDistill] phase gate passed: {gate_record}")
+                    algorithm.training_status = (
+                        "completed_with_warnings"
+                        if quality_warning_seen
+                        else "completed"
+                    )
                 release_status = (
-                    "completed"
-                    if algorithm.training_status == "completed"
-                    else "phase_passed"
+                    algorithm.training_status
+                    if phase_index + 1 == len(phase_ratios)
+                    else ("phase_warning" if not quality_ok else "phase_candidate")
                 )
                 save_r1_checkpoint(
                     iter_id,
@@ -604,30 +651,22 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
             if (
                 iter_id % save_interval == 0
-                and not blocked
                 and last_saved_iteration != iter_id
             ):
                 save_r1_checkpoint(iter_id)
                 last_saved_iteration = iter_id
 
-        if not blocked:
-            algorithm.training_status = "completed"
-            if last_saved_iteration != max_iterations:
-                save_r1_checkpoint(
-                    max_iterations,
-                    checkpoint_label="bridge",
-                    publish_privileged_teacher=True,
-                    release_status="completed",
-                )
-            logger.info(
-                "[BehaviorDistill] completed in "
-                f"{time.time() - loop_start:.1f}s, env_steps={algorithm.total_steps}, "
-                f"teacher_max_abs_diff={algorithm.teacher_max_abs_diff():.3e}"
+        if algorithm.training_status not in {"completed", "completed_with_warnings"}:
+            algorithm.training_status = (
+                "completed_with_warnings" if quality_warning_seen else "completed"
             )
-        else:
-            logger.warning(
-                "[BehaviorDistill] stopped at a blocked phase gate; no later "
-                "student-drive ratio was entered."
-            )
+        if last_saved_iteration != max_iterations:
+            save_r1_checkpoint(max_iterations)
+        logger.info(
+            "[BehaviorDistill] completed in "
+            f"{time.time() - loop_start:.1f}s, status={algorithm.training_status}, "
+            f"env_steps={algorithm.total_steps}, "
+            f"teacher_max_abs_diff={algorithm.teacher_max_abs_diff():.3e}"
+        )
     finally:
         env.close()

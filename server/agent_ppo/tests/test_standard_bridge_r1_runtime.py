@@ -29,10 +29,10 @@ if torch is not None:
     from agent_ppo.model.actor_critic_encoder import ActorCriticEncoder
     from agent_ppo.model.vision_encoder import DmEncoder
     from agent_ppo.workflow.behavior_distill_workflow import (
-        _evaluate_phase_gate,
+        _evaluate_phase_quality,
         _phase_for_iteration,
         _platform_model_id,
-        _validate_resume_contract,
+        _resume_warnings,
         _validate_schedule,
     )
 
@@ -194,20 +194,20 @@ class StandardBridgeR1RuntimeTests(unittest.TestCase):
             self.assertTrue(lbc_target.teacher_loaded)
             self.assertEqual(lbc_target.teacher_source, str(side_path))
 
-    def test_blocked_or_config_drift_resume_is_rejected(self):
+    def test_resume_drift_is_reported_without_blocking(self):
         resumed = SimpleNamespace(
             current_iteration=1500,
             config_sha256="old-config",
             training_status="running",
         )
-        with self.assertRaisesRegex(RuntimeError, "changed config"):
-            _validate_resume_contract(resumed, "new-config")
+        warnings = _resume_warnings(resumed, "new-config")
+        self.assertTrue(any("changed config" in warning for warning in warnings))
         resumed.config_sha256 = "new-config"
         resumed.training_status = "blocked"
-        with self.assertRaisesRegex(RuntimeError, "blocked"):
-            _validate_resume_contract(resumed, "new-config")
+        warnings = _resume_warnings(resumed, "new-config")
+        self.assertTrue(any("legacy checkpoint" in warning for warning in warnings))
 
-    def test_two_consecutive_gate_windows_are_required(self):
+    def test_two_quality_windows_produce_advisory_result(self):
         passing = {
             "action_cos": 0.99,
             "normalized_action_mse": 0.05,
@@ -217,7 +217,7 @@ class StandardBridgeR1RuntimeTests(unittest.TestCase):
             "hard_termination_rate": 0.02,
             "action_l2_p95": 0.1,
         }
-        passed, details = _evaluate_phase_gate(
+        passed, details = _evaluate_phase_quality(
             [passing.copy() for _ in range(100)],
             50,
             {},
@@ -228,10 +228,18 @@ class StandardBridgeR1RuntimeTests(unittest.TestCase):
         failing = [passing.copy() for _ in range(100)]
         for row in failing[50:]:
             row["action_cos"] = 0.90
-        passed, details = _evaluate_phase_gate(failing, 50, {}, 0.02)
+        passed, details = _evaluate_phase_quality(failing, 50, {}, 0.02)
         self.assertFalse(passed)
         self.assertTrue(
             any("window2 action_cos" in reason for reason in details["reasons"])
+        )
+
+        nonfinite = [passing.copy() for _ in range(100)]
+        nonfinite[-1]["action_cos"] = float("nan")
+        passed, details = _evaluate_phase_quality(nonfinite, 50, {}, 0.02)
+        self.assertFalse(passed)
+        self.assertTrue(
+            any("action_cos is not finite" in reason for reason in details["reasons"])
         )
 
 

@@ -710,9 +710,9 @@ class Agent(BaseAgent):
                                   plus model.ckpt-{id}.pkl platform alias
 
         STD-BRIDGE-R1 always emits the probe-compatible regular checkpoint
-        model.ckpt-{id}.pkl.  A passed phase may additionally emit
-        model.ckpt-bridge-{id}.pkl and model.ckpt-teacher-{id}.pkl; a blocked
-        phase emits model.ckpt-blocked-{id}.pkl and never publishes a teacher.
+        model.ckpt-{id}.pkl.  Each DAgger phase boundary additionally emits
+        model.ckpt-bridge-{id}.pkl and model.ckpt-teacher-{id}.pkl; advisory
+        quality status is recorded in the checkpoint for manual evaluation.
         """
         path = self._resolve_checkpoint_dir(path, create=True)
         ckpt_name = getattr(self.stage, "ckpt_name", "") or ""
@@ -722,10 +722,10 @@ class Agent(BaseAgent):
             model_file_path = os.path.join(path, f"model.ckpt-{str(id)}.pkl")
 
         if self.is_behavior_distill:
-            if checkpoint_label not in {None, "bridge", "blocked"}:
+            if checkpoint_label not in {None, "bridge"}:
                 raise ValueError(
-                    "Behavior-distill checkpoint_label must be bridge, blocked, "
-                    f"or None; got {checkpoint_label!r}"
+                    "Behavior-distill checkpoint_label must be bridge or None; "
+                    f"got {checkpoint_label!r}"
                 )
             if publish_privileged_teacher and checkpoint_label != "bridge":
                 raise ValueError(
@@ -1313,43 +1313,6 @@ class Agent(BaseAgent):
                 if not self._ckpt_exact_match(state, expected_state):
                     return False, f"incompatible {key}"
             return True, "compatible"
-
-        # ``latest`` normally means "newest compatible artifact".  A blocked
-        # R1 checkpoint is different: it records an explicit failed phase gate,
-        # so silently falling back to an older privileged teacher would hide the
-        # failure and could start visual distillation from the wrong milestone.
-        # Explicit numeric IDs remain available when an operator intentionally
-        # selects an earlier passed teacher.
-        if str(id) == "latest" and candidate_paths:
-            parsed_candidates = [
-                (_checkpoint_id_from_name(os.path.basename(candidate)), candidate)
-                for candidate in candidate_paths
-            ]
-            numeric_ids = [
-                checkpoint_id
-                for checkpoint_id, _candidate in parsed_candidates
-                if checkpoint_id is not None
-            ]
-            if numeric_ids:
-                latest_id = max(numeric_ids)
-                for checkpoint_id, candidate in parsed_candidates:
-                    if checkpoint_id != latest_id:
-                        continue
-                    try:
-                        checkpoint = _load_checkpoint(candidate)
-                    except Exception:
-                        continue
-                    if (
-                        isinstance(checkpoint, dict)
-                        and checkpoint.get("format") == "behavior_distill_v2"
-                        and checkpoint.get("training_status") == "blocked"
-                    ):
-                        raise RuntimeError(
-                            "[LBC-Loco] Latest STD-BRIDGE-R1 checkpoint is blocked "
-                            f"at platform ID {latest_id}: {candidate}. Refusing to "
-                            "fall back to an older teacher; select an explicitly "
-                            "reviewed model.ckpt-teacher-<id>.pkl instead."
-                        )
 
         # Eval 路径：模拟真机视角
         is_eval = getattr(self, "is_eval", False)
