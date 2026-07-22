@@ -31,6 +31,7 @@ if torch is not None:
     from agent_ppo.workflow.behavior_distill_workflow import (
         _evaluate_phase_gate,
         _phase_for_iteration,
+        _platform_model_id,
         _validate_resume_contract,
         _validate_schedule,
     )
@@ -71,6 +72,9 @@ class StandardBridgeR1RuntimeTests(unittest.TestCase):
             [_phase_for_iteration(value, ends) for value in (0, 1499, 1500, 2249, 2250, 4999)],
             [0, 0, 1, 1, 2, 4],
         )
+        self.assertEqual(_platform_model_id(1, 10288), 10289)
+        self.assertEqual(_platform_model_id(1500, 10288), 11788)
+        self.assertEqual(_platform_model_id(5000, 10288), 15288)
 
     def test_per_environment_driver_and_zero_weight_guard(self):
         algorithm = self._algorithm()
@@ -157,11 +161,19 @@ class StandardBridgeR1RuntimeTests(unittest.TestCase):
             self.assertEqual(resumed.training_status, "running")
 
             side_path = Path(temp_dir) / "teacher.pkl"
-            algorithm.save_privileged_teacher(str(side_path), bridge_sha)
+            algorithm.save_privileged_teacher(
+                str(side_path),
+                bridge_sha,
+                platform_model_id=12538,
+                source_training_status="phase_passed",
+            )
             side = torch.load(side_path, map_location="cpu", weights_only=False)
             self.assertEqual(side["format"], PRIVILEGED_TEACHER_FORMAT)
             self.assertIs(side["deployable"], False)
             self.assertEqual(side["model_spec"]["actor_input_dim"], 77)
+            self.assertEqual(side["source_iteration"], 2250)
+            self.assertEqual(side["source_training_status"], "phase_passed")
+            self.assertEqual(side["platform_model_id"], 12538)
 
             lbc_target = SimpleNamespace(
                 proprio_dim=45,

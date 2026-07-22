@@ -20,6 +20,12 @@ whose Actor input is 77-D. Numeric ID `10288` was reused and is not a structure
 contract. New work must first complete and validate `STD-BRIDGE-R1`, then load
 its `privileged_loco_teacher_v1` side artifact here.
 
+R1 continues platform filename IDs from the parent: the completed 5000-iteration
+run publishes `model.ckpt-teacher-15288.pkl`, while its payload records
+`source_iteration=5000`.  Intermediate or blocked recovery aliases must not be
+selected as the D1 teacher; only a `teacher` artifact emitted after a passed gate
+is eligible.
+
 ## Runtime Contract
 
 - Stage: `StandardDistill1Config`

@@ -72,6 +72,21 @@ def _phase_for_iteration(iteration: int, phase_end_iterations: list[int]) -> int
     return len(phase_end_iterations) - 1
 
 
+def _platform_model_id(current_iteration: int, platform_model_id_base: int) -> int:
+    """Map the true R1 iteration to a monotonic platform liveness ID."""
+    iteration = int(current_iteration)
+    base = int(platform_model_id_base)
+    if iteration <= 0:
+        raise ValueError(
+            f"Platform checkpoint mapping requires iteration > 0, got {iteration}"
+        )
+    if base < 0:
+        raise ValueError(
+            f"platform_model_id_base must be non-negative, got {base}"
+        )
+    return base + iteration
+
+
 def _unpack_step_result(step_data, device):
     """Normalize Tencent wrapper 6/7-item step payloads."""
     if step_data is None:
@@ -262,6 +277,19 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     max_iterations = int(distill_conf.get("max_iterations", stage.max_iterations))
     log_interval = int(distill_conf.get("log_interval", stage.log_interval))
     save_interval = int(distill_conf.get("save_interval", stage.model_save_interval))
+    if save_interval <= 0:
+        raise ValueError("save_interval must be positive")
+    platform_model_id_base = int(
+        distill_conf.get("platform_model_id_base", 10288)
+    )
+    initial_probe_save_iteration = int(
+        distill_conf.get("initial_probe_save_iteration", 1)
+    )
+    if not 1 <= initial_probe_save_iteration <= max_iterations:
+        raise ValueError(
+            "initial_probe_save_iteration must stay within the R1 run: "
+            f"{initial_probe_save_iteration} not in [1, {max_iterations}]"
+        )
     num_steps_per_env = int(
         distill_conf.get("num_steps_per_env", stage.num_steps_per_env)
     )
@@ -327,6 +355,8 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         "[BehaviorDistill] STD-BRIDGE-R1 start: "
         f"iteration={start_iteration}/{max_iterations}, steps_per_env={num_steps_per_env}, "
         f"phase_ends={phase_end_iterations}, ratios={phase_ratios}, "
+        f"platform_model_id_base={platform_model_id_base}, "
+        f"initial_probe_save_iteration={initial_probe_save_iteration}, "
         f"teacher={algorithm.teacher_source}, teacher_sha256={algorithm.teacher_sha256}, "
         f"config_sha256={current_config_sha}, code_commit={algorithm.code_commit}"
     )
@@ -340,6 +370,31 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     loop_start = time.time()
     blocked = False
     last_saved_iteration: int | None = None
+
+    def save_r1_checkpoint(
+        current_iteration: int,
+        *,
+        checkpoint_label: str | None = None,
+        publish_privileged_teacher: bool = False,
+        release_status: str | None = None,
+    ) -> int:
+        platform_id = _platform_model_id(
+            current_iteration, platform_model_id_base
+        )
+        agent.save_model(
+            id=str(platform_id),
+            checkpoint_label=checkpoint_label,
+            publish_privileged_teacher=publish_privileged_teacher,
+            release_status=release_status,
+        )
+        logger.info(
+            "[BehaviorDistill] checkpoint mapping: "
+            f"current_iteration={current_iteration} -> platform_model_id="
+            f"{platform_id}, label={checkpoint_label or 'periodic'}, "
+            f"publish_teacher={publish_privileged_teacher}"
+        )
+        return platform_id
+
     try:
         for iteration in range(start_iteration, max_iterations):
             iter_start = time.time()
@@ -437,6 +492,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             algorithm.current_iteration = iter_id
             algorithm.dagger_phase_iteration = iter_id - phase_start
 
+            # The platform probe needs a student artifact immediately.  Its
+            # numeric filename ID must already outrank the source teacher 10288.
+            if (
+                iter_id == initial_probe_save_iteration
+                and last_saved_iteration != iter_id
+            ):
+                save_r1_checkpoint(iter_id)
+                last_saved_iteration = iter_id
+
             if iter_id % log_interval == 0 or iteration == start_iteration:
                 logger.info(
                     "[BehaviorDistill] "
@@ -483,6 +547,9 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 gate_record = {
                     "phase_index": phase_index,
                     "phase_end_iteration": iter_id,
+                    "platform_model_id": _platform_model_id(
+                        iter_id, platform_model_id_base
+                    ),
                     "student_drive_probability": student_probability,
                     "passed": gate_passed,
                     **gate_details,
@@ -495,7 +562,12 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         "[BehaviorDistill] phase gate blocked progression: "
                         f"{gate_record}"
                     )
-                    agent.save_model(id=str(iter_id))
+                    save_r1_checkpoint(
+                        iter_id,
+                        checkpoint_label="blocked",
+                        publish_privileged_teacher=False,
+                        release_status="blocked",
+                    )
                     last_saved_iteration = iter_id
                     break
 
@@ -517,7 +589,17 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 else:
                     algorithm.training_status = "completed"
                 logger.info(f"[BehaviorDistill] phase gate passed: {gate_record}")
-                agent.save_model(id=str(iter_id))
+                release_status = (
+                    "completed"
+                    if algorithm.training_status == "completed"
+                    else "phase_passed"
+                )
+                save_r1_checkpoint(
+                    iter_id,
+                    checkpoint_label="bridge",
+                    publish_privileged_teacher=True,
+                    release_status=release_status,
+                )
                 last_saved_iteration = iter_id
 
             if (
@@ -525,13 +607,18 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 and not blocked
                 and last_saved_iteration != iter_id
             ):
-                agent.save_model(id=str(iter_id))
+                save_r1_checkpoint(iter_id)
                 last_saved_iteration = iter_id
 
         if not blocked:
             algorithm.training_status = "completed"
             if last_saved_iteration != max_iterations:
-                agent.save_model(id=str(max_iterations))
+                save_r1_checkpoint(
+                    max_iterations,
+                    checkpoint_label="bridge",
+                    publish_privileged_teacher=True,
+                    release_status="completed",
+                )
             logger.info(
                 "[BehaviorDistill] completed in "
                 f"{time.time() - loop_start:.1f}s, env_steps={algorithm.total_steps}, "

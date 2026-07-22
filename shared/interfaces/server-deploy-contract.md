@@ -31,6 +31,7 @@ student_model_state_dict
 teacher_model_state_dict
 optimizer_state_dict
 current_iteration / total_steps / gradient_steps
+platform_model_id / checkpoint_role
 dagger_phase_index / dagger_phase_iteration / student_drive_probability
 safety_threshold / gate_history / recent_iteration_metrics
 rng_state
@@ -38,6 +39,11 @@ teacher_sha256 / config_sha256 / code_commit
 critic_trained = false
 training_status
 ```
+
+R1 文件名采用 `platform_model_id = 10288 + current_iteration`，确保平台探活不会
+把预训练教师 10288 误判为最新学生。R1 TOML 原有的常规定时 checkpoint 使用
+`model.ckpt-<platform_model_id>.pkl`；通过阶段闸门的完整桥接副本使用
+`model.ckpt-bridge-<platform_model_id>.pkl`；blocked 文件不得发布教师制品。
 
 该文件依赖仿真 `height_scan256`，`deployable=false`（语义上），部署端不得接受。
 旧 raw bridge checkpoint 只能作为显式 weight-only 输入，不能伪装成精确 resume。
@@ -52,12 +58,15 @@ actor_state_dict
 model_spec = proprio45 / scan256 / latent32 / action12 / goal0
 source_teacher_sha256
 bridge_checkpoint_sha256
+source_iteration / source_training_status / platform_model_id
 critic_trained = false
 deployable = false
 ```
 
 它是后续 Standard LBC 的冻结教师，不是 Jetson 制品。server LBC loader 兼容该
-封装与历史 `encoder.*`/`actor.*` raw 权重；新产物优先使用封装格式。
+封装与历史 `encoder.*`/`actor.*` raw 权重；新产物优先使用封装格式。如最新
+R1 checkpoint 已标记 `blocked`，LBC loader 不得在 `latest` 模式下静默回退到
+更旧的 teacher；需人工审核后显式选择已通过闸门的 teacher ID。
 
 ### 2.3 `lbc_loco`：可部署视觉策略候选
 

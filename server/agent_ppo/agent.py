@@ -691,7 +691,15 @@ class Agent(BaseAgent):
                 hidden_states,
             )
 
-    def save_model(self, path=None, id="1"):
+    def save_model(
+        self,
+        path=None,
+        id="1",
+        *,
+        checkpoint_label=None,
+        publish_privileged_teacher=False,
+        release_status=None,
+    ):
         """
         Save model checkpoint.
         保存模型 checkpoint。
@@ -701,8 +709,10 @@ class Agent(BaseAgent):
           - LBCLocoConfig     -> stage-specific single-label checkpoint
                                   plus model.ckpt-{id}.pkl platform alias
 
-        STD-BRIDGE-R1 emits model.ckpt-standard-bridge-r1-{id}.pkl, a platform
-        alias, and a non-deployable privileged-loco-teacher side artifact.
+        STD-BRIDGE-R1 always emits the probe-compatible regular checkpoint
+        model.ckpt-{id}.pkl.  A passed phase may additionally emit
+        model.ckpt-bridge-{id}.pkl and model.ckpt-teacher-{id}.pkl; a blocked
+        phase emits model.ckpt-blocked-{id}.pkl and never publishes a teacher.
         """
         path = self._resolve_checkpoint_dir(path, create=True)
         ckpt_name = getattr(self.stage, "ckpt_name", "") or ""
@@ -712,34 +722,69 @@ class Agent(BaseAgent):
             model_file_path = os.path.join(path, f"model.ckpt-{str(id)}.pkl")
 
         if self.is_behavior_distill:
-            bridge_sha256 = self.algorithm.save(
-                model_file_path,
+            if checkpoint_label not in {None, "bridge", "blocked"}:
+                raise ValueError(
+                    "Behavior-distill checkpoint_label must be bridge, blocked, "
+                    f"or None; got {checkpoint_label!r}"
+                )
+            if publish_privileged_teacher and checkpoint_label != "bridge":
+                raise ValueError(
+                    "A privileged teacher may only be published with a passed "
+                    "bridge checkpoint."
+                )
+            platform_model_id = int(id)
+            if platform_model_id <= 0:
+                raise ValueError(
+                    f"Platform checkpoint ID must be positive, got {id!r}"
+                )
+
+            checkpoint_role = checkpoint_label or "periodic"
+            platform_alias = os.path.join(
+                path, f"model.ckpt-{platform_model_id}.pkl"
+            )
+            alias_sha256 = self.algorithm.save(
+                platform_alias,
                 iteration=self.algorithm.current_iteration,
+                platform_model_id=platform_model_id,
+                checkpoint_role=checkpoint_role,
             )
             self.logger.info(
-                f"[BehaviorDistill] saved {model_file_path}, sha256={bridge_sha256}"
+                "[BehaviorDistill] saved regular platform checkpoint "
+                f"{platform_alias}, current_iteration="
+                f"{self.algorithm.current_iteration}, sha256={alias_sha256}"
             )
-            platform_alias = os.path.join(path, f"model.ckpt-{str(id)}.pkl")
-            if os.path.abspath(platform_alias) != os.path.abspath(model_file_path):
-                alias_sha256 = self.algorithm.save(
-                    platform_alias,
+
+            bridge_sha256 = alias_sha256
+            if checkpoint_label is not None:
+                labelled_path = os.path.join(
+                    path,
+                    f"model.ckpt-{checkpoint_label}-{platform_model_id}.pkl",
+                )
+                bridge_sha256 = self.algorithm.save(
+                    labelled_path,
                     iteration=self.algorithm.current_iteration,
+                    platform_model_id=platform_model_id,
+                    checkpoint_role=checkpoint_role,
                 )
                 self.logger.info(
-                    "[BehaviorDistill] saved platform alias "
-                    f"{platform_alias}, sha256={alias_sha256}"
+                    "[BehaviorDistill] saved labelled checkpoint "
+                    f"{labelled_path}, sha256={bridge_sha256}"
                 )
-            teacher_path = os.path.join(
-                path, f"model.ckpt-privileged-loco-teacher-{str(id)}.pkl"
-            )
-            teacher_sha256 = self.algorithm.save_privileged_teacher(
-                teacher_path,
-                bridge_checkpoint_sha256=bridge_sha256,
-            )
-            self.logger.info(
-                "[BehaviorDistill] saved non-deployable privileged teacher "
-                f"{teacher_path}, sha256={teacher_sha256}"
-            )
+
+            if publish_privileged_teacher:
+                teacher_path = os.path.join(
+                    path, f"model.ckpt-teacher-{platform_model_id}.pkl"
+                )
+                teacher_sha256 = self.algorithm.save_privileged_teacher(
+                    teacher_path,
+                    bridge_checkpoint_sha256=bridge_sha256,
+                    platform_model_id=platform_model_id,
+                    source_training_status=release_status,
+                )
+                self.logger.info(
+                    "[BehaviorDistill] published non-deployable privileged teacher "
+                    f"{teacher_path}, sha256={teacher_sha256}"
+                )
             return
 
         if self.is_visual_ppo:
@@ -1268,6 +1313,43 @@ class Agent(BaseAgent):
                 if not self._ckpt_exact_match(state, expected_state):
                     return False, f"incompatible {key}"
             return True, "compatible"
+
+        # ``latest`` normally means "newest compatible artifact".  A blocked
+        # R1 checkpoint is different: it records an explicit failed phase gate,
+        # so silently falling back to an older privileged teacher would hide the
+        # failure and could start visual distillation from the wrong milestone.
+        # Explicit numeric IDs remain available when an operator intentionally
+        # selects an earlier passed teacher.
+        if str(id) == "latest" and candidate_paths:
+            parsed_candidates = [
+                (_checkpoint_id_from_name(os.path.basename(candidate)), candidate)
+                for candidate in candidate_paths
+            ]
+            numeric_ids = [
+                checkpoint_id
+                for checkpoint_id, _candidate in parsed_candidates
+                if checkpoint_id is not None
+            ]
+            if numeric_ids:
+                latest_id = max(numeric_ids)
+                for checkpoint_id, candidate in parsed_candidates:
+                    if checkpoint_id != latest_id:
+                        continue
+                    try:
+                        checkpoint = _load_checkpoint(candidate)
+                    except Exception:
+                        continue
+                    if (
+                        isinstance(checkpoint, dict)
+                        and checkpoint.get("format") == "behavior_distill_v2"
+                        and checkpoint.get("training_status") == "blocked"
+                    ):
+                        raise RuntimeError(
+                            "[LBC-Loco] Latest STD-BRIDGE-R1 checkpoint is blocked "
+                            f"at platform ID {latest_id}: {candidate}. Refusing to "
+                            "fall back to an older teacher; select an explicitly "
+                            "reviewed model.ckpt-teacher-<id>.pkl instead."
+                        )
 
         # Eval 路径：模拟真机视角
         is_eval = getattr(self, "is_eval", False)

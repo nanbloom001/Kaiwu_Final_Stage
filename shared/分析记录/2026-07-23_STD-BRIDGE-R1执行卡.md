@@ -32,7 +32,7 @@ R1 仍然读取仿真特权 `height_scan256`，不读取深度相机，因此不
 | Critic 第一层 | `[512,316]` |
 | Actor 输出层 | `[12,128]` |
 | R1 配置 | `server/agent_ppo/conf/train_env_conf_standard_standard_bridge_r1.toml` |
-| 配置 SHA256 | `f7716353e736bb7dd4b01becc8aa0580fb3cb9e67f676f79f5a49d8bf3fadeea` |
+| 配置 SHA256 | `b7d8b5725d8f9c5976e1ccb3d7fd903a63198a56064a8468fea7553ea0da049e` |
 
 旧本地 `archive/代码存档/hjcnew蒸馏1_10288/` 仅作为审计证据，不进入分支。
 其中 checkpoint `model.ckpt-locomotion-10288.pkl` 的 SHA256 为
@@ -86,11 +86,25 @@ checkpoint，以免直接进入下一比例。阶段 0 通过后，动作安全�
 
 ## 5. Checkpoint 与后续接口
 
-训练恢复文件：
+平台探活取目录内最大的文件名数字。为避免预训练教师 `10288` 压过 R1 的
+`1--5000` 真实 iteration，文件名使用：
 
 ```text
-model.ckpt-standard-bridge-r1-<iteration>.pkl
-model.ckpt-<iteration>.pkl              # 平台探活别名
+platform_model_id = 10288 + current_iteration
+```
+
+checkpoint payload 内的 `current_iteration` 仍保持真实 `1--5000`，DAgger 调度和
+恢复一律读取 payload，不从文件名反推。第一轮完整 rollout 后立即保存
+`model.ckpt-10289.pkl`；原有 `save_interval=500` 常规定时保存保持不变。
+这不是额外划分的“每 500 轮恢复阶段”。`conf/configure_app.toml` 的
+`dump_model_freq` 是框架 Learner 调用 `learn()` 时的落模频率；R1 在自定义
+workflow 中直接更新学生，因此 R1 的可控定时保存以本节的
+`save_interval` 为准，不假设框架参数会代替这个调用。
+
+常规定时 checkpoint（内容完整，需要时可用于续训）：
+
+```text
+model.ckpt-<platform_model_id>.pkl
 format = "behavior_distill_v2"
 schema_version = 1
 ```
@@ -99,17 +113,34 @@ schema_version = 1
 源教师 SHA、配置 SHA、代码 commit 和 `training_status`，可做单文件精确恢复。
 旧 raw checkpoint 只允许显式 weight-only 导入。
 
-视觉蒸馏教师 side artifact：
+阶段闸门通过时额外发布：
 
 ```text
-model.ckpt-privileged-loco-teacher-<iteration>.pkl
+model.ckpt-bridge-<platform_model_id>.pkl   # 完整恢复 checkpoint
+model.ckpt-teacher-<platform_model_id>.pkl  # 视觉蒸馏教师
 format = "privileged_loco_teacher_v1"
 schema_version = 1
 deployable = false
 critic_trained = false
 ```
 
+阶段闸门失败时只额外保存
+`model.ckpt-blocked-<platform_model_id>.pkl`，不得发布 `teacher` 文件。所有标签只用
+单个小写单词，确保平台的 `[a-z]*` 探活正则可识别。关键映射为：
+
+| current_iteration | platform_model_id |
+|---:|---:|
+| 1 | 10289 |
+| 1500 | 11788 |
+| 2250 | 12538 |
+| 3000 | 13288 |
+| 3750 | 14038 |
+| 5000 | 15288 |
+
 后续 LBC loader 可严格读取该封装，也兼容历史 `encoder.*`/`actor.*` 权重。
+如果最新 R1 阶段已 `blocked`，使用 `latest` 启动 LBC 必须失败，不得自动
+回退到更旧 teacher；审核闸门结果后应显式选择某个
+`model.ckpt-teacher-<id>.pkl`。
 部署端继续只接受 `format="lbc_loco"`；本轮不修改 exporter、ONNX 或 Jetson 代码。
 
 ## 6. 启动与恢复
@@ -130,7 +161,8 @@ python train_test.py
 - `teacher_frozen=true` 且 optimizer 仅含学生 encoder+actor；
 - 配置 SHA 和代码 commit 已记录。
 
-恢复时只能选择 `behavior_distill_v2` 文件；配置 SHA 变化、教师 SHA 变化、
+恢复时只能选择 `behavior_distill_v2` 文件；文件名数字是平台 ID，不是内部
+iteration。配置 SHA 变化、教师 SHA 变化、
 阶段/iteration 不一致或 `training_status="blocked"` 都应在 rollout 前失败。
 
 ## 7. 最终比较与放行

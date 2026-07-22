@@ -295,7 +295,10 @@ class StandardBridgeR1Config(StandardRefDistillConfig):
 
     name = "standard_bridge_r1"
     parent_checkpoint = "replay Standard flat checkpoint 10288"
-    ckpt_name = "model.ckpt-standard-bridge-r1"
+    # Keep the platform-visible label to one lowercase word.  The platform
+    # liveness probe cannot reliably parse multi-segment labels such as
+    # model.ckpt-standard-bridge-r1-<id>.pkl.
+    ckpt_name = "model.ckpt-bridge"
 
 
 class StandardDistill1Config(LBCLocoConfig):

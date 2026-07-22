@@ -9,8 +9,11 @@
   0/25/50/75/100% 单任务 DAgger、安全接管、终止后样本权重和两窗口阶段闸门。
   `behavior_distill_v2` 保存学生、冻结教师、optimizer、RNG、DAgger 阶段和配置/
   代码血缘；同时导出不可部署的 `privileged_loco_teacher_v1`，供后续视觉 LBC
-  严格加载。首轮保持源命令/地形分布并关闭随机化、噪声和 push；平台训练与
-  闭环验收待执行。
+  严格加载。平台文件 ID 从父教师 `10288` 继续递增，第一轮立即落探活 checkpoint，
+  原有 500-iteration 常规定时保存保持不变，并非新增一套 500 轮阶段；只有通过
+  阶段闸门才额外发布单标签
+  `bridge`/`teacher` 文件，失败只保存 `blocked`。首轮保持源命令/地形分布并
+  关闭随机化、噪声和 push；平台训练与闭环验收待执行。
 - **[本地同步可诊断性]** `local_sync_client.py` 新增零网络 `--check-local` 和
   `--refresh-cookie`；Cookie 优先级改为显式值、缓存、旧兼容值、交互输入。
   代理拒绝时打印实际来源，且只在拒绝的是缓存 Cookie 时删除缓存。

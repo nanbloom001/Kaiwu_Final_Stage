@@ -2,6 +2,7 @@
 """Static contract tests for STD-BRIDGE-R1."""
 
 from pathlib import Path
+import re
 import unittest
 
 try:
@@ -43,6 +44,9 @@ class StandardBridgeR1ConfigTests(unittest.TestCase):
             stage["student_drive_ratios"], [0.0, 0.25, 0.5, 0.75, 1.0]
         )
         self.assertEqual(stage["gate_window_iterations"], 50)
+        self.assertEqual(stage["save_interval"], 500)
+        self.assertEqual(stage["platform_model_id_base"], 10288)
+        self.assertEqual(stage["initial_probe_save_iteration"], 1)
         self.assertIs(config["domain_rand"]["enable_domain_rand"], False)
         self.assertIs(config["domain_rand"]["randomize_friction"], False)
         self.assertIs(config["domain_rand"]["push_robots"], False)
@@ -102,6 +106,36 @@ class StandardBridgeR1ConfigTests(unittest.TestCase):
             "class StandardBridgeR1Config(StandardRefDistillConfig):", conf_source
         )
         self.assertIn("CURRENT = StandardBridgeR1Config", conf_source)
+        self.assertIn('ckpt_name = "model.ckpt-bridge"', conf_source)
+
+    def test_platform_probe_names_and_ids_are_monotonic(self):
+        probe = re.compile(
+            r".*model\.ckpt-[a-z]*-*([0-9][0-9]*)\..*"
+        )
+
+        def checkpoint_id(filename):
+            match = probe.fullmatch(filename)
+            return int(match.group(1)) if match else None
+
+        expected = {
+            "model.ckpt-10289.pkl": 10289,
+            "model.ckpt-bridge-11788.pkl": 11788,
+            "model.ckpt-teacher-11788.pkl": 11788,
+            "model.ckpt-blocked-11788.pkl": 11788,
+        }
+        for filename, model_id in expected.items():
+            self.assertEqual(checkpoint_id(filename), model_id)
+
+        self.assertIsNone(
+            checkpoint_id("model.ckpt-standard-bridge-r1-1500.pkl")
+        )
+        self.assertIsNone(
+            checkpoint_id("model.ckpt-privileged-loco-teacher-1500.pkl")
+        )
+        self.assertGreater(
+            checkpoint_id("model.ckpt-10289.pkl"),
+            checkpoint_id("model.ckpt-10288.pkl"),
+        )
 
     def test_behavior_evaluation_explicitly_uses_student_model(self):
         agent_source = (ROOT / "agent_ppo" / "agent.py").read_text(

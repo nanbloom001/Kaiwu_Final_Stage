@@ -544,6 +544,9 @@ class AlgorithmBehaviorDistill:
         self,
         path: str,
         bridge_checkpoint_sha256: str,
+        *,
+        platform_model_id: int | None = None,
+        source_training_status: str | None = None,
     ) -> str:
         payload = {
             "format": PRIVILEGED_TEACHER_FORMAT,
@@ -554,6 +557,11 @@ class AlgorithmBehaviorDistill:
             "model_spec": self.model_spec(),
             "source_teacher_sha256": self.teacher_sha256,
             "bridge_checkpoint_sha256": bridge_checkpoint_sha256,
+            "source_iteration": self.current_iteration,
+            "source_training_status": (
+                source_training_status or self.training_status
+            ),
+            "platform_model_id": platform_model_id,
             "critic_trained": False,
             "deployable": False,
         }

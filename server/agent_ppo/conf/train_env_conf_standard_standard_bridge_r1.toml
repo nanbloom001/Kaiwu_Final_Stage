@@ -240,10 +240,17 @@ ang_vel_yaw = [-0.3, 0.3]
 # The platform should preload the original replay Standard checkpoint 10288.
 # A local teacher_ckpt may be supplied only for offline/platform debugging.
 expected_teacher_sha256 = "d5999461f00c4634bdea0648e46baac9fba34e621eaa586fe26f64f68953eeed"
+# Platform liveness chooses the largest numeric filename ID.  Continue from
+# the parent ID so every R1 artifact outranks model.ckpt-10288.pkl while the
+# checkpoint payload keeps the true 1..5000 current_iteration.
+platform_model_id_base = 10288
+initial_probe_save_iteration = 1
 learning_rate = 3e-4
 max_iterations = 5000
 num_steps_per_env = 24
 log_interval = 50
+# R1 custom workflow's regular periodic save interval.  This is distinct from
+# configure_app.toml dump_model_freq, which belongs to framework-driven learn().
 save_interval = 500
 max_grad_norm = 1.0
 action_loss_weight = 1.0
