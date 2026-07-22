@@ -4,6 +4,17 @@
 
 ## [未发布]
 
+- **[STD-BRIDGE-R1]** 以原始复赛 Standard 10288 flat301 checkpoint 为唯一
+  行为教师，新增严格 SHA/key/shape 校验、冻结教师证明、逐环境
+  0/25/50/75/100% 单任务 DAgger、安全接管、终止后样本权重和两窗口阶段闸门。
+  `behavior_distill_v2` 保存学生、冻结教师、optimizer、RNG、DAgger 阶段和配置/
+  代码血缘；同时导出不可部署的 `privileged_loco_teacher_v1`，供后续视觉 LBC
+  严格加载。首轮保持源命令/地形分布并关闭随机化、噪声和 push；平台训练与
+  闭环验收待执行。
+- **[本地同步可诊断性]** `local_sync_client.py` 新增零网络 `--check-local` 和
+  `--refresh-cookie`；Cookie 优先级改为显式值、缓存、旧兼容值、交互输入。
+  代理拒绝时打印实际来源，且只在拒绝的是缓存 Cookie 时删除缓存。
+  `--dry-run` 继续连接远程但不写入。真实在线验证仍待刷新 Cookie。
 - **[STD-D3A]** 从 D2-40min 视觉学生继续 LBC，保持 D2 地形分布与相机外参，
   将动作模仿权重从 `0.2` 提高到 `1.0`，关闭 student-drive，并以
   `2e-4` 学习率在教师驱动的干净轨迹上修复楼梯动作对齐。训练命令按环境
@@ -16,10 +27,10 @@
   student-drive 与 D1 完全一致。新增 `require_student_resume=true` 作为预加载
   硬检查，不改变正确续训时的优化行为。输出仍为探活兼容的
   `model.ckpt-standard-<id>.pkl` 与 `model.ckpt-<id>.pkl`。
-- **[standard-distill-1]** 根据平台实际 preload 契约与决赛文档，将当前入口
-  修正为 77-D `ActorCriticEncoder` 教师的直接视觉 LBC。教师 checkpoint
-  包含 `encoder.* / actor.* / critic_encoder.* / critic.*`，LBC 只拆分前两组；
-  301-D 旧模型桥接保留为非活动 `StandardRefDistillConfig`。训练命令覆盖
+- **[standard-distill-1，历史]** 该视觉 LBC 实际需要已经完成桥接的 77-D
+  `ActorCriticEncoder` 教师；原始复赛 10288 文件已核验为 flat301，不能直接
+  进入 LBC。旧 HJC 约 10 分钟产物包含
+  `encoder.* / actor.* / critic_encoder.* / critic.*`，LBC 只拆分前两组。训练命令覆盖
   低速前后、横移和双向转动，开启 Standard 地形课程、摩擦随机化、观测
   噪声和深度增强，第一阶段关闭外部 push。相机安装外参为
   `offset_pos=[0.339871,0.034697,0.075010]`、
