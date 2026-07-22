@@ -15,7 +15,10 @@
   DAgger 阶段边界额外发布单标签 `bridge`/`teacher` 候选。action/终止/OOD
   阈值只产生 warning 并写入 checkpoint，不再生成 `blocked` 文件或中断后续比例；
   命令越界行权重置零。首轮保持源命令/地形分布并关闭随机化、噪声和 push；
-  平台训练与闭环验收待执行。
+  `configure_app.toml` 明确启用 `/data/pre_model/ckpt` 预加载并以 `10288` 为
+  首轮默认 ID；平台注入 checkpoint 优先，未注入时 workflow 从该目录加载最新
+  兼容制品，且每个 iteration 调用一次平台 lifecycle callback。平台训练与闭环
+  验收待执行。
 - **[本地同步可诊断性]** `local_sync_client.py` 新增零网络 `--check-local` 和
   `--refresh-cookie`；Cookie 优先级改为显式值、缓存、旧兼容值、交互输入。
   代理拒绝时打印实际来源，且只在拒绝的是缓存 Cookie 时删除缓存。

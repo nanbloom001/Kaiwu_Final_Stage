@@ -24,6 +24,7 @@ SOURCE_CONFIG_PATH = (
     / "conf"
     / "train_env_conf_standard_stair_inv_finetune.toml"
 )
+APP_CONFIG_PATH = ROOT / "conf" / "configure_app.toml"
 
 
 def _config():
@@ -107,6 +108,21 @@ class StandardBridgeR1ConfigTests(unittest.TestCase):
         )
         self.assertIn("CURRENT = StandardBridgeR1Config", conf_source)
         self.assertIn('ckpt_name = "model.ckpt-bridge"', conf_source)
+
+    def test_r1_preloads_10288_without_hard_coding_workflow_id(self):
+        with APP_CONFIG_PATH.open("rb") as stream:
+            app_config = tomllib.load(stream)
+        app = app_config["app"]
+        self.assertIs(app["preload_model"], True)
+        self.assertEqual(app["preload_model_dir"], "/data/pre_model/ckpt")
+        self.assertEqual(app["preload_model_id"], 10288)
+
+        workflow_source = (
+            ROOT / "agent_ppo" / "workflow" / "behavior_distill_workflow.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('agent.load_model(path=preload_dir, id="latest")', workflow_source)
+        self.assertNotIn('agent.load_model(id="10288")', workflow_source)
+        self.assertIn("agent.learn(list_sample_data=None)", workflow_source)
 
     def test_platform_probe_names_and_ids_are_monotonic(self):
         probe = re.compile(

@@ -154,6 +154,13 @@ cd server
 python train_test.py
 ```
 
+本分支的 `conf/configure_app.toml` 已明确设置
+`preload_model=true`、`preload_model_dir=/data/pre_model/ckpt` 和首轮默认
+`preload_model_id=10288`。平台任务页若把所选父模型提前传给 `Agent.load_model`
+则优先使用该制品；否则 workflow 从上述目录查找最新的结构兼容 checkpoint。
+`10288` 没有写死在 workflow 中，因此恢复 R1 时仍可由平台选择新的
+`behavior_distill_v2` checkpoint，而不会退回原始教师。
+
 预训练教师由操作者手动确认。上表 SHA 只用于事后审计，不作为
 平台 rollout 启动门禁。启动日志应显示：
 

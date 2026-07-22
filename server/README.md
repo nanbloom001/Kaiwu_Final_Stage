@@ -25,6 +25,10 @@
   key/shape、成功加载与冻结状态。命令和地形分布保持不变，首轮关闭随机化/
   噪声/push；它不读取
   depth、不执行 PPO，也不修改 Goal/UWB/Track/部署端。
+- R1 已在 `conf/configure_app.toml` 明确启用预加载，首轮默认 ID 为 `10288`、
+  目录为 `/data/pre_model/ckpt`。平台任务页若已经注入所选父模型则直接使用；
+  否则 workflow 从该目录加载最新的结构兼容 checkpoint。workflow 不写死 ID，
+  因而同一代码也能恢复后续 `behavior_distill_v2` checkpoint。
 - `StandardDistill1Config` 到 D5 继续作为已经尝试过的视觉路线保留；它们不是
   R1 的父 checkpoint。D1 需要 encoder-based bridge artifact，不能直接加载原始
   flat301 文件。

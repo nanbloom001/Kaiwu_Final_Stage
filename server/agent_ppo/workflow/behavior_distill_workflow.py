@@ -344,10 +344,24 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             param_group["lr"] = override_lr
         algorithm.learning_rate = override_lr
 
-    # Platform-selected checkpoints can be injected after Agent construction.
+    # The Arena task form may inject its selected checkpoint before this
+    # workflow starts. If it did not, use the platform preload mount and scan
+    # the selected artifact by its real filename ID instead of hard-coding
+    # 10288 here; the same path must also support an R1 resume checkpoint.
     if not algorithm.teacher_loaded:
-        logger.info("[BehaviorDistill] loading selected teacher/resume checkpoint")
-        agent.load_model(id="latest")
+        preload_dir = os.environ.get(
+            "KAIWU_MODEL_CKPT_DIR", "/data/pre_model/ckpt"
+        )
+        logger.warning(
+            "[BehaviorDistill] no checkpoint was injected before workflow start; "
+            f"loading the latest compatible teacher/resume from {preload_dir}"
+        )
+        agent.load_model(path=preload_dir, id="latest")
+    else:
+        logger.info(
+            "[BehaviorDistill] using the checkpoint injected by the platform: "
+            f"{algorithm.teacher_source}"
+        )
     algorithm.assert_teacher_ready()
     logger.warning(
         "[BehaviorDistill] this workflow updates the student directly from env.step; "
@@ -525,6 +539,11 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             iter_id = iteration + 1
             algorithm.current_iteration = iter_id
             algorithm.dagger_phase_iteration = iter_id - phase_start
+
+            # Match the platform lifecycle used by the working LBC workflow.
+            # Agent.learn() is intentionally a no-op for behavior distillation;
+            # the student was already updated by finish_update().
+            agent.learn(list_sample_data=None)
 
             # The platform probe needs a student artifact immediately.  Its
             # numeric filename ID must already outrank the source teacher 10288.
