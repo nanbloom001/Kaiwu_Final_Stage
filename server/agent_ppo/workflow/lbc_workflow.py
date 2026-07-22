@@ -150,8 +150,13 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         except Exception as exc:
             logger.warning(f"[LBC-Loco] platform teacher load failed: {exc}")
     algorithm.assert_teacher_ready()
-    if bool(lbc_conf.get("require_student_resume", False)):
+    require_student_resume = bool(lbc_conf.get("require_student_resume", False))
+    if require_student_resume:
         algorithm.assert_student_ready()
+        logger.info(
+            f"{log_prefix} resumed visual student checkpoint: "
+            f"{algorithm.student_source}"
+        )
     teacher_encoder_frozen = (
         not algorithm.teacher_encoder.training
         and all(not parameter.requires_grad for parameter in algorithm.teacher_encoder.parameters())
