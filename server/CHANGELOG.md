@@ -4,6 +4,12 @@
 
 ## [未发布]
 
+- **[STD-D2-Stair]** 从当前 Standard 视觉学生继续 LBC，只调整训练数据分布：
+  `max_init_terrain_level=4`，上/下坡各 5%，上楼梯 30%，下楼梯 60%，
+  maze 0%。网络、latent、LSTM、损失、相机外参、深度增强、命令、随机化和
+  student-drive 与 D1 完全一致。新增 `require_student_resume=true` 作为预加载
+  硬检查，不改变正确续训时的优化行为。输出仍为探活兼容的
+  `model.ckpt-standard-<id>.pkl` 与 `model.ckpt-<id>.pkl`。
 - **[standard-distill-1]** 根据平台实际 preload 契约与决赛文档，将当前入口
   修正为 77-D `ActorCriticEncoder` 教师的直接视觉 LBC。教师 checkpoint
   包含 `encoder.* / actor.* / critic_encoder.* / critic.*`，LBC 只拆分前两组；

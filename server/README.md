@@ -19,7 +19,8 @@
 ## 活动基线
 
 - **起始基线**：`codex/st7-opt3`（提交 `9b0b3df`，ST7 Opt3 UWB goal noise）
-- **当前活动入口**：`StandardDistill1Config`（standard-distill-1），从平台 10288 的 77-D `ActorCriticEncoder` 教师直接进行深度视觉 LBC，并使用标定后的相机外参。
+- **当前活动入口**：`StandardDistill2StairConfig`（STD-D2-Stair），从当前 Standard 视觉学生续训；仅把训练分布调整为 60% 下楼梯、30% 上楼梯、10% 坡面，并把初始覆盖提高到 L4。
+- `StandardDistill1Config` 保留为视觉 D1 基线；D2-Stair 不修改网络、损失、相机、增强、命令、随机化或 student-drive。
 - 301-D 扁平旧模型的行为桥接仅作为 `StandardRefDistillConfig` 备用；ST9-Opt3-D2 的动作感知、闭环 DAgger 与时序实现继续保留。
 - TrackNav 保留 Opt3 基线 + J9 通用学习率接口修复 + Opt4 角速度保护；`navopt5debug` 与 `navopt5b` 作为独立可复现实验阶段保留，不是默认入口。
 - 含 ST7-Opt2B `dynamic_tilt_risk`、ST7-Opt3 `goal_noise`、行为蒸馏/LBC 机制（在 `codex/st7-opt2a` 并入主干）。

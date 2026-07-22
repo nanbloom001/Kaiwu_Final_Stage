@@ -89,11 +89,11 @@ def build_monitor():
 
     algorithm = getattr(Config.CURRENT, "algorithm", "ppo")
     if algorithm == "lbc_loco":
-        title = (
-            "Standard_Distill_1"
-            if Config.CURRENT.name == "standard_distill_1"
-            else "ST9_Opt3_D2"
-        )
+        titles = {
+            "standard_distill_1": "Standard_Distill_1",
+            "standard_distill_2_stair": "STD_D2_Stair",
+        }
+        title = titles.get(Config.CURRENT.name, "ST9_Opt3_D2")
         return _build_lbc_monitor(title)
     if algorithm == "behavior_distill":
         return _build_behavior_distill_monitor()
