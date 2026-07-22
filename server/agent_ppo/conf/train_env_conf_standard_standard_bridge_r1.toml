@@ -255,7 +255,7 @@ num_steps_per_env = 24
 log_interval = 50
 # R1 custom workflow's regular periodic save interval.  This is distinct from
 # configure_app.toml dump_model_freq, which belongs to framework-driven learn().
-save_interval = 500
+save_interval = 100
 max_grad_norm = 1.0
 action_loss_weight = 1.0
 quality_window_iterations = 50

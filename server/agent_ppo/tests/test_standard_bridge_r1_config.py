@@ -45,7 +45,7 @@ class StandardBridgeR1ConfigTests(unittest.TestCase):
             stage["student_drive_ratios"], [0.0, 0.25, 0.5, 0.75, 1.0]
         )
         self.assertEqual(stage["quality_window_iterations"], 50)
-        self.assertEqual(stage["save_interval"], 500)
+        self.assertEqual(stage["save_interval"], 100)
         self.assertEqual(stage["platform_model_id_base"], 10288)
         self.assertEqual(stage["initial_probe_save_iteration"], 1)
         self.assertIs(config["domain_rand"]["enable_domain_rand"], False)

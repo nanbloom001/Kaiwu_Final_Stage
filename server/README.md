@@ -35,8 +35,8 @@
 - R1 训练恢复格式为 `behavior_distill_v2`；后续视觉 LBC 教师格式为
   `privileged_loco_teacher_v1`；二者均不能交给当前部署导出器。
 - R1 的平台文件 ID 为 `10288 + current_iteration`：第一轮保存 `10289`，最终
-  保存 `15288`。内部 DAgger iteration 仍为 `1--5000`；原有每 500 iteration
-  常规定时保存不变，这不是额外划分的“500 轮恢复阶段”；每个 DAgger 阶段
+  保存 `15288`。内部 DAgger iteration 仍为 `1--5000`；当前每 100 iteration
+  常规定时保存一次，这不是额外划分的“100 轮恢复阶段”；每个 DAgger 阶段
   边界额外发布 `bridge`/`teacher` 候选，质量阈值只记录 warning，不会停训。
 - TrackNav 保留 Opt3 基线 + J9 通用学习率接口修复 + Opt4 角速度保护；`navopt5debug` 与 `navopt5b` 作为独立可复现实验阶段保留，不是默认入口。
 - 含 ST7-Opt2B `dynamic_tilt_risk`、ST7-Opt3 `goal_noise`、行为蒸馏/LBC 机制（在 `codex/st7-opt2a` 并入主干）。

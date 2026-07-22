@@ -11,7 +11,7 @@
   `behavior_distill_v2` 保存学生、冻结教师、optimizer、RNG、DAgger 阶段和配置/
   代码血缘；同时导出不可部署的 `privileged_loco_teacher_v1`，供后续视觉 LBC
   严格加载。平台文件 ID 从父教师 `10288` 继续递增，第一轮立即落探活 checkpoint，
-  原有 500-iteration 常规定时保存保持不变，并非新增一套 500 轮阶段；每个
+  常规定时保存调整为每 100 iteration 一次，并非新增一套 100 轮阶段；每个
   DAgger 阶段边界额外发布单标签 `bridge`/`teacher` 候选。action/终止/OOD
   阈值只产生 warning 并写入 checkpoint，不再生成 `blocked` 文件或中断后续比例；
   命令越界行权重置零。首轮保持源命令/地形分布并关闭随机化、噪声和 push；

@@ -96,8 +96,8 @@ platform_model_id = 10288 + current_iteration
 
 checkpoint payload 内的 `current_iteration` 仍保持真实 `1--5000`，DAgger 调度和
 恢复一律读取 payload，不从文件名反推。第一轮完整 rollout 后立即保存
-`model.ckpt-10289.pkl`；原有 `save_interval=500` 常规定时保存保持不变。
-这不是额外划分的“每 500 轮恢复阶段”。`conf/configure_app.toml` 的
+`model.ckpt-10289.pkl`；当前 `save_interval=100`，每 100 iteration 常规定时保存。
+这不是额外划分的“每 100 轮恢复阶段”。`conf/configure_app.toml` 的
 `dump_model_freq` 是框架 Learner 调用 `learn()` 时的落模频率；R1 在自定义
 workflow 中直接更新学生，因此 R1 的可控定时保存以本节的
 `save_interval` 为准，不假设框架参数会代替这个调用。
