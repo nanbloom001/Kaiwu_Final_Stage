@@ -103,25 +103,14 @@ class VisionEncoder(nn.Module):
         if not self.use_lstm or self._hidden_state is None:
             return
         h, c = self._hidden_state
-        # Do not mutate graph-carrying recurrent states in place.  During TBPTT
-        # the prior states remain part of the current sequence's autograd graph.
-        h = h.clone()
-        c = c.clone()
         h[:, env_ids, :] = 0
         c[:, env_ids, :] = 0
-        self._hidden_state = (h, c)
-
-    def detach_hidden_state(self):
-        """End the current truncated-BPTT segment without changing its values."""
-        if self.use_lstm and self._hidden_state is not None:
-            self._hidden_state = tuple(state.detach() for state in self._hidden_state)
 
     def forward(
         self,
         depth_image: torch.Tensor,
         proprio: torch.Tensor,
         masks: torch.Tensor = None,
-        detach_hidden: bool = True,
     ) -> torch.Tensor:
         """Forward pass: depth + proprio → CNN → LSTM → L2-normed latent.
 
@@ -153,19 +142,20 @@ class VisionEncoder(nn.Module):
                     torch.zeros(self.rnn_num_layers, batch_size, self.rnn_hidden_dim, device=device),
                 )
 
-            # Handle mask: reset hidden state for envs where masks is False.
-            # Multiplication is graph-safe when this is called inside TBPTT.
+            # Handle mask: reset hidden state for envs where masks is False
             if masks is not None:
-                keep = masks.bool().view(1, batch_size, 1).to(dtype=self._hidden_state[0].dtype)
-                self._hidden_state = (
-                    self._hidden_state[0] * keep,
-                    self._hidden_state[1] * keep,
-                )
+                reset_indices = ~masks.bool()
+                if reset_indices.any():
+                    self._hidden_state[0][:, reset_indices, :] = 0
+                    self._hidden_state[1][:, reset_indices, :] = 0
 
             rnn_output, self._hidden_state = self.rnn(rnn_input, self._hidden_state)
 
-            if detach_hidden:
-                self.detach_hidden_state()
+            # Detach hidden to avoid BPTT-style gradient explosion
+            self._hidden_state = (
+                self._hidden_state[0].detach(),
+                self._hidden_state[1].detach(),
+            )
 
             features = self.rnn_output_layer(rnn_output.squeeze(1))  # [B, rnn_output_dim]
         else:

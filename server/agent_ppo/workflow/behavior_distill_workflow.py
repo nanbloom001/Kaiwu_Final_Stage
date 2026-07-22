@@ -3,689 +3,147 @@
 ###########################################################################
 # Copyright © 1998 - 2026 Tencent. All Rights Reserved.
 ###########################################################################
-"""STD-BRIDGE-R1 one-run behavior distillation workflow."""
+"""Workflow for standard_ref_distill behavior cloning."""
 
 from __future__ import annotations
 
-import hashlib
-import math
 import os
-import subprocess
 import time
-from collections import defaultdict
-from pathlib import Path
-from typing import Any
+from collections import deque
 
 import torch
 
 from agent_ppo.conf.conf import Config
 
 
-def _sha256_file(path: str | os.PathLike[str]) -> str:
-    digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _code_commit() -> str:
-    configured = os.environ.get("KAIWU_CODE_COMMIT", "").strip()
-    if configured:
-        return configured
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return result.stdout.strip() or "unknown"
-    except Exception:
-        return "unknown"
-
-
-def _validate_schedule(
-    phase_end_iterations: list[int],
-    phase_ratios: list[float],
-    max_iterations: int,
-) -> None:
-    if not phase_end_iterations or len(phase_end_iterations) != len(phase_ratios):
-        raise ValueError("DAgger phase endpoints and ratios must be non-empty and aligned")
-    if any(end <= 0 for end in phase_end_iterations):
-        raise ValueError("DAgger phase endpoints must be positive")
-    if phase_end_iterations != sorted(set(phase_end_iterations)):
-        raise ValueError("DAgger phase endpoints must be strictly increasing")
-    if phase_end_iterations[-1] != max_iterations:
-        raise ValueError(
-            "Final DAgger phase endpoint must equal max_iterations: "
-            f"{phase_end_iterations[-1]} != {max_iterations}"
-        )
-    if any(ratio < 0.0 or ratio > 1.0 for ratio in phase_ratios):
-        raise ValueError("DAgger student-drive ratios must stay in [0, 1]")
-
-
-def _phase_for_iteration(iteration: int, phase_end_iterations: list[int]) -> int:
-    for phase_index, phase_end in enumerate(phase_end_iterations):
-        if iteration < phase_end:
-            return phase_index
-    return len(phase_end_iterations) - 1
-
-
-def _platform_model_id(current_iteration: int, platform_model_id_base: int) -> int:
-    """Map the true R1 iteration to a monotonic platform liveness ID."""
-    iteration = int(current_iteration)
-    base = int(platform_model_id_base)
-    if iteration <= 0:
-        raise ValueError(
-            f"Platform checkpoint mapping requires iteration > 0, got {iteration}"
-        )
-    if base < 0:
-        raise ValueError(
-            f"platform_model_id_base must be non-negative, got {base}"
-        )
-    return base + iteration
-
-
-def _unpack_step_result(step_data, device):
-    """Normalize Tencent wrapper 6/7-item step payloads."""
-    if step_data is None:
-        raise RuntimeError("[BehaviorDistill] env.step returned None")
-    if not isinstance(step_data, (tuple, list)):
-        raise TypeError(
-            f"Unexpected env.step return type: {type(step_data).__name__}"
-        )
-    if len(step_data) == 6:
-        frame_no, next_obs, rewards, terminated, truncated, extra = step_data
-        if isinstance(extra, (tuple, list)):
-            if len(extra) < 2:
-                raise ValueError(f"Unexpected env.step extra length: {len(extra)}")
-            infos, privileged_obs = extra[0], extra[1]
-        elif isinstance(extra, dict):
-            infos = extra
-            privileged_obs = extra.get("privileged_obs", extra.get("critic_obs"))
-        else:
-            raise TypeError(
-                f"Unexpected env.step extra type: {type(extra).__name__}"
-            )
-    elif len(step_data) >= 7:
-        frame_no, next_obs, rewards, terminated, truncated = step_data[:5]
-        infos_or_extra = step_data[5]
-        if isinstance(infos_or_extra, (tuple, list)) and len(infos_or_extra) >= 2:
-            infos, privileged_obs = infos_or_extra[:2]
-        else:
-            infos = infos_or_extra
-            privileged_obs = step_data[6]
-    else:
-        raise ValueError(f"Unexpected env.step return length: {len(step_data)}")
-
-    if infos is None or not isinstance(infos, dict):
-        infos = {}
-    return (
-        frame_no,
-        torch.as_tensor(next_obs, device=device),
-        torch.as_tensor(rewards, device=device).reshape(-1),
-        torch.as_tensor(terminated, device=device).reshape(-1).bool(),
-        torch.as_tensor(truncated, device=device).reshape(-1).bool(),
-        infos,
-        privileged_obs,
-    )
-
-
-def _command_ood_mask(obs: torch.Tensor, command_guard: dict[str, Any]) -> torch.Tensor:
-    if obs.ndim != 2 or obs.shape[-1] < 9:
-        raise ValueError(
-            "Command guard requires proprio command at obs[:, 6:9], "
-            f"got shape={tuple(obs.shape)}"
-        )
-    bounds = (
-        command_guard.get("lin_vel_x", [0.3, 1.3]),
-        command_guard.get("lin_vel_y", [-0.2, 0.2]),
-        command_guard.get("ang_vel_z", [-0.3, 0.3]),
-    )
-    tolerance = float(command_guard.get("tolerance", 1.0e-5))
-    in_domain = torch.ones(obs.shape[0], dtype=torch.bool, device=obs.device)
-    for index, bound in zip((6, 7, 8), bounds):
-        if not isinstance(bound, (tuple, list)) or len(bound) != 2:
-            raise ValueError(f"Invalid command guard bound: {bound!r}")
-        lower, upper = float(bound[0]), float(bound[1])
-        in_domain &= (obs[:, index] >= lower - tolerance) & (
-            obs[:, index] <= upper + tolerance
-        )
-    return ~in_domain
-
-
-def _mean_metrics(step_metrics: list[dict[str, float]]) -> dict[str, float]:
-    values: dict[str, list[float]] = defaultdict(list)
-    for metrics in step_metrics:
-        for key, value in metrics.items():
-            values[key].append(float(value))
-    return {
-        key: sum(samples) / max(1, len(samples))
-        for key, samples in values.items()
-    }
-
-
-def _window_average(rows: list[dict[str, float]]) -> dict[str, float]:
-    return _mean_metrics(rows)
-
-
-def _evaluate_phase_quality(
-    recent_metrics: list[dict[str, float]],
-    quality_window_iterations: int,
-    quality_conf: dict[str, Any],
-    previous_hard_termination_rate: float | None,
-) -> tuple[bool, dict[str, Any]]:
-    required = 2 * quality_window_iterations
-    if len(recent_metrics) < required:
-        return False, {
-            "reasons": [
-                f"need {required} quality iterations, only have {len(recent_metrics)}"
-            ],
-            "windows": [],
-        }
-    selected = recent_metrics[-required:]
-    windows = [
-        _window_average(selected[:quality_window_iterations]),
-        _window_average(selected[quality_window_iterations:]),
-    ]
-    minimum_cosine = float(quality_conf.get("minimum_action_cosine", 0.98))
-    maximum_normalized_mse = float(
-        quality_conf.get("maximum_normalized_action_mse", 0.10)
-    )
-    maximum_takeover = float(
-        quality_conf.get("maximum_safety_takeover_rate", 0.10)
-    )
-    maximum_hard_delta = float(
-        quality_conf.get("maximum_hard_termination_delta", 0.01)
-    )
-    reasons: list[str] = []
-    for index, window in enumerate(windows, start=1):
-        for metric_name in (
-            "action_cos",
-            "normalized_action_mse",
-            "nonfinite_rate",
-            "teacher_ood_rate",
-            "safety_takeover_rate",
-            "hard_termination_rate",
-            "action_l2_p95",
-        ):
-            metric_value = window.get(metric_name)
-            if metric_value is None or not math.isfinite(float(metric_value)):
-                reasons.append(
-                    f"window{index} {metric_name} is not finite: {metric_value}"
-                )
-        if window.get("action_cos", float("-inf")) < minimum_cosine:
-            reasons.append(
-                f"window{index} action_cos={window.get('action_cos')} < {minimum_cosine}"
-            )
-        if window.get("normalized_action_mse", float("inf")) > maximum_normalized_mse:
-            reasons.append(
-                "window"
-                f"{index} normalized_action_mse={window.get('normalized_action_mse')} "
-                f"> {maximum_normalized_mse}"
-            )
-        if window.get("nonfinite_rate", 1.0) > 0.0:
-            reasons.append(
-                f"window{index} nonfinite_rate={window.get('nonfinite_rate')} > 0"
-            )
-        if window.get("teacher_ood_rate", 1.0) > 0.0:
-            reasons.append(
-                f"window{index} teacher_ood_rate={window.get('teacher_ood_rate')} > 0"
-            )
-        if window.get("safety_takeover_rate", 1.0) > maximum_takeover:
-            reasons.append(
-                f"window{index} safety_takeover_rate="
-                f"{window.get('safety_takeover_rate')} > {maximum_takeover}"
-            )
-        if previous_hard_termination_rate is not None:
-            hard_rate = window.get("hard_termination_rate", 1.0)
-            allowed = previous_hard_termination_rate + maximum_hard_delta
-            if hard_rate > allowed:
-                reasons.append(
-                    f"window{index} hard_termination_rate={hard_rate} > {allowed}"
-                )
-    return not reasons, {
-        "reasons": reasons,
-        "windows": windows,
-        "hard_termination_rate": sum(
-            window.get("hard_termination_rate", 0.0) for window in windows
-        )
-        / 2.0,
-        "action_l2_p95": sum(
-            window.get("action_l2_p95", 0.0) for window in windows
-        )
-        / 2.0,
-    }
-
-
-def _resume_warnings(algorithm, current_config_sha: str) -> list[str]:
-    """Describe non-fatal resume drift for operator visibility."""
-    warnings: list[str] = []
-    if (
-        algorithm.current_iteration > 0
-        and algorithm.config_sha256 not in {"", "unknown", current_config_sha}
-    ):
-        warnings.append(
-            "resuming STD-BRIDGE-R1 with a changed config: "
-            f"checkpoint={algorithm.config_sha256}, current={current_config_sha}"
-        )
-    if algorithm.training_status == "blocked":
-        warnings.append(
-            "resuming a legacy checkpoint marked training_status='blocked'; "
-            "the DAgger phase will be recomputed from current_iteration"
-        )
-    return warnings
-
-
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
-    """Run flat Standard 10288 -> modular privileged teacher distillation."""
+    """Run flat-standard-teacher -> ActorCriticEncoder student distillation."""
     agent = agents[0]
     env = envs[0]
-    if not getattr(agent, "is_behavior_distill", False):
-        raise RuntimeError(
-            "behavior_distill_workflow called while agent.is_behavior_distill is false"
-        )
+
+    assert getattr(agent, "is_behavior_distill", False), (
+        "behavior_distill_workflow called but agent.is_behavior_distill is False"
+    )
 
     stage = agent.stage
     algorithm = agent.algorithm
-    usr_conf, usr_conf_file, _is_eval, _stage = Config.load_conf(logger)
-    distill_conf = usr_conf.get(stage.name, {}) if isinstance(usr_conf, dict) else {}
+    usr_conf, _usr_conf_file, _is_eval, _stage = Config.load_conf(logger)
+    section = stage.name
+    distill_conf = usr_conf.get(section, {}) if isinstance(usr_conf, dict) else {}
+
     max_iterations = int(distill_conf.get("max_iterations", stage.max_iterations))
     log_interval = int(distill_conf.get("log_interval", stage.log_interval))
     save_interval = int(distill_conf.get("save_interval", stage.model_save_interval))
-    if save_interval <= 0:
-        raise ValueError("save_interval must be positive")
-    platform_model_id_base = int(
-        distill_conf.get("platform_model_id_base", 10288)
-    )
-    initial_probe_save_iteration = int(
-        distill_conf.get("initial_probe_save_iteration", 1)
-    )
-    if not 1 <= initial_probe_save_iteration <= max_iterations:
-        raise ValueError(
-            "initial_probe_save_iteration must stay within the R1 run: "
-            f"{initial_probe_save_iteration} not in [1, {max_iterations}]"
-        )
-    num_steps_per_env = int(
-        distill_conf.get("num_steps_per_env", stage.num_steps_per_env)
-    )
-    phase_end_iterations = [
-        int(value)
-        for value in distill_conf.get(
-            "phase_end_iterations", [1500, 2250, 3000, 3750, 5000]
-        )
-    ]
-    phase_ratios = [
-        float(value)
-        for value in distill_conf.get(
-            "student_drive_ratios", [0.0, 0.25, 0.50, 0.75, 1.0]
-        )
-    ]
-    _validate_schedule(phase_end_iterations, phase_ratios, max_iterations)
-    quality_window_iterations = int(
-        distill_conf.get("quality_window_iterations", 50)
-    )
-    if quality_window_iterations <= 0:
-        raise ValueError("quality_window_iterations must be positive")
-    quality_conf = distill_conf.get("quality_thresholds", {})
-    safety_conf = distill_conf.get("safety", {})
-    command_guard = distill_conf.get("command_guard", {})
-    minimum_safety_threshold = float(
-        safety_conf.get("minimum_action_l2_threshold", 0.25)
-    )
-    threshold_multiplier = float(safety_conf.get("p95_multiplier", 2.0))
+    num_steps_per_env = int(distill_conf.get("num_steps_per_env", stage.num_steps_per_env))
+    student_drive = bool(distill_conf.get("student_drive", False))
 
     override_lr = distill_conf.get("learning_rate")
     if override_lr is not None:
         override_lr = float(override_lr)
-        for param_group in algorithm.optimizer.param_groups:
-            param_group["lr"] = override_lr
+        for pg in algorithm.optimizer.param_groups:
+            pg["lr"] = override_lr
         algorithm.learning_rate = override_lr
 
-    # The Arena task form may inject its selected checkpoint before this
-    # workflow starts. If it did not, use the platform preload mount and scan
-    # the selected artifact by its real filename ID instead of hard-coding
-    # 10288 here; the same path must also support an R1 resume checkpoint.
-    if not algorithm.teacher_loaded:
-        preload_dir = os.environ.get(
-            "KAIWU_MODEL_CKPT_DIR", "/data/pre_model/ckpt"
-        )
-        logger.warning(
-            "[BehaviorDistill] no checkpoint was injected before workflow start; "
-            f"loading the latest compatible teacher/resume from {preload_dir}"
-        )
-        agent.load_model(path=preload_dir, id="latest")
-    else:
-        logger.info(
-            "[BehaviorDistill] using the checkpoint injected by the platform: "
-            f"{algorithm.teacher_source}"
-        )
-    algorithm.assert_teacher_ready()
-    logger.warning(
-        "[BehaviorDistill] this workflow updates the student directly from env.step; "
-        "the platform learner_proxy sample success counter may remain 0 during a "
-        "healthy R1 run. Use the BehaviorDistill iteration/loss logs and checkpoint "
-        "files to confirm progress."
+    logger.info(
+        f"[BehaviorDistill] Start: max_iterations={max_iterations}, "
+        f"num_steps_per_env={num_steps_per_env}, save_interval={save_interval}, "
+        f"student_drive={student_drive}, lr={algorithm.optimizer.param_groups[0]['lr']:.2e}"
     )
 
-    current_config_sha = _sha256_file(usr_conf_file)
-    resume_warnings = _resume_warnings(algorithm, current_config_sha)
-    for warning in resume_warnings:
-        logger.warning(f"[BehaviorDistill] {warning}")
-    algorithm.set_run_metadata(current_config_sha, _code_commit())
-
-    start_iteration = int(algorithm.current_iteration)
-    if start_iteration < 0 or start_iteration >= max_iterations:
-        raise ValueError(
-            f"Invalid resume iteration {start_iteration} for max={max_iterations}"
+    if not getattr(algorithm, "teacher_loaded", False):
+        preload_dir = os.environ.get("KAIWU_MODEL_CKPT_DIR", "/data/pre_model/ckpt")
+        logger.info(
+            "[BehaviorDistill] teacher not loaded yet; trying the explicit "
+            f"10288 preload from {preload_dir}"
         )
-    expected_phase = _phase_for_iteration(start_iteration, phase_end_iterations)
-    if algorithm.dagger_phase_index not in {expected_phase, 0} and start_iteration > 0:
-        logger.warning(
-            "[BehaviorDistill] checkpoint DAgger phase differs from iteration; "
-            "using the phase derived from current_iteration: "
-            f"phase={algorithm.dagger_phase_index}, expected={expected_phase}, "
-            f"iteration={start_iteration}"
-        )
-    algorithm.dagger_phase_index = expected_phase
-    algorithm.training_status = "running"
-    max_recent = 2 * quality_window_iterations
-    algorithm.recent_iteration_metrics = algorithm.recent_iteration_metrics[-max_recent:]
-
-    logger.info(
-        "[BehaviorDistill] STD-BRIDGE-R1 start: "
-        f"iteration={start_iteration}/{max_iterations}, steps_per_env={num_steps_per_env}, "
-        f"phase_ends={phase_end_iterations}, ratios={phase_ratios}, "
-        f"platform_model_id_base={platform_model_id_base}, "
-        f"initial_probe_save_iteration={initial_probe_save_iteration}, "
-        f"teacher={algorithm.teacher_source}, teacher_sha256={algorithm.teacher_sha256}, "
-        f"config_sha256={current_config_sha}, code_commit={algorithm.code_commit}"
+        try:
+            agent.load_model(path=preload_dir, id="10288")
+        except Exception as exc:
+            logger.warning(
+                "[BehaviorDistill] 10288 preload fallback did not complete; "
+                "continuing because this minimal run delegates pretrained-model "
+                f"selection to the platform operator. Error: {exc}"
+            )
+    logger.warning(
+        "[BehaviorDistill] teacher status after preload: "
+        f"loaded={algorithm.teacher_loaded}. Verify the task selected the original "
+        "flat Standard 10288 checkpoint."
     )
 
     data = env.reset(usr_conf)
-    if data is None or not isinstance(data, (tuple, list)) or len(data) < 1:
-        raise RuntimeError("[BehaviorDistill] env.reset returned an invalid payload")
-    obs = torch.as_tensor(data[0], device=agent.device)
-    agent.model.train()
+    if data is None:
+        raise RuntimeError("[BehaviorDistill] env.reset returned None")
+    obs, _critic_obs = data
+    obs = torch.as_tensor(obs, device=agent.device)
+
+    if student_drive:
+        agent.model.eval()
+    else:
+        agent.model.train()
+
+    metric_windows = {
+        "loss": deque(maxlen=log_interval),
+        "action_mse": deque(maxlen=log_interval),
+        "action_l2": deque(maxlen=log_interval),
+        "action_cos": deque(maxlen=log_interval),
+        "teacher_abs": deque(maxlen=log_interval),
+        "student_abs": deque(maxlen=log_interval),
+        "grad_norm": deque(maxlen=log_interval),
+    }
 
     loop_start = time.time()
-    quality_warning_seen = bool(resume_warnings) or any(
-        record.get("passed") is False for record in algorithm.gate_history
+    for iteration in range(max_iterations):
+        algorithm.current_iteration = iteration
+        iter_start = time.time()
+
+        for _step in range(num_steps_per_env):
+            if student_drive:
+                actions = algorithm.act_student(obs)
+                metrics = algorithm.compute_metrics(obs)
+            else:
+                metrics = algorithm.update(obs)
+                actions = algorithm.act_teacher(obs)
+
+            for key, window in metric_windows.items():
+                if key in metrics:
+                    window.append(metrics[key])
+
+            step_data = env.step(torch.clip(actions, -6.0, 6.0).to(agent.device))
+            if step_data is None:
+                raise RuntimeError("[BehaviorDistill] env.step returned None")
+            _frame_no, next_obs, _rewards, _terminated, _truncated, (_infos, _privileged_obs) = step_data
+            obs = torch.as_tensor(next_obs, device=agent.device)
+
+        if (iteration + 1) % log_interval == 0 or iteration == 0:
+            def _avg(buf):
+                return sum(buf) / max(1, len(buf))
+
+            log_data = {key: _avg(window) for key, window in metric_windows.items()}
+            logger.info(
+                f"[BehaviorDistill] iter={iteration+1}/{max_iterations} "
+                f"mse={log_data['action_mse']:.6f} "
+                f"l2={log_data['action_l2']:.4f} "
+                f"cos={log_data['action_cos']:.4f} "
+                f"student_abs={log_data['student_abs']:.4f} "
+                f"teacher_abs={log_data['teacher_abs']:.4f} "
+                f"grad={log_data['grad_norm']:.3f} "
+                f"steps={algorithm.total_steps} "
+                f"iter_time={time.time() - iter_start:.2f}s"
+            )
+            if monitor is not None:
+                try:
+                    payload = {"iteration": iteration + 1, "total_steps": algorithm.total_steps}
+                    payload.update(log_data)
+                    monitor.put_data({os.getpid(): payload})
+                except Exception as exc:
+                    logger.warning(f"[BehaviorDistill] monitor.put_data failed: {exc}")
+
+        if (iteration + 1) % save_interval == 0:
+            agent.save_model(id=str(iteration + 1))
+
+    agent.save_model(id=str(max_iterations))
+    logger.info(
+        f"[BehaviorDistill] finished in {time.time() - loop_start:.1f}s, "
+        f"total steps={algorithm.total_steps}"
     )
-    command_ood_warning_emitted = False
-    last_saved_iteration: int | None = None
-
-    def save_r1_checkpoint(
-        current_iteration: int,
-        *,
-        checkpoint_label: str | None = None,
-        publish_privileged_teacher: bool = False,
-        release_status: str | None = None,
-    ) -> int:
-        platform_id = _platform_model_id(
-            current_iteration, platform_model_id_base
-        )
-        agent.save_model(
-            id=str(platform_id),
-            checkpoint_label=checkpoint_label,
-            publish_privileged_teacher=publish_privileged_teacher,
-            release_status=release_status,
-        )
-        logger.info(
-            "[BehaviorDistill] checkpoint mapping: "
-            f"current_iteration={current_iteration} -> platform_model_id="
-            f"{platform_id}, label={checkpoint_label or 'periodic'}, "
-            f"publish_teacher={publish_privileged_teacher}"
-        )
-        return platform_id
-
-    try:
-        for iteration in range(start_iteration, max_iterations):
-            iter_start = time.time()
-            phase_index = _phase_for_iteration(iteration, phase_end_iterations)
-            phase_start = 0 if phase_index == 0 else phase_end_iterations[phase_index - 1]
-            student_probability = phase_ratios[phase_index]
-            algorithm.dagger_phase_index = phase_index
-            algorithm.dagger_phase_iteration = iteration - phase_start
-            algorithm.student_drive_probability = student_probability
-            step_metric_rows: list[dict[str, float]] = []
-
-            for _step in range(num_steps_per_env):
-                teacher_ood = _command_ood_mask(obs, command_guard)
-                teacher_ood_rate = float(teacher_ood.float().mean().item())
-                if bool(teacher_ood.any().item()) and not command_ood_warning_emitted:
-                    offending = obs[teacher_ood, 6:9][:5].detach().cpu().tolist()
-                    logger.warning(
-                        "[BehaviorDistill] command observations exceeded the recorded "
-                        "teacher range; affected rows receive zero training weight and "
-                        f"the run continues. examples={offending}, guard={command_guard}"
-                    )
-                    command_ood_warning_emitted = True
-
-                batch = algorithm.prepare_update(obs)
-                actions, selection = algorithm.select_driver_actions(
-                    batch,
-                    student_drive_probability=student_probability,
-                    safety_threshold=algorithm.safety_threshold,
-                )
-                step_data = env.step(torch.clip(actions, -6.0, 6.0).to(agent.device))
-                (
-                    _frame_no,
-                    next_obs,
-                    _rewards,
-                    terminated,
-                    truncated,
-                    infos,
-                    _privileged_obs,
-                ) = _unpack_step_result(step_data, agent.device)
-
-                timeouts = infos.get("time_outs", truncated)
-                timeouts = torch.as_tensor(
-                    timeouts, device=agent.device
-                ).reshape(-1).bool()
-                hard_failure = terminated & ~timeouts
-                sample_weights = torch.ones(
-                    obs.shape[0], device=agent.device, dtype=torch.float32
-                )
-                sample_weights = torch.where(
-                    selection["safety_takeover"],
-                    torch.full_like(sample_weights, 0.25),
-                    sample_weights,
-                )
-                sample_weights = torch.where(
-                    ~batch["student_finite"] | hard_failure | teacher_ood,
-                    torch.zeros_like(sample_weights),
-                    sample_weights,
-                )
-                metrics = algorithm.finish_update(batch, sample_weights)
-
-                requested_count = int(selection["requested_student"].sum().item())
-                takeover_count = int(selection["safety_takeover"].sum().item())
-                metrics.update(
-                    {
-                        "student_drive_probability": student_probability,
-                        "requested_student_drive_ratio": float(
-                            selection["requested_student"].float().mean().item()
-                        ),
-                        "effective_student_drive_ratio": float(
-                            selection["effective_student"].float().mean().item()
-                        ),
-                        "safety_takeover_rate": (
-                            takeover_count / requested_count
-                            if requested_count > 0
-                            else 0.0
-                        ),
-                        "teacher_ood_rate": teacher_ood_rate,
-                        "hard_termination_rate": float(
-                            hard_failure.float().mean().item()
-                        ),
-                        "terminated_rate": float(terminated.float().mean().item()),
-                        "truncated_rate": float(truncated.float().mean().item()),
-                    }
-                )
-                step_metric_rows.append(metrics)
-                obs = next_obs
-
-            iteration_metrics = _mean_metrics(step_metric_rows)
-            iteration_metrics["teacher_max_abs_diff"] = (
-                algorithm.teacher_max_abs_diff()
-            )
-            algorithm.recent_iteration_metrics.append(iteration_metrics)
-            algorithm.recent_iteration_metrics = algorithm.recent_iteration_metrics[
-                -max_recent:
-            ]
-            iter_id = iteration + 1
-            algorithm.current_iteration = iter_id
-            algorithm.dagger_phase_iteration = iter_id - phase_start
-
-            # Match the platform lifecycle used by the working LBC workflow.
-            # Agent.learn() is intentionally a no-op for behavior distillation;
-            # the student was already updated by finish_update().
-            agent.learn(list_sample_data=None)
-
-            # The platform probe needs a student artifact immediately.  Its
-            # numeric filename ID must already outrank the source teacher 10288.
-            if (
-                iter_id == initial_probe_save_iteration
-                and last_saved_iteration != iter_id
-            ):
-                save_r1_checkpoint(iter_id)
-                last_saved_iteration = iter_id
-
-            if iter_id % log_interval == 0 or iteration == start_iteration:
-                logger.info(
-                    "[BehaviorDistill] "
-                    f"iter={iter_id}/{max_iterations} phase={phase_index} "
-                    f"p_student={student_probability:.2f} "
-                    f"effective={iteration_metrics.get('effective_student_drive_ratio', 0):.3f} "
-                    f"takeover={iteration_metrics.get('safety_takeover_rate', 0):.3f} "
-                    f"mse={iteration_metrics.get('action_mse', 0):.6f} "
-                    f"nmse={iteration_metrics.get('normalized_action_mse', 0):.6f} "
-                    f"cos={iteration_metrics.get('action_cos', 0):.4f} "
-                    f"teacher_ood={iteration_metrics.get('teacher_ood_rate', 0):.4f} "
-                    f"hard_term={iteration_metrics.get('hard_termination_rate', 0):.4f} "
-                    f"teacher_diff={iteration_metrics['teacher_max_abs_diff']:.3e} "
-                    f"env_steps={algorithm.total_steps} "
-                    f"iter_time={time.time() - iter_start:.2f}s"
-                )
-                if monitor is not None:
-                    try:
-                        payload = {
-                            "iteration": iter_id,
-                            "total_steps": algorithm.total_steps,
-                            "dagger_phase": phase_index,
-                            **iteration_metrics,
-                        }
-                        monitor.put_data({os.getpid(): payload})
-                    except Exception as exc:
-                        logger.warning(
-                            f"[BehaviorDistill] monitor.put_data failed: {exc}"
-                        )
-
-            phase_end = phase_end_iterations[phase_index]
-            if iter_id == phase_end:
-                quality_ok, quality_details = _evaluate_phase_quality(
-                    algorithm.recent_iteration_metrics,
-                    quality_window_iterations,
-                    quality_conf,
-                    algorithm.previous_hard_termination_rate,
-                )
-                if algorithm.teacher_max_abs_diff() != 0.0:
-                    raise RuntimeError(
-                        "[BehaviorDistill] frozen teacher parameters changed during "
-                        f"training at iteration {iter_id}"
-                    )
-                quality_record = {
-                    "phase_index": phase_index,
-                    "phase_end_iteration": iter_id,
-                    "platform_model_id": _platform_model_id(
-                        iter_id, platform_model_id_base
-                    ),
-                    "student_drive_probability": student_probability,
-                    "passed": quality_ok,
-                    "diagnostic_only": True,
-                    **quality_details,
-                }
-                # Keep the historical checkpoint key for schema compatibility;
-                # these records are diagnostics and never block DAgger progression.
-                algorithm.gate_history.append(quality_record)
-                if quality_ok:
-                    logger.info(
-                        "[BehaviorDistill] phase quality within thresholds: "
-                        f"{quality_record}"
-                    )
-                else:
-                    quality_warning_seen = True
-                    logger.warning(
-                        "[BehaviorDistill] phase quality outside advisory thresholds; "
-                        "continuing with the configured DAgger schedule. Review before "
-                        f"promoting the artifact: {quality_record}"
-                    )
-
-                hard_termination_rate = quality_details.get(
-                    "hard_termination_rate"
-                )
-                if hard_termination_rate is not None:
-                    algorithm.previous_hard_termination_rate = float(
-                        hard_termination_rate
-                    )
-                if phase_index == 0:
-                    algorithm.safety_threshold = max(
-                        minimum_safety_threshold,
-                        threshold_multiplier
-                        * float(quality_details.get("action_l2_p95", 0.0)),
-                    )
-                    logger.info(
-                        "[BehaviorDistill] calibrated safety threshold="
-                        f"{algorithm.safety_threshold:.6f} from phase-0 P95"
-                    )
-                if phase_index + 1 < len(phase_ratios):
-                    algorithm.dagger_phase_index = phase_index + 1
-                    algorithm.dagger_phase_iteration = 0
-                    algorithm.training_status = (
-                        "running_with_warnings"
-                        if quality_warning_seen
-                        else "running"
-                    )
-                else:
-                    algorithm.training_status = (
-                        "completed_with_warnings"
-                        if quality_warning_seen
-                        else "completed"
-                    )
-                release_status = (
-                    algorithm.training_status
-                    if phase_index + 1 == len(phase_ratios)
-                    else ("phase_warning" if not quality_ok else "phase_candidate")
-                )
-                save_r1_checkpoint(
-                    iter_id,
-                    checkpoint_label="bridge",
-                    publish_privileged_teacher=True,
-                    release_status=release_status,
-                )
-                last_saved_iteration = iter_id
-
-            if (
-                iter_id % save_interval == 0
-                and last_saved_iteration != iter_id
-            ):
-                save_r1_checkpoint(iter_id)
-                last_saved_iteration = iter_id
-
-        if algorithm.training_status not in {"completed", "completed_with_warnings"}:
-            algorithm.training_status = (
-                "completed_with_warnings" if quality_warning_seen else "completed"
-            )
-        if last_saved_iteration != max_iterations:
-            save_r1_checkpoint(max_iterations)
-        logger.info(
-            "[BehaviorDistill] completed in "
-            f"{time.time() - loop_start:.1f}s, status={algorithm.training_status}, "
-            f"env_steps={algorithm.total_steps}, "
-            f"teacher_max_abs_diff={algorithm.teacher_max_abs_diff():.3e}"
-        )
-    finally:
-        env.close()
+    env.close()

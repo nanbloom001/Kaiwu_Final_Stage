@@ -200,32 +200,14 @@ save_interval = 1000
 # Steps collected from env per round.
 # 每轮从 env 采集的步数
 num_steps_per_env = 24
-# Train recurrent memory on short environment sequences instead of one-step LSTM updates.
-bptt_steps = 8
 
-# Student-drive mode: scheduled DAgger uses student actions to drive closed-loop
-# states while continuing privileged teacher-label supervision.
-# 学生驱动模式：DAgger 用学生动作访问闭环状态，并持续查询特权教师监督。
-#   student_drive = true  → closed-loop DAgger distillation
-#   student_drive = true  → 学生闭环 DAgger 蒸馏
+# Student-drive mode: student closed-loop drives env, no backward pass, MSE only as a metric.
+# 学生驱动模式：学生闭环驱动 env，不做反向传播，仅计算 MSE 作为指标
+#   student_drive = true  → preload vision ckpt + visualize student perf
+#   student_drive = true  → 配合 preload 的 vision ckpt 可视化学生表现
 #   student_drive = false → standard distillation training (default)
 #   student_drive = false → 标准蒸馏训练（默认）
 student_drive = false
-
-[depth_aug]
-# Configured by lbc_workflow before reset; disabled automatically in evaluation.
-enabled = true
-pixel_dropout_prob = 0.10
-gaussian_noise_scale = 0.02
-edge_dropout_prob = 0.10
-hole_patch_prob = 0.20
-hole_patch_size = [4, 16]
-hole_hold_steps = [2, 8]
-frame_hold_prob = 0.10
-frame_hold_steps = [1, 5]
-blur_kernel_size = 3
-roll_range_deg = 5.0
-pitch_shift_pix = 6
 
 
 # Depth Camera Configuration
@@ -253,10 +235,10 @@ pitch_shift_pix = 6
 [camera.depth_camera]
 # Camera mount position in robot base frame (x forward, y left, z up), unit m, calibrated per machine.
 # 相机在机器人 base 系下的安装位置 (x前, y左, z上)，单位 m，逐台校准。
-offset_pos = [0.339871, 0.034697, 0.07501]
+offset_pos = [0.486886, 0.024533, 0.079897]
 # Camera mount orientation quaternion (w, x, y, z), world convention, calibrated per machine.
 # 相机安装姿态 quaternion (w, x, y, z)，world convention，逐台校准。
-offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
+offset_rot = [0.995199, -0.001619, 0.097217, 0.011225]
 
 # No [rewards] section.
 # 不配置 [rewards]

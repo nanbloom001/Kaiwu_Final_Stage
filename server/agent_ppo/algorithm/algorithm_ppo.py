@@ -45,8 +45,6 @@ class AlgorithmPPO:
         num_learning_epochs: int = 5,
         desired_kl: float = 0.01,
         schedule: str = "adaptive",
-        min_learning_rate: float = 1e-5,
-        max_learning_rate: float = 1e-2,
         **kwargs,
     ):
         """
@@ -90,10 +88,6 @@ class AlgorithmPPO:
             desired_kl: 自适应学习率的目标KL散度
             schedule: Learning rate schedule ("adaptive" or "fixed")
             schedule: 学习率调度策略（"adaptive"或"fixed"）
-            min_learning_rate: Minimum allowed adaptive learning rate
-            min_learning_rate: 自适应学习率下限
-            max_learning_rate: Maximum allowed adaptive learning rate
-            max_learning_rate: 自适应学习率上限
         """
         self.device = device
         self.actor_critic = model
@@ -116,39 +110,12 @@ class AlgorithmPPO:
         self.num_learning_epochs = num_learning_epochs
         self.desired_kl = desired_kl
         self.schedule = schedule
-        self.min_learning_rate = min_learning_rate
-        self.max_learning_rate = max_learning_rate
-        self._initial_lr = learning_rate
 
-        # Std clamp keeps exploration useful but bounded. Without the upper
-        # bound a high entropy run can keep inflating std and destroy gait.
-        # 标准差上下限：保留探索，但避免高熵继续训练把步态扰乱。
+        # Minimum std clamp (prevents std from going negative / too small)
+        # 标准差下限（防止标准差变为负值或过小）
         from agent_ppo.conf.conf import Config
 
-        min_std_cfg = getattr(Config.CURRENT, "min_normalized_std", None)
-        max_std_cfg = getattr(Config.CURRENT, "max_normalized_std", None)
-        self.min_std = torch.tensor(min_std_cfg, device=device) if min_std_cfg is not None else None
-        self.max_std = torch.tensor(max_std_cfg, device=device) if max_std_cfg is not None else None
-        self.action_anchor_ema = float(getattr(Config.CURRENT, "action_anchor_ema", 0.0))
-        self.action_anchor_schedule_enabled = bool(
-            getattr(Config.CURRENT, "action_anchor_schedule_enabled", False)
-        )
-        self.action_anchor_schedule_total_steps = int(
-            getattr(Config.CURRENT, "action_anchor_schedule_total_steps", 1)
-        )
-        raw_schedule_points = getattr(
-            Config.CURRENT,
-            "action_anchor_schedule_points",
-            ((0.0, 1.0), (1.0, 1.0)),
-        )
-        self.action_anchor_schedule_points = tuple(
-            (float(progress), float(coef))
-            for progress, coef in raw_schedule_points
-        )
-        self._validate_action_anchor_schedule()
-        self.action_anchor_initial_coef = 0.0
-        self.current_action_anchor_progress = 0.0
-        self._last_anchor_log_step = -1
+        self.min_std = torch.tensor(Config.CURRENT.min_normalized_std, device=device)
 
         # Training state
         # 训练状态
@@ -158,74 +125,6 @@ class AlgorithmPPO:
         # Storage (to be initialized)
         # 存储（待初始化）
         self.storage = None
-        self.reference_actor_critic = None
-        self.action_anchor_coef = 0.0
-        self.action_anchor_decay_updates = 0
-
-    def set_reference_policy(
-        self,
-        reference_model: nn.Module,
-        action_anchor_coef: float = 0.0,
-        decay_updates: int = 0,
-    ):
-        """Freeze the reference policy and retain the schedule's initial coefficient."""
-        self.reference_actor_critic = reference_model
-        initial_coef = float(action_anchor_coef)
-        self.action_anchor_initial_coef = initial_coef
-        self.action_anchor_coef = initial_coef
-        self.action_anchor_decay_updates = max(int(decay_updates), 0)
-        if self.reference_actor_critic is not None:
-            self.reference_actor_critic.eval()
-            for param in self.reference_actor_critic.parameters():
-                param.requires_grad_(False)
-
-    def _validate_action_anchor_schedule(self):
-        if self.action_anchor_schedule_total_steps <= 0:
-            raise ValueError("action_anchor_schedule_total_steps must be positive")
-        previous_progress = -1.0
-        for progress, coef in self.action_anchor_schedule_points:
-            if not 0.0 <= progress <= 1.0:
-                raise ValueError(
-                    f"action anchor schedule progress must be in [0, 1], got {progress}"
-                )
-            if progress <= previous_progress:
-                raise ValueError("action anchor schedule progress points must increase")
-            if coef < 0.0:
-                raise ValueError(
-                    f"action anchor schedule coefficient must be non-negative, got {coef}"
-                )
-            previous_progress = progress
-
-    def _get_action_anchor_progress(self) -> float:
-        total_steps = max(int(self.action_anchor_schedule_total_steps), 1)
-        progress = float(self.train_step) / float(total_steps)
-        return min(max(progress, 0.0), 1.0)
-
-    def _get_scheduled_action_anchor_coef(self) -> float:
-        """Linearly interpolate the action-anchor coefficient at train_step."""
-        if self.reference_actor_critic is None or self.action_anchor_initial_coef <= 0.0:
-            return 0.0
-        if not self.action_anchor_schedule_enabled:
-            return self.action_anchor_initial_coef
-
-        progress = self._get_action_anchor_progress()
-        self.current_action_anchor_progress = progress
-        points = self.action_anchor_schedule_points
-        if not points:
-            return self.action_anchor_initial_coef
-        if progress <= points[0][0]:
-            return float(points[0][1])
-
-        for index in range(1, len(points)):
-            left_progress, left_coef = points[index - 1]
-            right_progress, right_coef = points[index]
-            if progress <= right_progress:
-                interval = right_progress - left_progress
-                if interval <= 1.0e-8:
-                    return float(right_coef)
-                ratio = (progress - left_progress) / interval
-                return float(left_coef + ratio * (right_coef - left_coef))
-        return float(points[-1][1])
 
     def init_storage(
         self,
@@ -322,43 +221,15 @@ class AlgorithmPPO:
             tuple: (mean_surrogate_loss, mean_value_loss, mean_entropy_loss)
             返回值：(平均替代损失, 平均价值损失, 平均熵损失)
         """
-        # J9 fixed-LR runtime contract: validate before any update
-        self._validate_fixed_lr()
-        if self.action_anchor_schedule_enabled:
-            self.action_anchor_coef = self._get_scheduled_action_anchor_coef()
-            if (
-                self.logger is not None
-                and self.train_step != self._last_anchor_log_step
-                and (self.train_step == 0 or self.train_step % 50 == 0)
-            ):
-                self.logger.info(
-                    "[D5 Action Anchor Schedule] "
-                    f"step={self.train_step}/{self.action_anchor_schedule_total_steps}, "
-                    f"progress={self.current_action_anchor_progress:.3f}, "
-                    f"coef={self.action_anchor_coef:.4f}"
-                )
-                self._last_anchor_log_step = self.train_step
-
         # Initialize loss accumulators
         # 初始化损失累加器
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy_loss = 0
-        mean_action_anchor_loss = 0
-        num_updates = 0
 
         # Get mini-batch generator
         # 获取mini-batch生成器
-        is_recurrent_model = getattr(self.actor_critic, "is_recurrent", False)
-        if is_recurrent_model:
-            if getattr(self.storage, "saved_hidden_states_a", None) is None:
-                raise RuntimeError("Recurrent PPO requires hidden states in rollout storage.")
-            generator = self.storage.recurrent_mini_batch_generator(
-                self.num_mini_batches,
-                self.num_learning_epochs,
-            )
-        else:
-            generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
+        generator = self.storage.mini_batch_generator(self.num_mini_batches, self.num_learning_epochs)
 
         # Training loop over mini-batches
         # mini-batch训练循环
@@ -383,11 +254,7 @@ class AlgorithmPPO:
 
             # Forward pass through actor-critic
             # 前向传播计算actor-critic
-            recurrent_batch = obs_batch.dim() == 3
-            if recurrent_batch:
-                self.actor_critic.update_distribution(obs_batch, hidden_states=hid_states_batch, masks=masks_batch)
-            else:
-                self.actor_critic.update_distribution(obs_batch)
+            self.actor_critic.update_distribution(obs_batch)
 
             # Get action log probabilities
             # 获取动作对数概率
@@ -399,12 +266,7 @@ class AlgorithmPPO:
 
             # Get value estimates
             # 获取价值估计
-            if recurrent_batch:
-                value_batch = self.actor_critic.evaluate(
-                    critic_obs_batch.reshape(-1, critic_obs_batch.shape[-1])
-                ).view(critic_obs_batch.shape[0], critic_obs_batch.shape[1], 1)
-            else:
-                value_batch = self.actor_critic.evaluate(critic_obs_batch)
+            value_batch = self.actor_critic.evaluate(critic_obs_batch)
 
             # Get distribution parameters
             # 获取分布参数
@@ -421,22 +283,10 @@ class AlgorithmPPO:
                 actions_log_prob_batch, old_actions_log_prob_batch, advantages_batch
             )
             value_loss = self._compute_value_loss(value_batch, returns_batch, target_values_batch)
-            action_anchor_loss = self._compute_action_anchor_loss(
-                obs_batch,
-                mu_batch,
-                hidden_states=hid_states_batch,
-                masks=masks_batch,
-            )
-            effective_anchor_coef = self._effective_action_anchor_coef()
 
             # Combine losses
             # 组合损失
-            loss = (
-                surrogate_loss
-                + self.value_loss_coef * value_loss
-                - self.entropy_coef * entropy_batch.mean()
-                + effective_anchor_coef * action_anchor_loss
-            )
+            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy_batch.mean()
 
             # NaN/Inf guard: skip this mini-batch update entirely if loss is invalid
             # NaN/Inf 防护：如果 loss 非法则跳过此 mini-batch 更新，避免坏梯度写入参数
@@ -473,120 +323,41 @@ class AlgorithmPPO:
 
             nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
-            self._blend_actor_towards_reference()
 
-            # Clamp action std: replace NaN/Inf, then enforce configured bounds.
-            # 清洗并夹住 std：替换 NaN/Inf，然后限制到配置的上下限。
+            # Clamp action std: replace NaN/Inf, then enforce [min_std, 1e6]
+            # 清洗并夹住 std：替换 NaN/Inf，然后限制到 [min_std, 1e6]
             if hasattr(self.actor_critic, "std") and self.min_std is not None:
-                min_std_t = self.min_std
-                max_std_t = self.max_std
-                if min_std_t.shape != self.actor_critic.std.data.shape:
-                    min_std_t = torch.zeros_like(self.actor_critic.std.data)
-                if max_std_t is None or max_std_t.shape != self.actor_critic.std.data.shape:
-                    max_std_t = torch.full_like(self.actor_critic.std.data, 1.0e6)
+                max_std_t = torch.full_like(self.actor_critic.std.data, 1.0e6)
                 safe_std = torch.nan_to_num(
                     self.actor_critic.std.data,
                     nan=1.0,
-                    posinf=float(torch.max(max_std_t).item()),
+                    posinf=1.0e6,
                     neginf=0.0,
                 )
-                self.actor_critic.std.data.copy_(torch.clamp(safe_std, min=min_std_t, max=max_std_t))
+                self.actor_critic.std.data.copy_(torch.clamp(safe_std, min=self.min_std, max=max_std_t))
 
             # Accumulate losses (use 0.0 for any remaining NaN as safety net)
             # 累加损失（对残留 NaN 兜底为 0.0）
             sl = surrogate_loss.item()
             vl = value_loss.item()
             el = entropy_batch.mean().item()
-            al = action_anchor_loss.item()
             mean_surrogate_loss += sl if not (sl != sl) else 0.0
             mean_value_loss += vl if not (vl != vl) else 0.0
             mean_entropy_loss += el if not (el != el) else 0.0
-            mean_action_anchor_loss += al if not (al != al) else 0.0
-            num_updates += 1
-
-        # J9 fixed-LR runtime contract: validate again after all updates
-        self._validate_fixed_lr()
 
         # Average losses
         # 平均损失
-        num_updates = max(1, num_updates)
+        num_updates = self.num_learning_epochs * self.num_mini_batches
         mean_value_loss /= num_updates
         mean_surrogate_loss /= num_updates
         mean_entropy_loss /= num_updates
-        mean_action_anchor_loss /= num_updates
 
         # Report metrics
         # 上报指标
-        self._report_training_metrics(
-            mean_surrogate_loss,
-            mean_value_loss,
-            mean_entropy_loss,
-            mean_action_anchor_loss,
-        )
+        self._report_training_metrics(mean_surrogate_loss, mean_value_loss, mean_entropy_loss)
 
         self.train_step += 1
         return mean_surrogate_loss, mean_value_loss, mean_entropy_loss
-
-    def _compute_action_anchor_loss(
-        self,
-        obs_batch: torch.Tensor,
-        mu_batch: torch.Tensor,
-        hidden_states=None,
-        masks=None,
-    ) -> torch.Tensor:
-        if self.reference_actor_critic is None or self._effective_action_anchor_coef() <= 0.0:
-            return mu_batch.new_tensor(0.0)
-
-        with torch.no_grad():
-            if getattr(self.reference_actor_critic, "is_recurrent", False):
-                ref_mu = self.reference_actor_critic.act_inference(
-                    obs_batch,
-                    hidden_states=hidden_states,
-                    masks=masks,
-                )
-            else:
-                ref_mu = self.reference_actor_critic.act_inference(obs_batch)
-        return torch.mean(torch.square(mu_batch - ref_mu.detach()))
-
-    def _effective_action_anchor_coef(self) -> float:
-        if self.action_anchor_schedule_enabled:
-            return self.action_anchor_coef
-        if self.action_anchor_decay_updates <= 0:
-            return self.action_anchor_coef
-        remaining = 1.0 - self.train_step / float(self.action_anchor_decay_updates)
-        return self.action_anchor_coef * max(0.0, remaining)
-
-    def _blend_actor_towards_reference(self):
-        if self.reference_actor_critic is None or self.action_anchor_ema <= 0.0:
-            return
-
-        alpha = min(max(self.action_anchor_ema, 0.0), 1.0)
-        ref_state = self.reference_actor_critic.state_dict()
-        with torch.no_grad():
-            for name, param in self.actor_critic.named_parameters():
-                if name not in ref_state:
-                    continue
-                if not (name.startswith("actor.") or name in ("std", "log_std")):
-                    continue
-                param.data.mul_(1.0 - alpha).add_(
-                    ref_state[name].to(param.device), alpha=alpha
-                )
-
-    def _validate_fixed_lr(self):
-        """Abort if fixed-LR contract is violated. Checks both algorithm LR and every optimizer param_group."""
-        if self.schedule != "fixed":
-            return
-        if abs(self.learning_rate - self._initial_lr) > 1e-12:
-            raise RuntimeError(
-                f"Fixed PPO learning-rate contract violated: "
-                f"algorithm lr={self.learning_rate}, expected={self._initial_lr}"
-            )
-        for _pg in self.optimizer.param_groups:
-            if abs(_pg["lr"] - self._initial_lr) > 1e-12:
-                raise RuntimeError(
-                    f"Fixed PPO learning-rate contract violated: "
-                    f"optimizer lr={_pg['lr']}, expected={self._initial_lr}"
-                )
 
     def _update_learning_rate(
         self,
@@ -613,9 +384,9 @@ class AlgorithmPPO:
             kl_mean = torch.mean(kl)
 
             if kl_mean > self.desired_kl * 2.0:
-                self.learning_rate = max(self.min_learning_rate, self.learning_rate / 1.5)
+                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
             elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                self.learning_rate = min(self.max_learning_rate, self.learning_rate * 1.5)
+                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
 
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.learning_rate
@@ -670,7 +441,6 @@ class AlgorithmPPO:
         mean_surrogate_loss: float,
         mean_value_loss: float,
         mean_entropy_loss: float,
-        mean_action_anchor_loss: float = 0.0,
     ):
         """
         Report training metrics to monitor
@@ -678,24 +448,11 @@ class AlgorithmPPO:
         """
         now = time.time()
         if now - self.last_report_monitor_time >= 60:
-            effective_anchor_coef = self._effective_action_anchor_coef()
-            weighted_action_anchor_loss = (
-                effective_anchor_coef * mean_action_anchor_loss
-            )
             monitor_data = {
                 "policy_loss": mean_surrogate_loss,
                 "value_loss": mean_value_loss,
                 "entropy_loss": mean_entropy_loss,
-                "action_anchor_loss": mean_action_anchor_loss,
-                "action_anchor_coef": effective_anchor_coef,
-                "weighted_action_anchor_loss": weighted_action_anchor_loss,
-                "action_anchor_progress": self.current_action_anchor_progress,
-                "total_loss": (
-                    mean_surrogate_loss
-                    + mean_value_loss
-                    + mean_entropy_loss
-                    + weighted_action_anchor_loss
-                ),
+                "total_loss": mean_surrogate_loss + mean_value_loss + mean_entropy_loss,
                 "learning_rate": self.learning_rate,
             }
             if self.monitor:

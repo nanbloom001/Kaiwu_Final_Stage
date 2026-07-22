@@ -238,10 +238,6 @@ class ActorCriticEncoder(ActorCritic):
         keep_parts = []
         cur = 0
         total = critic_obs.shape[-1]
-        goal = None
-        if self.num_goal_obs > 0:
-            goal = critic_obs[:, -self.num_goal_obs :]
-            total -= self.num_goal_obs
         for s, e in bad_intervals:
             if cur < s:
                 keep_parts.append(critic_obs[:, cur:s])
@@ -250,8 +246,6 @@ class ActorCriticEncoder(ActorCritic):
             keep_parts.append(critic_obs[:, cur:total])
 
         keep_parts.append(latent)
-        if goal is not None:
-            keep_parts.append(goal)
         return torch.cat(keep_parts, dim=-1)
 
     def evaluate(self, critic_obs: torch.Tensor, **kwargs) -> torch.Tensor:
