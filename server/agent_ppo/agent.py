@@ -583,6 +583,8 @@ class Agent(BaseAgent):
             teacher_actor_hidden_dims=stage.teacher_actor_hidden_dims,
             teacher_critic_hidden_dims=stage.teacher_critic_hidden_dims,
             teacher_activation=stage.teacher_activation,
+            expected_teacher_sha256=distill_conf.get("expected_teacher_sha256"),
+            stage_name=stage.name,
             logger=self.logger,
         )
         self.optimizer = self.algorithm.optimizer
@@ -699,8 +701,8 @@ class Agent(BaseAgent):
           - LBCLocoConfig     -> stage-specific single-label checkpoint
                                   plus model.ckpt-{id}.pkl platform alias
 
-        Active StandardDistill1 emits model.ckpt-standard-{id}.pkl. Both that
-        file and the unlabelled alias satisfy the platform liveness probe.
+        STD-BRIDGE-R1 emits model.ckpt-standard-bridge-r1-{id}.pkl, a platform
+        alias, and a non-deployable privileged-loco-teacher side artifact.
         """
         path = self._resolve_checkpoint_dir(path, create=True)
         ckpt_name = getattr(self.stage, "ckpt_name", "") or ""
@@ -708,6 +710,37 @@ class Agent(BaseAgent):
             model_file_path = os.path.join(path, f"{ckpt_name}-{str(id)}.pkl")
         else:
             model_file_path = os.path.join(path, f"model.ckpt-{str(id)}.pkl")
+
+        if self.is_behavior_distill:
+            bridge_sha256 = self.algorithm.save(
+                model_file_path,
+                iteration=self.algorithm.current_iteration,
+            )
+            self.logger.info(
+                f"[BehaviorDistill] saved {model_file_path}, sha256={bridge_sha256}"
+            )
+            platform_alias = os.path.join(path, f"model.ckpt-{str(id)}.pkl")
+            if os.path.abspath(platform_alias) != os.path.abspath(model_file_path):
+                alias_sha256 = self.algorithm.save(
+                    platform_alias,
+                    iteration=self.algorithm.current_iteration,
+                )
+                self.logger.info(
+                    "[BehaviorDistill] saved platform alias "
+                    f"{platform_alias}, sha256={alias_sha256}"
+                )
+            teacher_path = os.path.join(
+                path, f"model.ckpt-privileged-loco-teacher-{str(id)}.pkl"
+            )
+            teacher_sha256 = self.algorithm.save_privileged_teacher(
+                teacher_path,
+                bridge_checkpoint_sha256=bridge_sha256,
+            )
+            self.logger.info(
+                "[BehaviorDistill] saved non-deployable privileged teacher "
+                f"{teacher_path}, sha256={teacher_sha256}"
+            )
+            return
 
         if self.is_visual_ppo:
             reference_model = getattr(
@@ -830,10 +863,7 @@ class Agent(BaseAgent):
             self._load_visual_ppo(path, id)
             return
         if self.is_behavior_distill:
-            if self.is_eval:
-                self._load_flat(path, id)
-            else:
-                self._load_behavior_distill_teacher(path, id)
+            self._load_behavior_distill(path, id)
             return
         self._load_flat(path, id)
 
@@ -946,13 +976,23 @@ class Agent(BaseAgent):
             "or D2 checkpoint for this stage."
         )
 
-    def _load_behavior_distill_teacher(self, path, id):
-        """Strictly load the platform-selected legacy flat ActorCritic teacher."""
+    def _load_behavior_distill(self, path, id):
+        """Load a strict flat teacher, resume v2, or eval an explicit student."""
+        from agent_ppo.algorithm.algorithm_behavior_distill import (
+            BEHAVIOR_DISTILL_FORMAT,
+            sha256_file,
+        )
+
         checkpoint_id = str(id)
+        ckpt_name = getattr(self.stage, "ckpt_name", "") or ""
         preferred = [
+            os.path.join(path, f"{ckpt_name}-{checkpoint_id}.pkl")
+            if ckpt_name
+            else "",
             os.path.join(path, f"model.ckpt-{checkpoint_id}.pkl"),
             os.path.join(path, f"model.ckpt-locomotion-{checkpoint_id}.pkl"),
         ]
+        preferred = [candidate for candidate in preferred if candidate]
         candidates = _checkpoint_candidates(path, id, preferred_paths=preferred)
         rejected = []
         for candidate in candidates:
@@ -960,25 +1000,55 @@ class Agent(BaseAgent):
                 checkpoint = torch.load(
                     candidate, weights_only=False, map_location=self.device
                 )
-                if isinstance(checkpoint, dict) and checkpoint.get("format"):
-                    raise ValueError(
-                        f"packaged checkpoint format={checkpoint.get('format')}"
-                    )
-                self.algorithm.load_teacher_state_dict(
-                    checkpoint,
-                    source=candidate,
+                checkpoint_format = (
+                    checkpoint.get("format")
+                    if isinstance(checkpoint, dict)
+                    else None
                 )
+                if checkpoint_format == BEHAVIOR_DISTILL_FORMAT:
+                    self.algorithm.load_checkpoint_dict(
+                        checkpoint,
+                        source=candidate,
+                        load_optimizer=not self.is_eval,
+                        load_teacher=not self.is_eval,
+                        restore_rng=not self.is_eval,
+                    )
+                    mode = "student evaluation" if self.is_eval else "full resume"
+                    self.logger.info(
+                        f"[BehaviorDistill] loaded {mode} checkpoint {candidate}, "
+                        f"iteration={self.algorithm.current_iteration}"
+                    )
+                elif checkpoint_format:
+                    raise ValueError(
+                        f"unsupported packaged checkpoint format={checkpoint_format!r}"
+                    )
+                elif self.is_eval:
+                    self.algorithm.load_student_weights(
+                        checkpoint,
+                        source=candidate,
+                    )
+                    self.logger.warning(
+                        "[BehaviorDistill] loaded legacy raw student weights for "
+                        f"evaluation only: {candidate}"
+                    )
+                else:
+                    self.algorithm.load_teacher_state_dict(
+                        checkpoint,
+                        source=candidate,
+                        source_sha256=sha256_file(candidate),
+                    )
+                    self.logger.info(
+                        f"[BehaviorDistill] loaded strict flat 301-D teacher {candidate}"
+                    )
             except Exception as exc:
                 rejected.append(f"{os.path.basename(candidate)}: {exc}")
                 continue
             self.cur_model_name = candidate
-            self.logger.info(
-                f"[BehaviorDistill] loaded flat 301-D teacher {candidate}"
-            )
             return
 
         raise FileNotFoundError(
-            f"[BehaviorDistill] No compatible flat teacher for id={id} in {path}. "
+            f"[BehaviorDistill] No compatible teacher/student checkpoint for id={id} "
+            f"in {path}. "
             f"Candidates={candidates}; rejected={rejected}."
         )
 
@@ -1261,7 +1331,7 @@ class Agent(BaseAgent):
                 continue
             self.cur_model_name = candidate
             self.logger.info(
-                f"[LBC-Loco] Teacher loaded by splitting flat ckpt {candidate}; "
+                f"[LBC-Loco] Teacher loaded from packaged or legacy ckpt {candidate}; "
                 f"student randomly initialized."
             )
             return

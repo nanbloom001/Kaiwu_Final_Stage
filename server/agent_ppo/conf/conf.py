@@ -255,11 +255,11 @@ class LBCLocoConfig(StageConfig):
 
 
 class HJCNew10288LBCLocoConfig(LBCLocoConfig):
-    """Legacy visual-stage label for an encoder-based Standard teacher.
+    """Legacy visual-stage label for the old ten-minute bridge artifact.
 
     Compatibility is determined from checkpoint keys and tensor shapes, not
-    from the numeric ID. A checkpoint with encoder.* and a 77-D Actor is valid;
-    a legacy 301-D flat checkpoint is not.
+    from the numeric ID.  The original replay Standard 10288 is flat 301-D;
+    only its later behavior-distilled artifact has encoder.* and a 77-D Actor.
     """
 
     name = "hjcnew10288_lbc_loco"
@@ -269,11 +269,7 @@ class HJCNew10288LBCLocoConfig(LBCLocoConfig):
 
 
 class StandardRefDistillConfig(LocomotionConfig):
-    """Optional bridge for a legacy 301-D flat Standard teacher.
-
-    This is not the active 10288 path. Use it only when checkpoint inspection
-    proves that the selected teacher has no encoder.* keys.
-    """
+    """Legacy behavior-bridge configuration for a flat 301-D teacher."""
 
     name = "standard_ref_distill"
     algorithm = "behavior_distill"
@@ -294,18 +290,26 @@ class StandardRefDistillConfig(LocomotionConfig):
     teacher_activation = "elu"
 
 
-class StandardDistill1Config(LBCLocoConfig):
-    """Depth-camera LBC from the platform-selected Standard 10288 teacher.
+class StandardBridgeR1Config(StandardRefDistillConfig):
+    """STD-BRIDGE-R1: guarded one-run bridge from the original 10288 teacher."""
 
-    Platform inspection shows an ActorCriticEncoder checkpoint with
-    encoder.*, actor.*, critic_encoder.* and critic.* keys. LBC consumes only
-    encoder.* and actor.*; critic-side keys are intentionally ignored.
+    name = "standard_bridge_r1"
+    parent_checkpoint = "replay Standard flat checkpoint 10288"
+    ckpt_name = "model.ckpt-standard-bridge-r1"
+
+
+class StandardDistill1Config(LBCLocoConfig):
+    """Historical direct visual LBC experiment from a bridge artifact.
+
+    The original replay 10288 checkpoint is flat 301-D and cannot enter LBC
+    directly.  This stage requires an encoder.* + actor.* bridge artifact such
+    as the old ten-minute HJC result or a validated STD-BRIDGE-R1 output.
     """
 
     name = "standard_distill_1"
     task_type = "standard"
     num_goal_obs = 0
-    parent_checkpoint = "platform Standard ActorCriticEncoder checkpoint 10288"
+    parent_checkpoint = "validated encoder-based Standard bridge artifact"
     ckpt_name = "model.ckpt-standard"
 
 
@@ -419,9 +423,9 @@ class Config:
 
     # Explicit stage selector for both training and evaluation.
     # 训练和评估均显式使用该阶段，避免环境名称误改模型结构。
-    # STD-D5 is the active platform training stage. D1-D4 remain reproducible
-    # through their independent TOML files.
-    CURRENT = StandardVisualPPO2D5Config
+    # STD-BRIDGE-R1 is the active platform stage on this feature branch.
+    # D1-D5 remain reproducible through their independent TOML files/classes.
+    CURRENT = StandardBridgeR1Config
 
     @staticmethod
     def load_conf(logger):

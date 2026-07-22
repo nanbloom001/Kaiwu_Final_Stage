@@ -525,6 +525,55 @@ class AlgorithmLBC:
 
     def load_teacher_state_dict(self, full_state: dict, source: str = "<platform>"):
         """Load frozen teacher encoder/actor from a platform-selected state dict."""
+        if (
+            isinstance(full_state, dict)
+            and full_state.get("format") == "privileged_loco_teacher_v1"
+        ):
+            if int(full_state.get("schema_version", 0)) != 1:
+                raise ValueError(
+                    "Unsupported privileged_loco_teacher_v1 schema: "
+                    f"{full_state.get('schema_version')!r}"
+                )
+            model_spec = full_state.get("model_spec")
+            if not isinstance(model_spec, dict):
+                raise ValueError(
+                    f"model_spec missing from privileged teacher {source}"
+                )
+            expected_spec = {
+                "proprio_dim": self.proprio_dim,
+                "scan_dim": self.scan_dim,
+                "latent_dim": self.latent_dim,
+                "actor_input_dim": self.proprio_dim + self.latent_dim + self.goal_dim,
+                "action_dim": self.teacher_actor[-1].out_features,
+                "goal_dim": self.goal_dim,
+            }
+            mismatched_spec = {
+                key: (model_spec.get(key), expected)
+                for key, expected in expected_spec.items()
+                if int(model_spec.get(key, -1)) != int(expected)
+            }
+            if mismatched_spec:
+                raise ValueError(
+                    "Privileged teacher model_spec mismatch: "
+                    f"{mismatched_spec} at {source}"
+                )
+            encoder_state = full_state.get("encoder_state_dict")
+            actor_state = full_state.get("actor_state_dict")
+            if not isinstance(encoder_state, dict) or not isinstance(actor_state, dict):
+                raise KeyError(
+                    "privileged_loco_teacher_v1 requires encoder_state_dict and "
+                    "actor_state_dict"
+                )
+            if hasattr(self.teacher_encoder, "mlp"):
+                self.teacher_encoder.mlp.load_state_dict(encoder_state, strict=True)
+            else:
+                self.teacher_encoder.load_state_dict(encoder_state, strict=True)
+            self.teacher_actor.load_state_dict(actor_state, strict=True)
+            self._freeze_teacher()
+            self.teacher_loaded = True
+            self.teacher_source = source
+            return
+
         if isinstance(full_state, dict) and "model_state_dict" in full_state:
             full_state = full_state["model_state_dict"]
         if isinstance(full_state, dict) and "state_dict" in full_state:
