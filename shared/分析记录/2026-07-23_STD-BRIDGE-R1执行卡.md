@@ -2,7 +2,8 @@
 
 > Experiment ID：`STD-BRIDGE-R1`
 > 总阶段：`STD-DEPTH-5STAGE` 的阶段 2 第一轮
-> 状态：代码静态就绪；腾讯平台训练、闭环评估和运行时 round-trip 未执行
+> 状态：历史 R1 设计稿；已由
+> [`STD-DAGGER-R2`](./2026-07-23_STD-DAGGER-R2执行卡.md) 取代，不再作为当前启动依据
 > 基线：`main@ba175ca`
 > 实现分支：`codex/standard-bridge-r1`
 > 禁止事项：本卡未授权深度视觉训练、PPO、Goal/UWB/Track 或部署端改动

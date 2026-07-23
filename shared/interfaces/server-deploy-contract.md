@@ -1,6 +1,6 @@
 # server ↔ deploy 接口契约
 
-> 版本：`v0.2`
+> 版本：`v0.3`
 > 状态：已固化 checkpoint 类别与 Standard/Track 维度；深度、ONNX 和动作字段仍需随发布候选补齐
 > 运行时边界：本文件只作协作契约，`server/` 与 `deploy/` 不得依赖 `shared/`
 
@@ -17,40 +17,56 @@ exporter 或 `deploy.yaml` 都必须先核对 task、format、goal_dim 和 Actor
 
 ## 2. Checkpoint 类别
 
-### 2.1 `behavior_distill_v2`：训练恢复文件
+### 2.1 `kaiwu_train_v1`：统一训练包
 
-用途：把 flat301 Standard 教师桥接为模块化特权策略，并精确恢复训练。
+用途：在训练阶段之间复用同一顶层 schema。R2 先保存 low-level；后续视觉蒸馏
+增加 `modules.vision_encoder`，高低层混合增加 `modules.high_level`，不通过改名
+伪装为部署制品。
 
 必需字段：
 
 ```text
-format = "behavior_distill_v2"
+format = "kaiwu_train_v1"
 schema_version = 1
 model_spec
-student_model_state_dict
-teacher_model_state_dict
-optimizer_state_dict
-current_iteration / total_steps / gradient_steps
-platform_model_id / checkpoint_role
-dagger_phase_index / dagger_phase_iteration / student_drive_probability
-safety_threshold / gate_history / recent_iteration_metrics
-rng_state
-teacher_sha256 / config_sha256 / code_commit
-critic_trained = false
-training_status
+modules.low_level.policy_state_dict
+modules.low_level.encoder_state_dict
+modules.low_level.actor_state_dict
+modules.privileged_teacher.state_dict
+optimizers.low_level_distill
+training_state.current_iteration / total_steps / gradient_steps
+training_state.dagger_phase_index / dagger_phase_iteration
+training_state.student_drive_probability / safety_threshold
+training_state.promotion_history / recent_iteration_metrics / rng_state
+replay.capacity / size / seen / obs_fp16 / teacher_actions_fp16
+phase_snapshots.entry / best / exit
+lineage.parent_model_id / teacher_sha256 / config_sha256 / code_commit
+capabilities.critic_trained = false
+capabilities.deployable = false
 ```
 
-R1 文件名采用 `platform_model_id = 10288 + current_iteration`，确保平台探活不会
-把预训练教师 10288 误判为最新学生。R1 TOML 原有的常规定时 checkpoint 使用
-`model.ckpt-<platform_model_id>.pkl`；每个 DAgger 阶段边界的完整桥接候选使用
-`model.ckpt-bridge-<platform_model_id>.pkl`，对应视觉教师候选使用
-`model.ckpt-teacher-<platform_model_id>.pkl`。质量阈值仅记录诊断 warning，
-不阻止保存或继续训练。
+文件数字 ID 完全使用开悟框架传入值，不由业务代码从 iteration 或父模型 ID
+计算。R2 每次保存同一 payload 的阶段文件和评估兼容别名：
 
-该文件依赖仿真 `height_scan256`，`deployable=false`（语义上），部署端不得接受。
-旧 raw bridge checkpoint 只能作为显式 weight-only 输入，不能伪装成精确 resume。
+```text
+model.ckpt-daggerzero-<平台ID>.pkl
+model.ckpt-daggerquarter-<平台ID>.pkl
+model.ckpt-daggerhalf-<平台ID>.pkl
+model.ckpt-daggerthreequarter-<平台ID>.pkl
+model.ckpt-daggerfull-<平台ID>.pkl
+model.ckpt-locomotion-<平台ID>.pkl
+```
 
-### 2.2 `privileged_loco_teacher_v1`：视觉蒸馏教师
+阶段标签只用小写字母，数字只出现在平台 ID 中。该训练包依赖仿真
+`height_scan256` 且 `deployable=false`，deploy 不得接受。Standard eval 从
+`modules.low_level.policy_state_dict` 加载学生；视觉 LBC 从 low-level
+encoder/actor 建立冻结教师。
+
+旧 raw bridge checkpoint 只能显式 weight-only 导入；旧
+`behavior_distill_v2` 和 `privileged_loco_teacher_v1` 作为历史格式保留，不得
+仅改 `format` 字段冒充新 schema。
+
+### 2.2 `privileged_loco_teacher_v1`：历史视觉教师封装
 
 ```text
 format = "privileged_loco_teacher_v1"
@@ -65,10 +81,9 @@ critic_trained = false
 deployable = false
 ```
 
-它是后续 Standard LBC 的冻结教师，不是 Jetson 制品。server LBC loader 兼容该
-封装与历史 `encoder.*`/`actor.*` raw 权重；新产物优先使用封装格式。阶段边界
-制品只是候选，进入视觉蒸馏前仍需人工比较质量诊断与固定评估结果，并显式记录
-选用的 teacher ID。
+它是历史独立封装，不是 Jetson 制品。R2 后新产物优先使用
+`kaiwu_train_v1.modules.low_level`；进入视觉蒸馏前仍需比较固定 seed、上下楼
+视频和失败率，并记录选用的 checkpoint ID 与 SHA256。
 
 ### 2.3 `lbc_loco`：可部署视觉策略候选
 
@@ -89,17 +104,17 @@ checkpoint，才允许进入现有 Standard exporter 的部署审查。至少需
 - Track `lbc_loco`：若 `goal_dim=3`，Actor 必须为 80-D，不能交给 Actor77 exporter；
 - Git LFS pointer：不是可用 checkpoint/ONNX 制品。
 
-## 3. STD-BRIDGE-R1 的冻结边界
+## 3. STD-DAGGER-R2 的冻结边界
 
 本轮只改 `server/` 的 flat301→Actor77 特权桥接及 loader 契约：
 
 - 已审计的原始源教师 SHA256 为
-  `d5999461f00c4634bdea0648e46baac9fba34e621eaa586fe26f64f68953eeed`，但 R1 运行时不将它
+  `d5999461f00c4634bdea0648e46baac9fba34e621eaa586fe26f64f68953eeed`，但 R2 运行时不将它
   作为字节级加载门禁；预训练教师身份由操作者确认；
 - 教师输入 301，学生输入仍含特权 scan，输出 action12；
 - 不接入 depth、Goal、UWB；
 - 不修改部署 exporter、ONNX、C++ 或 `deploy.yaml`；
-- R1 产物不得复制到 `deploy/` 或登记为“可部署”。
+- R2 产物不得复制到 `deploy/` 或登记为“可部署”。
 
 ## 4. 发布候选必须原子固化的字段
 

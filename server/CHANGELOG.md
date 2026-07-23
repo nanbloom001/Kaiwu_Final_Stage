@@ -4,6 +4,15 @@
 
 ## [未发布]
 
+- **[Standard 特权网络结构蒸馏]** 从已验证可启动的 minimal lifecycle 重新构建 10288
+  flat301→Actor77 桥接。单次 6000-iteration 任务自适应完成
+  0/25/50/75/100% 逐环境 DAgger；加入动作安全接管、1/0.25/0 样本权重、
+  8192 条 FP16 reservoir、75/25 当前/回放损失和阶段 entry/best/exit 回退。
+  新训练包统一为 `kaiwu_train_v1`，保存纯英文阶段文件与同 ID
+  `locomotion` 别名；数字 ID 只使用平台注入值。平台完成 6000 iterations，
+  最终 `daggerfull` 有效学生比例约 99.8%，视频评估 4/4 完成。四次升档均为
+  forced，因此模型能力通过但晋升状态机不复用。后续视觉阶段只登记
+  `daggerfull-16288`，并改用失败后停留而非强制升档。
 - **[STD-BRIDGE-R1]** 以原始复赛 Standard 10288 flat301 checkpoint 为唯一
   行为教师。预训练教师身份改由操作者手动确认，不再以字节级 SHA
   不一致阻断 rollout；仍保留 key/shape 校验、成功加载要求和冻结教师证明。新增逐环境
