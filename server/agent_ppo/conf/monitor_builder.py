@@ -65,17 +65,19 @@ def _build_lbc_monitor(title="LBC_Loco"):
 
 
 def _build_behavior_distill_monitor():
-    monitor = MonitorConfigBuilder().title("Standard_Distill_1")
+    monitor = MonitorConfigBuilder().title("STD_Bridge_R1")
     monitor.add_group(group_name="行为蒸馏", group_name_en="behavior_distill")
     panels = (
         ("动作均方差", "action_mse", "action_mse"),
+        ("归一动作误差", "normalized_mse", "normalized_action_mse"),
         ("动作距离", "action_l2", "action_l2"),
         ("动作余弦", "action_cos", "action_cos"),
-        ("教师动作幅值", "teacher_abs", "teacher_abs"),
-        ("学生动作幅值", "student_abs", "student_abs"),
-        ("梯度范数", "grad_norm", "grad_norm"),
-        ("训练轮次", "iteration", "iteration"),
-        ("累计步数", "total_steps", "total_steps"),
+        ("学生驱动概率", "student_prob", "student_drive_probability"),
+        ("安全接管率", "takeover_rate", "safety_takeover_rate"),
+        ("有效样本率", "sample_rate", "weighted_sample_rate"),
+        ("教师域外率", "teacher_ood", "teacher_ood_rate"),
+        ("硬终止率", "hard_term", "hard_termination_rate"),
+        ("DAgger阶段", "dagger_phase", "dagger_phase"),
     )
     for display_name, panel_name, metric_name in panels:
         _add_line_panel(monitor, display_name, panel_name, metric_name)

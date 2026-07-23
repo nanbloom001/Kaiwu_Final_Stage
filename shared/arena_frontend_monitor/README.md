@@ -27,12 +27,15 @@ export AGENT_BROWSER_SESSION=tencent-arena
 export AGENT_BROWSER_SESSION_NAME=tencent-arena
 ```
 
-先检查运行条件：
+先执行不会打开、切换或刷新网页的离线检查：
 
 ```bash
-command -v agent-browser
-agent-browser tab list
+python3 shared/arena_frontend_monitor/network_export.py --check
 ```
+
+该检查只验证 Python、`agent-browser --version`、各配套 CLI 的 `--help`、固定
+HAR fixture 解析和输出目录可写性。
+它不验证腾讯登录态；真实采集前仍需人工打开并登录目标监控页面。
 
 ## 推荐用法
 
@@ -86,6 +89,17 @@ python3 shared/arena_frontend_monitor/network_export.py
 ```bash
 python3 shared/arena_frontend_monitor/network_export.py --capture-mode har
 ```
+
+需要把“未抓到任何指标”视为失败时使用：
+
+```bash
+python3 shared/arena_frontend_monitor/network_export.py \
+  --capture-mode har \
+  --fail-on-empty-metrics
+```
+
+致命错误或上述空指标条件会返回非零退出码，同时仍保留失败
+`summary.json` 和诊断目录，便于自动化发现失败而不丢失证据。
 
 ### 生成本地快照页面
 
@@ -159,12 +173,24 @@ export ARENA_MONITOR_RUNTIME_DIR="$HOME/arena-monitor-runtime"
 
 ## 静态验证
 
+当前状态：**静态与 fixture 验证可执行；真实腾讯登录态 E2E 待人工打开页面后验证。**
+远程仓库版本是本工具的唯一代码来源，运行时采集结果不进入 Git。
+
+HAR 是主要采集路径，因为训练指标位于 iframe 并采用懒加载；普通
+`agent-browser network requests` 仅作为 HAR 没有获得指标时的备用路径。
+
 ```bash
 PYTHONPYCACHEPREFIX=/tmp/arena-monitor-pycache \
 python3 -m py_compile shared/arena_frontend_monitor/*.py
 
 bash -n shared/arena_frontend_monitor/collect_monitor.sh
 bash -n shared/arena_frontend_monitor/manual_metric_recorder.sh
+
+python3 -m unittest discover \
+  -s shared/arena_frontend_monitor/tests \
+  -p 'test_*.py'
 ```
 
-完整端到端采集依赖有效的平台登录会话，不能仅靠离线测试覆盖。
+完整端到端验收还必须确认：已有登录成功的 `/p/v5/exp/monitor` 标签页、
+自动刷新已启用、HAR 中至少存在一个 `GetTrainMetricRange`、日志可解析且
+coverage report 与页面指标清单一致。工具不会为了通过检查自动导航到其他页面。

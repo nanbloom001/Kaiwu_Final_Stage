@@ -1,0 +1,279 @@
+# STD-BRIDGE-R1: flat Standard 10288 -> modular privileged Actor77.
+# This run intentionally uses no depth image and no PPO/reward update.
+
+[env]
+num_envs = 1024
+episode_length_s = 25
+
+[env_conf]
+task_name = "Unitree-Go2-Velocity"
+seed = 0
+
+[terrain]
+mode = "standard"
+num_rows = 10
+num_cols = 20
+difficulty_range = [0.0, 1.0]
+curriculum = true
+max_init_terrain_level = 9
+
+[terrain.standard.pyramid_slope]
+proportion = 0.20
+
+[terrain.standard.pyramid_slope_inv]
+proportion = 0.20
+
+[terrain.standard.pyramid_stairs]
+proportion = 0.20
+
+[terrain.standard.pyramid_stairs_inv]
+proportion = 0.40
+
+[terrain.standard.maze]
+proportion = 0.0
+
+# R1 isolates structure transfer. Randomization is reintroduced only after the
+# clean 100% student-drive bridge passes its external evaluation gate.
+[domain_rand]
+enable_domain_rand = false
+randomize_friction = false
+friction_range = [0.45, 1.4]
+push_robots = false
+push_interval_s = 15
+max_push_vel_xy = 0.5
+
+[noise]
+add_noise = false
+
+[init_state]
+pos = [0.0, 0.0, 0.35]
+
+[commands]
+resampling_time = [6.0, 10.0]
+
+[commands.limit]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_z = [-0.3, 0.3]
+
+[commands.ranges]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_yaw = [-0.3, 0.3]
+
+# Preserve the source 10288 environment definition even though R1 performs no
+# reward/PPO update. This prevents the simulator task from falling back to a
+# different reward/command base while collecting teacher/student trajectories.
+[rewards.track_lin_vel_xy]
+weight = 2.65
+[rewards.track_lin_vel_xy.params]
+std = 0.25
+command_name = "base_velocity"
+
+[rewards.track_ang_vel_z]
+weight = 1.5
+[rewards.track_ang_vel_z.params]
+std = 0.25
+command_name = "base_velocity"
+
+[rewards.lin_vel_z]
+weight = -0.52
+
+[rewards.ang_vel_xy]
+weight = -0.37
+
+[rewards.joint_acc]
+weight = -7.5e-7
+
+[rewards.joint_torques]
+weight = -1.05e-4
+
+[rewards.dof_pos_limits]
+weight = -0.3
+
+[rewards.action_rate]
+weight = -0.016
+
+[rewards.undesired_contacts]
+weight = -0.3
+[rewards.undesired_contacts.params]
+threshold = 1
+
+[rewards.flat_orientation]
+weight = -1.18
+
+[rewards.reach_goal]
+weight = 10.0
+[rewards.reach_goal.params]
+threshold = 0.6
+
+[rewards.action_smoothness]
+weight = -0.011
+
+[rewards.energy]
+weight = -1.7e-5
+
+[rewards.correct_base_height]
+weight = -0.45
+[rewards.correct_base_height.params]
+target_height = 0.38
+
+[rewards.hip_to_default]
+weight = -0.15
+
+[rewards.joint_position_penalty]
+weight = -0.11
+[rewards.joint_position_penalty.params]
+stand_still_scale = 2.0
+cmd_threshold = 0.1
+ang_cmd_threshold = 0.2
+
+[rewards.stand_still_motion]
+weight = -0.85
+[rewards.stand_still_motion.params]
+command_name = "base_velocity"
+lin_cmd_threshold = 0.15
+ang_cmd_threshold = 0.2
+vertical_vel_scale = 0.5
+ang_vel_scale = 0.5
+joint_vel_scale = 0.1
+
+[rewards.commanded_still_penalty]
+weight = -0.19
+[rewards.commanded_still_penalty.params]
+command_name = "base_velocity"
+cmd_threshold = 0.2
+still_speed_threshold = 0.12
+
+[rewards.score_guidance]
+weight = 0.17
+[rewards.score_guidance.params]
+command_name = "base_velocity"
+min_command = 0.15
+tracking_std = 0.35
+posture_std = 0.25
+power_scale = 35.0
+posture_weight = 0.6
+
+[rewards.feet_air_time]
+weight = 0.95
+[rewards.feet_air_time.params]
+command_name = "base_velocity"
+threshold = 0.18
+
+[rewards.feet_slide]
+weight = -0.12
+
+[rewards.feet_stumble]
+weight = -0.04
+
+[rewards.termination]
+weight = -3.0
+
+[rewards.dof_vel]
+weight = -3.9e-4
+
+[rewards.base_lateral_vel]
+weight = -0.7
+
+[rewards.air_time_variance_penalty]
+weight = -0.55
+
+[rewards.pivot_turning]
+weight = -0.2
+[rewards.pivot_turning.params]
+lin_vel_threshold = 0.2
+ang_vel_threshold = 0.5
+
+[rewards.feet_clearance]
+weight = 0.31
+[rewards.feet_clearance.params]
+command_name = "base_velocity"
+target_height = 0.08
+std = 0.05
+terrain_height_scale = 0.6
+max_terrain_extra_height = 0.08
+speed_height_scale = 0.01
+body_y_start = 5
+body_y_end = 11
+near_x_start = 2
+near_x_end = 10
+delta_quantile = 0.85
+
+[rewards.feet_swing_forward]
+weight = 0.105
+[rewards.feet_swing_forward.params]
+command_name = "base_velocity"
+target_forward = 0.1
+std = 0.08
+min_command = 0.1
+
+# All curriculum stages intentionally use the same verified teacher command
+# envelope. R1 must not expand or narrow the source behavior distribution.
+[velocity_curriculum]
+promote_threshold = 0.62
+promote_count = 3
+demote_threshold = 0.38
+demote_count = 2
+
+[[velocity_curriculum.stages]]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_yaw = [-0.3, 0.3]
+
+[[velocity_curriculum.stages]]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_yaw = [-0.3, 0.3]
+
+[[velocity_curriculum.stages]]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_yaw = [-0.3, 0.3]
+
+[[velocity_curriculum.stages]]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_yaw = [-0.3, 0.3]
+
+[standard_bridge_r1]
+# The platform should preload the original replay Standard checkpoint 10288.
+# A local teacher_ckpt may be supplied only for offline/platform debugging.
+# Teacher identity is operator-verified for this run.  Keep this empty so a
+# platform repackage does not block rollout on a byte-for-byte SHA mismatch.
+# Key names, tensor shapes, successful loading and teacher freezing are still
+# validated before the first environment step.
+expected_teacher_sha256 = ""
+# Platform liveness chooses the largest numeric filename ID.  Continue from
+# the parent ID so every R1 artifact outranks model.ckpt-10288.pkl while the
+# checkpoint payload keeps the true 1..5000 current_iteration.
+platform_model_id_base = 10288
+initial_probe_save_iteration = 1
+learning_rate = 3e-4
+max_iterations = 5000
+num_steps_per_env = 24
+log_interval = 50
+# R1 custom workflow's regular periodic save interval.  This is distinct from
+# configure_app.toml dump_model_freq, which belongs to framework-driven learn().
+save_interval = 100
+max_grad_norm = 1.0
+action_loss_weight = 1.0
+quality_window_iterations = 50
+phase_end_iterations = [1500, 2250, 3000, 3750, 5000]
+student_drive_ratios = [0.0, 0.25, 0.50, 0.75, 1.0]
+
+[standard_bridge_r1.command_guard]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_z = [-0.3, 0.3]
+tolerance = 1e-5
+
+[standard_bridge_r1.quality_thresholds]
+minimum_action_cosine = 0.98
+maximum_normalized_action_mse = 0.10
+maximum_safety_takeover_rate = 0.10
+maximum_hard_termination_delta = 0.01
+
+[standard_bridge_r1.safety]
+minimum_action_l2_threshold = 0.25
+p95_multiplier = 2.0
