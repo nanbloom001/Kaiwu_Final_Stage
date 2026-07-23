@@ -144,9 +144,9 @@ class StandardRefDistillConfig(StageConfig):
     ckpt_name = "model.ckpt-locomotion"
     critic_use_encoder = True
 
-    # Pure supervised behavior cloning from the frozen reference actor.
+    # Adaptive action-supervised DAgger from the frozen reference actor.
     lr = 3e-4
-    max_iterations = 5000
+    max_iterations = 6000
     num_steps_per_env = 24
     max_grad_norm = 1.0
     log_interval = 10

@@ -10,6 +10,7 @@ Author: Tencent AI Arena Authors
 
 import os
 import glob
+import shutil
 
 import numpy as np
 import torch
@@ -25,6 +26,13 @@ from agent_ppo.feature.definition import ActData
 from agent_ppo.conf.conf import Config
 from agent_ppo.model.actor_critic_encoder import ActorCriticEncoder
 from agent_ppo.algorithm.algorithm_ppo import AlgorithmPPO
+from agent_ppo.checkpoint_io import (
+    checkpoint_candidates,
+    is_kaiwu_train_bundle,
+    low_level_policy_state,
+    validate_low_level_spec,
+    validate_probe_filename,
+)
 from tools.train_env_conf_validate import check_usr_conf
 
 
@@ -173,6 +181,7 @@ class Agent(BaseAgent):
         learning_rate = float(distill_conf.get("learning_rate", stage.lr))
         max_grad_norm = float(distill_conf.get("max_grad_norm", stage.max_grad_norm))
         action_loss_weight = float(distill_conf.get("action_loss_weight", 1.0))
+        replay_conf = distill_conf.get("replay", {})
 
         self.algorithm = AlgorithmBehaviorDistill(
             student=self.model,
@@ -187,6 +196,10 @@ class Agent(BaseAgent):
             teacher_actor_hidden_dims=stage.teacher_actor_hidden_dims,
             teacher_critic_hidden_dims=stage.teacher_critic_hidden_dims,
             teacher_activation=stage.teacher_activation,
+            replay_capacity=int(replay_conf.get("capacity", 8192)),
+            replay_batch_size=int(replay_conf.get("batch_size", 256)),
+            replay_loss_ratio=float(replay_conf.get("loss_ratio", 0.25)),
+            replay_add_per_step=int(replay_conf.get("add_per_step", 64)),
             logger=self.logger,
         )
         self.optimizer = self.algorithm.optimizer
@@ -378,8 +391,31 @@ class Agent(BaseAgent):
             )
             self.logger.info(f"[{self.algorithm_name}] save {model_file_path} successfully")
         elif self.is_behavior_distill:
-            self.algorithm.save(model_file_path, iteration=self.algorithm.current_iteration)
-            self.logger.info(f"[{self.algorithm_name}] save {model_file_path} successfully")
+            phase_file_path = (
+                f"{path}/model.ckpt-"
+                f"{self.algorithm.current_phase_label}-{str(id)}.pkl"
+            )
+            alias_file_path = f"{path}/model.ckpt-locomotion-{str(id)}.pkl"
+            for candidate in (phase_file_path, alias_file_path):
+                if not validate_probe_filename(candidate):
+                    raise ValueError(
+                        f"Checkpoint filename is not probe-compatible: {candidate}"
+                    )
+            checksum = self.algorithm.save(
+                phase_file_path,
+                platform_model_id=id,
+            )
+            shutil.copyfile(phase_file_path, alias_file_path)
+            alias_size = os.path.getsize(alias_file_path)
+            if alias_size <= 0 or os.path.getsize(phase_file_path) != alias_size:
+                raise IOError(
+                    "Checkpoint alias verification failed: "
+                    f"phase={phase_file_path}, alias={alias_file_path}"
+                )
+            self.logger.info(
+                f"[{self.algorithm_name}] save phase={phase_file_path}, "
+                f"alias={alias_file_path}, sha256={checksum}"
+            )
         else:
             torch.save(self.model.state_dict(), model_file_path)
             self.logger.info(f"save model {model_file_path} successfully")
@@ -443,15 +479,23 @@ class Agent(BaseAgent):
             return
 
         id_str = str(id)
-        candidates = [
-            f"{path}/model.ckpt-{id_str}.pkl",
-            f"{path}/model.ckpt-locomotion-{id_str}.pkl",
-        ]
+        candidates = checkpoint_candidates(path, id_str)
+        # The original 10288 teacher normally uses the unlabelled filename.
+        original_teacher = f"{path}/model.ckpt-{id_str}.pkl"
+        candidates = [original_teacher, *[
+            candidate for candidate in candidates if candidate != original_teacher
+        ]]
 
         # Some platform calls use id='latest'. In that case scan the provided
         # model directory and choose the first flat standard teacher we can load.
         if id_str == "latest":
-            candidates.extend(sorted(glob.glob(f"{path}/model.ckpt-*.pkl"), reverse=True))
+            candidates.extend(
+                sorted(
+                    glob.glob(f"{path}/model.ckpt-*.pkl"),
+                    key=os.path.getmtime,
+                    reverse=True,
+                )
+            )
 
         tried = []
         for model_file_path in candidates:
@@ -463,6 +507,20 @@ class Agent(BaseAgent):
 
             try:
                 pretrained = torch.load(model_file_path, weights_only=False, map_location=self.device)
+                if is_kaiwu_train_bundle(pretrained):
+                    self.algorithm.load_checkpoint_dict(
+                        pretrained,
+                        model_file_path,
+                        load_optimizer=True,
+                        load_teacher=True,
+                        restore_rng=True,
+                    )
+                    self.cur_model_name = model_file_path
+                    self.logger.info(
+                        f"[BehaviorDistill] resumed common training bundle "
+                        f"{model_file_path}"
+                    )
+                    return
                 if isinstance(pretrained, dict) and "format" in pretrained:
                     self.logger.info(
                         f"[BehaviorDistill] skip non-flat ckpt {model_file_path}: "
@@ -492,15 +550,34 @@ class Agent(BaseAgent):
         else:
             model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
 
+        candidates = checkpoint_candidates(path, id)
+        if model_file_path not in candidates:
+            candidates.insert(0, model_file_path)
+        model_file_path = next(
+            (candidate for candidate in candidates if os.path.exists(candidate)),
+            model_file_path,
+        )
         if not os.path.exists(model_file_path):
-            raise FileNotFoundError(
-                f"No flat checkpoint found: {model_file_path}"
-            )
+            raise FileNotFoundError(f"No flat checkpoint found: {model_file_path}")
         if self.cur_model_name == model_file_path:
             self.logger.info(f"current model is {model_file_path}, so skip load model")
             return
 
-        pretrained = torch.load(model_file_path, map_location=self.device)
+        pretrained = torch.load(
+            model_file_path, weights_only=False, map_location=self.device
+        )
+        if is_kaiwu_train_bundle(pretrained):
+            validate_low_level_spec(
+                pretrained,
+                expected={
+                    "proprio_dim": self.stage.num_proprio_obs,
+                    "scan_dim": self.stage.num_scan,
+                    "latent_dim": self.stage.latent_dim,
+                    "action_dim": self.stage.num_actions,
+                    "goal_dim": getattr(self.stage, "num_goal_obs", 0),
+                },
+            )
+            pretrained = low_level_policy_state(pretrained)
         current_state = self.model.state_dict()
 
         if self._ckpt_exact_match(pretrained, current_state):
@@ -555,11 +632,20 @@ class Agent(BaseAgent):
             return
 
         # 训练期路径 P2: locomotion ckpt
-        if os.path.exists(loco_path):
-            self.algorithm.load_teacher_from_locomotion_ckpt(loco_path)
-            self.cur_model_name = loco_path
+        teacher_candidates = checkpoint_candidates(path, id)
+        teacher_path = next(
+            (
+                candidate
+                for candidate in teacher_candidates
+                if os.path.exists(candidate)
+            ),
+            loco_path,
+        )
+        if os.path.exists(teacher_path):
+            self.algorithm.load_teacher_from_locomotion_ckpt(teacher_path)
+            self.cur_model_name = teacher_path
             self.logger.info(
-                f"[LBC-Loco] Teacher loaded by splitting locomotion ckpt {loco_path}; "
+                f"[LBC-Loco] Teacher loaded from {teacher_path}; "
                 f"student randomly initialized."
             )
             return

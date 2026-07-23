@@ -18,6 +18,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from agent_ppo.checkpoint_io import (
+    is_kaiwu_train_bundle,
+    low_level_teacher_parts,
+    validate_low_level_spec,
+)
+
 
 class AlgorithmLBC:
     """LBC (Learning by Cheating) training algorithm.
@@ -380,6 +386,29 @@ class AlgorithmLBC:
             ckpt_path: locomotion 模型文件路径（model.ckpt-locomotion-{id}.pkl）。
         """
         full_state = torch.load(ckpt_path, weights_only=False, map_location=self.device)
+        if is_kaiwu_train_bundle(full_state):
+            validate_low_level_spec(
+                full_state,
+                expected={
+                    "proprio_dim": self.proprio_dim,
+                    "scan_dim": self.scan_dim,
+                    "latent_dim": self.latent_dim,
+                    "action_dim": 12,
+                    "goal_dim": 0,
+                },
+            )
+            encoder_state, actor_state = low_level_teacher_parts(full_state)
+            if hasattr(self.teacher_encoder, "mlp"):
+                self.teacher_encoder.mlp.load_state_dict(
+                    encoder_state, strict=True
+                )
+            else:
+                self.teacher_encoder.load_state_dict(
+                    encoder_state, strict=True
+                )
+            self.teacher_actor.load_state_dict(actor_state, strict=True)
+            self._freeze_teacher()
+            return
 
         # 拆分 encoder 权重 → teacher_encoder.mlp
         encoder_state = {

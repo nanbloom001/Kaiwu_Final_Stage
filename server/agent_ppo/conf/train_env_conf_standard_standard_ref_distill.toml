@@ -64,10 +64,42 @@ ang_vel_yaw = [-0.3, 0.3]
 # 平台会通过 Agent.load_model(...) 把该 ckpt 注入为 frozen teacher。
 # 只有本地离线调试时，才手动添加 teacher_ckpt = "..."
 learning_rate = 3e-4
-max_iterations = 5000
+max_iterations = 6000
 num_steps_per_env = 24
 log_interval = 10
 save_interval = 100
 max_grad_norm = 1.0
 action_loss_weight = 1.0
-student_drive = false
+quality_window_iterations = 50
+phase_labels = [
+  "daggerzero",
+  "daggerquarter",
+  "daggerhalf",
+  "daggerthreequarter",
+  "daggerfull",
+]
+student_drive_ratios = [0.0, 0.25, 0.50, 0.75, 1.0]
+phase_min_iterations = [900, 600, 600, 600, 1800]
+phase_max_iterations = [1500, 900, 900, 900, 6000]
+
+[standard_ref_distill.quality_thresholds]
+minimum_action_cosine = 0.98
+maximum_normalized_action_mse = 0.10
+maximum_safety_takeover_rate = 0.10
+maximum_hard_termination_delta = 0.01
+
+[standard_ref_distill.safety]
+minimum_action_l2_threshold = 0.25
+p95_multiplier = 2.0
+
+[standard_ref_distill.replay]
+capacity = 8192
+batch_size = 256
+loss_ratio = 0.25
+add_per_step = 64
+
+[standard_ref_distill.command_guard]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_z = [-0.3, 0.3]
+tolerance = 1e-5
