@@ -159,5 +159,42 @@ class DryRunTests(unittest.TestCase):
             client.post.assert_not_called()
 
 
+class EmptyFinishResponseTests(unittest.TestCase):
+    def test_upload_accepts_empty_finish_only_after_matching_readback(self):
+        client = MODULE.SyncClient("https://example.invalid", "token", 30)
+        payload = b"bridge-sync"
+        client.get = mock.Mock(
+            side_effect=[
+                {"ok": True},
+                {"ok": True},
+                {"ok": True, "empty_response": True, "status": 200},
+                {"sha256": MODULE.sha256_bytes(payload)},
+            ]
+        )
+
+        result = client.upload_file_get("agent_ppo/model.py", payload, 1.0)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified_after_empty_response"])
+        self.assertEqual(result["sha256"], MODULE.sha256_bytes(payload))
+        self.assertEqual(client.get.call_args_list[-1].args, ("/read",))
+
+    def test_upload_keeps_empty_finish_failure_when_readback_mismatches(self):
+        client = MODULE.SyncClient("https://example.invalid", "token", 30)
+        client.get = mock.Mock(
+            side_effect=[
+                {"ok": True},
+                {"ok": True},
+                {"ok": True, "empty_response": True, "status": 200},
+                {"sha256": "different"},
+            ]
+        )
+
+        result = client.upload_file_get("agent_ppo/model.py", b"bridge-sync", 1.0)
+
+        self.assertTrue(result["empty_response"])
+        self.assertNotIn("sha256", result)
+
+
 if __name__ == "__main__":
     unittest.main()

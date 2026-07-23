@@ -157,7 +157,17 @@ class SyncClient:
             chunk = data[offset : offset + GET_UPLOAD_CHUNK_SIZE]
             encoded = base64.urlsafe_b64encode(chunk).decode("ascii")
             self.get("/write_chunk", path=rel_path, data=encoded)
-        return self.get("/write_finish", path=rel_path, mtime=str(mtime))
+        result = self.get("/write_finish", path=rel_path, mtime=str(mtime))
+        if result.get("empty_response"):
+            expected_sha256 = sha256_bytes(data)
+            readback = self.get("/read", path=rel_path)
+            if readback.get("sha256") == expected_sha256:
+                return {
+                    "ok": True,
+                    "sha256": expected_sha256,
+                    "verified_after_empty_response": True,
+                }
+        return result
 
     def _open(self, req: Request, expect_json: bool = True) -> dict[str, Any]:
         try:
@@ -370,6 +380,8 @@ def sync_files(
         result = client.upload_file_get(rel, data, item["mtime"])
         if not result.get("ok") or result.get("sha256") != item["sha256"]:
             raise RuntimeError(f"failed to upload {rel}: {result}")
+        if result.get("verified_after_empty_response"):
+            print(f"verified by readback after empty response: {rel}")
         uploaded_bytes += len(data)
         if index == 1 or index % 20 == 0 or index == len(changed):
             print(f"uploaded {index}/{len(changed)} files, {uploaded_bytes / 1024:.1f} KiB")
