@@ -4,7 +4,8 @@
 ###########################################################################
 """
 Local side sync client.
-放在本地项目根目录运行，将 agent_diy / agent_ppo / conf 同步到网页 IDE。
+放在本地项目根目录运行，将 agent_diy / agent_ppo / conf / isaac_env
+同步到网页 IDE。
 
 Run example:
 运行示例：
@@ -51,7 +52,7 @@ SKIP_SUFFIXES = {
     ".pth",
     ".pyc",
 }
-SYNC_DIR_NAMES = ("agent_diy", "agent_ppo", "conf")
+SYNC_DIR_NAMES = ("agent_diy", "agent_ppo", "conf", "isaac_env")
 GET_UPLOAD_CHUNK_SIZE = 4096
 DEFAULT_SYNC_URL = "https://tencentarena.com/p5/ide/18005/proxy/8765"
 DEFAULT_SYNC_TOKEN = "fwwb-new-codex-sync-20260512-5a7f58a98ddf4e9c9b4c9e1b6a2d8f41"
