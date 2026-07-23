@@ -23,7 +23,7 @@ exporter 或 `deploy.yaml` 都必须先核对 task、format、goal_dim 和 Actor
 增加 `modules.vision_encoder`，高低层混合增加 `modules.high_level`，不通过改名
 伪装为部署制品。
 
-必需字段：
+必需字段（特权 DAgger 路径，R2）：
 
 ```text
 format = "kaiwu_train_v1"
@@ -43,6 +43,29 @@ phase_snapshots.entry / best / exit
 lineage.parent_model_id / teacher_sha256 / config_sha256 / code_commit
 capabilities.critic_trained = false
 capabilities.deployable = false
+```
+
+视觉蒸馏路径（阶段 4）在上述 schema 上用 `modules.vision_encoder` +
+`modules.low_level`（冻结教师副本）替代 `modules.privileged_teacher`，并改用
+线性 ramp 调度字段：
+
+```text
+format = "kaiwu_train_v1"
+schema_version = 1
+ramp_label                         # visionteacher / visionhalf / visionfull / visionblocked
+model_spec
+modules.vision_encoder.state_dict  # 视觉学生（本轮训练对象）
+modules.low_level.encoder_state_dict / actor_state_dict   # 冻结教师副本（daggerfull-16288）
+optimizers.vision_distill
+training_state.current_iteration / total_steps
+training_state.ramp_probability / ramp_start_h / ramp_end_h
+training_state.soft_stay_frozen / soft_stay_reason / training_status
+replay.enabled = false             # 首轮不启用单帧 replay（LSTM 不适用）
+lineage.parent_checkpoint_sha256 / teacher_low_level_sha256 / config_sha256 / code_commit
+capabilities.uses_depth = true
+capabilities.uses_height_scan_at_inference = false
+capabilities.deployable = false
+lstm_reset_contract                # reset mask 语义；hidden 不跨运行恢复
 ```
 
 文件数字 ID 完全使用开悟框架传入值，不由业务代码从 iteration 或父模型 ID
@@ -97,6 +120,12 @@ checkpoint，才允许进入现有 Standard exporter 的部署审查。至少需
 - 与同一训练产物配套的配置、commit 和 SHA256。
 
 `lbc_loco` 只表示结构可导出，不自动表示相机、ONNX、真机安全或比赛能力已验收。
+
+阶段 4 起，视觉训练恢复包统一为 `kaiwu_train_v1`（§2.1 视觉路径，含
+`modules.vision_encoder`）。`lbc_loco` 顶层 key 格式保留给后续部署导出制品：
+训练期 save 仍会同时落一份 `lbc_loco` 兼容副本（不作为平台探活主文件，因其
+两段标签 `lbc-loco` 不满足探活正则），未来 `lbc_loco` exporter 会改读
+`kaiwu_train_v1.modules.vision_encoder`。
 
 ### 2.4 其他格式
 

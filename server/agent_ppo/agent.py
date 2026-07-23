@@ -27,11 +27,13 @@ from agent_ppo.conf.conf import Config
 from agent_ppo.model.actor_critic_encoder import ActorCriticEncoder
 from agent_ppo.algorithm.algorithm_ppo import AlgorithmPPO
 from agent_ppo.checkpoint_io import (
+    KAIWU_TRAIN_FORMAT,
     checkpoint_candidates,
     is_kaiwu_train_bundle,
     low_level_policy_state,
     validate_low_level_spec,
     validate_probe_filename,
+    vision_checkpoint_candidates,
 )
 from tools.train_env_conf_validate import check_usr_conf
 
@@ -382,14 +384,33 @@ class Agent(BaseAgent):
             model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
 
         if self.is_lbc:
-            # LBC saves via algorithm.save which writes the full LBC dict
-            # (vision_encoder + teachers + optimizer + iter).
+            # 阶段 4 起视觉训练包统一为 kaiwu_train_v1（modules.vision_encoder），
+            # 文件名用纯字母 ramp 标签（visionfull/visionhalf/...）以满足探活正则。
+            # 默认每次保存写规范主文件 model.ckpt-visionfull-{id}.pkl；
+            # workflow 在 ramp 关键比例点会额外调用 save_vision_at_ramp_label。
+            ramp_label = getattr(self.algorithm, "_pending_ramp_label", None) or "visionfull"
+            vision_file_path = f"{path}/model.ckpt-{ramp_label}-{str(id)}.pkl"
+            if not validate_probe_filename(vision_file_path):
+                raise ValueError(
+                    f"Vision checkpoint filename not probe-compatible: {vision_file_path}"
+                )
+            checksum = self.algorithm.save_vision_bundle(
+                vision_file_path,
+                platform_model_id=id,
+                ramp_label=ramp_label,
+            )
+            # 同时保留一份 lbc_loco 顶层 key 格式（部署导出制品兼容；探活正则
+            # 不接受 lbc-loco 两段标签，故这只作为内部 side artifact，不作为
+            # 平台探活主文件）。未来 lbc_loco 导出器会改读 kaiwu_train_v1。
             self.algorithm.save(
                 model_file_path,
                 format_tag=self.algorithm_name,
                 iteration=self.algorithm.current_iteration,
             )
-            self.logger.info(f"[{self.algorithm_name}] save {model_file_path} successfully")
+            self.logger.info(
+                f"[{self.algorithm_name}] save vision bundle={vision_file_path} "
+                f"(sha256={checksum}), legacy lbc_loco={model_file_path}"
+            )
         elif self.is_behavior_distill:
             phase_file_path = (
                 f"{path}/model.ckpt-"
@@ -424,6 +445,30 @@ class Agent(BaseAgent):
         # 将冻结的 teacher_encoder + teacher_actor 重组为 encoder.*/actor.* 命名，
         # 使产物目录内保留一份可独立部署 / 供下阶段拆分教师的 locomotion ckpt。
         self._save_side_locomotion(path, id)
+
+    def save_vision_at_ramp_label(self, path, id, ramp_label: str):
+        """在 ramp 关键比例点额外保存带标签的视觉训练包。
+
+        ramp_label 必须是纯字母视觉标签（visionteacher/visionhalf/visionfull/
+        visionblocked），满足探活正则。workflow 在 ramp 达到 ~50% / 100% 或
+        soft-stay 冻结时调用，落 model.ckpt-visionhalf-{id}.pkl 等。
+        """
+        if not self.is_lbc:
+            return
+        vision_file_path = f"{path}/model.ckpt-{ramp_label}-{str(id)}.pkl"
+        if not validate_probe_filename(vision_file_path):
+            raise ValueError(
+                f"Ramp-label filename not probe-compatible: {vision_file_path}"
+            )
+        checksum = self.algorithm.save_vision_bundle(
+            vision_file_path,
+            platform_model_id=id,
+            ramp_label=ramp_label,
+        )
+        self.logger.info(
+            f"[{self.algorithm_name}] save ramp-label {vision_file_path} "
+            f"(sha256={checksum})"
+        )
 
     def _save_side_locomotion(self, path, id):
         """保存 lbc_loco 教师为 locomotion 形态的 side ckpt。
@@ -591,99 +636,131 @@ class Agent(BaseAgent):
     def _load_lbc_loco(self, path, id):
         """LBC Loco 模型加载，按 is_eval 分发训练期 / eval 两条路径。
 
+        阶段 4 起视觉训练包统一为 kaiwu_train_v1（modules.vision_encoder）。
+        老的 lbc_loco 顶层 key 格式只作为兼容回退（部署导出制品另用 lbc_loco）。
+
         Eval 路径（模拟真机视角）:
-            必须有 main ckpt (model.ckpt-lbc-loco-{id}.pkl)
+            优先 vision* 标签的视觉训练包，回退 lbc-loco；
             → 仅加载 vision_encoder + teacher_actor（不加载 teacher_encoder）
             → 真机没有 height_scan，teacher_encoder 永远不会被调用
 
         训练期路径:
-            P1 (续训): main ckpt → algorithm.load(...)，全部恢复
-            P2 (首训): model.ckpt-locomotion-{id}.pkl → 按前缀拆分教师
+            P1 (续训): vision* 视觉训练包 → load_vision_resume(...)，恢复
+               vision_encoder + 冻结教师 + optimizer + ramp_state（不恢复 LSTM hidden）
+            P2 (首训): daggerfull / locomotion 父包 → load_parent_bundle(...)
+               显式优先 daggerfull-16288，打印路径/SHA/model_spec 供操作者核对
             miss: FileNotFoundError
         """
-        main_path = f"{path}/model.ckpt-lbc-loco-{str(id)}.pkl"
-        loco_path = f"{path}/model.ckpt-locomotion-{str(id)}.pkl"
+        is_eval = getattr(self, "is_eval", False)
 
         # Eval 路径：模拟真机视角
-        is_eval = getattr(self, "is_eval", False)
         if is_eval:
-            if not os.path.exists(main_path):
-                raise FileNotFoundError(
-                    f"[LBC-Loco eval] Required vision ckpt not found: {main_path}. "
-                    f"Eval mode simulates real-robot deployment and cannot fall back to "
-                    f"teacher-only ckpt."
-                )
-            self._load_lbc_loco_for_eval(main_path)
-            self.cur_model_name = main_path
+            eval_path = self._find_vision_eval_ckpt(path, id)
+            self._load_lbc_loco_for_eval(eval_path)
+            self.cur_model_name = eval_path
             return
 
-        # 训练期路径 P1: 续训 main ckpt
-        if os.path.exists(main_path):
-            self.algorithm.load(
-                main_path,
-                expected_format=self.algorithm_name,
-                load_optimizer=True,
-            )
-            self.cur_model_name = main_path
+        # 训练期路径 P1: 续训视觉训练包（vision* 标签优先）
+        resumed = self.algorithm.load_vision_resume(path, id)
+        if resumed is not None:
+            self.cur_model_name = resumed
             self.logger.info(
-                f"[LBC-Loco] Loaded main ckpt {main_path} "
-                f"(iter={self.algorithm.current_iteration})"
+                f"[LBC-Loco] Resumed vision bundle {resumed} "
+                f"(iter={self.algorithm.current_iteration}, "
+                f"ramp_p={self.algorithm.ramp_probability:.3f})"
             )
             return
 
-        # 训练期路径 P2: locomotion ckpt
-        teacher_candidates = checkpoint_candidates(path, id)
-        teacher_path = next(
-            (
-                candidate
-                for candidate in teacher_candidates
-                if os.path.exists(candidate)
-            ),
-            loco_path,
-        )
-        if os.path.exists(teacher_path):
-            self.algorithm.load_teacher_from_locomotion_ckpt(teacher_path)
-            self.cur_model_name = teacher_path
+        # 训练期路径 P2: 首训，加载特权父文件（daggerfull-16288）
+        try:
+            parent_path = self.algorithm.load_parent_bundle(path, id)
+            self.cur_model_name = parent_path
             self.logger.info(
-                f"[LBC-Loco] Teacher loaded from {teacher_path}; "
+                f"[LBC-Loco] Vision parent (frozen teacher) loaded from {parent_path}; "
                 f"student randomly initialized."
             )
             return
+        except FileNotFoundError:
+            pass
 
         raise FileNotFoundError(
-            f"[LBC-Loco] No ckpt found in {path}/: "
-            f"tried {main_path} (resume) and {loco_path} (first-train teacher)."
+            f"[LBC-Loco] No ckpt found in {path}/ for id={id}: "
+            f"no vision* resume bundle and no daggerfull/locomotion parent."
+        )
+
+    def _find_vision_eval_ckpt(self, path, id) -> str:
+        """评估时查找视觉 checkpoint：优先 vision* 视觉包，回退 lbc-loco。"""
+        candidates = vision_checkpoint_candidates(path, id)
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        # 兼容：老 lbc-loco 顶层 key 格式
+        legacy = f"{path}/model.ckpt-lbc-loco-{str(id)}.pkl"
+        if os.path.exists(legacy):
+            return legacy
+        raise FileNotFoundError(
+            f"[LBC-Loco eval] No vision ckpt found in {path}/ for id={id}; "
+            f"eval simulates real-robot deployment and cannot fall back to "
+            f"teacher-only ckpt."
         )
 
     def _load_lbc_loco_for_eval(self, vision_path):
         """Eval 模式：模拟真机视角，只加载 vision_encoder + teacher_actor。
 
         真机部署时 teacher_encoder（吃 height_scan）不存在，故 eval 也不加载它。
+        支持两种格式：
+          - kaiwu_train_v1 视觉包（modules.vision_encoder / modules.low_level）
+          - 老 lbc_loco 顶层 key（vision_encoder_state_dict / teacher_actor_state_dict）
         """
         ckpt = torch.load(vision_path, weights_only=False, map_location=self.device)
-        got = ckpt.get("format")
-        if got != self.algorithm_name:
-            raise ValueError(
-                f"Ckpt format mismatch: expected '{self.algorithm_name}', got '{got}' "
-                f"at {vision_path}."
-            )
+        fmt = ckpt.get("format")
 
-        # 学生 VisionEncoder：真机推理主角
+        if fmt == KAIWU_TRAIN_FORMAT:
+            # 新视觉训练包：从 modules 读取
+            modules = ckpt.get("modules", {})
+            vision_section = modules.get("vision_encoder", {})
+            ve_state = vision_section.get("state_dict")
+            if not isinstance(ve_state, dict):
+                raise KeyError(
+                    f"modules.vision_encoder.state_dict missing in {vision_path}"
+                )
+            self.vision_encoder.load_state_dict(ve_state)
+            self.vision_encoder.eval()
+            self.vision_encoder.reset_hidden_state(
+                batch_size=self.num_envs, device=self.device
+            )
+            low_level = modules.get("low_level", {})
+            act_state = low_level.get("actor_state_dict")
+            if not isinstance(act_state, dict):
+                raise KeyError(
+                    f"modules.low_level.actor_state_dict missing in {vision_path}"
+                )
+            self.teacher_actor.load_state_dict(act_state)
+            self.teacher_actor.eval()
+            self.logger.info(
+                f"[LBC-Loco eval] Loaded vision bundle {vision_path} "
+                f"(kaiwu_train_v1; teacher_encoder NOT loaded — pure vision view, "
+                f"no height_scan)"
+            )
+            return
+
+        # 兼容老 lbc_loco 顶层 key 格式
+        if fmt != self.algorithm_name:
+            raise ValueError(
+                f"Ckpt format mismatch: expected '{self.algorithm_name}' or "
+                f"'{KAIWU_TRAIN_FORMAT}', got '{fmt}' at {vision_path}."
+            )
         if "vision_encoder_state_dict" not in ckpt:
             raise KeyError(f"vision_encoder_state_dict missing in {vision_path}")
         self.vision_encoder.load_state_dict(ckpt["vision_encoder_state_dict"])
         self.vision_encoder.eval()
         self.vision_encoder.reset_hidden_state(batch_size=self.num_envs, device=self.device)
-
-        # 教师 Actor：latent → joint 的解码器，真机仍需要
         if "teacher_actor_state_dict" not in ckpt:
             raise KeyError(f"teacher_actor_state_dict missing in {vision_path}")
         self.teacher_actor.load_state_dict(ckpt["teacher_actor_state_dict"])
         self.teacher_actor.eval()
-
-        # teacher_encoder 不加载 —— 真机无 height_scan
         self.logger.info(
-            f"[LBC-Loco eval] Loaded student + teacher_actor from {vision_path} "
+            f"[LBC-Loco eval] Loaded legacy lbc_loco {vision_path} "
             f"(teacher_encoder NOT loaded — simulates real-robot view)"
         )
 
