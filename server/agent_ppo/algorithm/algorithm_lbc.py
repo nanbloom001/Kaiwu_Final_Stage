@@ -848,6 +848,10 @@ class AlgorithmLBC:
         self.vision_encoder.load_state_dict(vision_section["state_dict"], strict=True)
 
         # 冻结教师副本（Encoder + Actor77）
+        # save 写的是 teacher_encoder.state_dict()，key 形如 mlp.0.weight（DmEncoder
+        # 内部有 self.mlp）。load 必须用 teacher_encoder.load_state_dict() 让 PyTorch
+        # 按 mlp.* 前缀匹配，而不是剥前缀给 .mlp.load_state_dict()（后者期望 0.weight，
+        # 会 key 不匹配）。eval 路径同理。
         low_level = modules.get("low_level", {})
         enc_state = low_level.get("encoder_state_dict")
         act_state = low_level.get("actor_state_dict")
@@ -855,10 +859,7 @@ class AlgorithmLBC:
             raise KeyError(
                 "modules.low_level.encoder_state_dict/actor_state_dict missing"
             )
-        if hasattr(self.teacher_encoder, "mlp"):
-            self.teacher_encoder.mlp.load_state_dict(enc_state, strict=True)
-        else:
-            self.teacher_encoder.load_state_dict(enc_state, strict=True)
+        self.teacher_encoder.load_state_dict(enc_state, strict=True)
         self.teacher_actor.load_state_dict(act_state, strict=True)
         self._freeze_teacher()
 

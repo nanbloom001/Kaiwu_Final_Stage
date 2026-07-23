@@ -17,8 +17,8 @@
 #   1. LBC 不是 RL —— 无 [rewards] section
 #   2. Policy obs = [proprio(45) | height_scan(256) | depth(57600)] = 57901D
 #      （由 LBCObservationProcess 拼接，lbc_workflow 按偏移切分）
-#   3. 地形 / 域随机化 / 速度命令与 Stage 1 locomotion 完全一致，
-#      保证教师驱动环境时行走分布与原训练分布相符
+#   3. 速度命令域 / 地形比例 / max_init_terrain_level 与父模型 daggerfull-16288
+#      训练域（standard_ref_distill.toml）对齐；首轮关闭域随机化和噪声以隔离感知迁移。
 
 # Basic Configuration
 # 基础配置
@@ -43,8 +43,8 @@ task_name = "Unitree-Go2-Velocity-Camera"
 # 随机种子
 seed = 0
 
-# Terrain Configuration (consistent with Stage 1)
-# 地形配置（与 Stage 1 一致）
+# Terrain Configuration
+# 地形比例 / max_init_terrain_level 与父模型 standard_ref_distill.toml 对齐。
 [terrain]
 # Terrain mode, valid values: "standard" | "track".
 # 地形模式，合法值："standard" | "track"
@@ -62,8 +62,8 @@ difficulty_range = [0.0, 1.0]
 # 是否启用地形课程学习（按表现晋级/降级难度）
 curriculum = true
 # Max init difficulty tier for robot placement, valid range: [0, 9].
-# 机器人初始放置的最大难度档，合法范围：[0, 9]
-max_init_terrain_level = 5
+# 阶段 4 控制变量：与父模型 standard_ref_distill.toml 一致（9），不限制初始难度档。
+max_init_terrain_level = 9
 
 # Pre-expose side walls on high-difficulty standard terrain (consistent with Stage 1 locomotion).
 # 高难度 standard 地形侧墙预暴露（与 Stage 1 locomotion 保持一致）

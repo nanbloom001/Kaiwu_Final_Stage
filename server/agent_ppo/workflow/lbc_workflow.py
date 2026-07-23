@@ -36,6 +36,10 @@ _SOFT_STAY_NONFINITE = 0.0          # 任一 nonfinite 立即触发
 _SOFT_STAY_EFFECTIVE_DELTA = 0.10   # effective < requested - 0.10 触发
 _SOFT_STAY_NMSE_DELTA = 0.05        # normalized_action_mse 相对前窗口恶化超此值触发
 _SOFT_STAY_HARD_DELTA = 0.02        # hard_termination 相对前窗口恶化超此值触发
+# 解冻的绝对质量门槛（不只是"不再恶化"，必须质量绝对达标才继续 ramp）
+_SOFT_STAY_UNFREEZE_MAX_NMSE = 0.15      # normalized_action_mse 必须低于此值
+_SOFT_STAY_UNFREEZE_MAX_HARD = 0.05      # hard_termination_rate 必须低于此值
+_SOFT_STAY_UNFREEZE_MIN_ACTION_COS = 0.90  # action_cosine 必须高于此值
 
 
 def _mean_metrics(rows: list[dict]) -> dict:
@@ -60,6 +64,19 @@ def _ramp_probability(elapsed_h: float, ramp_start_h: float, ramp_end_h: float) 
     if elapsed_h >= ramp_end_h:
         return 1.0
     return (elapsed_h - ramp_start_h) / (ramp_end_h - ramp_start_h)
+
+
+def _ramp_elapsed_from_probability(p: float, ramp_start_h: float, ramp_end_h: float) -> float:
+    """从 ramp_probability 反推已用 ramp 时长（续训恢复用）。
+
+    ramp_clock 在冻结时暂停；续训时从保存的 ramp_probability 反推 clock，
+    保证从断点的 ramp 比例继续，而不是按墙钟时间追赶。
+    """
+    if p <= 0.0:
+        return 0.0
+    if p >= 1.0:
+        return ramp_end_h
+    return ramp_start_h + p * (ramp_end_h - ramp_start_h)
 
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
@@ -110,9 +127,6 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         algorithm.optimizer, T_max=max_iterations, eta_min=lr_min,
     )
 
-    # ramp 里程碑保存（每个比例点只存一次）
-    milestone_saved = {"half": False, "full": False}
-
     logger.info(
         f"[LBC-Vision] Start linear-ramp DAgger: "
         f"max_iterations={max_iterations}, ramp={ramp_start_h}h->{ramp_end_h}h, "
@@ -134,19 +148,32 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     algorithm.train_mode()
     algorithm.training_status = "running"
 
-    recent_for_soft_stay: list[dict] = []
+    # soft-stay 用 per-iteration 聚合指标（不是 per-step），每 _SOFT_STAY_WINDOW
+    # 个 iteration 形成一个窗口。避免 24 steps/iteration 下 100 条 step 记录
+    # 只覆盖约 4 个 iteration 的失真。
+    iter_metric_history: list[dict] = []
     prev_window_metrics: dict | None = None
+    # ramp clock：冻结时暂停累加，恢复后继续，避免解冻后追赶墙钟时间突然跳高。
+    # 续训时从 algorithm.ramp_probability 反推已用 ramp 时长，保证从断点继续。
+    ramp_clock_h = _ramp_elapsed_from_probability(
+        algorithm.ramp_probability, ramp_start_h, ramp_end_h
+    )
     loop_start = time.time()
+    iter_start_prev = loop_start
     last_save_iter = -1
 
     try:
         for iteration in range(max_iterations):
             algorithm.current_iteration = iteration
-            elapsed_h = (time.time() - loop_start) / 3600.0
             iter_start = time.time()
 
-            # 计算 ramp probability（soft-stay 冻结时不再上升）
-            requested_p = _ramp_probability(elapsed_h, ramp_start_h, ramp_end_h)
+            # 推进 ramp clock（只在未冻结时累加，冻结时暂停）
+            if not algorithm.soft_stay_frozen:
+                ramp_clock_h += (iter_start - iter_start_prev) / 3600.0
+            iter_start_prev = iter_start
+
+            # 计算 ramp probability
+            requested_p = _ramp_probability(ramp_clock_h, ramp_start_h, ramp_end_h)
             if algorithm.soft_stay_frozen:
                 # 冻结：保持冻结时的比例，不上升
                 effective_p = algorithm.ramp_probability
@@ -164,7 +191,6 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     safety_threshold=safety_threshold,
                 )
                 step_rows.append(step_metrics)
-                recent_for_soft_stay.append(step_metrics)
                 obs = step_metrics["_next_obs"]  # 内部传递
 
             if not safety_fixed and effective_p >= 0.10:
@@ -185,12 +211,21 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             lr_scheduler.step()
             algorithm.assert_student_parameters_finite()
 
-            # soft-stay 检查（每 _SOFT_STAY_WINDOW iterations）
+            # 收集本 iteration 的聚合指标（per-iteration，不是 per-step）
+            iteration_metrics = _mean_metrics(step_rows)
+            iter_metric_history.append(iteration_metrics)
+
+            # soft-stay 检查（每 _SOFT_STAY_WINDOW iterations，两个连续窗口）
             if (iteration + 1) % _SOFT_STAY_WINDOW == 0:
-                recent_for_soft_stay = recent_for_soft_stay[-(2 * _SOFT_STAY_WINDOW):]
-                if len(recent_for_soft_stay) >= 2 * _SOFT_STAY_WINDOW:
-                    w1 = _mean_metrics(recent_for_soft_stay[-(2 * _SOFT_STAY_WINDOW):-_SOFT_STAY_WINDOW])
-                    w2 = _mean_metrics(recent_for_soft_stay[-_SOFT_STAY_WINDOW:])
+                iter_metric_history = iter_metric_history[-(2 * _SOFT_STAY_WINDOW):]
+                if len(iter_metric_history) >= 2 * _SOFT_STAY_WINDOW:
+                    w1_rows = iter_metric_history[-(2 * _SOFT_STAY_WINDOW):-_SOFT_STAY_WINDOW]
+                    w2_rows = iter_metric_history[-_SOFT_STAY_WINDOW:]
+                    # _mean_metrics 接受 list[dict]；这里每个 w*_rows 是 list[dict]
+                    # 但每个元素本身是 iteration_metrics（dict），需要对窗口内多个
+                    # iteration 的 dict 再聚合一次。直接传 list[dict] 即可。
+                    w1 = _mean_metrics(w1_rows)
+                    w2 = _mean_metrics(w2_rows)
                     reasons = _soft_stay_check(w1, w2, prev_window_metrics, effective_p)
                     if reasons and not algorithm.soft_stay_frozen:
                         algorithm.soft_stay_frozen = True
@@ -200,8 +235,9 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                             "[LBC-Vision] soft-stay FROZEN at ramp_p="
                             f"{effective_p:.3f}: {algorithm.soft_stay_reason}"
                         )
-                    elif algorithm.soft_stay_frozen and not reasons:
-                        # 已冻结：连续两个窗口恢复正常后解冻继续 ramp
+                    elif algorithm.soft_stay_frozen and not reasons and _quality_absolutely_ok(w2):
+                        # 已冻结：连续两个窗口既无新故障、且质量绝对达标后才解冻。
+                        # 不只是"不再恶化"——NMSE 在差水平稳定不能解冻。
                         algorithm.soft_stay_frozen = False
                         algorithm.soft_stay_reason = None
                         algorithm.training_status = "running"
@@ -210,8 +246,6 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                             f"{effective_p:.3f}"
                         )
                     prev_window_metrics = w2
-
-            iteration_metrics = _mean_metrics(step_rows)
 
             # 日志
             if (iteration + 1) % log_interval == 0 or iteration == 0:
@@ -246,25 +280,20 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     except Exception as e:
                         logger.warning(f"[LBC-Vision] monitor.put_data failed: {e}")
 
-            # 定时保存
+            # 定时保存。不传 id，让平台框架注入当前模型池 ID（R2 验证过的做法）；
+            # 用 iteration 作 id 会让平台模型池 ID / 文件名 / 任务页记录不一致。
+            # 标签由 _current_ramp_label 按 ramp 进度自动决定，无需显式里程碑保存。
             if (iteration + 1) % save_interval == 0 and iteration != last_save_iter:
                 agent.learn(list_sample_data=None)
-                agent.save_model(id=str(iteration + 1))
+                agent.save_model()
                 last_save_iter = iteration
 
-            # ramp 里程碑保存（50% / 100% 各一次，纯字母标签）
-            if not milestone_saved["half"] and effective_p >= 0.50:
-                _save_milestone(agent, "visionhalf", iteration + 1)
-                milestone_saved["half"] = True
-            if not milestone_saved["full"] and effective_p >= 1.0:
-                _save_milestone(agent, "visionfull", iteration + 1)
-                milestone_saved["full"] = True
-
-        # 最终保存
+        # 最终保存。不传 id，平台注入。标签由 _current_ramp_label 自动决定
+        # （完成 100% → visionfull；soft-stay 未恢复 → visionblocked）。
         algorithm.training_status = (
             "completed_with_warnings" if algorithm.soft_stay_frozen else "completed"
         )
-        agent.save_model(id=str(max_iterations))
+        agent.save_model()
         total_time = time.time() - loop_start
         logger.info(
             f"[LBC-Vision] Training finished in {total_time:.1f}s, "
@@ -274,15 +303,6 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         )
     finally:
         env.close()
-
-
-def _save_milestone(agent, label: str, iter_id: int):
-    """在 ramp 关键比例点保存带纯字母标签的视觉训练包。"""
-    try:
-        path = getattr(agent, "ckpt_save_dir", None) or "./ckpt"
-        agent.save_vision_at_ramp_label(path, str(iter_id), label)
-    except Exception as e:
-        agent.logger.warning(f"[LBC-Vision] milestone save {label} failed: {e}")
 
 
 def _soft_stay_check(
@@ -312,6 +332,23 @@ def _soft_stay_check(
             if hard_now - hard_prev > _SOFT_STAY_HARD_DELTA:
                 reasons.append(f"hard_term worsened {hard_prev:.4f}->{hard_now:.4f}")
     return reasons
+
+
+def _quality_absolutely_ok(w: dict) -> bool:
+    """解冻的绝对质量门槛：不只是"不再恶化"，必须质量绝对达标。
+
+    避免 NMSE 在较差水平稳定下来后被自动解冻（"不再恶化"≠"质量够好"）。
+    """
+    nmse = w.get("normalized_action_mse")
+    hard = w.get("hard_termination_rate")
+    cos = w.get("action_cosine")
+    if nmse is None or hard is None or cos is None:
+        return False
+    return (
+        nmse <= _SOFT_STAY_UNFREEZE_MAX_NMSE
+        and hard <= _SOFT_STAY_UNFREEZE_MAX_HARD
+        and cos >= _SOFT_STAY_UNFREEZE_MIN_ACTION_COS
+    )
 
 
 def _vision_dagger_step(
