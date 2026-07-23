@@ -238,8 +238,12 @@ class Config:
     """
 
     # Default stage; can be overridden by TOML env_conf.task_name during eval.
-    # 默认阶段；eval 时可由 TOML env_conf.task_name 覆盖。
-    CURRENT = StandardRefDistillConfig
+    # 阶段 4（深度视觉蒸馏）：训练入口固定为 lbc_loco。
+    # 阶段 2 的 standard_ref_distill 已完成（daggerfull-16288），R2 分支的默认值
+    # 会让训练继续进入特权桥接，读取错误的 TOML。视觉阶段必须默认 lbc_loco，
+    # 才会加载 train_env_conf_standard_lbc_loco.toml 并走 lbc_workflow。
+    # eval 时仍由 _infer_stage_from_task_name 按 task_name 覆盖。
+    CURRENT = LBCLocoConfig
 
     @staticmethod
     def load_conf(logger):

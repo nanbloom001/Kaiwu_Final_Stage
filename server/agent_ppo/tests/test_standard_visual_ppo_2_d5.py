@@ -160,4 +160,3 @@ def test_d5_monitor_exposes_raw_weighted_and_progress_metrics():
         "action_anchor_progress",
     ):
         assert f'metrics_name="{metric}"' in source
-

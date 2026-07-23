@@ -368,14 +368,38 @@ class Agent(BaseAgent):
                 critic_obs.detach(),
             )
 
+    def _current_ramp_label(self) -> str:
+        """根据当前 ramp 进度和 soft-stay 状态决定 checkpoint 标签。
+
+        让文件名本身反映训练阶段，避免 0% 教师驱动阶段就出现 visionfull：
+          - soft-stay 冻结且未恢复        → visionblocked
+          - ramp_probability < 0.10       → visionteacher（早期教师驱动为主）
+          - 0.10 <= ramp_probability < 1.0 → visionhalf（学生逐步接管）
+          - ramp_probability >= 1.0       → visionfull（纯学生闭环）
+        """
+        algo = self.algorithm
+        if getattr(algo, "soft_stay_frozen", False):
+            return "visionblocked"
+        p = float(getattr(algo, "ramp_probability", 0.0))
+        if p >= 1.0:
+            return "visionfull"
+        if p >= 0.10:
+            return "visionhalf"
+        return "visionteacher"
+
     def save_model(self, path=None, id="1"):
         """
         Save model checkpoint.
-        保存模型 checkpoint。
+        保存 model checkpoint。
 
-        Path is driven by stage.ckpt_name:
-          - LocomotionConfig  → model.ckpt-locomotion-{id}.pkl
-          - LBCLocoConfig     → model.ckpt-lbc-loco-{id}.pkl
+        LBC（阶段 4）：只保存一个规范的 kaiwu_train_v1 视觉训练包，文件名用
+        纯字母 ramp 标签（visionteacher/visionhalf/visionfull/visionblocked），
+        标签由 _current_ramp_label 按 ramp 进度动态决定。不再生成 lbc_loco
+        或 locomotion 副本（那些是冻结教师或部署格式，会在产物目录造成多个
+        模型文件的混淆）。
+
+        id 由平台框架注入（调用 agent.save_model() 时不传 id）；不得用 iteration
+        人工计算 id，否则平台模型池 ID / 文件名 / 任务页记录会不一致。
         """
         ckpt_name = getattr(Config.CURRENT, "ckpt_name", "") or ""
         if ckpt_name:
@@ -384,11 +408,7 @@ class Agent(BaseAgent):
             model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
 
         if self.is_lbc:
-            # 阶段 4 起视觉训练包统一为 kaiwu_train_v1（modules.vision_encoder），
-            # 文件名用纯字母 ramp 标签（visionfull/visionhalf/...）以满足探活正则。
-            # 默认每次保存写规范主文件 model.ckpt-visionfull-{id}.pkl；
-            # workflow 在 ramp 关键比例点会额外调用 save_vision_at_ramp_label。
-            ramp_label = getattr(self.algorithm, "_pending_ramp_label", None) or "visionfull"
+            ramp_label = self._current_ramp_label()
             vision_file_path = f"{path}/model.ckpt-{ramp_label}-{str(id)}.pkl"
             if not validate_probe_filename(vision_file_path):
                 raise ValueError(
@@ -399,17 +419,10 @@ class Agent(BaseAgent):
                 platform_model_id=id,
                 ramp_label=ramp_label,
             )
-            # 同时保留一份 lbc_loco 顶层 key 格式（部署导出制品兼容；探活正则
-            # 不接受 lbc-loco 两段标签，故这只作为内部 side artifact，不作为
-            # 平台探活主文件）。未来 lbc_loco 导出器会改读 kaiwu_train_v1。
-            self.algorithm.save(
-                model_file_path,
-                format_tag=self.algorithm_name,
-                iteration=self.algorithm.current_iteration,
-            )
             self.logger.info(
                 f"[{self.algorithm_name}] save vision bundle={vision_file_path} "
-                f"(sha256={checksum}), legacy lbc_loco={model_file_path}"
+                f"(ramp_p={float(getattr(self.algorithm, 'ramp_probability', 0.0)):.3f}, "
+                f"label={ramp_label}, sha256={checksum})"
             )
         elif self.is_behavior_distill:
             phase_file_path = (
@@ -441,17 +454,20 @@ class Agent(BaseAgent):
             torch.save(self.model.state_dict(), model_file_path)
             self.logger.info(f"save model {model_file_path} successfully")
 
-        # Side model: 训练 lbc_loco 时同时落一份 locomotion 形态的 ckpt。
-        # 将冻结的 teacher_encoder + teacher_actor 重组为 encoder.*/actor.* 命名，
-        # 使产物目录内保留一份可独立部署 / 供下阶段拆分教师的 locomotion ckpt。
-        self._save_side_locomotion(path, id)
+        # Side model: 非 lbc_loco 阶段才落 locomotion 形态的 side ckpt。
+        # 阶段 4 视觉训练包已含冻结教师副本（modules.low_level），不再额外生成
+        # locomotion 副本，避免产物目录出现 vision* + lbc-loco + locomotion 三个
+        # 文件的混淆（locomotion 只是冻结教师，不是视觉学生）。
+        if not self.is_lbc:
+            self._save_side_locomotion(path, id)
 
     def save_vision_at_ramp_label(self, path, id, ramp_label: str):
         """在 ramp 关键比例点额外保存带标签的视觉训练包。
 
         ramp_label 必须是纯字母视觉标签（visionteacher/visionhalf/visionfull/
-        visionblocked），满足探活正则。workflow 在 ramp 达到 ~50% / 100% 或
-        soft-stay 冻结时调用，落 model.ckpt-visionhalf-{id}.pkl 等。
+        visionblocked），满足探活正则。注意：常规定时保存已通过 _current_ramp_label
+        自动按 ramp 进度命名，本方法仅用于需要显式覆盖标签的场合（如任务结束时
+        强制落 visionfull）。多数情况下无需调用。
         """
         if not self.is_lbc:
             return
