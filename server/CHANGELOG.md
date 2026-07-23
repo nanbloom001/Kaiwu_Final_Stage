@@ -23,12 +23,15 @@
   (6) **LSTM 不跨运行恢复**：每次启动 reset 环境 + 清零 hidden，checkpoint 只存
   `lstm_reset_contract`。(7) **父文件显式优先**：`vision_parent_candidates` 让
   `daggerfull` 显式排在 `locomotion` 之前，不靠偶然排序命中父模型。配置：
-  `num_envs=256`（规则上限）；指令域/地形对齐父模型（`vx=[0.3,1.3]`、maze=0%）；
-  关闭 domain_rand/noise/push 隔离感知迁移。**外参待验证**：当前 11.16° 值来自
-  `05734d7` 恢复 HJC 最小路径，非单纯误改；21.22° 值在仓库另有 9 处 config/docs
-  使用，启动长训前需操作者凭原始标定 + 四元数约定 + 真机安装证据确认。本阶段
-  `deployable=false`，不动 deploy；评估 loader 只读 `modules.vision_encoder`，
-  不读 height_scan。平台短训验证（步骤 6）与 10h 长训待执行。
+  `num_envs=256`（规则上限）；指令域/地形对齐父模型（`vx=[0.3,1.3]`、maze=0%、
+  `max_init_terrain_level=9`）；关闭 domain_rand/noise/push 隔离感知迁移。
+  **相机外参对齐 21.22° 标准值**：`offset_pos=[0.339871,0.034697,0.075010]` /
+  `offset_rot=[0.982631,-0.007085,0.184337,-0.020153]`（pitch≈21.22°），与仓库
+  9 处 config + CHANGELOG + docs（standard-distill-1/3 明确标注 "calibrated
+  21.22-degree"）一致；lbc_loco.toml 此前用的 ~11.16° 值（`05734d7` 带入）与
+  其余视觉阶段冲突，本次统一到 21.22°。本阶段 `deployable=false`，不动 deploy；
+  评估 loader 只读 `modules.vision_encoder`，不读 height_scan。平台短训验证
+  （步骤 6）与 10h 长训待执行。
 
 - **[Standard 特权网络结构蒸馏]** 从已验证可启动的 minimal lifecycle 重新构建 10288
   flat301→Actor77 桥接。单次 6000-iteration 任务自适应完成
