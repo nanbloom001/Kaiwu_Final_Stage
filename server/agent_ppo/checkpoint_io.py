@@ -29,6 +29,17 @@ DAGGER_PHASE_LABELS = (
     "daggerfull",
 )
 
+# 视觉 ramp 阶段标签（阶段 4：深度视觉蒸馏）。
+# 纯小写字母，必须满足探活正则 _PROBE_NAME 的 [a-z]* 段。
+# 线性 ramp 不产生离散档位晋升；这些标签仅用于 ramp 关键比例点
+# 和任务结束时落盘的阶段性文件名，便于追溯。
+VISION_PHASE_LABELS = (
+    "visionteacher",     # 早期（低学生比例）窗口的代表文件
+    "visionhalf",        # ramp 到约 50% 学生比例
+    "visionfull",        # ramp 到 100% 或任务结束的规范主文件
+    "visionblocked",     # soft-stay 冻结后未恢复、提前结束
+)
+
 _PROBE_NAME = re.compile(r"^model\.ckpt-[a-z]*-*[0-9]+\.[^.]+$")
 
 
@@ -52,6 +63,20 @@ def phase_label(phase_index: int) -> str:
         raise ValueError(f"Invalid DAgger phase index: {phase_index}") from exc
 
 
+def vision_phase_label(name: str) -> str:
+    """校验并返回视觉 ramp 阶段标签。
+
+    线性 ramp 不用整数 phase index（没有离散档位），改用显式标签名。
+    仅接受 VISION_PHASE_LABELS 中的纯小写字母标签，保证探活正则可匹配。
+    """
+    if name not in VISION_PHASE_LABELS:
+        raise ValueError(
+            f"Invalid vision ramp label: {name!r}; "
+            f"expected one of {VISION_PHASE_LABELS}"
+        )
+    return name
+
+
 def checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
     """Return deterministic checkpoint candidates for one platform model ID."""
     model_id = str(model_id)
@@ -63,6 +88,37 @@ def checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
         ],
         os.path.join(path, f"model.ckpt-{model_id}.pkl"),
         os.path.join(path, f"model.ckpt-lbc-loco-{model_id}.pkl"),
+    ]
+    discovered = sorted(
+        glob.glob(os.path.join(path, f"model.ckpt-*-{model_id}.*")),
+        reverse=True,
+    )
+    result: list[str] = []
+    for candidate in [*preferred, *discovered]:
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def vision_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
+    """视觉蒸馏阶段的 checkpoint 候选（阶段 4）。
+
+    与特权 DAgger 的 checkpoint_candidates 区分：
+      - 优先 vision* 标签文件（规范主文件优先 visionfull，其次 visionhalf 等）；
+      - 再回退 lbc-loco / 裸 ID（兼容历史视觉产物）；
+      - locomotion / dagger* 不作为视觉续训候选（它们是特权教师，不是视觉学生）。
+
+    视觉训练包 format=kaiwu_train_v1 且含 modules.vision_encoder；loader 在读取
+    后会再次校验，这里只保证文件存在性和优先级。
+    """
+    model_id = str(model_id)
+    preferred = [
+        os.path.join(path, f"model.ckpt-visionfull-{model_id}.pkl"),
+        os.path.join(path, f"model.ckpt-visionhalf-{model_id}.pkl"),
+        os.path.join(path, f"model.ckpt-visionteacher-{model_id}.pkl"),
+        os.path.join(path, f"model.ckpt-visionblocked-{model_id}.pkl"),
+        os.path.join(path, f"model.ckpt-lbc-loco-{model_id}.pkl"),
+        os.path.join(path, f"model.ckpt-{model_id}.pkl"),
     ]
     discovered = sorted(
         glob.glob(os.path.join(path, f"model.ckpt-*-{model_id}.*")),
@@ -91,6 +147,42 @@ def validate_low_level_spec(bundle: dict[str, Any], expected: dict[str, int]) ->
     }
     if mismatches:
         raise ValueError(f"Low-level checkpoint contract mismatch: {mismatches}")
+
+
+def vision_parent_candidates(path: str, model_id: str | int) -> list[str]:
+    """视觉蒸馏的特权教师父文件候选（阶段 4 首训加载）。
+
+    P1 修正：当前 checkpoint_candidates 把 locomotion 排在 dagger* 之前，
+    依赖"两文件同 SHA"的偶然排序来命中 daggerfull-16288。视觉阶段不能靠
+    偶然排序，因此显式给出父文件候选顺序：
+
+      1. 显式 daggerfull 标签（规范父文件，阶段 2 产物）
+      2. locomotion 别名（兼容副本，与 daggerfull 同 payload）
+      3. 任何 kaiwu_train_v1 low-level 包（兜底）
+
+    loader 加载后会打印实际命中路径、SHA 和 model_spec，供操作者核对
+    是否真的是 daggerfull-16288 血缘。
+    """
+    model_id = str(model_id)
+    preferred = [
+        os.path.join(path, f"model.ckpt-daggerfull-{model_id}.pkl"),
+        os.path.join(path, f"model.ckpt-locomotion-{model_id}.pkl"),
+        *[
+            os.path.join(path, f"model.ckpt-{label}-{model_id}.pkl")
+            for label in reversed(DAGGER_PHASE_LABELS)
+            if label != "daggerfull"
+        ],
+        os.path.join(path, f"model.ckpt-{model_id}.pkl"),
+    ]
+    discovered = sorted(
+        glob.glob(os.path.join(path, f"model.ckpt-*-{model_id}.*")),
+        reverse=True,
+    )
+    result: list[str] = []
+    for candidate in [*preferred, *discovered]:
+        if candidate not in result:
+            result.append(candidate)
+    return result
 
 
 def low_level_policy_state(bundle: dict[str, Any]) -> dict[str, Any]:
