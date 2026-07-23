@@ -222,18 +222,20 @@ safety_p95_multiplier = 2.0
 # Camera mount position in robot base frame (x forward, y left, z up), unit m, calibrated per machine.
 # 相机在机器人 base 系下的安装位置 (x前, y左, z上)，单位 m，逐台校准。
 #
-# TODO: pending real-robot calibration evidence.
-# 当前值（约 11.16° pitch）来自 commit 05734d7「恢复 HJC 最小训练路径」，该提交
-# 同时改了位置和旋转，并非单纯的 21.22°→11.16° 误改。仓库其他 9 处 config +
-# CHANGELOG + docs（standard-distill-1/3）使用另一套 21.22° 值：
-#   offset_pos = [0.339871, 0.034697, 0.075010]
-#   offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
-# 在拿到原始标定记录、确认四元数约定 (w,x,y,z) 和真机安装照片/测量证据前，
-# 不锁定任何一套。启动 10h 长训前必须由操作者确认并写定，记录到 CHANGELOG。
-offset_pos = [0.486886, 0.024533, 0.079897]
+# 21.22° pitch 标定值（约 pitch 21.22° / roll -1.31° / yaw -2.60°）。
+# 这是仓库统一采纳的真机安装外参，与下列出处完全一致：
+#   - 9 处 config（standard_distill_1/2/3、visual_ppo_1/2、hjcnew10288_lbc_loco、
+#     track_lbc_loco / _d2 / p22_lbc_loco）
+#   - server/CHANGELOG.md standard-distill-1 条目
+#   - server/docs/standard-distill-1.md / standard-distill-3-action.md
+#     （后者明确写 "calibrated 21.22-degree camera extrinsics"）
+# 此前 lbc_loco.toml 用的是另一套 ~11.16° 值（offset_pos=[0.486886,...] /
+# offset_rot=[0.995199,...]），由 commit 05734d7「恢复 HJC 最小训练路径」带入，
+# 与仓库其余视觉阶段不一致；本次视觉蒸馏对齐到 21.22° 标准值。
+offset_pos = [0.339871, 0.034697, 0.075010]
 # Camera mount orientation quaternion (w, x, y, z), world convention, calibrated per machine.
 # 相机安装姿态 quaternion (w, x, y, z)，world convention，逐台校准。
-offset_rot = [0.995199, -0.001619, 0.097217, 0.011225]
+offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
 
 # No [rewards] section.
 # 不配置 [rewards]
