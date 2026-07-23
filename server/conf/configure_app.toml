@@ -45,9 +45,11 @@ reverb_error_buffer = 8
 # Learner训练时样本批处理大小
 train_batch_size = 2048
 
-# Model dump frequency (steps)
-# 训练间隔多少步输出模型参数文件
-dump_model_freq = 100
+# Model-pool fallback dump frequency in BaseAgent.learn() callbacks.
+# BehaviorDistill performs its reviewed periodic save every 100 outer iterations;
+# keep this platform fallback at the proven Standard default to avoid duplicate
+# saves at the same boundary.
+dump_model_freq = 1000
 
 # The Learner pushes model updates, and the frequency at which Actors fetch the model (in minutes).
 # Learner推送模型参数文件至模型池，以及Actor从模型池获取模型参数文件的频次（单位：分钟）

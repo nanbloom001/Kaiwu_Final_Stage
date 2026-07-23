@@ -15,49 +15,49 @@ num_rows = 10
 num_cols = 20
 difficulty_range = [0.0, 1.0]
 curriculum = true
-max_init_terrain_level = 3
+max_init_terrain_level = 9
 
 [terrain.standard.pyramid_slope]
-proportion = 0.15
+proportion = 0.20
 
 [terrain.standard.pyramid_slope_inv]
-proportion = 0.2
+proportion = 0.20
 
 [terrain.standard.pyramid_stairs]
-proportion = 0.25
+proportion = 0.20
 
 [terrain.standard.pyramid_stairs_inv]
-proportion = 0.3
+proportion = 0.40
 
 [terrain.standard.maze]
-proportion = 0.1
+proportion = 0.0
 
 [domain_rand]
-enable_domain_rand = true
-randomize_friction = true
+enable_domain_rand = false
+randomize_friction = false
 friction_range = [0.3, 1.5]
-push_robots = true
+push_robots = false
 push_interval_s = 15
 max_push_vel_xy = 0.5
 
 [noise]
-add_noise = true
+add_noise = false
 
 [init_state]
 pos = [0.0, 0.0, 0.35]
 
 [commands]
-resampling_time = [2.0, 4.0]
+resampling_time = [6.0, 10.0]
 
 [commands.limit]
-lin_vel_x = [0.0, 1.0]
-lin_vel_y = [-0.5, 0.5]
-ang_vel_z = [-1.0, 1.0]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_z = [-0.3, 0.3]
 
 [commands.ranges]
-lin_vel_x = [0.3, 0.6]
+lin_vel_x = [0.3, 1.3]
 lin_vel_y = [-0.2, 0.2]
-ang_vel_yaw = [-0.5, 0.5]
+ang_vel_yaw = [-0.3, 0.3]
 
 [standard_ref_distill]
 # 默认不写 teacher_ckpt；训练启动页选择 hjcnew8 预训练模型后，

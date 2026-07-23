@@ -93,7 +93,8 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
     loop_start = time.time()
     for iteration in range(max_iterations):
-        algorithm.current_iteration = iteration
+        iter_id = iteration + 1
+        algorithm.current_iteration = iter_id
         iter_start = time.time()
 
         for _step in range(num_steps_per_env):
@@ -114,13 +115,19 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             _frame_no, next_obs, _rewards, _terminated, _truncated, (_infos, _privileged_obs) = step_data
             obs = torch.as_tensor(next_obs, device=agent.device)
 
-        if (iteration + 1) % log_interval == 0 or iteration == 0:
+        # The supervised update above does not pass through BaseAgent.learn().
+        # Keep one no-op callback per outer iteration so Kaiwu can advance
+        # train_global_step and generate a fresh model-pool checkpoint id.
+        if not student_drive:
+            agent.learn(list_sample_data=None)
+
+        if iter_id % log_interval == 0 or iteration == 0:
             def _avg(buf):
                 return sum(buf) / max(1, len(buf))
 
             log_data = {key: _avg(window) for key, window in metric_windows.items()}
             logger.info(
-                f"[BehaviorDistill] iter={iteration+1}/{max_iterations} "
+                f"[BehaviorDistill] iter={iter_id}/{max_iterations} "
                 f"mse={log_data['action_mse']:.6f} "
                 f"l2={log_data['action_l2']:.4f} "
                 f"cos={log_data['action_cos']:.4f} "
@@ -132,16 +139,19 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             )
             if monitor is not None:
                 try:
-                    payload = {"iteration": iteration + 1, "total_steps": algorithm.total_steps}
+                    payload = {"iteration": iter_id, "total_steps": algorithm.total_steps}
                     payload.update(log_data)
                     monitor.put_data({os.getpid(): payload})
                 except Exception as exc:
                     logger.warning(f"[BehaviorDistill] monitor.put_data failed: {exc}")
 
-        if (iteration + 1) % save_interval == 0:
-            agent.save_model(id=str(iteration + 1))
+        # Match the proven Standard workflow: call save_model without a business
+        # id and let the platform inject its current, monotonically increasing id.
+        if not student_drive and iter_id % save_interval == 0:
+            agent.save_model()
 
-    agent.save_model(id=str(max_iterations))
+    if not student_drive and max_iterations % save_interval != 0:
+        agent.save_model()
     logger.info(
         f"[BehaviorDistill] finished in {time.time() - loop_start:.1f}s, "
         f"total steps={algorithm.total_steps}"
