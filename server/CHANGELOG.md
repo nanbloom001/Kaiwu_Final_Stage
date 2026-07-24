@@ -4,6 +4,50 @@
 
 ## [未发布]
 
+- **[Standard 视觉长训计数修复]** 视觉 LBC 的平台 lifecycle 从每个 inner
+  environment step 调用一次改为每个完整 outer iteration 调用一次，恢复与上一阶段
+  一致的 iteration / 平台模型 ID 语义；checkpoint 新增
+  `iteration_semantics=completed_outer_iterations_v1`，并兼容修复前的零基视觉包。
+  定时发布改为 225 outer iterations（按平台实测约 9.9 分钟），
+  `max_iterations=20000` 仅作高安全上限，平台任务页控制 10 小时，余弦学习率
+  独立按 14000 iterations 衰减。教师预热延长到 30 分钟，4.5 小时线性 ramp
+  在第 5 小时结束，随后保留约 5 小时纯学生训练。Standard LBC 显式启用
+  `continuous_training`，避免全局 `frame_no` 超过单 episode 的 1250 帧后持续误报
+  `all_done`；底层逐环境 auto-reset 和评估终止语义不变。
+
+- **[Standard 深度视觉蒸馏]** 阶段 4：用 D435i 深度图替换特权 `height_scan256`，
+  训练 `VisionEncoder(CNN+LSTM)` 蒸馏视觉能力到冻结的 Actor77。分支
+  `codex/depth-vision-distillation` 基于 `codex/standard-dagger-r2@5c5b5ab`
+  （R2 已含 `kaiwu_train_v1` 低层加载、base_env 修复和视觉路径核心改动），
+  并从 `origin/main` 恢复 R2 误删的 10 个 `agent_ppo/tests/` 文件。核心改动：
+  (1) **视觉训练包 codec**：新增 `kaiwu_train_v1 + modules.vision_encoder` 格式
+  （`save_vision_bundle`/`load_vision_bundle`），与现有 `lbc_loco` 部署导出格式
+  分离；checkpoint 文件名用纯字母 ramp 标签（`visionteacher`/`visionhalf`/
+  `visionfull`/`visionblocked`）满足探活正则。(2) **线性 ramp DAgger**：学生驱动
+  比例从 0 线性 ramp 到 100%（约 4.5h），取代原计划的 6 阶段离散分档；无强制晋升，
+  质量恶化时 soft-stay 冻结当前比例（不回退、不升档），恢复后继续 ramp。(3) **单次
+  forward**：`prepare_vision_update` 缓存 teacher/student latent+action，动作选择和
+  三路损失复用同一结果，避免学生驱动时 LSTM 对同一观测推进两次。(4) **三路损失**：
+  `0.5*SmoothL1(latent) + 0.1*(1-cos) + 1.0*SmoothL1(action)`，action_loss 梯度穿过
+  冻结 teacher_actor 回传到 vision_encoder。(5) **首轮不启用 replay**：LSTM 单帧
+  replay 会用错误 hidden 历史算 latent；序列回放（8-16 帧 + burn-in）留作独立消融。
+  (6) **LSTM 不跨运行恢复**：每次启动 reset 环境 + 清零 hidden，checkpoint 只存
+  `lstm_reset_contract`。(7) **父文件显式优先**：`vision_parent_candidates` 让
+  `daggerfull` 显式排在 `locomotion` 之前，并从视觉续训候选中排除低层父文件。
+  (8) **长训恢复状态**：视觉包增加 ramp clock、LR scheduler、安全阈值/
+  预热样本和 RNG；workflow 从已完成 iteration 继续，不再覆盖为 0。
+  (9) **深度增强显式化**：评估无条件关闭随机增强，Standard 首轮通过
+  `[camera.depth_camera.augmentation] enabled=false` 保持干净控制变量。配置：
+  `num_envs=256`（规则上限）；指令域/地形对齐父模型（`vx=[0.3,1.3]`、maze=0%、
+  `max_init_terrain_level=9`）；关闭 domain_rand/noise/push 隔离感知迁移。
+  **相机外参对齐 21.22° 标准值**：`offset_pos=[0.339871,0.034697,0.075010]` /
+  `offset_rot=[0.982631,-0.007085,0.184337,-0.020153]`（pitch≈21.22°），与仓库
+  9 处 config + CHANGELOG + docs（standard-distill-1/3 明确标注 "calibrated
+  21.22-degree"）一致；lbc_loco.toml 此前用的 ~11.16° 值（`05734d7` 带入）与
+  其余视觉阶段冲突，本次统一到 21.22°。本阶段 `deployable=false`，不动 deploy；
+  评估 loader 只读 `modules.vision_encoder`，不读 height_scan。平台短训验证
+  （步骤 6）与 10h 长训待执行。
+
 - **[Standard 特权网络结构蒸馏]** 从已验证可启动的 minimal lifecycle 重新构建 10288
   flat301→Actor77 桥接。单次 6000-iteration 任务自适应完成
   0/25/50/75/100% 逐环境 DAgger；加入动作安全接管、1/0.25/0 样本权重、

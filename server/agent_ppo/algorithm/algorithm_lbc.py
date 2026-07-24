@@ -9,20 +9,31 @@ Author: Tencent AI Arena Authors
 
 from __future__ import annotations
 
+import hashlib
 import os
+import random
 import statistics
 from collections import deque
+from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from agent_ppo.checkpoint_io import (
+    KAIWU_TRAIN_FORMAT,
+    KAIWU_TRAIN_SCHEMA_VERSION,
     is_kaiwu_train_bundle,
     low_level_teacher_parts,
     validate_low_level_spec,
+    vision_checkpoint_candidates,
+    vision_parent_candidates,
+    vision_phase_label,
 )
+
+_SAFETY_CALIBRATION_SAMPLES = 256
 
 
 class AlgorithmLBC:
@@ -84,6 +95,38 @@ class AlgorithmLBC:
         # Training state
         self.current_iteration = 0
         self.total_steps = 0
+        self.resume_loaded = False
+
+        # 线性 ramp 调度状态（阶段 4）。每次启动 reset 环境 + 清零 LSTM hidden，
+        # 因此这里只存 ramp 进度和软停留诊断，不存任何 LSTM 状态。
+        # ramp_probability 由 workflow 按 elapsed_h 重算并写回；checkpoint 只记录
+        # 断点，让续训从相同 ramp 比例继续（而不依赖墙钟时间）。
+        self.ramp_probability = 0.0
+        self.ramp_start_h = 0.50      # 默认：前 30min 教师预热后开始 ramp
+        self.ramp_end_h = 5.00        # 默认：约 4.5h ramp 到 100%
+        self.ramp_clock_h = 0.0
+        self.soft_stay_frozen = False
+        self.soft_stay_reason: Optional[str] = None
+        self.training_status = "initialized"
+        self.safety_threshold = float("inf")
+        self.safety_fixed = False
+        self.safety_calibration_l2: list[float] = []
+        self.lr_scheduler_state: Optional[dict] = None
+
+        # 血缘与审计（运行时不做字节级 SHA 门禁，只记录用于追溯）
+        self.parent_checkpoint_sha256 = "unknown"
+        self.teacher_low_level_sha256 = "unknown"
+        self.config_sha256 = "unknown"
+        self.code_commit = "unknown"
+
+        # LSTM reset 契约记录（供 eval/导出对齐 reset mask 语义）
+        self.lstm_reset_contract = {
+            "per_env_hidden": True,          # 每环境独立 hidden/cell
+            "reset_on_done": True,           # episode done 在同 env 索引清零
+            "teacher_to_student_no_clear": True,  # 同 episode 内切换驱动不清空
+            "eval_no_random_aug": True,      # eval 关闭随机增强
+            "cross_run_not_restored": True,  # 跨运行不恢复旧 hidden
+        }
 
         # Logging buffers
         self.mse_buffer = deque(maxlen=100)
@@ -207,6 +250,209 @@ class AlgorithmLBC:
             "teacher_latent": teacher_latent.detach(),
             "student_latent": student_latent.detach(),
         }
+
+    # ------------------------------------------------------------------
+    # 单次 forward 的逐环境线性 DAgger（阶段 4）
+    # ------------------------------------------------------------------
+
+    def prepare_vision_update(self, obs, masks: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+        """单次 forward 缓存：一次跑出教师/学生的 latent 和 action。
+
+        P1 第 5 条：动作选择和三路损失必须复用同一 forward 结果，否则
+        学生驱动环境时 LSTM 会对同一观测推进两次（一次选动作，一次算 loss），
+        导致 hidden 错位、latent 与动作不对应。
+
+        返回的 batch 中：
+          - teacher_latent / teacher_action：no_grad，监督目标
+          - student_latent：带梯度，三路损失回传到此
+          - student_action：teacher_actor(proprio, student_latent)，带梯度
+            （梯度穿过冻结 teacher_actor 回传到 vision_encoder）
+        """
+        obs_dict = self._split_obs(obs)
+
+        # Teacher forward (frozen, no_grad)
+        with torch.no_grad():
+            teacher_latent = self.teacher_encoder(obs_dict["height_scan"])
+            teacher_action = self.teacher_actor(
+                torch.cat([obs_dict["proprio"], teacher_latent], dim=-1)
+            )
+
+        # Student forward (trainable, 带梯度)。LSTM 在此推进一次。
+        student_latent = self.vision_encoder(
+            depth_image=obs_dict["depth_image"],
+            proprio=obs_dict["proprio"],
+            masks=masks,
+        )
+        # student_action 复用同一 student_latent（不再跑第二次 vision_encoder）
+        student_action = self.teacher_actor(
+            torch.cat([obs_dict["proprio"], student_latent], dim=-1)
+        )
+
+        return {
+            "proprio": obs_dict["proprio"],
+            "teacher_latent": teacher_latent,
+            "teacher_action": teacher_action,
+            "student_latent": student_latent,      # 带梯度
+            "student_action": student_action,      # 带梯度（穿过冻结 actor）
+            "student_finite": torch.isfinite(student_action).all(dim=-1),
+        }
+
+    def compute_three_way_loss(
+        self, batch: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """三路蒸馏损失（阶段 4 计划 §6）。
+
+            latent_loss = SmoothL1(student_latent, teacher_latent)
+            cosine_loss = 1 - cosine(student_latent, teacher_latent).mean()
+            action_loss = SmoothL1(student_action, teacher_action)
+            total       = 0.5*latent + 0.1*cosine + 1.0*action
+
+        action_loss 的梯度穿过冻结 teacher_actor 回传到 vision_encoder：
+        teacher_actor 的权重 requires_grad=False（_freeze_teacher 已设），
+        但 student_latent 带梯度，因此 autograd 会把 action_loss 的梯度
+        经 teacher_actor 的线性变换回传到 student_latent，再到 vision_encoder。
+        teacher_actor 自身不进入 optimizer。
+        """
+        t_lat = batch["teacher_latent"]
+        s_lat = batch["student_latent"]
+        t_act = batch["teacher_action"]
+        s_act = batch["student_action"]
+
+        latent_loss = F.smooth_l1_loss(s_lat, t_lat)
+        cosine_loss = 1.0 - F.cosine_similarity(s_lat, t_lat, dim=-1).mean()
+        action_loss = F.smooth_l1_loss(s_act, t_act)
+        total = 0.5 * latent_loss + 0.1 * cosine_loss + 1.0 * action_loss
+
+        return {
+            "latent_loss": latent_loss,
+            "cosine_loss": cosine_loss,
+            "action_loss": action_loss,
+            "total_loss": total,
+        }
+
+    def select_driver_actions(
+        self,
+        batch: Dict[str, torch.Tensor],
+        student_drive_probability: float,
+        safety_threshold: float,
+    ) -> tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """逐环境采样 driver：Bernoulli(probability) 决定学生驱动，安全接管兜底。
+
+        学生动作 NaN/Inf 或与教师动作 L2 超过 safety_threshold 时，该环境
+        由教师接管（但仍保留为有效训练样本，权重降为 0.25）。
+        动作来源全部是 prepare_vision_update 缓存的结果，不重复跑 forward。
+        """
+        probability = float(student_drive_probability)
+        requested_student = (
+            torch.rand(batch["teacher_action"].shape[0], device=self.device)
+            < probability
+        )
+        # 学生与教师动作的逐样本 L2（用于安全判定）
+        with torch.no_grad():
+            per_sample_l2 = (
+                (batch["student_action"] - batch["teacher_action"])
+                .pow(2).sum(dim=-1).sqrt()
+            )
+        excessive = per_sample_l2 > float(safety_threshold)
+        safety_takeover = requested_student & (
+            ~batch["student_finite"] | excessive
+        )
+        effective_student = requested_student & ~safety_takeover
+        actions = torch.where(
+            effective_student.unsqueeze(-1),
+            batch["student_action"].detach(),
+            batch["teacher_action"].detach(),
+        )
+        return actions, {
+            "requested_student": requested_student,
+            "effective_student": effective_student,
+            "safety_takeover": safety_takeover,
+            "per_sample_l2": per_sample_l2,
+        }
+
+    def finish_vision_update(
+        self,
+        batch: Dict[str, torch.Tensor],
+        sample_weights: torch.Tensor,
+    ) -> Dict[str, float]:
+        """加权三路损失更新。sample_weights: 1.0/0.25/0（计划 §10.2）。
+
+        首轮不启用 replay（P1 第 6 条）：LSTM 单帧 replay 会用错误的 hidden
+        历史算 latent，训练到错误目标。replay 接口预留为 no-op。
+        """
+        weights = torch.as_tensor(
+            sample_weights, device=self.device, dtype=batch["student_latent"].dtype
+        ).reshape(-1)
+        weights = torch.clamp(torch.nan_to_num(weights, nan=0.0), 0.0, 1.0)
+
+        loss_dict = self.compute_three_way_loss(batch)
+        # 加权：把 per-sample 权重作用到每一项（每项都是 mean，改写为加权 mean）
+        # 这里简化：权重整体作用于 total_loss 的反向。若 train_mask 全 0 则跳过。
+        train_mask = weights > 0.0
+        grad_norm = torch.zeros((), device=self.device)
+
+        if bool(train_mask.any().item()):
+            # per-sample total loss
+            t_lat = batch["teacher_latent"]
+            s_lat = batch["student_latent"]
+            t_act = batch["teacher_action"]
+            s_act = batch["student_action"]
+            per_latent = F.smooth_l1_loss(s_lat, t_lat, reduction="none").mean(dim=-1)
+            per_cosine = 1.0 - F.cosine_similarity(s_lat, t_lat, dim=-1)
+            per_action = F.smooth_l1_loss(s_act, t_act, reduction="none").mean(dim=-1)
+            per_total = 0.5 * per_latent + 0.1 * per_cosine + 1.0 * per_action
+            w = weights[train_mask]
+            loss = (w * per_total[train_mask]).sum() / w.sum().clamp_min(1.0)
+
+            if not bool(torch.isfinite(loss).item()):
+                raise FloatingPointError("vision distill loss is NaN/Inf")
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            grad_norm = nn.utils.clip_grad_norm_(
+                self.vision_encoder.parameters(), self.max_grad_norm
+            )
+            if not bool(torch.isfinite(grad_norm).item()):
+                raise FloatingPointError("vision distill gradient norm is NaN/Inf")
+            self.optimizer.step()
+        else:
+            loss = loss_dict["total_loss"].detach()
+
+        self.total_steps += int(batch["teacher_action"].shape[0])
+
+        with torch.no_grad():
+            t_lat = batch["teacher_latent"]
+            s_lat = batch["student_latent"]
+            t_act = batch["teacher_action"]
+            s_act = batch["student_action"]
+            cos_lat = F.cosine_similarity(s_lat, t_lat, dim=-1).mean().item()
+            cos_act = F.cosine_similarity(s_act, t_act, dim=-1).mean().item()
+            latent_mse = (s_lat - t_lat).pow(2).sum(dim=-1).mean().item()
+            action_mse = (s_act - t_act).pow(2).sum(dim=-1).mean().item()
+            # normalized action mse: 按维除以教师方差
+            t_var = t_act.var(dim=0, unbiased=False).clamp_min(1e-6)
+            per_dim = (s_act - t_act).pow(2).mean(dim=0)
+            norm_action_mse = (per_dim / t_var).mean().item()
+
+        return {
+            "loss": float(loss.detach().item()),
+            "latent_loss": float(loss_dict["latent_loss"].detach().item()),
+            "cosine_loss": float(loss_dict["cosine_loss"].detach().item()),
+            "action_loss": float(loss_dict["action_loss"].detach().item()),
+            "latent_mse": latent_mse,
+            "action_mse": action_mse,
+            "normalized_action_mse": norm_action_mse,
+            "latent_cosine": cos_lat,
+            "action_cosine": cos_act,
+            "grad_norm": float(grad_norm.detach().item()),
+            "nonfinite_rate": float((~batch["student_finite"]).float().mean().item()),
+        }
+
+    def assert_student_parameters_finite(self):
+        """断言 vision_encoder 参数全有限（每 outer iteration 检查一次）。"""
+        params = list(self.vision_encoder.parameters())
+        if not all(bool(torch.isfinite(p).all().item()) for p in params):
+            raise FloatingPointError("vision_encoder parameters became NaN/Inf")
 
     def update(
         self,
@@ -386,6 +632,7 @@ class AlgorithmLBC:
             ckpt_path: locomotion 模型文件路径（model.ckpt-locomotion-{id}.pkl）。
         """
         full_state = torch.load(ckpt_path, weights_only=False, map_location=self.device)
+        parent_sha = self._sha256_file(ckpt_path) if os.path.isfile(ckpt_path) else "unknown"
         if is_kaiwu_train_bundle(full_state):
             validate_low_level_spec(
                 full_state,
@@ -408,6 +655,17 @@ class AlgorithmLBC:
                 )
             self.teacher_actor.load_state_dict(actor_state, strict=True)
             self._freeze_teacher()
+            # 记录父血缘供追溯（P1 第 4 条）：打印实际命中路径、SHA、model_spec，
+            # 让操作者核对是否真的是 daggerfull-16288 血缘。运行时不做字节级门禁。
+            self.parent_checkpoint_sha256 = parent_sha
+            self.teacher_low_level_sha256 = parent_sha
+            spec = full_state.get("model_spec", {})
+            print(
+                f"[AlgorithmLBC] vision parent loaded from {ckpt_path}\n"
+                f"  sha256={parent_sha}\n"
+                f"  model_spec={spec}\n"
+                f"  (operator must confirm this is daggerfull-16288 lineage)"
+            )
             return
 
         # 拆分 encoder 权重 → teacher_encoder.mlp
@@ -441,5 +699,346 @@ class AlgorithmLBC:
 
         # critic.* 和 log_std 按设计丢弃
 
+        # 记录父血缘（raw state dict 分支，历史格式）
+        self.parent_checkpoint_sha256 = parent_sha
+        self.teacher_low_level_sha256 = parent_sha
+        print(
+            f"[AlgorithmLBC] vision parent loaded (raw state dict) from {ckpt_path}\n"
+            f"  sha256={parent_sha}\n"
+            f"  (operator must confirm this is daggerfull-16288 lineage)"
+        )
+
         # 确保教师冻结
         self._freeze_teacher()
+
+    # ------------------------------------------------------------------
+    # 视觉训练包 codec（阶段 4：kaiwu_train_v1 + modules.vision_encoder）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sha256_file(path: str) -> str:
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _vision_model_spec(self) -> dict:
+        """视觉学生的 model_spec。教师 low-level spec 由父包带入，这里只描述学生。"""
+        return {
+            "task": "standard",
+            "proprio_dim": int(self.proprio_dim),
+            "scan_dim": int(self.scan_dim),  # 教师用，学生推理不读
+            "latent_dim": int(self.latent_dim),
+            "depth_shape": list(self.depth_shape),
+            "actor_input_dim": int(self.proprio_dim) + int(self.latent_dim),
+            "action_dim": 12,
+            "goal_dim": 0,
+        }
+
+    @staticmethod
+    def _capture_rng_state() -> dict:
+        """Capture driver-mask and augmentation RNG state for safe resume."""
+        state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    @staticmethod
+    def _restore_rng_state(state: Any) -> None:
+        """Restore RNG state saved by _capture_rng_state()."""
+        if not isinstance(state, dict):
+            return
+        if "python" in state:
+            random.setstate(state["python"])
+        if "numpy" in state:
+            np.random.set_state(state["numpy"])
+        if "torch_cpu" in state:
+            torch.set_rng_state(state["torch_cpu"].cpu())
+        if torch.cuda.is_available() and "torch_cuda" in state:
+            torch.cuda.set_rng_state_all(
+                [value.cpu() for value in state["torch_cuda"]]
+            )
+
+    def vision_bundle_payload(
+        self,
+        *,
+        platform_model_id: Optional[str | int] = None,
+        ramp_label: Optional[str] = None,
+        **extra: Any,
+    ) -> dict:
+        """构造视觉训练包 payload（kaiwu_train_v1 + modules.vision_encoder）。
+
+        与特权 DAgger 的 kaiwu_train_v1 区别：
+          - modules.vision_encoder：视觉学生（本轮训练对象）
+          - modules.low_level：冻结教师副本（Encoder + Actor77），供续训和血缘审计
+          - 不含 modules.privileged_teacher（那是 flat301 教师，视觉阶段不需要）
+          - 不含 LSTM hidden state（跨运行不恢复，见 lstm_reset_contract）
+
+        capabilities.deployable=false：本训练包不是 Jetson 制品。
+        """
+        valid_label = vision_phase_label(ramp_label) if ramp_label else "visionfull"
+        payload = {
+            "format": KAIWU_TRAIN_FORMAT,
+            "schema_version": KAIWU_TRAIN_SCHEMA_VERSION,
+            "artifact_role": "vision_training_bundle",
+            "stage_type": "standard_vision_distill",
+            "ramp_label": valid_label,
+            "model_spec": self._vision_model_spec(),
+            "modules": {
+                "vision_encoder": {
+                    "class_name": self.vision_encoder.__class__.__name__,
+                    "state_dict": self.vision_encoder.state_dict(),
+                    "trainable": True,
+                },
+                # 冻结教师副本：Encoder(scan256→latent32) + Actor77(proprio+latent→action12)
+                # 供续训时重建教师、血缘审计和未来 lbc_loco 导出拆分。
+                "low_level": {
+                    "class_name": "ActorCriticEncoder",
+                    "encoder_state_dict": self.teacher_encoder.state_dict(),
+                    "actor_state_dict": self.teacher_actor.state_dict(),
+                    "frozen": True,
+                    "source": "parent_daggerfull",
+                },
+            },
+            "optimizers": {
+                "vision_distill": self.optimizer.state_dict(),
+            },
+            "training_state": {
+                "current_iteration": self.current_iteration,
+                "iteration_semantics": "completed_outer_iterations_v1",
+                "total_steps": self.total_steps,
+                "ramp_probability": self.ramp_probability,
+                "ramp_start_h": self.ramp_start_h,
+                "ramp_end_h": self.ramp_end_h,
+                "ramp_clock_h": self.ramp_clock_h,
+                "soft_stay_frozen": self.soft_stay_frozen,
+                "soft_stay_reason": self.soft_stay_reason,
+                "safety_threshold": self.safety_threshold,
+                "safety_fixed": self.safety_fixed,
+                "safety_calibration_l2": list(
+                    self.safety_calibration_l2[-_SAFETY_CALIBRATION_SAMPLES:]
+                ),
+                "lr_scheduler_state": self.lr_scheduler_state,
+                "rng_state": self._capture_rng_state(),
+                "training_status": self.training_status,
+            },
+            "replay": {
+                # 首轮不启用单帧 replay（LSTM 单帧 replay 会训到错误 latent）。
+                # 字段保留为空，待未来序列回放（8-16 帧 + burn-in）消融时填充。
+                "enabled": False,
+                "note": "single-frame replay invalid for LSTM; deferred to sequence-replay ablation",
+            },
+            "lineage": {
+                "parent_checkpoint_sha256": self.parent_checkpoint_sha256,
+                "teacher_low_level_sha256": self.teacher_low_level_sha256,
+                "config_sha256": self.config_sha256,
+                "code_commit": self.code_commit,
+                "platform_model_id": (
+                    None if platform_model_id is None else str(platform_model_id)
+                ),
+            },
+            "capabilities": {
+                "task": "standard",
+                "uses_depth": True,
+                "uses_height_scan_at_inference": False,
+                "goal_dim": 0,
+                "deployable": False,
+            },
+            "lstm_reset_contract": dict(self.lstm_reset_contract),
+        }
+        payload.update(extra)
+        return payload
+
+    def save_vision_bundle(
+        self,
+        path: str,
+        *,
+        platform_model_id: Optional[str | int] = None,
+        ramp_label: Optional[str] = None,
+        **extra: Any,
+    ) -> str:
+        """保存视觉训练包到 path，返回文件 SHA256。"""
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        payload = self.vision_bundle_payload(
+            platform_model_id=platform_model_id,
+            ramp_label=ramp_label,
+            **extra,
+        )
+        torch.save(payload, path)
+        return self._sha256_file(path)
+
+    def load_vision_bundle(self, path: str) -> None:
+        """从视觉训练包恢复学生/教师/optimizer/ramp 状态。
+
+        P1 第 7 条：不恢复 LSTM hidden。每次启动 workflow 会 reset 环境 + 清零 hidden
+        （lbc_workflow 现状），这里只恢复可跨运行持久化的状态。
+        """
+        ckpt = torch.load(path, weights_only=False, map_location=self.device)
+        if not is_kaiwu_train_bundle(ckpt):
+            raise ValueError(
+                f"Not a {KAIWU_TRAIN_FORMAT} vision bundle: {path} "
+                f"(format={ckpt.get('format')!r})"
+            )
+        modules = ckpt.get("modules", {})
+
+        # 视觉学生
+        vision_section = modules.get("vision_encoder")
+        if not isinstance(vision_section, dict) or "state_dict" not in vision_section:
+            raise KeyError("modules.vision_encoder.state_dict missing from vision bundle")
+        self.vision_encoder.load_state_dict(vision_section["state_dict"], strict=True)
+
+        # 冻结教师副本（Encoder + Actor77）
+        # save 写的是 teacher_encoder.state_dict()，key 形如 mlp.0.weight（DmEncoder
+        # 内部有 self.mlp）。load 必须用 teacher_encoder.load_state_dict() 让 PyTorch
+        # 按 mlp.* 前缀匹配，而不是剥前缀给 .mlp.load_state_dict()（后者期望 0.weight，
+        # 会 key 不匹配）。eval 路径同理。
+        low_level = modules.get("low_level", {})
+        enc_state = low_level.get("encoder_state_dict")
+        act_state = low_level.get("actor_state_dict")
+        if not isinstance(enc_state, dict) or not isinstance(act_state, dict):
+            raise KeyError(
+                "modules.low_level.encoder_state_dict/actor_state_dict missing"
+            )
+        self.teacher_encoder.load_state_dict(enc_state, strict=True)
+        self.teacher_actor.load_state_dict(act_state, strict=True)
+        self._freeze_teacher()
+
+        # Optimizer
+        opt_state = ckpt.get("optimizers", {}).get("vision_distill")
+        if isinstance(opt_state, dict):
+            try:
+                self.optimizer.load_state_dict(opt_state)
+                self.learning_rate = float(
+                    self.optimizer.param_groups[0]["lr"]
+                )
+            except ValueError as exc:
+                print(
+                    "[AlgorithmLBC] WARNING: optimizer state was not restored: "
+                    f"{exc}"
+                )
+
+        # Ramp / training state（不恢复 LSTM hidden）
+        state = ckpt.get("training_state", {})
+        stored_iteration = int(state.get("current_iteration", 0))
+        if state.get("iteration_semantics") == "completed_outer_iterations_v1":
+            self.current_iteration = stored_iteration
+        else:
+            # 兼容本次修复前已生成的视觉包：旧 workflow 保存的是从 0 开始的
+            # 当前 loop index，而不是已完成次数。转换后续训不会重复最后一轮。
+            self.current_iteration = max(0, stored_iteration + 1)
+        self.total_steps = int(state.get("total_steps", 0))
+        self.ramp_probability = float(state.get("ramp_probability", 0.0))
+        self.ramp_start_h = float(state.get("ramp_start_h", self.ramp_start_h))
+        self.ramp_end_h = float(state.get("ramp_end_h", self.ramp_end_h))
+        self.ramp_clock_h = float(
+            state.get(
+                "ramp_clock_h",
+                self.ramp_start_h
+                + self.ramp_probability * (self.ramp_end_h - self.ramp_start_h)
+                if self.ramp_probability > 0.0
+                else 0.0,
+            )
+        )
+        self.soft_stay_frozen = bool(state.get("soft_stay_frozen", False))
+        self.soft_stay_reason = state.get("soft_stay_reason")
+        self.safety_threshold = float(
+            state.get("safety_threshold", float("inf"))
+        )
+        self.safety_fixed = bool(state.get("safety_fixed", False))
+        self.safety_calibration_l2 = [
+            float(value)
+            for value in state.get("safety_calibration_l2", [])
+            if isinstance(value, (int, float))
+        ][-_SAFETY_CALIBRATION_SAMPLES:]
+        scheduler_state = state.get("lr_scheduler_state")
+        self.lr_scheduler_state = (
+            scheduler_state if isinstance(scheduler_state, dict) else None
+        )
+        self._restore_rng_state(state.get("rng_state"))
+        self.training_status = str(state.get("training_status", "resumed"))
+        self.resume_loaded = True
+
+        # LSTM reset 契约（仅记录，不恢复 hidden）
+        contract = ckpt.get("lstm_reset_contract")
+        if isinstance(contract, dict):
+            self.lstm_reset_contract = dict(contract)
+
+        # 血缘
+        lineage = ckpt.get("lineage", {})
+        self.parent_checkpoint_sha256 = str(
+            lineage.get("parent_checkpoint_sha256", "unknown")
+        )
+        self.teacher_low_level_sha256 = str(
+            lineage.get("teacher_low_level_sha256", "unknown")
+        )
+        self.config_sha256 = str(lineage.get("config_sha256", "unknown"))
+        self.code_commit = str(lineage.get("code_commit", "unknown"))
+
+        print(
+            f"[AlgorithmLBC] resumed vision bundle from {path}\n"
+            f"  iteration={self.current_iteration}, ramp_probability={self.ramp_probability:.3f},\n"
+            f"  parent_sha256={self.parent_checkpoint_sha256},\n"
+            f"  LSTM hidden NOT restored (will reset on env.reset)"
+        )
+
+    def load_parent_bundle(self, path: str, model_id: str | int) -> str:
+        """按视觉父候选顺序查找并加载特权父文件（daggerfull-16288）。
+
+        P1 第 4 条：显式优先 daggerfull，再 locomotion，不靠偶然排序。
+        返回实际命中的文件路径。
+        """
+        candidates = vision_parent_candidates(path, model_id)
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                self.load_teacher_from_locomotion_ckpt(candidate)
+                return candidate
+        raise FileNotFoundError(
+            f"No vision parent checkpoint found in {path}/ for id={model_id}; "
+            f"tried: {candidates[:4]}"
+        )
+
+    def load_vision_resume(self, path: str, model_id: str | int) -> Optional[str]:
+        """按视觉候选顺序查找并加载续训视觉包。
+
+        返回命中的文件路径；无候选时返回 None（调用方据此走首训父加载分支）。
+        """
+        candidates = vision_checkpoint_candidates(path, model_id)
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                payload = torch.load(
+                    candidate, weights_only=False, map_location=self.device
+                )
+                modules = payload.get("modules", {}) if isinstance(payload, dict) else {}
+                vision_section = (
+                    modules.get("vision_encoder", {})
+                    if isinstance(modules, dict)
+                    else {}
+                )
+                if is_kaiwu_train_bundle(payload) and isinstance(
+                    vision_section.get("state_dict"), dict
+                ):
+                    self.load_vision_bundle(candidate)
+                    return candidate
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("format") == "lbc_loco"
+                    and isinstance(payload.get("vision_encoder_state_dict"), dict)
+                ):
+                    self.load(
+                        candidate,
+                        expected_format="lbc_loco",
+                        load_optimizer=True,
+                    )
+                    self.resume_loaded = True
+                    return candidate
+                # A low-level daggerfull/locomotion bundle is a parent, not a
+                # visual resume. Skip it so _load_lbc_loco can reach
+                # load_parent_bundle().
+        return None

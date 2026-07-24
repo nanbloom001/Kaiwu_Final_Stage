@@ -17,8 +17,8 @@
 #   1. LBC 不是 RL —— 无 [rewards] section
 #   2. Policy obs = [proprio(45) | height_scan(256) | depth(57600)] = 57901D
 #      （由 LBCObservationProcess 拼接，lbc_workflow 按偏移切分）
-#   3. 地形 / 域随机化 / 速度命令与 Stage 1 locomotion 完全一致，
-#      保证教师驱动环境时行走分布与原训练分布相符
+#   3. 速度命令域 / 地形比例 / max_init_terrain_level 与父模型 daggerfull-16288
+#      训练域（standard_ref_distill.toml）对齐；首轮关闭域随机化和噪声以隔离感知迁移。
 
 # Basic Configuration
 # 基础配置
@@ -43,8 +43,13 @@ task_name = "Unitree-Go2-Velocity-Camera"
 # 随机种子
 seed = 0
 
-# Terrain Configuration (consistent with Stage 1)
-# 地形配置（与 Stage 1 一致）
+[custom_parameters]
+# 长时间蒸馏 workflow 自己按各环境 done/reset 维护时序，不使用从 env.reset()
+# 起累计的全局 frame_no 作为任务结束条件。评估模式仍使用正常终止语义。
+continuous_training = true
+
+# Terrain Configuration
+# 地形比例 / max_init_terrain_level 与父模型 standard_ref_distill.toml 对齐。
 [terrain]
 # Terrain mode, valid values: "standard" | "track".
 # 地形模式，合法值："standard" | "track"
@@ -62,8 +67,8 @@ difficulty_range = [0.0, 1.0]
 # 是否启用地形课程学习（按表现晋级/降级难度）
 curriculum = true
 # Max init difficulty tier for robot placement, valid range: [0, 9].
-# 机器人初始放置的最大难度档，合法范围：[0, 9]
-max_init_terrain_level = 5
+# 阶段 4 控制变量：与父模型 standard_ref_distill.toml 一致（9），不限制初始难度档。
+max_init_terrain_level = 9
 
 # Pre-expose side walls on high-difficulty standard terrain (consistent with Stage 1 locomotion).
 # 高难度 standard 地形侧墙预暴露（与 Stage 1 locomotion 保持一致）
@@ -97,60 +102,50 @@ eligible_keywords = ["slope", "stairs"]
 exclude_keywords = ["maze", "corridor"]
 
 # Sub-terrain proportions (all proportions must sum to 1.0).
-# proportion: fraction of plots assigned to this sub-terrain.
-# step_height_range [min, max] (m): stair step height random range.
+# 阶段 4 控制变量：地形比例与父模型 daggerfull-16288 的训练域
+# (train_env_conf_standard_standard_ref_distill.toml) 完全一致，
+# 只验证 height_scan → depth 的感知迁移，不扩展地形分布。
 # 子地形比例（所有 proportion 之和必须 = 1.0）
-# proportion：分配给该子地形的地块比例
-# step_height_range [min, max]（米）：台阶高度随机范围
 [terrain.standard.pyramid_slope]
-proportion = 0.15
+proportion = 0.20
 
 [terrain.standard.pyramid_slope_inv]
-proportion = 0.2
+proportion = 0.20
 
 [terrain.standard.pyramid_stairs]
-proportion = 0.25
+proportion = 0.20
 #step_height_range = [0.05, 0.23]
 
 [terrain.standard.pyramid_stairs_inv]
-proportion = 0.3
+proportion = 0.40
 #step_height_range = [0.05, 0.23]
 
 [terrain.standard.maze]
-proportion = 0.1
+proportion = 0.0
 # Width of the flat platform at the maze center (m).
 # 迷宫中心平台宽度（米）
 platform_width = 3.0
 
 
-# Domain Randomization (consistent with Stage 1)
-# 域随机化（与 Stage 1 一致）
+# Domain Randomization
+# 阶段 4 控制变量：首轮关闭动力学随机化、外力推动和观测噪声，隔离感知迁移
+# （与父模型 daggerfull-16288 训练期一致）。Sim-to-Real 增强留待视觉基线通过后。
 [domain_rand]
 # Master switch for domain randomization.
 # 域随机化总开关
-enable_domain_rand = true
+enable_domain_rand = false
 # Whether to randomize ground friction.
-# 是否随机化地面摩擦系数
-randomize_friction = true
-# Friction range [min, max], must be >= 0.
-# 摩擦系数采样范围 [min, max]，必须 >= 0
+randomize_friction = false
 friction_range = [0.3, 1.5]
 # Whether to periodically push the robot.
-# 是否周期性对机器人施加外部推力
-push_robots = true
-# Push interval (seconds), must be > 0.
-# 推力间隔（秒），必须 > 0
+push_robots = false
 push_interval_s = 15
-# Max push velocity in XY plane (m/s), must be >= 0.
-# XY 平面最大推力速度 (m/s)，必须 >= 0
 max_push_vel_xy = 0.5
 
 # Observation Noise
-# 观测噪声
 [noise]
-# Whether to add noise to observations.
-# 是否在观测中加入噪声
-add_noise = true
+# 阶段 4 首轮关闭观测噪声
+add_noise = false
 
 # Initial State
 # 初始状态
@@ -159,55 +154,55 @@ add_noise = true
 # 机器人初始位置 [x, y, z] (m)；z 合法范围：[0.30, 0.60]m
 pos = [0.0, 0.0, 0.35]
 
-# Velocity Commands (for the teacher, consistent with Stage 1)
-# 速度命令（教师用，与 Stage 1 一致）
+# Velocity Commands
+# 阶段 4 控制变量：指令域与父模型 daggerfull-16288 训练域完全一致
+# （train_env_conf_standard_standard_ref_distill.toml:50-60），
+# 不扩展速度/转向范围。只验证 height_scan → depth 的感知迁移。
 [commands]
-resampling_time = [10.0, 10.0]
+resampling_time = [6.0, 10.0]
 
 [commands.ranges]
-# LBC 无 command curriculum，命令始终在此区间均匀采样（与 hier_nav 一致）。
-lin_vel_x = [-0.2, 0.65]
-lin_vel_y = [-0.15, 0.15]
-ang_vel_yaw = [-1.3, 1.3]
+# 命令始终在此区间均匀采样，与父模型教师域一致。
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_yaw = [-0.3, 0.3]
 
 # Lock curriculum-expansion upper bound to the initial ranges, preventing
 # lin_vel_cmd_levels / ang_vel_cmd_levels from expanding the command range to
 # the hard-coded default limit_ranges in velocity_env_cfg
 # ((-2.0, 2.0) / (-1.5, 1.5) / (-1.5, 1.5)), which would drive the frozen
 # teacher OOD and cause distillation sample drift.
-# 锁死 curriculum 扩张上限 = 初始 ranges，避免 lin_vel_cmd_levels /
-# ang_vel_cmd_levels 把命令区间扩到 velocity_env_cfg 硬编码的默认 limit_ranges
-# ((-2.0, 2.0) / (-1.5, 1.5) / (-1.5, 1.5))，让教师推理 OOD 导致蒸馏样本漂移。
 [commands.limit]
-lin_vel_x = [-0.2, 0.65]
-lin_vel_y = [-0.15, 0.15]
-ang_vel_z = [-1.3, 1.3]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_z = [-0.3, 0.3]
 
 
 # LBC-specific parameters (matching LBCLocoConfig; priority on read is TOML > class default).
-# LBC 专用参数（与 LBCLocoConfig 对应，读取时优先级 TOML > class default）
+# 阶段 4：线性 ramp DAgger + 三路损失（0.5*SmoothL1(latent) + 0.1*(1-cos) + 1.0*SmoothL1(action)）
 [lbc_loco]
-# 蒸馏阶段保守 lr（更高值下 angle/mse 会原地震荡不收敛）；lr_min 可选，未给则用 conf.py 默认 1e-5。
-learning_rate = 5e-4
-max_iterations = 10000
+# 蒸馏阶段保守 lr；lr_min 可选，未给则用 conf.py 默认 1e-5。
+learning_rate = 2e-4
+max_iterations = 20000
 max_grad_norm = 1.0
-# Print MSE loss every N steps.
-# 每 N 步打印 MSE loss
 log_interval = 100
-# Save vision_encoder ckpt every N steps.
-# 每 N 步保存 vision_encoder ckpt
-save_interval = 1000
-# Steps collected from env per round.
-# 每轮从 env 采集的步数
+save_interval = 225
 num_steps_per_env = 24
+# max_iterations 是高安全上限；学习率按约 10h 的预计 outer iterations 衰减。
+lr_scheduler_iterations = 14000
 
-# Student-drive mode: student closed-loop drives env, no backward pass, MSE only as a metric.
-# 学生驱动模式：学生闭环驱动 env，不做反向传播，仅计算 MSE 作为指标
-#   student_drive = true  → preload vision ckpt + visualize student perf
-#   student_drive = true  → 配合 preload 的 vision ckpt 可视化学生表现
-#   student_drive = false → standard distillation training (default)
-#   student_drive = false → 标准蒸馏训练（默认）
-student_drive = false
+# 线性 ramp 调度（阶段 4）：学生驱动比例从 0 线性增长到 100%。
+# ramp_start_h / ramp_end_h 为有效训练墙钟小时数；前 30min 纯教师预热，
+# 随后用 4.5h 线性 ramp 到 100%，为 10h 任务保留约 5h 纯学生阶段。
+# 质量恶化时 soft-stay 冻结当前比例，恢复后继续 ramp；无离散档位、无强制晋升。
+ramp_start_h = 0.50
+ramp_end_h = 5.00
+# 安全接管阈值：在首次学生接管前，用教师预热期样本固定为
+# max(safety_min_threshold, safety_p95_multiplier * P95(action_l2))
+safety_min_threshold = 0.25
+safety_p95_multiplier = 2.0
+
+# 注：student_drive 全局布尔已移除，由 ramp 调度取代。评估模式由平台 is_eval 触发。
 
 
 # Depth Camera Configuration
@@ -235,10 +230,31 @@ student_drive = false
 [camera.depth_camera]
 # Camera mount position in robot base frame (x forward, y left, z up), unit m, calibrated per machine.
 # 相机在机器人 base 系下的安装位置 (x前, y左, z上)，单位 m，逐台校准。
-offset_pos = [0.486886, 0.024533, 0.079897]
+#
+# 21.22° pitch 标定值（约 pitch 21.22° / roll -1.31° / yaw -2.60°）。
+# 这是仓库统一采纳的真机安装外参，与下列出处完全一致：
+#   - 9 处 config（standard_distill_1/2/3、visual_ppo_1/2、hjcnew10288_lbc_loco、
+#     track_lbc_loco / _d2 / p22_lbc_loco）
+#   - server/CHANGELOG.md standard-distill-1 条目
+#   - server/docs/standard-distill-1.md / standard-distill-3-action.md
+#     （后者明确写 "calibrated 21.22-degree camera extrinsics"）
+# 此前 lbc_loco.toml 用的是另一套 ~11.16° 值（offset_pos=[0.486886,...] /
+# offset_rot=[0.995199,...]），由 commit 05734d7「恢复 HJC 最小训练路径」带入，
+# 与仓库其余视觉阶段不一致；本次视觉蒸馏对齐到 21.22° 标准值。
+offset_pos = [0.339871, 0.034697, 0.075010]
 # Camera mount orientation quaternion (w, x, y, z), world convention, calibrated per machine.
 # 相机安装姿态 quaternion (w, x, y, z)，world convention，逐台校准。
-offset_rot = [0.995199, -0.001619, 0.097217, 0.011225]
+offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
+max_depth = 5.0
+
+# 本轮只迁移 height_scan→depth，不同时扩大视觉噪声分布。后续 Sim-to-Real
+# 强化阶段再逐项开启；评估模式无条件关闭随机增强。
+[camera.depth_camera.augmentation]
+enabled = false
+pixel_dropout_prob = 0.10
+gaussian_noise_scale = 0.02
+roll_range_deg = 10.0
+pitch_shift_pix = 10
 
 # No [rewards] section.
 # 不配置 [rewards]
