@@ -38,7 +38,8 @@
 - 迁移新建/维护的 14 份 Markdown 中，相对链接 17 个，0 断链；导入的历史文档不纳入该 scoped gate
 - `server/` 无运行时引用 `shared/`/`archive/`；`deploy/` 无运行时引用 `server/`（subtree 独立性确认）
 - ⚠️ 全量 `git diff --check 9b0b3df..HEAD` 会报告迁入的历史 whitespace，因此不记为“全过”；验收以迁移作者实际编辑文件的 scoped `git diff --check` 为准，历史内容不在本次格式化范围内。
-- 本机没有安装 `pytest`，J9 单测文件已静态审查但不能宣称本机执行通过；需在训练环境补跑。
+- 本机没有安装 `pytest`，J9 测试曾在迁移提交中静态审查但不能宣称执行通过；
+  当前最小 R1 测试集已删除该历史文件，需要复现实验时应从对应历史提交恢复。
 
 ## 3. 当前状态
 
@@ -49,7 +50,7 @@
 
 ## 4. 关键决策与注意事项
 
-1. **J9 仅移植通用接口**（非整实验提升）：`TrackNavConfig` 保持 Opt3 自适应 `lr=1.5e-5`（无 schedule/min/max 字段）；接口修复 latent（PPO 构造器不再静默忽略 schedule/bounds）。验收分两套：活动 Opt3/Opt4 验证 adaptive 学习率在配置边界内更新；fixed `1e-5` 由 `test_j9_fixed_lr.py` 直接构造算法验证。当前主线没有启用 `TrackNavStage3J9Config`，需要复现实验时从历史提交恢复或显式新增阶段，不能把 `train_env_conf_track_navj9.toml` 单独视为可运行入口。
+1. **J9 仅移植通用接口**（非整实验提升）：`TrackNavConfig` 保持 Opt3 自适应 `lr=1.5e-5`（无 schedule/min/max 字段）；接口修复 latent（PPO 构造器不再静默忽略 schedule/bounds）。验收分两套：活动 Opt3/Opt4 验证 adaptive 学习率在配置边界内更新；fixed `1e-5` 的原测试保存在历史迁移提交中，当前最小 R1 分支不再携带。当前主线没有启用 `TrackNavStage3J9Config`，需要复现实验时从历史提交恢复测试与阶段，不能把 `train_env_conf_track_navj9.toml` 单独视为可运行入口。
 2. **deploy 用 merge commit 导入**：第二父 = `b297b3f`（部署独立历史根），已验证。四套目录并列不去重（两份 378413 ckpt Git 自动复用 blob）。
 3. **LFS pointer 排除**：`archive/unitree_isaaclab_deploy/` 有 10 个 git-lfs pointer（ONNX Runtime .so、`model.ckpt-lbc-loco-637427.pkl`、mimic CSV、npy、标定 PDF），真实对象不在本地，经 `.gitignore` 排除（Plan 禁止把 pointer 登记为可用 ckpt）。需真实对象则在源仓 `git lfs pull`。
 4. **ST7/standard deploy 缺 checkpoint**：`sim2real_test_st7` 缺 `model.ckpt-track-lbc-loco-28608.pkl`；`sim2real_test_standard` 缺 `model.ckpt-hjcnew-20288.pkl`。各 `ARTIFACTS.md` 已标"待提供"。补齐前 deploy 这两套只能源码静态验收。
@@ -68,7 +69,7 @@
 
 ### 5c. 模型发布验证（仓库布局合并后执行）
 1. 活动 Opt3/Opt4：确认 adaptive 学习率按 KL 更新且不越过配置上下界；不要期待 `_validate_fixed_lr()` 恒定日志。
-2. J9 fixed 接口：在具备 PyTorch/pytest 的环境执行 `test_j9_fixed_lr.py`，验证算法 LR 和所有 optimizer 参数组始终为 `1e-5`；主线当前没有启用 navj9 stage class。
+2. J9 fixed 接口：若恢复该实验，从历史迁移提交取回专用测试，在具备 PyTorch/pytest 的环境验证算法 LR 和所有 optimizer 参数组始终为 `1e-5`；主线当前没有启用 navj9 stage class。
 3. 腾讯开悟训练 smoke、30-60 分钟训练和 Jetson Sim2Real 属于后续模型发布验收，不阻断仓库布局 PR。
 
 ### 5d. 删除散落分支

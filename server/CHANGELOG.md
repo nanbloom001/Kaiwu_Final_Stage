@@ -4,6 +4,34 @@
 
 ## [未发布]
 
+- **[Standard 特权网络结构蒸馏]** 从已验证可启动的 minimal lifecycle 重新构建 10288
+  flat301→Actor77 桥接。单次 6000-iteration 任务自适应完成
+  0/25/50/75/100% 逐环境 DAgger；加入动作安全接管、1/0.25/0 样本权重、
+  8192 条 FP16 reservoir、75/25 当前/回放损失和阶段 entry/best/exit 回退。
+  新训练包统一为 `kaiwu_train_v1`，保存纯英文阶段文件与同 ID
+  `locomotion` 别名；数字 ID 只使用平台注入值。平台完成 6000 iterations，
+  最终 `daggerfull` 有效学生比例约 99.8%，视频评估 4/4 完成。四次升档均为
+  forced，因此模型能力通过但晋升状态机不复用。后续视觉阶段只登记
+  `daggerfull-16288`，并改用失败后停留而非强制升档。
+- **[STD-BRIDGE-R1]** 以原始复赛 Standard 10288 flat301 checkpoint 为唯一
+  行为教师。预训练教师身份改由操作者手动确认，不再以字节级 SHA
+  不一致阻断 rollout；仍保留 key/shape 校验、成功加载要求和冻结教师证明。新增逐环境
+  0/25/50/75/100% 单任务 DAgger、安全接管、终止后样本权重和两窗口质量诊断。
+  `behavior_distill_v2` 保存学生、冻结教师、optimizer、RNG、DAgger 阶段和配置/
+  代码血缘；同时导出不可部署的 `privileged_loco_teacher_v1`，供后续视觉 LBC
+  严格加载。平台文件 ID 从父教师 `10288` 继续递增，第一轮立即落探活 checkpoint，
+  常规定时保存调整为每 100 iteration 一次，并非新增一套 100 轮阶段；每个
+  DAgger 阶段边界额外发布单标签 `bridge`/`teacher` 候选。action/终止/OOD
+  阈值只产生 warning 并写入 checkpoint，不再生成 `blocked` 文件或中断后续比例；
+  命令越界行权重置零。首轮保持源命令/地形分布并关闭随机化、噪声和 push；
+  `configure_app.toml` 明确启用 `/data/pre_model/ckpt` 预加载并以 `10288` 为
+  首轮默认 ID；平台注入 checkpoint 优先，未注入时 workflow 从该目录加载最新
+  兼容制品，且每个 iteration 调用一次平台 lifecycle callback。平台训练与闭环
+  验收待执行。
+- **[本地同步可诊断性]** `local_sync_client.py` 新增零网络 `--check-local` 和
+  `--refresh-cookie`；Cookie 优先级改为显式值、缓存、旧兼容值、交互输入。
+  代理拒绝时打印实际来源，且只在拒绝的是缓存 Cookie 时删除缓存。
+  `--dry-run` 继续连接远程但不写入。真实在线验证仍待刷新 Cookie。
 - **[STD-D3A]** 从 D2-40min 视觉学生继续 LBC，保持 D2 地形分布与相机外参，
   将动作模仿权重从 `0.2` 提高到 `1.0`，关闭 student-drive，并以
   `2e-4` 学习率在教师驱动的干净轨迹上修复楼梯动作对齐。训练命令按环境
@@ -16,10 +44,10 @@
   student-drive 与 D1 完全一致。新增 `require_student_resume=true` 作为预加载
   硬检查，不改变正确续训时的优化行为。输出仍为探活兼容的
   `model.ckpt-standard-<id>.pkl` 与 `model.ckpt-<id>.pkl`。
-- **[standard-distill-1]** 根据平台实际 preload 契约与决赛文档，将当前入口
-  修正为 77-D `ActorCriticEncoder` 教师的直接视觉 LBC。教师 checkpoint
-  包含 `encoder.* / actor.* / critic_encoder.* / critic.*`，LBC 只拆分前两组；
-  301-D 旧模型桥接保留为非活动 `StandardRefDistillConfig`。训练命令覆盖
+- **[standard-distill-1，历史]** 该视觉 LBC 实际需要已经完成桥接的 77-D
+  `ActorCriticEncoder` 教师；原始复赛 10288 文件已核验为 flat301，不能直接
+  进入 LBC。旧 HJC 约 10 分钟产物包含
+  `encoder.* / actor.* / critic_encoder.* / critic.*`，LBC 只拆分前两组。训练命令覆盖
   低速前后、横移和双向转动，开启 Standard 地形课程、摩擦随机化、观测
   噪声和深度增强，第一阶段关闭外部 push。相机安装外参为
   `offset_pos=[0.339871,0.034697,0.075010]`、

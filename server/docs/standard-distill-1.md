@@ -1,16 +1,30 @@
 # standard-distill-1
 
-## Goal
+## Historical scope
 
-Distill the platform-selected Standard checkpoint 10288 from privileged
-height scan to the calibrated depth camera while preserving its locomotion
-Actor contract.
+This document describes the historical direct visual LBC experiment. It can
+distill an **encoder-based bridge artifact** from privileged height scan to the
+calibrated depth camera while preserving its Actor77 contract.
 
-The platform preload log proves that this checkpoint is already an
-`ActorCriticEncoder`: it contains `encoder.*`, `actor.*`, `critic_encoder.*`
-and `critic.*`; the Actor and Critic first layers use the 77-D and 92-D final
-contracts. This matches the final-round task specification. It must therefore
-enter LBC directly, not the optional 301-D legacy behavior bridge.
+The original replay checkpoint
+`archive/代码存档/复赛_standard/ckpt/model.ckpt-10288.pkl` has now been inspected
+from its real pickle tensors. Its Actor and Critic first layers are `[512,301]`
+and `[512,316]`; it contains `std`, `actor.*`, and `critic.*`, with no
+`encoder.*`. Its SHA256 is
+`d5999461f00c4634bdea0648e46baac9fba34e621eaa586fe26f64f68953eeed`.
+It therefore **cannot** enter this LBC stage directly.
+
+The earlier platform preload log showing `encoder.*`, `actor.*`,
+`critic_encoder.*`, and `critic.*` referred to the later HJC bridge artifact
+whose Actor input is 77-D. Numeric ID `10288` was reused and is not a structure
+contract. New work must first complete and validate `STD-BRIDGE-R1`, then load
+its `privileged_loco_teacher_v1` side artifact here.
+
+R1 continues platform filename IDs from the parent: the completed 5000-iteration
+run publishes `model.ckpt-teacher-15288.pkl`, while its payload records
+`source_iteration=5000`. Phase-boundary teacher files are candidates rather than
+automatic promotions; select the D1 teacher only after reviewing its quality
+diagnostics and fixed-evaluation evidence.
 
 ## Runtime Contract
 
@@ -18,15 +32,15 @@ enter LBC directly, not the optional 301-D legacy behavior bridge.
 - TOML: `agent_ppo/conf/train_env_conf_standard_standard_distill_1.toml`
 - Algorithm: `lbc_loco`
 - Environment: `Unitree-Go2-Velocity-Camera`
-- Frozen teacher: platform Standard `ActorCriticEncoder` checkpoint 10288
+- Frozen teacher: validated encoder-based Standard bridge artifact
 - Teacher encoder: height scan 256 -> latent 32
 - Teacher Actor: proprio 45 + latent 32 = 77 -> action 12
 - Student: depth 180x320 + proprio 45 -> CNN/LSTM -> latent 32
 - Goal input: none
 
-LBC loads only `encoder.*` and `actor.*`. The teacher checkpoint's
-`critic_encoder.*`, `critic.*` and exploration standard deviation are not part
-of deployment and are intentionally ignored.
+LBC accepts the new `privileged_loco_teacher_v1` package and legacy raw
+`encoder.*`/`actor.*` weights. Critic-side keys and exploration standard
+deviation are not part of visual distillation or deployment and are ignored.
 
 ## Checkpoint Naming
 

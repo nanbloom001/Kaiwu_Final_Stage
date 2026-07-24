@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -892,7 +893,7 @@ def capture_requests(args: argparse.Namespace, raw_dir: Path, errors: list[str])
     return network_metric, network_log, "network" if network_metric else "none", har_meta
 
 
-def export_capture(args: argparse.Namespace) -> None:
+def export_capture(args: argparse.Namespace) -> int:
     capture_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     session_dir = SESSIONS_DIR / capture_id
     raw_dir = session_dir / "raw"
@@ -957,6 +958,98 @@ def export_capture(args: argparse.Namespace) -> None:
     print(session_dir / "views" / "page_metric_inventory.json")
     print(session_dir / "views" / "coverage_report.json")
     print(session_dir / "views" / "latest_logs_compact.json")
+    return 1 if fatal_error else 0
+
+
+def offline_preflight() -> int:
+    """Check local prerequisites without opening or controlling a browser tab."""
+    errors: list[str] = []
+    if sys.version_info < (3, 9):
+        errors.append(f"Python 3.9+ required, got {sys.version.split()[0]}")
+
+    executable = shutil.which("agent-browser") or shutil.which("agent-browser.cmd")
+    browser_version = "unavailable"
+    if executable is None:
+        errors.append("agent-browser executable is not available in PATH")
+    else:
+        try:
+            result = subprocess.run(
+                [executable, "--version"],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            browser_version = (result.stdout or result.stderr).strip()
+            if result.returncode != 0:
+                errors.append(
+                    f"agent-browser --version failed with exit code {result.returncode}"
+                )
+        except Exception as exc:  # noqa: BLE001 - preflight must report all failures.
+            errors.append(f"agent-browser version check failed: {exc}")
+
+    companion_files = (
+        "collect_monitor_overview.py",
+        "frontend_monitor.py",
+        "manual_metric_recorder.py",
+        "metric_probe.py",
+        "postprocess_monitor_capture.py",
+    )
+    missing = [name for name in companion_files if not (ROOT / name).is_file()]
+    if missing:
+        errors.append(f"missing companion CLI files: {missing}")
+    for name in companion_files:
+        cli_path = ROOT / name
+        if not cli_path.is_file():
+            continue
+        try:
+            result = subprocess.run(
+                [sys.executable, str(cli_path), "--help"],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode != 0:
+                errors.append(
+                    f"{name} --help failed with exit code {result.returncode}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{name} --help failed: {exc}")
+
+    fixture_path = ROOT / "tests" / "fixtures" / "sample.har"
+    try:
+        fixture_metrics, fixture_logs = parse_har_entries(fixture_path)
+        if not fixture_metrics or not fixture_logs:
+            errors.append(
+                "sample HAR fixture must contain metric and log requests"
+            )
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"sample HAR fixture parse failed: {exc}")
+
+    try:
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix="arena-monitor-preflight-", dir=RUNTIME_DIR, delete=True
+        ) as stream:
+            stream.write(b"ok")
+            stream.flush()
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"runtime directory is not writable: {RUNTIME_DIR}: {exc}")
+
+    print(f"Python: {sys.version.split()[0]}")
+    print(f"agent-browser: {executable or 'missing'}")
+    print(f"agent-browser version: {browser_version or 'unknown'}")
+    print(f"companion CLI checks: {len(companion_files) - len(missing)}")
+    print(f"HAR fixture: {fixture_path}")
+    print(f"runtime directory: {RUNTIME_DIR}")
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        print("Static preflight failed. No browser tab was opened or modified.")
+        return 1
+    print("Static preflight passed. No browser tab was opened or modified.")
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -974,15 +1067,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logs-settle-ms", type=int, default=4000)
     parser.add_argument("--zoom-out-steps", type=int, default=4)
     parser.add_argument("--zoom-settle-ms", type=int, default=6000)
-    parser.add_argument("--keep-har", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fail-on-empty-metrics", action="store_true")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Run offline dependency/output checks without controlling a browser tab",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    export_capture(args)
-    return 0
+    if args.check:
+        return offline_preflight()
+    return export_capture(args)
 
 
 if __name__ == "__main__":
