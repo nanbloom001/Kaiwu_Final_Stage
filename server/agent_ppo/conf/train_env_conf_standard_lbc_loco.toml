@@ -43,6 +43,11 @@ task_name = "Unitree-Go2-Velocity-Camera"
 # 随机种子
 seed = 0
 
+[custom_parameters]
+# 长时间蒸馏 workflow 自己按各环境 done/reset 维护时序，不使用从 env.reset()
+# 起累计的全局 frame_no 作为任务结束条件。评估模式仍使用正常终止语义。
+continuous_training = true
+
 # Terrain Configuration
 # 地形比例 / max_init_terrain_level 与父模型 standard_ref_distill.toml 对齐。
 [terrain]
@@ -178,18 +183,22 @@ ang_vel_z = [-0.3, 0.3]
 [lbc_loco]
 # 蒸馏阶段保守 lr；lr_min 可选，未给则用 conf.py 默认 1e-5。
 learning_rate = 2e-4
-max_iterations = 10000
+max_iterations = 20000
 max_grad_norm = 1.0
 log_interval = 100
-save_interval = 250
+save_interval = 225
 num_steps_per_env = 24
+# max_iterations 是高安全上限；学习率按约 10h 的预计 outer iterations 衰减。
+lr_scheduler_iterations = 14000
 
 # 线性 ramp 调度（阶段 4）：学生驱动比例从 0 线性增长到 100%。
-# ramp_start_h / ramp_end_h 为墙钟小时数；默认 0.33h–4.83h（前 20min 预检 + 4.5h ramp）。
+# ramp_start_h / ramp_end_h 为有效训练墙钟小时数；前 30min 纯教师预热，
+# 随后用 4.5h 线性 ramp 到 100%，为 10h 任务保留约 5h 纯学生阶段。
 # 质量恶化时 soft-stay 冻结当前比例，恢复后继续 ramp；无离散档位、无强制晋升。
-ramp_start_h = 0.33
-ramp_end_h = 4.83
-# 安全接管阈值：ramp 达到约 10% 后固定为 max(safety_min_threshold, safety_p95_multiplier * P95(action_l2))
+ramp_start_h = 0.50
+ramp_end_h = 5.00
+# 安全接管阈值：在首次学生接管前，用教师预热期样本固定为
+# max(safety_min_threshold, safety_p95_multiplier * P95(action_l2))
 safety_min_threshold = 0.25
 safety_p95_multiplier = 2.0
 
@@ -236,6 +245,16 @@ offset_pos = [0.339871, 0.034697, 0.075010]
 # Camera mount orientation quaternion (w, x, y, z), world convention, calibrated per machine.
 # 相机安装姿态 quaternion (w, x, y, z)，world convention，逐台校准。
 offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
+max_depth = 5.0
+
+# 本轮只迁移 height_scan→depth，不同时扩大视觉噪声分布。后续 Sim-to-Real
+# 强化阶段再逐项开启；评估模式无条件关闭随机增强。
+[camera.depth_camera.augmentation]
+enabled = false
+pixel_dropout_prob = 0.10
+gaussian_noise_scale = 0.02
+roll_range_deg = 10.0
+pitch_shift_pix = 10
 
 # No [rewards] section.
 # 不配置 [rewards]

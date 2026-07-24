@@ -40,6 +40,9 @@ _SOFT_STAY_HARD_DELTA = 0.02        # hard_termination 相对前窗口恶化超�
 _SOFT_STAY_UNFREEZE_MAX_NMSE = 0.15      # normalized_action_mse 必须低于此值
 _SOFT_STAY_UNFREEZE_MAX_HARD = 0.05      # hard_termination_rate 必须低于此值
 _SOFT_STAY_UNFREEZE_MIN_ACTION_COS = 0.90  # action_cosine 必须高于此值
+# 只保留教师预热末段的近期学生—教师动作差异。若把随机初始化阶段的
+# 全部历史都纳入 P95，安全阈值会被早期大误差永久抬高，学生接管将失去保护。
+_SAFETY_CALIBRATION_SAMPLES = 256
 
 
 def _mean_metrics(rows: list[dict]) -> dict:
@@ -100,22 +103,39 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     log_interval = int(lbc_conf.get("log_interval", stage.log_interval))
     save_interval = int(lbc_conf.get("save_interval", stage.model_save_interval))
     num_steps_per_env = int(lbc_conf.get("num_steps_per_env", stage.num_steps_per_env))
+    lr_scheduler_iterations = int(
+        lbc_conf.get("lr_scheduler_iterations", max_iterations)
+    )
+    if lr_scheduler_iterations <= 0:
+        raise ValueError(
+            "lr_scheduler_iterations must be positive: "
+            f"{lr_scheduler_iterations}"
+        )
 
-    # 线性 ramp 配置（TOML 可配，默认 0.33h–4.83h = 4.5h ramp）
+    # 线性 ramp 配置（TOML 可配，默认 0.50h–5.00h = 4.5h ramp）
     ramp_start_h = float(lbc_conf.get("ramp_start_h", algorithm.ramp_start_h))
     ramp_end_h = float(lbc_conf.get("ramp_end_h", algorithm.ramp_end_h))
     if ramp_end_h <= ramp_start_h:
         raise ValueError(f"ramp_end_h must exceed ramp_start_h: {ramp_end_h}<={ramp_start_h}")
+    # 当前任务 TOML 是调度的唯一生效来源。旧视觉包可能记录 0.33h/4.83h，
+    # 续训时不得让旧元数据覆盖本轮明确的 0.50h/5.00h 契约。
+    algorithm.ramp_start_h = ramp_start_h
+    algorithm.ramp_end_h = ramp_end_h
 
-    # 安全阈值固定时机：ramp 达到约 10% 后用 P95 固定
-    safety_threshold = float("inf")
+    # 安全阈值：优先用 0% 教师预热期的 action-L2 P95，在首次学生接管前固定。
+    safety_threshold = float(
+        getattr(algorithm, "safety_threshold", float("inf"))
+    )
     safety_min_threshold = float(lbc_conf.get("safety_min_threshold", 0.25))
     safety_p95_multiplier = float(lbc_conf.get("safety_p95_multiplier", 2.0))
-    safety_fixed = False
+    safety_fixed = bool(getattr(algorithm, "safety_fixed", False))
+    safety_calibration_l2 = list(
+        getattr(algorithm, "safety_calibration_l2", [])
+    )[-_SAFETY_CALIBRATION_SAMPLES:]
 
     # LR override：toml 优先于 conf.py 的 stage.lr。
     override_lr = lbc_conf.get("learning_rate")
-    if override_lr is not None:
+    if override_lr is not None and not getattr(algorithm, "resume_loaded", False):
         override_lr = float(override_lr)
         for pg in algorithm.optimizer.param_groups:
             pg["lr"] = override_lr
@@ -124,15 +144,24 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         logger.info(f"[LBC] toml override learning_rate: stage.lr={stage.lr} -> {override_lr}")
     lr_min = float(lbc_conf.get("lr_min", getattr(stage, "lr_min", 1e-5)))
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        algorithm.optimizer, T_max=max_iterations, eta_min=lr_min,
+        algorithm.optimizer, T_max=lr_scheduler_iterations, eta_min=lr_min,
     )
+    if getattr(algorithm, "lr_scheduler_state", None) is not None:
+        lr_scheduler.load_state_dict(algorithm.lr_scheduler_state)
+        # PyTorch scheduler state_dict 也会恢复旧 T_max；本轮 TOML 明确指定的
+        # 10h 调度必须优先，同时保留 last_epoch 等真实续训进度。
+        lr_scheduler.T_max = lr_scheduler_iterations
+        logger.info(
+            "[LBC-Vision] restored LR scheduler "
+            f"(last_epoch={lr_scheduler.last_epoch}, T_max={lr_scheduler.T_max})"
+        )
 
     logger.info(
         f"[LBC-Vision] Start linear-ramp DAgger: "
         f"max_iterations={max_iterations}, ramp={ramp_start_h}h->{ramp_end_h}h, "
         f"num_steps_per_env={num_steps_per_env}, save_interval={save_interval}, "
         f"init_lr={algorithm.optimizer.param_groups[0]['lr']:.2e}, "
-        f"lr_scheduler=cosine(eta_min={lr_min:.0e})"
+        f"lr_scheduler=cosine(T_max={lr_scheduler_iterations}, eta_min={lr_min:.0e})"
     )
 
     # env reset + 清零 LSTM hidden（每次启动都重置，不恢复旧 hidden）
@@ -155,16 +184,38 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     prev_window_metrics: dict | None = None
     # ramp clock：冻结时暂停累加，恢复后继续，避免解冻后追赶墙钟时间突然跳高。
     # 续训时从 algorithm.ramp_probability 反推已用 ramp 时长，保证从断点继续。
-    ramp_clock_h = _ramp_elapsed_from_probability(
-        algorithm.ramp_probability, ramp_start_h, ramp_end_h
+    ramp_clock_h = float(
+        getattr(
+            algorithm,
+            "ramp_clock_h",
+            _ramp_elapsed_from_probability(
+                algorithm.ramp_probability, ramp_start_h, ramp_end_h
+            ),
+        )
     )
+    if ramp_clock_h <= 0.0 and algorithm.ramp_probability > 0.0:
+        ramp_clock_h = _ramp_elapsed_from_probability(
+            algorithm.ramp_probability, ramp_start_h, ramp_end_h
+        )
     loop_start = time.time()
     iter_start_prev = loop_start
     last_save_iter = -1
+    # current_iteration 的新契约是“已完成的外层 iteration 数”。旧视觉包在
+    # load_vision_bundle() 中已转换为该语义，因此这里可直接作为 range 起点。
+    start_iteration = (
+        int(algorithm.current_iteration)
+        if getattr(algorithm, "resume_loaded", False)
+        else 0
+    )
+    if start_iteration > 0:
+        logger.info(
+            f"[LBC-Vision] resume loop at iteration={start_iteration}, "
+            f"ramp_p={algorithm.ramp_probability:.3f}, "
+            f"safety_fixed={safety_fixed}"
+        )
 
     try:
-        for iteration in range(max_iterations):
-            algorithm.current_iteration = iteration
+        for iteration_index in range(start_iteration, max_iterations):
             iter_start = time.time()
 
             # 推进 ramp clock（只在未冻结时累加，冻结时暂停）
@@ -182,7 +233,25 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 effective_p = max(requested_p, algorithm.ramp_probability)
                 algorithm.ramp_probability = effective_p
 
-            # safety_threshold 在 ramp 达到约 10% 后用 P95 固定（只固定一次）
+            # 在第一个学生驱动环境出现前，使用 0% 教师驱动预热期采集的
+            # action-L2 P95 固定安全阈值，避免最弱的早期学生无保护接管。
+            if (
+                not safety_fixed
+                and effective_p > 0.0
+                and safety_calibration_l2
+            ):
+                ordered = sorted(safety_calibration_l2)
+                p95 = ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
+                safety_threshold = max(
+                    safety_min_threshold, safety_p95_multiplier * p95
+                )
+                safety_fixed = True
+                logger.info(
+                    f"[LBC-Vision] safety_threshold fixed before student drive "
+                    f"at {safety_threshold:.4f} "
+                    f"(warmup_p95={p95:.4f}, samples={len(ordered)})"
+                )
+
             step_rows: list[dict] = []
             for _step in range(num_steps_per_env):
                 step_metrics = _vision_dagger_step(
@@ -193,13 +262,21 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 step_rows.append(step_metrics)
                 obs = step_metrics["_next_obs"]  # 内部传递
 
-            if not safety_fixed and effective_p >= 0.10:
+            if not safety_fixed:
                 recent_l2 = [
                     r["_action_l2_p95"] for r in step_rows
                     if math.isfinite(r.get("_action_l2_p95", float("nan")))
                 ]
-                if recent_l2:
-                    p95 = sorted(recent_l2)[int(0.95 * len(recent_l2))]
+                safety_calibration_l2.extend(recent_l2)
+                safety_calibration_l2 = safety_calibration_l2[
+                    -_SAFETY_CALIBRATION_SAMPLES:
+                ]
+                # ramp_start_h=0 等没有教师预热的兼容回退：首个学生窗口后立即固定。
+                if effective_p > 0.0 and safety_calibration_l2:
+                    ordered = sorted(safety_calibration_l2)
+                    p95 = ordered[
+                        min(len(ordered) - 1, int(0.95 * len(ordered)))
+                    ]
                     safety_threshold = max(safety_min_threshold, safety_p95_multiplier * p95)
                     safety_fixed = True
                     logger.info(
@@ -209,6 +286,13 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
             # LR scheduler 步进
             lr_scheduler.step()
+            algorithm.lr_scheduler_state = lr_scheduler.state_dict()
+            algorithm.ramp_clock_h = ramp_clock_h
+            algorithm.safety_threshold = safety_threshold
+            algorithm.safety_fixed = safety_fixed
+            algorithm.safety_calibration_l2 = safety_calibration_l2[
+                -_SAFETY_CALIBRATION_SAMPLES:
+            ]
             algorithm.assert_student_parameters_finite()
 
             # 收集本 iteration 的聚合指标（per-iteration，不是 per-step）
@@ -216,7 +300,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             iter_metric_history.append(iteration_metrics)
 
             # soft-stay 检查（每 _SOFT_STAY_WINDOW iterations，两个连续窗口）
-            if (iteration + 1) % _SOFT_STAY_WINDOW == 0:
+            completed_iteration = iteration_index + 1
+            algorithm.current_iteration = completed_iteration
+
+            # 平台 lifecycle 只按“外层 iteration”推进一次。一个外层 iteration
+            # 已包含 num_steps_per_env 个环境步/优化更新；在内层逐步调用会把平台
+            # global step 和 checkpoint ID 人为放大 num_steps_per_env 倍。
+            agent.learn(list_sample_data=None)
+
+            if completed_iteration % _SOFT_STAY_WINDOW == 0:
                 iter_metric_history = iter_metric_history[-(2 * _SOFT_STAY_WINDOW):]
                 if len(iter_metric_history) >= 2 * _SOFT_STAY_WINDOW:
                     w1_rows = iter_metric_history[-(2 * _SOFT_STAY_WINDOW):-_SOFT_STAY_WINDOW]
@@ -248,13 +340,13 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     prev_window_metrics = w2
 
             # 日志
-            if (iteration + 1) % log_interval == 0 or iteration == 0:
+            if completed_iteration % log_interval == 0 or iteration_index == 0:
                 cur_lr = algorithm.optimizer.param_groups[0]["lr"]
                 dt = time.time() - iter_start
                 cos_lat = iteration_metrics.get("latent_cosine", 0.0)
                 angle_deg = math.degrees(math.acos(max(-1.0, min(1.0, cos_lat))))
                 logger.info(
-                    f"[LBC-Vision] iter={iteration+1}/{max_iterations}  "
+                    f"[LBC-Vision] iter={completed_iteration}/{max_iterations}  "
                     f"ramp_p={effective_p:.3f}{'(FROZEN)' if algorithm.soft_stay_frozen else ''}  "
                     f"req={requested_p:.3f}  "
                     f"angle={angle_deg:.2f}deg  cos_lat={cos_lat:.4f}  "
@@ -265,12 +357,16 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     f"eff_ratio={iteration_metrics.get('effective_student_ratio', 0):.3f}  "
                     f"nonfinite={iteration_metrics.get('nonfinite_rate', 0):.4f}  "
                     f"grad={iteration_metrics.get('grad_norm', 0):.3f}  lr={cur_lr:.2e}  "
-                    f"total_steps={algorithm.total_steps}  iter_time={dt:.2f}s"
+                    f"sample_steps={algorithm.total_steps}  "
+                    f"optimizer_updates={algorithm.total_steps // agent.num_envs}  "
+                    f"iter_time={dt:.2f}s"
                 )
                 if monitor is not None:
                     try:
                         monitor.put_data({os.getpid(): {
-                            "iteration": iteration + 1,
+                            "iteration": completed_iteration,
+                            "sample_steps": algorithm.total_steps,
+                            "optimizer_updates": algorithm.total_steps // agent.num_envs,
                             "ramp_probability": effective_p,
                             "requested_probability": requested_p,
                             "soft_stay_frozen": int(algorithm.soft_stay_frozen),
@@ -283,10 +379,12 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             # 定时保存。不传 id，让平台框架注入当前模型池 ID（R2 验证过的做法）；
             # 用 iteration 作 id 会让平台模型池 ID / 文件名 / 任务页记录不一致。
             # 标签由 _current_ramp_label 按 ramp 进度自动决定，无需显式里程碑保存。
-            if (iteration + 1) % save_interval == 0 and iteration != last_save_iter:
-                agent.learn(list_sample_data=None)
+            if (
+                completed_iteration % save_interval == 0
+                and completed_iteration != last_save_iter
+            ):
                 agent.save_model()
-                last_save_iter = iteration
+                last_save_iter = completed_iteration
 
         # 最终保存。不传 id，平台注入。标签由 _current_ramp_label 自动决定
         # （完成 100% → visionfull；soft-stay 未恢复 → visionblocked）。
@@ -402,10 +500,8 @@ def _vision_dagger_step(
     # 6. 加权三路损失更新
     update_metrics = algorithm.finish_vision_update(batch, weights)
 
-    # 7. 平台 lifecycle callback（no-op，推进 train_global_step / 模型池 ID）
-    agent.learn(list_sample_data=None)
-
-    # 8. 收集诊断指标
+    # 7. 收集诊断指标。平台 lifecycle callback 由外层 workflow 在每个完整
+    # iteration 结束后统一调用一次，不能在 24 个 inner steps 中重复推进。
     requested_n = int(selection["requested_student"].sum().item())
     takeover_n = int(selection["safety_takeover"].sum().item())
     per_l2 = selection["per_sample_l2"]

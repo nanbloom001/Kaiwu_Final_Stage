@@ -120,8 +120,22 @@ def vision_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
         os.path.join(path, f"model.ckpt-lbc-loco-{model_id}.pkl"),
         os.path.join(path, f"model.ckpt-{model_id}.pkl"),
     ]
+    # Only discover visual checkpoints here.  The preload directory for the
+    # first visual run normally contains both daggerfull and locomotion files.
+    # Feeding either low-level parent into load_vision_bundle() raises because
+    # they intentionally do not contain modules.vision_encoder, and prevents
+    # the caller from reaching vision_parent_candidates().
+    visual_prefixes = tuple(
+        f"model.ckpt-{label}-{model_id}." for label in VISION_PHASE_LABELS
+    )
     discovered = sorted(
-        glob.glob(os.path.join(path, f"model.ckpt-*-{model_id}.*")),
+        (
+            candidate
+            for candidate in glob.glob(
+                os.path.join(path, f"model.ckpt-*-{model_id}.*")
+            )
+            if os.path.basename(candidate).startswith(visual_prefixes)
+        ),
         reverse=True,
     )
     result: list[str] = []

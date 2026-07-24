@@ -4,6 +4,17 @@
 
 ## [未发布]
 
+- **[Standard 视觉长训计数修复]** 视觉 LBC 的平台 lifecycle 从每个 inner
+  environment step 调用一次改为每个完整 outer iteration 调用一次，恢复与上一阶段
+  一致的 iteration / 平台模型 ID 语义；checkpoint 新增
+  `iteration_semantics=completed_outer_iterations_v1`，并兼容修复前的零基视觉包。
+  定时发布改为 225 outer iterations（按平台实测约 9.9 分钟），
+  `max_iterations=20000` 仅作高安全上限，平台任务页控制 10 小时，余弦学习率
+  独立按 14000 iterations 衰减。教师预热延长到 30 分钟，4.5 小时线性 ramp
+  在第 5 小时结束，随后保留约 5 小时纯学生训练。Standard LBC 显式启用
+  `continuous_training`，避免全局 `frame_no` 超过单 episode 的 1250 帧后持续误报
+  `all_done`；底层逐环境 auto-reset 和评估终止语义不变。
+
 - **[Standard 深度视觉蒸馏]** 阶段 4：用 D435i 深度图替换特权 `height_scan256`，
   训练 `VisionEncoder(CNN+LSTM)` 蒸馏视觉能力到冻结的 Actor77。分支
   `codex/depth-vision-distillation` 基于 `codex/standard-dagger-r2@5c5b5ab`
@@ -22,7 +33,11 @@
   replay 会用错误 hidden 历史算 latent；序列回放（8-16 帧 + burn-in）留作独立消融。
   (6) **LSTM 不跨运行恢复**：每次启动 reset 环境 + 清零 hidden，checkpoint 只存
   `lstm_reset_contract`。(7) **父文件显式优先**：`vision_parent_candidates` 让
-  `daggerfull` 显式排在 `locomotion` 之前，不靠偶然排序命中父模型。配置：
+  `daggerfull` 显式排在 `locomotion` 之前，并从视觉续训候选中排除低层父文件。
+  (8) **长训恢复状态**：视觉包增加 ramp clock、LR scheduler、安全阈值/
+  预热样本和 RNG；workflow 从已完成 iteration 继续，不再覆盖为 0。
+  (9) **深度增强显式化**：评估无条件关闭随机增强，Standard 首轮通过
+  `[camera.depth_camera.augmentation] enabled=false` 保持干净控制变量。配置：
   `num_envs=256`（规则上限）；指令域/地形对齐父模型（`vx=[0.3,1.3]`、maze=0%、
   `max_init_terrain_level=9`）；关闭 domain_rand/noise/push 隔离感知迁移。
   **相机外参对齐 21.22° 标准值**：`offset_pos=[0.339871,0.034697,0.075010]` /

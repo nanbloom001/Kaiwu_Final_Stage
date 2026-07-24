@@ -57,8 +57,11 @@ model_spec
 modules.vision_encoder.state_dict  # 视觉学生（本轮训练对象）
 modules.low_level.encoder_state_dict / actor_state_dict   # 冻结教师副本（daggerfull-16288）
 optimizers.vision_distill
-training_state.current_iteration / total_steps
+training_state.current_iteration / iteration_semantics / total_steps
 training_state.ramp_probability / ramp_start_h / ramp_end_h
+training_state.ramp_clock_h
+training_state.safety_threshold / safety_fixed / safety_calibration_l2
+training_state.lr_scheduler_state / rng_state
 training_state.soft_stay_frozen / soft_stay_reason / training_status
 replay.enabled = false             # 首轮不启用单帧 replay（LSTM 不适用）
 lineage.parent_checkpoint_sha256 / teacher_low_level_sha256 / config_sha256 / code_commit
@@ -67,6 +70,18 @@ capabilities.uses_height_scan_at_inference = false
 capabilities.deployable = false
 lstm_reset_contract                # reset mask 语义；hidden 不跨运行恢复
 ```
+
+视觉路径使用：
+
+```text
+iteration_semantics = "completed_outer_iterations_v1"
+```
+
+`current_iteration` 表示已经完整完成的外层 iteration 数；每个外层 iteration
+包含 `num_steps_per_env` 个环境步/视觉优化更新，但只推进一次平台 lifecycle。
+`total_steps` 是累计环境样本数，不是平台模型 ID，也不是 optimizer update 数。
+修复前没有 `iteration_semantics` 的视觉包按旧的零基 loop index 读取，并在恢复时
+加一转换，避免重复最后一轮。
 
 文件数字 ID 完全使用开悟框架传入值，不由业务代码从 iteration 或父模型 ID
 计算。R2 每次保存同一 payload 的阶段文件和评估兼容别名：
@@ -123,9 +138,9 @@ checkpoint，才允许进入现有 Standard exporter 的部署审查。至少需
 
 阶段 4 起，视觉训练恢复包统一为 `kaiwu_train_v1`（§2.1 视觉路径，含
 `modules.vision_encoder`）。`lbc_loco` 顶层 key 格式保留给后续部署导出制品：
-训练期 save 仍会同时落一份 `lbc_loco` 兼容副本（不作为平台探活主文件，因其
-两段标签 `lbc-loco` 不满足探活正则），未来 `lbc_loco` exporter 会改读
-`kaiwu_train_v1.modules.vision_encoder`。
+训练期只保存一个带 `vision*` 标签的 `kaiwu_train_v1` 文件，不再同时复制
+`lbc_loco` 或冻结教师的 `locomotion` 副本。未来 `lbc_loco` exporter 会改读
+`kaiwu_train_v1.modules.vision_encoder` 并单独导出部署制品。
 
 ### 2.4 其他格式
 
