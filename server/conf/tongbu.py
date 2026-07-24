@@ -26,6 +26,11 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+try:
+    from conf.sync_env import load_env_file, setting
+except ModuleNotFoundError:  # Supports `python conf/tongbu.py` from the IDE root.
+    from sync_env import load_env_file, setting
+
 
 BODY_LIMIT = int(os.environ.get("IDE_SYNC_MAX_BODY", 64 * 1024 * 1024))
 SECRET_KEY = ""
@@ -69,13 +74,14 @@ class Workspace:
     api_key: str
 
     def __post_init__(self) -> None:
-        # Keep root lexical/absolute instead of resolving every child symlink.
-        # 保持 root 为文本绝对路径，不解析子路径符号链接，兼容 IDE 中的挂载目录。
-        self.base_dir = self.base_dir.expanduser().absolute()
+        # Canonicalize once, then resolve every target below it. A lexical
+        # relative_to() check is insufficient when an existing symlink under
+        # the sync root points outside that root.
+        self.base_dir = self.base_dir.expanduser().resolve(strict=False)
 
     def resolve(self, raw: Optional[str]) -> Path:
         cleaned = unquote(raw or "").replace("\\", "/").lstrip("/")
-        destination = (self.base_dir / cleaned).absolute()
+        destination = (self.base_dir / cleaned).resolve(strict=False)
         try:
             destination.relative_to(self.base_dir)
         except ValueError as exc:
@@ -301,10 +307,15 @@ def main() -> None:
     parser.add_argument("--host", default=BIND_ADDRESS)
     parser.add_argument("--port", type=int, default=BIND_PORT)
     parser.add_argument("--root", default=os.environ.get("IDE_SYNC_ROOT", "."))
+    parser.add_argument("--env-file", default=os.environ.get("IDE_SYNC_ENV_FILE"), help="Optional dotenv credentials file")
     args = parser.parse_args()
 
     root = Path(args.root).expanduser().absolute()
-    token = os.environ.get("IDE_SYNC_TOKEN") or SECRET_KEY
+    try:
+        env_values = load_env_file(args.env_file)
+    except ValueError as exc:
+        parser.error(str(exc))
+    token = setting(None, "IDE_SYNC_TOKEN", env_values, SECRET_KEY)
     if not token and not AUTH_BYPASS:
         parser.error(
             "missing IDE_SYNC_TOKEN; set the same random value for the server "

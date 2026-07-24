@@ -4,6 +4,11 @@
 
 ## [未发布]
 
+- **[本地同步凭据与路径安全]** 同步客户端和 IDE 端服务支持显式
+  `--env-file`（CLI > 进程环境变量 > env 文件），仓库只提供无凭据
+  `.env.example`。IDE 端解析同步路径时会解析既有符号链接并拒绝任何
+  落到同步根目录外的读取、写入或删除请求。
+
 - **[Standard 视觉长训计数修复]** 视觉 LBC 的平台 lifecycle 从每个 inner
   environment step 调用一次改为每个完整 outer iteration 调用一次，恢复与上一阶段
   一致的 iteration / 平台模型 ID 语义；checkpoint 新增
