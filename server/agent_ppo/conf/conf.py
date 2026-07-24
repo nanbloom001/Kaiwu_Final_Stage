@@ -10,27 +10,7 @@ Author: Tencent AI Arena Authors
 
 import os
 
-try:
-    import toml
-except ModuleNotFoundError:
-    import tomllib
-
-    class _TomlCompat:
-        @staticmethod
-        def load(source):
-            if hasattr(source, "read"):
-                content = source.read()
-                if isinstance(content, bytes):
-                    content = content.decode("utf-8")
-                return tomllib.loads(content)
-            with open(source, "rb") as file:
-                return tomllib.load(file)
-
-    toml = _TomlCompat()
-
-
-def _load_toml(conf_file):
-    return toml.load(conf_file)
+import toml
 
 
 # Valid task types (Isaac Lab native config format)
@@ -87,16 +67,11 @@ class StageConfig:
     num_learning_epochs = 5
     num_mini_batches = 4
     num_steps_per_env = 48
-    clip_param = 0.2
-    entropy_coef = 0.01
-    desired_kl = 0.01
-    init_noise_std = 1.0
     min_normalized_std = [0.05, 0.02, 0.05] * 4
-    max_normalized_std = [1.2, 0.8, 1.2] * 4
 
     # --- Saving
     # 保存 ---
-    model_save_interval = 100
+    model_save_interval = 500
 
 
 class CustomConfig(StageConfig):
@@ -143,54 +118,46 @@ class LocomotionConfig(StageConfig):
     name = "locomotion"
     task_type = "standard"
     algorithm = "ppo"
-    # Use the platform-compatible filename model.ckpt-{id}.pkl.
-    ckpt_name = ""
+    ckpt_name = "model.ckpt-locomotion"
     critic_use_encoder = True
 
 
-class StairInvFineTuneConfig(LocomotionConfig):
-    """Fine-tune the locomotion policy on high-level inverse stairs."""
+class StandardRefDistillConfig(StageConfig):
+    """
+    Stage: standard_ref_distill — distill a mature flat standard teacher into
+    the mainline ActorCriticEncoder locomotion model.
+    阶段：standard_ref_distill —— 将成熟的扁平 standard 参考模型先蒸馏成
+    主线 ActorCriticEncoder 形态的 locomotion ckpt。
 
-    name = "stair_inv_finetune"
+    Why this stage exists:
+      reference ckpt actor input = [proprio(45) | height_scan(256)] = 301
+      mainline LBC teacher needs encoder.* + actor.* keys
+
+    Therefore the reference ckpt cannot be used directly by lbc_loco. This
+    stage makes a compatible model.ckpt-locomotion-{id}.pkl first, then the
+    existing lbc_loco stage can distill depth camera vision normally.
+    """
+
+    name = "standard_ref_distill"
     task_type = "standard"
-    lr = 1e-4
-    num_learning_epochs = 3
-    num_mini_batches = 4
-    num_steps_per_env = 48
+    algorithm = "behavior_distill"
+    ckpt_name = "model.ckpt-locomotion"
+    critic_use_encoder = True
+
+    # Adaptive action-supervised DAgger from the frozen reference actor.
+    lr = 3e-4
+    max_iterations = 6000
+    num_steps_per_env = 24
+    max_grad_norm = 1.0
+    log_interval = 10
     model_save_interval = 100
 
-
-class TrackNavConfig(LocomotionConfig):
-    """Track navigation fine-tune using the existing Encoder policy."""
-
-    name = "nav"
-    task_type = "track"
-    num_goal_obs = 3
-    lr = 1.5e-5
-    num_learning_epochs = 3
-    num_mini_batches = 4
-    num_steps_per_env = 48
-    entropy_coef = 0.0008
-    desired_kl = 0.003
-    init_noise_std = 0.80
-    min_normalized_std = [0.05, 0.025, 0.05] * 4
-    max_normalized_std = [0.24, 0.14, 0.24] * 4
-    model_save_interval = 20
-
-
-class TrackNavOpt5DebugConfig(TrackNavConfig):
-    """ST7-Opt5 reset diagnostics; checkpoints from this stage are disposable."""
-
-    name = "navopt5debug"
-    parent_checkpoint = "ST7-Opt3 30min (evaluation 595729)"
-    model_save_interval = 1000
-
-
-class TrackNavOpt5BConfig(TrackNavConfig):
-    """ST7-Opt5B: conservative hard-segment replay from Opt3-30min."""
-
-    name = "navopt5b"
-    parent_checkpoint = "ST7-Opt3 30min (evaluation 595729)"
+    # Flat reference standard model dimensions.
+    teacher_num_obs = 301
+    teacher_num_critic_obs = 316
+    teacher_actor_hidden_dims = [512, 256, 128]
+    teacher_critic_hidden_dims = [512, 256, 128]
+    teacher_activation = "elu"
 
 
 class LBCLocoConfig(StageConfig):
@@ -254,152 +221,6 @@ class LBCLocoConfig(StageConfig):
     teacher_actor_activation = "elu"
 
 
-class HJCNew10288LBCLocoConfig(LBCLocoConfig):
-    """Legacy visual-stage label for an encoder-based Standard teacher.
-
-    Compatibility is determined from checkpoint keys and tensor shapes, not
-    from the numeric ID. A checkpoint with encoder.* and a 77-D Actor is valid;
-    a legacy 301-D flat checkpoint is not.
-    """
-
-    name = "hjcnew10288_lbc_loco"
-    task_type = "standard"
-    ckpt_name = "model.ckpt-hjcnew"
-    num_goal_obs = 0
-
-
-class StandardRefDistillConfig(LocomotionConfig):
-    """Optional bridge for a legacy 301-D flat Standard teacher.
-
-    This is not the active 10288 path. Use it only when checkpoint inspection
-    proves that the selected teacher has no encoder.* keys.
-    """
-
-    name = "standard_ref_distill"
-    algorithm = "behavior_distill"
-    parent_checkpoint = "legacy flat Standard ActorCritic checkpoint"
-    ckpt_name = "model.ckpt-locomotion"
-
-    lr = 3e-4
-    num_steps_per_env = 24
-    max_iterations = 5000
-    max_grad_norm = 1.0
-    log_interval = 50
-    model_save_interval = 500
-
-    teacher_num_obs = 301
-    teacher_num_critic_obs = 316
-    teacher_actor_hidden_dims = [512, 256, 128]
-    teacher_critic_hidden_dims = [512, 256, 128]
-    teacher_activation = "elu"
-
-
-class StandardDistill1Config(LBCLocoConfig):
-    """Depth-camera LBC from the platform-selected Standard 10288 teacher.
-
-    Platform inspection shows an ActorCriticEncoder checkpoint with
-    encoder.*, actor.*, critic_encoder.* and critic.* keys. LBC consumes only
-    encoder.* and actor.*; critic-side keys are intentionally ignored.
-    """
-
-    name = "standard_distill_1"
-    task_type = "standard"
-    num_goal_obs = 0
-    parent_checkpoint = "platform Standard ActorCriticEncoder checkpoint 10288"
-    ckpt_name = "model.ckpt-standard"
-
-
-class StandardDistill2StairConfig(StandardDistill1Config):
-    """STD-D2-Stair: stair-heavy visual continuation from Standard D1."""
-
-    name = "standard_distill_2_stair"
-    parent_checkpoint = "current accepted Standard visual student checkpoint"
-
-
-class StandardDistill3ActionConfig(LBCLocoConfig):
-    """Continue from D2 and repair stair action imitation."""
-
-    name = "standard_distill_3_action"
-    task_type = "standard"
-    algorithm = "lbc_loco"
-    ckpt_name = "model.ckpt-standard-distill-3-action"
-    parent_checkpoint = "D2-40min visual student checkpoint"
-
-
-class StandardVisualPPO1HeadingConfig(LBCLocoConfig):
-    """STD-D4A: visual PPO heading fine-tune from the best D3A student."""
-
-    name = "standard_visual_ppo_1_heading"
-    task_type = "standard"
-    algorithm = "visual_ppo"
-    model_class = "VisualActorCritic"
-    ckpt_name = "model.ckpt-standard-visual-ppo-1-heading"
-    parent_checkpoint = "best D3A visual student checkpoint"
-
-    lr = 1.0e-4
-    schedule = "fixed"
-    min_learning_rate = 1.0e-4
-    max_learning_rate = 1.0e-4
-    num_steps_per_env = 8
-    num_learning_epochs = 2
-    num_mini_batches = 4
-    clip_param = 0.10
-    entropy_coef = 0.001
-    desired_kl = None
-    init_noise_std = 0.25
-    min_normalized_std = [0.05] * 12
-    max_normalized_std = [0.50] * 12
-    model_save_interval = 50
-    action_anchor_ema = 0.0
-
-
-class StandardVisualPPO2D5Config(StandardVisualPPO1HeadingConfig):
-    """STD-D5: conservative Visual PPO with scheduled D3 action anchoring."""
-
-    name = "standard_visual_ppo_2_d5"
-    ckpt_name = "model.ckpt-standard-visual-ppo-2-d5"
-    parent_checkpoint = "best D3A visual student checkpoint"
-
-    lr = 2.0e-5
-    schedule = "fixed"
-    min_learning_rate = 2.0e-5
-    max_learning_rate = 2.0e-5
-
-    action_anchor_coef = 1.0
-    action_anchor_ema = 0.0
-    action_anchor_schedule_enabled = True
-    action_anchor_schedule_total_steps = 1000
-    action_anchor_schedule_points = (
-        (0.00, 1.00),
-        (0.20, 1.00),
-        (0.40, 0.75),
-        (0.60, 0.50),
-        (0.80, 0.25),
-        (1.00, 0.10),
-    )
-    model_save_interval = 100
-
-
-class TrackLBCLocoConfig(LBCLocoConfig):
-    """Depth-camera distillation for the UWB-guided TrackNav teacher."""
-
-    name = "track_lbc_loco"
-    task_type = "track"
-    ckpt_name = "model.ckpt-track-lbc-loco"
-    num_goal_obs = 3
-
-
-class TrackLBCLocoD2Config(TrackLBCLocoConfig):
-    """ST9-Opt3-D2 action-aware, closed-loop visual distillation.
-
-    Parent checkpoint: ST9-Opt3-D1 visual student. The architecture and output
-    checkpoint label remain compatible with the existing Track LBC model.
-    """
-
-    name = "track_lbc_loco_d2"
-    parent_checkpoint = "ST9-Opt3-D1 visual student"
-
-
 class Config:
     """
     Unified config entry point.
@@ -411,17 +232,14 @@ class Config:
     设置 ``Config.CURRENT`` 为某个 StageConfig 子类，然后通过
     ``Config.CURRENT.lr``、``Config.CURRENT.num_mini_batches`` 等读取超参数。
 
-    Training and evaluation both use the explicitly selected ``CURRENT`` stage.
-    Platform evaluation TOML describes the environment, not the checkpoint
-    architecture, so it must not silently switch a Track LBC model back to the
-    77-D standard LBC actor.
+    Auto stage inference (based on TOML env_conf.task_name):
+        task_name = "Unitree-Go2-Velocity"        + mode=standard -> LocomotionConfig
+        task_name = "Unitree-Go2-Velocity-Camera" + mode=standard -> LBCLocoConfig
     """
 
-    # Explicit stage selector for both training and evaluation.
-    # 训练和评估均显式使用该阶段，避免环境名称误改模型结构。
-    # STD-D5 is the active platform training stage. D1-D4 remain reproducible
-    # through their independent TOML files.
-    CURRENT = StandardVisualPPO2D5Config
+    # Default stage; can be overridden by TOML env_conf.task_name during eval.
+    # 默认阶段；eval 时可由 TOML env_conf.task_name 覆盖。
+    CURRENT = StandardRefDistillConfig
 
     @staticmethod
     def load_conf(logger):
@@ -473,44 +291,21 @@ class Config:
             usr_conf["env"]["num_envs"] = 1
             logger.info("KAIWU_TRAIN_TEST detected, set num_envs to 1")
 
+        # Eval-time stage override: infer stage from task_name and terrain mode.
+        # 评估时按 task_name + terrain mode 推断 stage，覆盖 conf.py 顶部的 CURRENT，
+        # 从而同一份代码可在平台上自动识别 loco / lbc_loco 两条评估路径。
         if is_eval:
-            task_name = usr_conf.get("env_conf", {}).get("task_name", "")
-            mode = usr_conf.get("terrain", {}).get("mode", "")
-            logger.info(
-                f"[eval] Keep explicit stage '{stage.name}' for task "
-                f"'{task_name}' (terrain.mode='{mode}')"
-            )
-
-            # The platform evaluation TOML does not necessarily carry the
-            # camera mount calibration. Keep the explicitly selected model
-            # stage and inject its training-time camera section so evaluation
-            # uses the same geometry as visual distillation.
-            train_toml = (
-                f"agent_ppo/conf/train_env_conf_{task_type}_{stage.name}.toml"
-            )
-            if os.path.exists(train_toml):
-                try:
-                    train_conf = _load_toml(train_toml)
-                    camera_conf = train_conf.get("camera")
-                    if camera_conf:
-                        existing = usr_conf.get("camera")
-                        usr_conf["camera"] = (
-                            _deep_merge(existing, camera_conf)
-                            if isinstance(existing, dict)
-                            else camera_conf
-                        )
-                        logger.info(
-                            f"[eval] Injected [camera] override from {train_toml}"
-                        )
-                except Exception as exc:
-                    logger.warning(
-                        f"[eval] Failed to inject [camera] from {train_toml}: {exc}"
-                    )
+            inferred = _infer_stage_from_task_name(usr_conf, logger)
+            if inferred is not None and inferred is not stage:
+                logger.info(
+                    f"[eval] Override Config.CURRENT: {stage.name} -> {inferred.name} "
+                    f"(inferred from TOML task_name)"
+                )
+                Config.CURRENT = inferred
+                stage = inferred
+                task_type = stage.task_type
 
         logger.info(f"Stage: {stage.name}, task_type: {task_type}, model: {stage.model_class}")
-        parent_checkpoint = getattr(stage, "parent_checkpoint", None)
-        if parent_checkpoint:
-            logger.info(f"Parent checkpoint required: {parent_checkpoint}")
 
         return usr_conf, usr_conf_file, is_eval, stage
 
@@ -534,16 +329,14 @@ def _infer_stage_from_task_name(usr_conf, logger):
 
     terrain_conf = usr_conf.get("terrain", {})
     mode = str(terrain_conf.get("mode", "standard")).lower()
-    has_camera = "Camera" in task_name
-    if mode == "track":
-        return TrackLBCLocoConfig if has_camera else TrackNavConfig
     if mode != "standard":
         logger.warning(
-            f"[eval] Unsupported terrain.mode='{mode}', "
-            f"fallback to Config.CURRENT"
+            f"[eval] Only terrain.mode='standard' is supported; "
+            f"got '{mode}', fallback to Config.CURRENT"
         )
         return None
 
+    has_camera = "Camera" in task_name
     return LBCLocoConfig if has_camera else LocomotionConfig
 
 

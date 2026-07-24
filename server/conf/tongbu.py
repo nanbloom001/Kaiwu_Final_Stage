@@ -28,11 +28,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 
 BODY_LIMIT = int(os.environ.get("IDE_SYNC_MAX_BODY", 64 * 1024 * 1024))
-SECRET_KEY = "fwwb-new-codex-sync-20260512-5a7f58a98ddf4e9c9b4c9e1b6a2d8f41"
+SECRET_KEY = ""
 BIND_ADDRESS = "0.0.0.0"
 BIND_PORT = 8765
 EXTERNAL_ENDPOINT = "https://tencentarena.com/p5/ide/18005/proxy/8765"
-AUTH_BYPASS = True
+AUTH_BYPASS = os.environ.get("IDE_SYNC_DISABLE_AUTH", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 IGNORED_FOLDERS = {
     ".git",
     ".mypy_cache",
@@ -301,14 +305,19 @@ def main() -> None:
 
     root = Path(args.root).expanduser().absolute()
     token = os.environ.get("IDE_SYNC_TOKEN") or SECRET_KEY
+    if not token and not AUTH_BYPASS:
+        parser.error(
+            "missing IDE_SYNC_TOKEN; set the same random value for the server "
+            "and local_sync_client.py"
+        )
     server = ThreadingHTTPServer((args.host, args.port), RequestDispatcher)
     server.workspace = Workspace(base_dir=root, api_key=token)  # type: ignore[attr-defined]
 
     print(f"IDE sync server: http://{args.host}:{args.port}")
     print(f"Root: {root}")
-    print(f"Token: {token}")
+    print(f"Token auth: {'disabled by environment' if AUTH_BYPASS else 'enabled'}")
     print(f"Fixed outside URL: {EXTERNAL_ENDPOINT}/")
-    print(f"Fixed health URL: {EXTERNAL_ENDPOINT}/health?sync_token={token}")
+    print(f"Fixed health URL: {EXTERNAL_ENDPOINT}/health")
     server.serve_forever()
 
 
