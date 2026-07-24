@@ -55,17 +55,14 @@ SKIP_SUFFIXES = {
 SYNC_DIR_NAMES = ("agent_diy", "agent_ppo", "conf", "isaac_env")
 GET_UPLOAD_CHUNK_SIZE = 4096
 DEFAULT_SYNC_URL = "https://tencentarena.com/p5/ide/18005/proxy/8765"
-DEFAULT_SYNC_TOKEN = "fwwb-new-codex-sync-20260512-5a7f58a98ddf4e9c9b4c9e1b6a2d8f41"
+DEFAULT_SYNC_TOKEN = ""
 DEFAULT_COOKIE_FILE = Path.home() / ".fwwb_ide_proxy_cookie"
 DEFAULT_PROXY_COOKIE_NAME = "kaiwu-token"
 PROXY_COOKIE_NAME_ALIASES = ("kaiwu-token", "kaiwu_token")
 
-# Paste your Tencent Arena Cookie here if terminal paste is inconvenient.
-# Example / 示例：
-# USER_PROXY_COOKIE = "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3ODQyOTU0ODguNTcyMDg0LCJpYXQiOjE3ODM2OTA2ODguNTcyMDg0LCJpc3MiOiJrYWl3dSIsImN1c3RvbSI6NTkxNDB9.kpurv1xq8bffNMPBT-VGVwZNtfAR3-mWf24_oQuJ0iVltPsP8qAfMkI5SX_mG93jLCoH0KyJduQ8BYKXGU6lBg"
-# USER_PROXY_COOKIE = "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3ODQyOTU0ODguNTcyMDg0LCJpYXQiOjE3ODM2OTA2ODguNTcyMDg0LCJpc3MiOiJrYWl3dSIsImN1c3RvbSI6NTkxNDB9.kpurv1xq8bffNMPBT-VGVwZNtfAR3-mWf24_oQuJ0iVltPsP8qAfMkI5SX_mG93jLCoH0KyJduQ8BYKXGU6lBg"
-# USER_PROXY_COOKIE = "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3ODQyOTU0ODguNTcyMDg0LCJpYXQiOjE3ODM2OTA2ODguNTcyMDg0LCJpc3MiOiJrYWl3dSIsImN1c3RvbSI6NTkxNDB9.kpurv1xq8bffNMPBT-VGVwZNtfAR3-mWf24_oQuJ0iVltPsP8qAfMkI5SX_mG93jLCoH0KyJduQ8BYKXGU6lBg"
-USER_PROXY_COOKIE = "eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3ODQyOTU0ODguNTcyMDg0LCJpYXQiOjE3ODM2OTA2ODguNTcyMDg0LCJpc3MiOiJrYWl3dSIsImN1c3RvbSI6NTkxNDB9.kpurv1xq8bffNMPBT-VGVwZNtfAR3-mWf24_oQuJ0iVltPsP8qAfMkI5SX_mG93jLCoH0KyJduQ8BYKXGU6lBg"
+# Credentials must come from CLI/environment variables, the local cache, or
+# the interactive prompt. Never paste a real token or Cookie into this file.
+USER_PROXY_COOKIE = ""
 
 
 class TencentProxyAuthError(RuntimeError):
