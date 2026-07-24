@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import random
 import statistics
 from collections import deque
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,6 +32,8 @@ from agent_ppo.checkpoint_io import (
     vision_parent_candidates,
     vision_phase_label,
 )
+
+_SAFETY_CALIBRATION_SAMPLES = 256
 
 
 class AlgorithmLBC:
@@ -91,17 +95,23 @@ class AlgorithmLBC:
         # Training state
         self.current_iteration = 0
         self.total_steps = 0
+        self.resume_loaded = False
 
         # 线性 ramp 调度状态（阶段 4）。每次启动 reset 环境 + 清零 LSTM hidden，
         # 因此这里只存 ramp 进度和软停留诊断，不存任何 LSTM 状态。
         # ramp_probability 由 workflow 按 elapsed_h 重算并写回；checkpoint 只记录
         # 断点，让续训从相同 ramp 比例继续（而不依赖墙钟时间）。
         self.ramp_probability = 0.0
-        self.ramp_start_h = 0.33      # 默认：前 20min 预检后开始 ramp
-        self.ramp_end_h = 4.83        # 默认：约 4.5h ramp 到 100%
+        self.ramp_start_h = 0.50      # 默认：前 30min 教师预热后开始 ramp
+        self.ramp_end_h = 5.00        # 默认：约 4.5h ramp 到 100%
+        self.ramp_clock_h = 0.0
         self.soft_stay_frozen = False
         self.soft_stay_reason: Optional[str] = None
         self.training_status = "initialized"
+        self.safety_threshold = float("inf")
+        self.safety_fixed = False
+        self.safety_calibration_l2: list[float] = []
+        self.lr_scheduler_state: Optional[dict] = None
 
         # 血缘与审计（运行时不做字节级 SHA 门禁，只记录用于追溯）
         self.parent_checkpoint_sha256 = "unknown"
@@ -726,6 +736,34 @@ class AlgorithmLBC:
             "goal_dim": 0,
         }
 
+    @staticmethod
+    def _capture_rng_state() -> dict:
+        """Capture driver-mask and augmentation RNG state for safe resume."""
+        state = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    @staticmethod
+    def _restore_rng_state(state: Any) -> None:
+        """Restore RNG state saved by _capture_rng_state()."""
+        if not isinstance(state, dict):
+            return
+        if "python" in state:
+            random.setstate(state["python"])
+        if "numpy" in state:
+            np.random.set_state(state["numpy"])
+        if "torch_cpu" in state:
+            torch.set_rng_state(state["torch_cpu"].cpu())
+        if torch.cuda.is_available() and "torch_cuda" in state:
+            torch.cuda.set_rng_state_all(
+                [value.cpu() for value in state["torch_cuda"]]
+            )
+
     def vision_bundle_payload(
         self,
         *,
@@ -772,12 +810,21 @@ class AlgorithmLBC:
             },
             "training_state": {
                 "current_iteration": self.current_iteration,
+                "iteration_semantics": "completed_outer_iterations_v1",
                 "total_steps": self.total_steps,
                 "ramp_probability": self.ramp_probability,
                 "ramp_start_h": self.ramp_start_h,
                 "ramp_end_h": self.ramp_end_h,
+                "ramp_clock_h": self.ramp_clock_h,
                 "soft_stay_frozen": self.soft_stay_frozen,
                 "soft_stay_reason": self.soft_stay_reason,
+                "safety_threshold": self.safety_threshold,
+                "safety_fixed": self.safety_fixed,
+                "safety_calibration_l2": list(
+                    self.safety_calibration_l2[-_SAFETY_CALIBRATION_SAMPLES:]
+                ),
+                "lr_scheduler_state": self.lr_scheduler_state,
+                "rng_state": self._capture_rng_state(),
                 "training_status": self.training_status,
             },
             "replay": {
@@ -868,19 +915,55 @@ class AlgorithmLBC:
         if isinstance(opt_state, dict):
             try:
                 self.optimizer.load_state_dict(opt_state)
-            except ValueError:
-                pass  # optimizer 不匹配时静默忽略
+                self.learning_rate = float(
+                    self.optimizer.param_groups[0]["lr"]
+                )
+            except ValueError as exc:
+                print(
+                    "[AlgorithmLBC] WARNING: optimizer state was not restored: "
+                    f"{exc}"
+                )
 
         # Ramp / training state（不恢复 LSTM hidden）
         state = ckpt.get("training_state", {})
-        self.current_iteration = int(state.get("current_iteration", 0))
+        stored_iteration = int(state.get("current_iteration", 0))
+        if state.get("iteration_semantics") == "completed_outer_iterations_v1":
+            self.current_iteration = stored_iteration
+        else:
+            # 兼容本次修复前已生成的视觉包：旧 workflow 保存的是从 0 开始的
+            # 当前 loop index，而不是已完成次数。转换后续训不会重复最后一轮。
+            self.current_iteration = max(0, stored_iteration + 1)
         self.total_steps = int(state.get("total_steps", 0))
         self.ramp_probability = float(state.get("ramp_probability", 0.0))
         self.ramp_start_h = float(state.get("ramp_start_h", self.ramp_start_h))
         self.ramp_end_h = float(state.get("ramp_end_h", self.ramp_end_h))
+        self.ramp_clock_h = float(
+            state.get(
+                "ramp_clock_h",
+                self.ramp_start_h
+                + self.ramp_probability * (self.ramp_end_h - self.ramp_start_h)
+                if self.ramp_probability > 0.0
+                else 0.0,
+            )
+        )
         self.soft_stay_frozen = bool(state.get("soft_stay_frozen", False))
         self.soft_stay_reason = state.get("soft_stay_reason")
+        self.safety_threshold = float(
+            state.get("safety_threshold", float("inf"))
+        )
+        self.safety_fixed = bool(state.get("safety_fixed", False))
+        self.safety_calibration_l2 = [
+            float(value)
+            for value in state.get("safety_calibration_l2", [])
+            if isinstance(value, (int, float))
+        ][-_SAFETY_CALIBRATION_SAMPLES:]
+        scheduler_state = state.get("lr_scheduler_state")
+        self.lr_scheduler_state = (
+            scheduler_state if isinstance(scheduler_state, dict) else None
+        )
+        self._restore_rng_state(state.get("rng_state"))
         self.training_status = str(state.get("training_status", "resumed"))
+        self.resume_loaded = True
 
         # LSTM reset 契约（仅记录，不恢复 hidden）
         contract = ckpt.get("lstm_reset_contract")
@@ -929,6 +1012,33 @@ class AlgorithmLBC:
         candidates = vision_checkpoint_candidates(path, model_id)
         for candidate in candidates:
             if os.path.exists(candidate):
-                self.load_vision_bundle(candidate)
-                return candidate
+                payload = torch.load(
+                    candidate, weights_only=False, map_location=self.device
+                )
+                modules = payload.get("modules", {}) if isinstance(payload, dict) else {}
+                vision_section = (
+                    modules.get("vision_encoder", {})
+                    if isinstance(modules, dict)
+                    else {}
+                )
+                if is_kaiwu_train_bundle(payload) and isinstance(
+                    vision_section.get("state_dict"), dict
+                ):
+                    self.load_vision_bundle(candidate)
+                    return candidate
+                if (
+                    isinstance(payload, dict)
+                    and payload.get("format") == "lbc_loco"
+                    and isinstance(payload.get("vision_encoder_state_dict"), dict)
+                ):
+                    self.load(
+                        candidate,
+                        expected_format="lbc_loco",
+                        load_optimizer=True,
+                    )
+                    self.resume_loaded = True
+                    return candidate
+                # A low-level daggerfull/locomotion bundle is a parent, not a
+                # visual resume. Skip it so _load_lbc_loco can reach
+                # load_parent_bundle().
         return None

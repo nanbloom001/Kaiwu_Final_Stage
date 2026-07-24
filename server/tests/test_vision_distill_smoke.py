@@ -20,8 +20,14 @@ Run:  cd server && python -m pytest tests/test_vision_distill_smoke.py -v
 import os
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 on older Kaiwu images
+    import tomli as tomllib
 
 # Make `agent_ppo` importable when run from server/.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -88,6 +94,38 @@ class ProbeRegexTests(unittest.TestCase):
         self.assertEqual(cands[0], "/tmp/model.ckpt-daggerfull-16288.pkl")
         self.assertEqual(cands[1], "/tmp/model.ckpt-locomotion-16288.pkl")
 
+    def test_visual_resume_candidates_exclude_low_level_parent_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for filename in (
+                "model.ckpt-daggerfull-16288.pkl",
+                "model.ckpt-locomotion-16288.pkl",
+            ):
+                Path(directory, filename).touch()
+            names = {
+                os.path.basename(candidate)
+                for candidate in vision_checkpoint_candidates(directory, "16288")
+            }
+        self.assertNotIn("model.ckpt-daggerfull-16288.pkl", names)
+        self.assertNotIn("model.ckpt-locomotion-16288.pkl", names)
+
+    def test_standard_first_visual_run_disables_random_depth_augmentation(self):
+        config_path = (
+            Path(__file__).resolve().parents[1]
+            / "agent_ppo"
+            / "conf"
+            / "train_env_conf_standard_lbc_loco.toml"
+        )
+        with config_path.open("rb") as stream:
+            config = tomllib.load(stream)
+        augmentation = config["camera"]["depth_camera"]["augmentation"]
+        self.assertFalse(augmentation["enabled"])
+        self.assertTrue(config["custom_parameters"]["continuous_training"])
+        self.assertEqual(config["lbc_loco"]["max_iterations"], 20000)
+        self.assertEqual(config["lbc_loco"]["save_interval"], 225)
+        self.assertEqual(config["lbc_loco"]["lr_scheduler_iterations"], 14000)
+        self.assertAlmostEqual(config["lbc_loco"]["ramp_start_h"], 0.50)
+        self.assertAlmostEqual(config["lbc_loco"]["ramp_end_h"], 5.00)
+
 
 @unittest.skipUnless(HAS_TORCH, "torch not installed; run on platform/CI")
 class VisionCodecTests(unittest.TestCase):
@@ -132,6 +170,11 @@ class VisionCodecTests(unittest.TestCase):
         algo.current_iteration = 1234
         algo.total_steps = 999
         algo.ramp_probability = 0.42
+        algo.ramp_clock_h = 2.25
+        algo.safety_threshold = 0.73
+        algo.safety_fixed = True
+        algo.safety_calibration_l2 = [0.1, 0.2, 0.3]
+        algo.lr_scheduler_state = {"last_epoch": 1234, "_step_count": 1235}
         algo.parent_checkpoint_sha256 = "deadbeef" * 8
         algo.training_status = "running"
 
@@ -143,6 +186,11 @@ class VisionCodecTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "model.ckpt-visionhalf-55.pkl")
             sha = algo.save_vision_bundle(path, platform_model_id=55, ramp_label="visionhalf")
+            payload = torch.load(path, weights_only=False, map_location="cpu")
+            self.assertEqual(
+                payload["training_state"]["iteration_semantics"],
+                "completed_outer_iterations_v1",
+            )
 
             # load into a fresh algorithm
             algo2 = self._make_algorithm()
@@ -159,8 +207,34 @@ class VisionCodecTests(unittest.TestCase):
         # ramp / training state restored
         self.assertEqual(algo2.current_iteration, 1234)
         self.assertAlmostEqual(algo2.ramp_probability, 0.42, places=6)
+        self.assertAlmostEqual(algo2.ramp_clock_h, 2.25, places=6)
+        self.assertAlmostEqual(algo2.safety_threshold, 0.73, places=6)
+        self.assertTrue(algo2.safety_fixed)
+        self.assertEqual(algo2.safety_calibration_l2, [0.1, 0.2, 0.3])
+        self.assertEqual(algo2.lr_scheduler_state["last_epoch"], 1234)
+        self.assertTrue(algo2.resume_loaded)
         self.assertEqual(algo2.parent_checkpoint_sha256, "deadbeef" * 8)
         self.assertEqual(algo2.training_status, "running")
+
+    def test_legacy_zero_based_iteration_is_converted_on_load(self):
+        import torch
+        import tempfile
+
+        algo = self._make_algorithm()
+        algo.current_iteration = 249
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "model.ckpt-visionteacher-55.pkl")
+            algo.save_vision_bundle(
+                path, platform_model_id=55, ramp_label="visionteacher"
+            )
+            payload = torch.load(path, weights_only=False, map_location="cpu")
+            payload["training_state"].pop("iteration_semantics")
+            torch.save(payload, path)
+
+            restored = self._make_algorithm()
+            restored.load_vision_bundle(path)
+
+        self.assertEqual(restored.current_iteration, 250)
 
     def test_bundle_does_not_store_lstm_hidden(self):
         """P1 issue 7: LSTM hidden must NOT be in the checkpoint."""
