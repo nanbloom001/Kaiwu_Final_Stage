@@ -18,24 +18,27 @@
 
 ## 活动基线
 
-- **当前功能分支入口**：`StandardRefDistillConfig`（`STD-DAGGER-R2`），从原始
-  Standard 10288 flat301 教师重新开始，用一次 6000-iteration、3 小时任务自适应
-  完成 0/25/50/75/100% 逐环境 DAgger，产出不可部署的 Actor77 特权教师。
-- R2 由操作者手动确认预训练教师身份，不做字节级 SHA 门禁；仍校验教师
-  key/shape、成功加载与冻结状态。命令和地形分布保持不变，首轮关闭随机化/
-  噪声/push；它不读取
-  depth、不执行 PPO，也不修改 Goal/UWB/Track/部署端。
-- 平台任务页选择原始 10288；未提前注入时 workflow 从
-  `/data/pre_model/ckpt` 显式加载 10288。后续选择 `kaiwu_train_v1` 文件可恢复
-  optimizer、DAgger 阶段、reservoir 和 RNG。
-- `StandardDistill1Config` 到 D5 继续作为已经尝试过的视觉路线保留；它们不是
-  R1 的父 checkpoint。D1 需要 encoder-based bridge artifact，不能直接加载原始
-  flat301 文件。
-- R2 训练恢复格式统一为 `kaiwu_train_v1`；视觉和高层模块以后在同一 schema
-  的 `modules` 下扩展。训练包不能交给当前部署导出器。
-- 文件数字 ID 完全由平台注入，不再用 `10288 + iteration` 计算。每 100
-  iterations 保存阶段英文文件和同 ID 的 `locomotion` 评估别名；阶段最大预算
-  到期时从最佳点回退后强制晋升并写入 warning。
+- **当前功能分支入口**：`StandardVisualPPOConfig`
+  （`visual_policy_optimization`），从冻结的
+  `model.ckpt-visionfull-28401.pkl` 初始化深度视觉 Encoder 与 Actor77，
+  使用 recurrent PPO 改善停止、低速、转向和 command 跟踪。
+- 单次平台任务按墙钟执行 30 分钟 Critic 预热、60 分钟 Actor 微调和
+  90 分钟 LSTM/output-head 微调；CNN、S0 anchor 和部署接口始终冻结。任务页
+  控制实际 3 小时时长，workflow 约每 10 分钟请求一次 checkpoint。
+- Actor 只使用 `proprio45 + depth180x320x1 + LSTM state`；训练 Critic 可使用
+  `height_scan` 等特权状态。Camera 评估只加载视觉 Encoder 与低层 Actor，
+  不加载 Critic 或 S0 anchor。
+- 阶段 2 的 R2（`daggerfull-16288`）和阶段 4 的视觉蒸馏
+  （`visionfull-28401`）已作为父阶段合入 `main`。R2 仍是不可部署的
+  height-scan 教师，阶段 4 的 `visionfull-28401` 是当前视觉回滚基线。
+- D1–D5 是已被阶段 4 重建路线取代的历史实验。现存历史 TOML、测试和归档
+  Tag 仅用于复盘，不是当前入口；其 checkpoint、奖励、学习率、锚定衰减和
+  训练调度不得作为当前阶段参数来源。
+- 所有训练恢复包继续使用 `kaiwu_train_v1`，且
+  `capabilities.deployable=false`；当前部署导出器只接受单独审查生成的
+  `lbc_loco` 制品。
+- 文件数字 ID 完全由平台注入。Stage 5 保存
+  `rlcritic`/`rlactor`/`rlfull` 纯字母标签，不能从 iteration 人工计算 ID。
 - TrackNav 保留 Opt3 基线 + J9 通用学习率接口修复 + Opt4 角速度保护；`navopt5debug` 与 `navopt5b` 作为独立可复现实验阶段保留，不是默认入口。
 - 含 ST7-Opt2B `dynamic_tilt_risk`、ST7-Opt3 `goal_noise`、行为蒸馏/LBC 机制（在 `codex/st7-opt2a` 并入主干）。
 
@@ -56,8 +59,8 @@ Cookie 失效时用 `--refresh-cookie` 强制跳过缓存和旧兼容值重新�
 `--dry-run` 仍会连接腾讯代理并读取 `/health`、`/manifest`，但不写远程。
 当前在线状态必须标记为“待刷新 Cookie 验证”，不能由离线检查推断已经可同步。
 
-R2 的完整调度、污染保护和验收见
-[`../shared/分析记录/2026-07-23_STD-DAGGER-R2执行卡.md`](../shared/分析记录/2026-07-23_STD-DAGGER-R2执行卡.md)。
+当前阶段的 S0 冻结、三小时训练和 S0/S1 验收见
+[`../shared/分析记录/2026-07-24_Standard视觉学生独立化与发布冻结计划.md`](../shared/分析记录/2026-07-24_Standard视觉学生独立化与发布冻结计划.md)。
 
 ## 变更记录
 

@@ -3,7 +3,7 @@
 # Replay buffer configurations
 # 样本池容量
 preload_model_dir = "/data/pre_model/ckpt"
-preload_model_id = 10288
+preload_model_id = 28401
 preload_model = true
 replay_buffer_capacity = 4096
 
@@ -62,8 +62,11 @@ modelpool_max_save_model_count = 1
 # Whether to enable the preload model function. If enabled (true), the model specified by preload_model_id will be loaded as the initial model in the preload_model_dir directory; if disabled (false), no preloading will be performed.
 # 是否启用预加载模型功能，若开启(true)，将在preload_model_dir目录下加载由preload_model_id指定的模型作为初始模型；若关闭(false)，则不进行预加载。
 
-# The relative path of the preloaded model folder (the variable name {agent_name} refers to the agent_algorithm name directory in the code package). It is only effective when preload_model=true. When the preload model function is enabled, you need to create a new ckpt folder under the agent_algorithm name directory in the code package and place the model file (.pkl) there.
-# 预加载模型文件夹相对路径(变量名{agent_name}指代码包中agent_算法名目录)，仅在preload_model=true时生效；当开启预加载模型功能时，需要在代码包中agent_算法名目录下新建ckpt文件夹，将模型文件（.pkl）放置此即可。
+# This project uses the platform-mounted absolute preload_model_dir declared
+# above (`/data/pre_model/ckpt`). A package-relative ckpt directory may exist
+# in generic Kaiwu templates, but it is not the reviewed path for this stage.
+# 本项目使用上方声明的平台挂载绝对目录 `/data/pre_model/ckpt`。开悟通用模板
+# 可能也支持代码包内相对 ckpt 目录，但本阶段未采用、也未验证该路径。
 
 # The identification ID of the preloaded model (here refers to the number of model training steps). This ID corresponds to the number of training steps recorded in the model file name. It only takes effect when preload_model=true.
 # Note that it is forbidden to modify the original model file name, otherwise the model preloading process will fail.
@@ -71,4 +74,4 @@ modelpool_max_save_model_count = 1
 # 注意，禁止修改原始模型文件名，否则将导致模型预加载流程失败。
 
 eval_model_dir = "/data/projects/legged_robot_competition_26/ckpt"
-eval_model_id = "10288"
+eval_model_id = "28401"

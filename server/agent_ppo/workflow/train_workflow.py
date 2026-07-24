@@ -112,6 +112,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
         return behavior_distill_workflow(envs, agents, logger=logger, monitor=monitor, *args, **kwargs)
 
+    if getattr(agent, "is_visual_ppo", False):
+        from agent_ppo.workflow.visual_ppo_workflow import (
+            workflow as visual_ppo_workflow,
+        )
+
+        return visual_ppo_workflow(
+            envs, agents, logger=logger, monitor=monitor, *args, **kwargs
+        )
+
     # Initialize training state
     # 初始化训练状态
     (
@@ -264,6 +273,9 @@ def _process_env_step_result(data, episode, logger):
         raise Exception(f"episode {episode}, obs is None after processing!")
 
     dones = torch.logical_or(terminated, truncated)
+    if not isinstance(infos, dict):
+        infos = {}
+    infos["hard_terminated"] = terminated
     return frame_no, obs, critic_obs, rewards, dones, infos
 
 
@@ -307,6 +319,11 @@ def _update_transition_data(
     transition.critic_observations = critic_obs
     transition.rewards = rewards.clone()
     transition.dones = dones
+    transition.hard_terminations = infos.get("hard_terminated", dones)
+    if getattr(agent, "is_visual_ppo", False):
+        transition.hidden_states = agent._last_rollout_hidden
+        transition.anchor_actions = agent._last_anchor_action
+        transition.anchor_latents = agent._last_anchor_latent
 
     # Bootstrapping on time outs
     # 处理 timeouts
@@ -455,6 +472,8 @@ def run_episodes_(
                 agent,
             )
             storage.add_transitions(transition)
+            if getattr(agent, "is_visual_ppo", False):
+                agent.algorithm.reset_recurrent_states(dones)
             transition.clear()
 
         # Compute advantages and returns

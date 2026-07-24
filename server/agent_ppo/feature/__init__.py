@@ -8,13 +8,13 @@ Feature module entry — exposes Policy/Critic observation processors and
 RewardProcess. The PolicyObservationProcess actually used depends on the
 current stage's ``algorithm`` attribute in ``Config.CURRENT``:
 
-    - "lbc_loco"              → agent_ppo.feature.lbc_observation_process.LBCObservationProcess
+    - "lbc_loco"/"visual_ppo" → agent_ppo.feature.lbc_observation_process.LBCObservationProcess
                                  (policy obs 拼接 depth_image，供学生 VisionEncoder 使用)
     - anything else (default) → agent_ppo.feature.policy_observation_process.PolicyObservationProcess
                                  (proprio + height_scan)
 
 根据当前阶段 ``Config.CURRENT.algorithm`` 动态选择 PolicyObservationProcess：
-  - "lbc_loco"  → LBCObservationProcess（拼接 depth_image）
+  - "lbc_loco" / "visual_ppo" → LBCObservationProcess（拼接 depth_image）
   - 其他（默认） → PolicyObservationProcess
 """
 
@@ -33,7 +33,7 @@ def _resolve_policy_observation_process():
 
     algorithm = getattr(Config.CURRENT, "algorithm", "ppo")
 
-    if algorithm == "lbc_loco":
+    if algorithm in {"lbc_loco", "visual_ppo"}:
         from agent_ppo.feature.lbc_observation_process import (
             LBCObservationProcess as _Policy,
         )

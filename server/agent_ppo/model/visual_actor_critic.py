@@ -64,6 +64,7 @@ class VisualActorCritic(ActorCritic):
             rnn_output_dim=int(latent_dim),
             use_lstm=True,
         )
+        self._last_latent = None
 
     def _split_actor_observation(self, obs: torch.Tensor):
         if obs.shape[-1] != self.actor_observation_dim:
@@ -135,7 +136,14 @@ class VisualActorCritic(ActorCritic):
             raise ValueError(
                 f"Visual actor expects [B,D] or [T,B,D], got {tuple(obs.shape)}"
             )
+        self._last_latent = latent
         return torch.cat((proprio, latent), dim=-1)
+
+    @property
+    def last_latent(self):
+        if self._last_latent is None:
+            raise RuntimeError("Visual latent is unavailable before an actor forward pass")
+        return self._last_latent
 
     def update_distribution(self, obs, hidden_states=None, masks=None):
         mean = self.actor(
@@ -173,4 +181,3 @@ class VisualActorCritic(ActorCritic):
         done_ids = torch.nonzero(dones.reshape(-1).bool(), as_tuple=False).flatten()
         if done_ids.numel() > 0:
             self.vision_encoder.reset_hidden_state_for_envs(done_ids)
-

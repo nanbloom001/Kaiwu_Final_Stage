@@ -40,6 +40,12 @@ VISION_PHASE_LABELS = (
     "visionblocked",     # soft-stay 冻结后未恢复、提前结束
 )
 
+VISUAL_RL_PHASE_LABELS = (
+    "rlcritic",
+    "rlactor",
+    "rlfull",
+)
+
 _PROBE_NAME = re.compile(r"^model\.ckpt-[a-z]*-*[0-9]+\.[^.]+$")
 
 
@@ -140,6 +146,25 @@ def vision_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
     )
     result: list[str] = []
     for candidate in [*preferred, *discovered]:
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def visual_rl_checkpoint_candidates(
+    path: str, model_id: str | int
+) -> list[str]:
+    """Return visual-PPO resumes first, then the frozen Stage-4 S0 bundle."""
+    model_id = str(model_id)
+    preferred = [
+        *[
+            os.path.join(path, f"model.ckpt-{label}-{model_id}.pkl")
+            for label in reversed(VISUAL_RL_PHASE_LABELS)
+        ],
+        *vision_checkpoint_candidates(path, model_id),
+    ]
+    result: list[str] = []
+    for candidate in preferred:
         if candidate not in result:
             result.append(candidate)
     return result

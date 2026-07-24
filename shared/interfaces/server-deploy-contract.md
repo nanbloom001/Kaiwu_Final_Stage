@@ -83,6 +83,45 @@ iteration_semantics = "completed_outer_iterations_v1"
 修复前没有 `iteration_semantics` 的视觉包按旧的零基 loop index 读取，并在恢复时
 加一转换，避免重复最后一轮。
 
+受约束视觉 PPO 路径（阶段 5）继续使用相同顶层格式，并增加：
+
+```text
+format = "kaiwu_train_v1"
+schema_version = 1
+stage_type = "standard_visual_ppo"
+model_spec = proprio45 / scan256 / depth180x320x1 / latent32 / action12 / goal0
+modules.vision_encoder.state_dict
+modules.low_level.actor_state_dict
+modules.critic.state_dict
+modules.action_distribution.std
+modules.s0_anchor.vision_encoder_state_dict / actor_state_dict
+optimizers.visual_ppo
+training_state.current_iteration / elapsed_training_hours / phase_label
+training_state.action_anchor_weight
+training_state.actor_updates_paused / pause_reason
+training_state.baseline_hard_termination_rate
+training_state.rng_state
+lineage.s0_checkpoint_sha256
+lstm_reset_contract.live_hidden_saved = false
+capabilities.requires_depth = true
+capabilities.requires_height_scan_for_actor = false
+capabilities.deployable = false
+```
+
+阶段文件名固定为：
+
+```text
+model.ckpt-rlcritic-<平台ID>.pkl
+model.ckpt-rlactor-<平台ID>.pkl
+model.ckpt-rlfull-<平台ID>.pkl
+```
+
+恢复时以 `elapsed_training_hours` 重新计算阶段；若保存的 `phase_label` 与墙钟阶段
+不一致，以墙钟阶段为准并记录 warning。live LSTM hidden 不跨运行保存，恢复后
+必须 reset 环境并清零学生和 S0 anchor hidden。评估仍走部署形态的 Camera
+loader，只读取 `modules.vision_encoder` 与 `modules.low_level.actor_state_dict`，
+不加载 Critic 或 S0 anchor。
+
 文件数字 ID 完全使用开悟框架传入值，不由业务代码从 iteration 或父模型 ID
 计算。R2 每次保存同一 payload 的阶段文件和评估兼容别名：
 

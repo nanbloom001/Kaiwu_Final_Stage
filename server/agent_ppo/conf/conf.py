@@ -222,6 +222,37 @@ class LBCLocoConfig(StageConfig):
     teacher_actor_activation = "elu"
 
 
+class StandardVisualPPOConfig(StageConfig):
+    """Stage 5: constrained recurrent PPO from the frozen visual S0."""
+
+    name = "visual_policy_optimization"
+    task_type = "standard"
+    algorithm = "visual_ppo"
+    model_class = "VisualActorCritic"
+    ckpt_name = "model.ckpt-rlfull"
+
+    proprio_dim = 45
+    scan_dim = 256
+    depth_height = 180
+    depth_width = 320
+    depth_channels = 1
+    cnn_output_dim = 32
+    lstm_hidden_size = 64
+    lstm_num_layers = 2
+    latent_dim = 32
+
+    num_steps_per_env = 48
+    tbptt_sequence_length = 16
+    num_learning_epochs = 5
+    num_mini_batches = 4
+    actor_lr = 3e-5
+    lstm_lr = 3e-5
+    critic_lr = 3e-4
+    lr = actor_lr
+    max_grad_norm = 1.0
+    model_save_interval = 500  # platform fallback; workflow saves by wall clock
+
+
 class Config:
     """
     Unified config entry point.
@@ -233,18 +264,17 @@ class Config:
     设置 ``Config.CURRENT`` 为某个 StageConfig 子类，然后通过
     ``Config.CURRENT.lr``、``Config.CURRENT.num_mini_batches`` 等读取超参数。
 
-    Auto stage inference (based on TOML env_conf.task_name):
+    Evaluation-stage inference (based on TOML env_conf.task_name):
         task_name = "Unitree-Go2-Velocity"        + mode=standard -> LocomotionConfig
         task_name = "Unitree-Go2-Velocity-Camera" + mode=standard -> LBCLocoConfig
+        The Camera evaluation route intentionally uses the deployment-shaped
+        LBC loader. It loads only vision_encoder + low-level Actor, including
+        from Stage-5 standard_visual_ppo bundles; the training Critic is ignored.
     """
 
-    # Default stage; can be overridden by TOML env_conf.task_name during eval.
-    # 阶段 4（深度视觉蒸馏）：训练入口固定为 lbc_loco。
-    # 阶段 2 的 standard_ref_distill 已完成（daggerfull-16288），R2 分支的默认值
-    # 会让训练继续进入特权桥接，读取错误的 TOML。视觉阶段必须默认 lbc_loco，
-    # 才会加载 train_env_conf_standard_lbc_loco.toml 并走 lbc_workflow。
-    # eval 时仍由 _infer_stage_from_task_name 按 task_name 覆盖。
-    CURRENT = LBCLocoConfig
+    # Stage 5 training entry. Evaluation still infers the deploy-style visual
+    # loader from the Camera task and therefore never instantiates a Critic.
+    CURRENT = StandardVisualPPOConfig
 
     @staticmethod
     def load_conf(logger):
@@ -318,9 +348,13 @@ class Config:
 def _infer_stage_from_task_name(usr_conf, logger):
     """Infer StageConfig subclass from TOML env_conf.task_name + terrain.mode.
 
-    Rules:
+    Evaluation rules:
         task_name = "Unitree-Go2-Velocity"        + mode=standard -> LocomotionConfig
         task_name = "Unitree-Go2-Velocity-Camera" + mode=standard -> LBCLocoConfig
+
+    Camera evaluation deliberately maps to LBCLocoConfig even when the saved
+    bundle was produced by StandardVisualPPOConfig. That route mirrors
+    deployment by loading only the visual encoder and low-level actor.
 
     Returns None if task_name is missing or unrecognized (fallback to Config.CURRENT).
     """

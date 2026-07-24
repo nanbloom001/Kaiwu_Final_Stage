@@ -4,6 +4,21 @@
 
 ## [未发布]
 
+- **[Standard 视觉策略受约束 RL]** 新增独立的
+  `visual_policy_optimization` 阶段，从冻结的
+  `visionfull-28401`（`S0_visual_lbc`）初始化视觉编码器与 Actor，不复用
+  D4/D5 的配置、checkpoint 或调度。一次 3 小时平台任务依次执行 30 分钟
+  Critic 预热、60 分钟 Actor 微调和 90 分钟 LSTM/output-head 微调；CNN
+  始终冻结。训练采用 48 步 recurrent rollout、16 步 TBPTT、S0 action/latent
+  锚定、命令 bucket 和 hard-termination 安全暂停。新增
+  `standard_visual_ppo` 训练恢复包以及 `rlcritic`/`rlactor`/`rlfull`
+  探活标签；训练包仍为 `deployable=false`，Camera 评估路径只加载视觉编码器
+  与低层 Actor。已完成 Python/TOML/静态契约测试；真实 PyTorch tensor smoke、
+  平台预加载、command 实际值和首个 checkpoint 保存仍须在短平台启动中确认。
+  D1–D5 的历史 TOML、测试和归档 Tag 继续保留作复盘；它们不再是可直接运行的
+  活动入口。D1–D3 的视觉迁移经验与 D4/D5 的失败结论继续保留在
+  Changelog/分析文档中，但不作为当前阶段的实现来源。
+
 - **[Standard 视觉长训计数修复]** 视觉 LBC 的平台 lifecycle 从每个 inner
   environment step 调用一次改为每个完整 outer iteration 调用一次，恢复与上一阶段
   一致的 iteration / 平台模型 ID 语义；checkpoint 新增

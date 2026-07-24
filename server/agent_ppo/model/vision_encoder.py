@@ -111,6 +111,7 @@ class VisionEncoder(nn.Module):
         depth_image: torch.Tensor,
         proprio: torch.Tensor,
         masks: torch.Tensor = None,
+        detach_hidden: bool = True,
     ) -> torch.Tensor:
         """Forward pass: depth + proprio → CNN → LSTM → L2-normed latent.
 
@@ -144,18 +145,22 @@ class VisionEncoder(nn.Module):
 
             # Handle mask: reset hidden state for envs where masks is False
             if masks is not None:
-                reset_indices = ~masks.bool()
-                if reset_indices.any():
-                    self._hidden_state[0][:, reset_indices, :] = 0
-                    self._hidden_state[1][:, reset_indices, :] = 0
+                keep = masks.bool().reshape(1, batch_size, 1)
+                self._hidden_state = (
+                    self._hidden_state[0] * keep,
+                    self._hidden_state[1] * keep,
+                )
 
             rnn_output, self._hidden_state = self.rnn(rnn_input, self._hidden_state)
 
-            # Detach hidden to avoid BPTT-style gradient explosion
-            self._hidden_state = (
-                self._hidden_state[0].detach(),
-                self._hidden_state[1].detach(),
-            )
+            # Rollout/inference detaches between environment steps. Recurrent
+            # PPO sequence replay explicitly disables this so gradients flow
+            # through one bounded TBPTT chunk.
+            if detach_hidden:
+                self._hidden_state = (
+                    self._hidden_state[0].detach(),
+                    self._hidden_state[1].detach(),
+                )
 
             features = self.rnn_output_layer(rnn_output.squeeze(1))  # [B, rnn_output_dim]
         else:

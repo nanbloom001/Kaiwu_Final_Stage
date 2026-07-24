@@ -1,12 +1,18 @@
 # ARTIFACTS - sim2real_test_loco
 
 ## 概述
-Go2 lbc_loco 学生策略部署树（楼梯测试 + 固定命令模式）。目标 checkpoint `model.ckpt-vision-378413.pkl`，即 Sim2Real vision student（Actor80），已在 Go2/Jetson 上以固定 cmd [0.15,0,0] + D435i depth 验证可行走。
+Go2 lbc_loco 学生策略部署树（楼梯测试 + 固定命令模式）。目标 checkpoint
+`model.ckpt-vision-378413.pkl`，即 Sim2Real vision student（Actor80）。历史
+真机证据是在 Go2/Jetson 上以固定 cmd `[0.15,0,0]` + D435i depth 验证可行走；
+这不是当前配置默认值。仓库当前 `config.yaml` 使用 `command_source=uwb`，并把
+`fixed_cmd=[0.7,0,0]` 作为切换到 fixed 模式时的回退值，二者不得混写为同一次
+已验证工况。
 
 ## 与当前 Standard 训练包的边界
 
 `behavior_distill_v2`、`privileged_loco_teacher_v1` 和
-`kaiwu_train_v1`（包括 `daggerfull-16288`）都是训练/恢复制品，
+`kaiwu_train_v1`（包括 `daggerfull-16288`、`visionfull-28401` 以及
+`standard_visual_ppo` 的 `rlcritic`/`rlactor`/`rlfull` 文件）都是训练/恢复制品，
 `capabilities.deployable=false`。它们可能包含 `height_scan256`、optimizer、
 冻结教师或其他真机不可提供的状态，当前 `export_loco_onnx.py` 不接受这些格式。
 

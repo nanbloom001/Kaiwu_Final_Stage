@@ -11,6 +11,7 @@ Author: Tencent AI Arena Authors
 import os
 import glob
 import shutil
+import copy
 
 import numpy as np
 import torch
@@ -34,6 +35,7 @@ from agent_ppo.checkpoint_io import (
     validate_low_level_spec,
     validate_probe_filename,
     vision_checkpoint_candidates,
+    visual_rl_checkpoint_candidates,
 )
 from tools.train_env_conf_validate import check_usr_conf
 
@@ -82,10 +84,17 @@ class Agent(BaseAgent):
         self.algorithm_name = getattr(stage, "algorithm", "ppo")
         self.is_lbc = self.algorithm_name == "lbc_loco"
         self.is_behavior_distill = self.algorithm_name == "behavior_distill"
+        self.is_visual_ppo = self.algorithm_name == "visual_ppo"
 
         if self.is_lbc:
             # LBC 阶段：创建学生 + 教师；不初始化 PPO storage
             self._init_lbc_loco(num_proprio, num_scan, env_conf, stage, usr_conf)
+        elif self.is_visual_ppo:
+            depth_size = (
+                stage.depth_height * stage.depth_width * stage.depth_channels
+            )
+            self.num_obs = num_proprio + num_scan + depth_size
+            self._init_visual_ppo(num_proprio, num_scan, stage, usr_conf)
         else:
             self._init_flat(num_proprio, num_scan, stage)
             if self.is_behavior_distill:
@@ -106,6 +115,8 @@ class Agent(BaseAgent):
                 action_shape=(self.num_actions,),
                 device=self.device,
             )
+            if self.is_visual_ppo:
+                self.algorithm.initialize_recurrent_states(self.num_envs)
 
         super().__init__(agent_type, device, logger, monitor)
 
@@ -286,6 +297,119 @@ class Agent(BaseAgent):
         # 为与 PPO 路径下某些属性兼容，point self.model 到学生
         self.model = self.vision_encoder
 
+    def _init_visual_ppo(self, num_proprio, num_scan, stage, usr_conf):
+        """Initialize Stage-5 recurrent visual PPO from a frozen S0 preload."""
+        from agent_ppo.algorithm.algorithm_visual_ppo import AlgorithmVisualPPO
+        from agent_ppo.model.visual_actor_critic import VisualActorCritic
+
+        visual_conf = usr_conf.get(stage.name, {})
+        self.model = VisualActorCritic(
+            num_proprio=num_proprio,
+            num_scan=num_scan,
+            depth_shape=(
+                stage.depth_height,
+                stage.depth_width,
+                stage.depth_channels,
+            ),
+            latent_dim=stage.latent_dim,
+            cnn_output_dim=stage.cnn_output_dim,
+            lstm_hidden_size=stage.lstm_hidden_size,
+            lstm_num_layers=stage.lstm_num_layers,
+            num_critic_obs=self.num_critic_obs,
+            num_actions=self.num_actions,
+            actor_hidden_dims=stage.actor_hidden_dims,
+            critic_hidden_dims=stage.critic_hidden_dims,
+            activation=stage.activation,
+            init_noise_std=float(visual_conf.get("init_noise_std", 0.15)),
+        ).to(self.device)
+
+        self.anchor_encoder = copy.deepcopy(self.model.vision_encoder).to(self.device)
+        self.anchor_actor = copy.deepcopy(self.model.actor).to(self.device)
+        for parameter in self.model.vision_encoder.cnn.parameters():
+            parameter.requires_grad_(False)
+
+        actor_parameters = [
+            *self.model.actor.parameters(),
+            self.model.std,
+        ]
+        recurrent_parameters = [
+            *self.model.vision_encoder.rnn.parameters(),
+            *self.model.vision_encoder.rnn_output_layer.parameters(),
+        ]
+        self.optimizer = optim.Adam(
+            [
+                {
+                    "params": actor_parameters,
+                    "lr": float(visual_conf.get("actor_learning_rate", stage.actor_lr)),
+                    "name": "actor",
+                },
+                {
+                    "params": recurrent_parameters,
+                    "lr": float(visual_conf.get("lstm_learning_rate", stage.lstm_lr)),
+                    "name": "lstm",
+                },
+                {
+                    "params": self.model.critic.parameters(),
+                    "lr": float(visual_conf.get("critic_learning_rate", stage.critic_lr)),
+                    "name": "critic",
+                },
+            ]
+        )
+        self.algorithm = AlgorithmVisualPPO(
+            model=self.model,
+            anchor_encoder=self.anchor_encoder,
+            anchor_actor=self.anchor_actor,
+            optimizer=self.optimizer,
+            sequence_length=int(
+                visual_conf.get(
+                    "tbptt_sequence_length", stage.tbptt_sequence_length
+                )
+            ),
+            critic_only_hours=float(visual_conf.get("critic_only_hours", 0.5)),
+            actor_only_end_hours=float(
+                visual_conf.get("actor_only_end_hours", 1.5)
+            ),
+            task_end_hours=float(visual_conf.get("task_end_hours", 3.0)),
+            action_anchor_start=float(
+                visual_conf.get("action_anchor_start", 1.0)
+            ),
+            action_anchor_mid=float(visual_conf.get("action_anchor_mid", 0.5)),
+            action_anchor_end=float(visual_conf.get("action_anchor_end", 0.2)),
+            latent_anchor_weight=float(
+                visual_conf.get("latent_anchor_weight", 0.1)
+            ),
+            max_anchor_action_mse=float(
+                visual_conf.get("max_anchor_action_mse", 0.05)
+            ),
+            max_hard_termination_delta=float(
+                visual_conf.get("max_hard_termination_delta", 0.02)
+            ),
+            device=self.device,
+            logger=self.logger,
+            monitor=self.monitor,
+            clip_param=float(visual_conf.get("clip_param", 0.2)),
+            gamma=float(visual_conf.get("gamma", 0.99)),
+            lam=float(visual_conf.get("lam", 0.95)),
+            value_loss_coef=float(visual_conf.get("value_loss_coef", 1.0)),
+            entropy_coef=float(visual_conf.get("entropy_coef", 0.01)),
+            learning_rate=stage.actor_lr,
+            max_grad_norm=float(
+                visual_conf.get("max_grad_norm", stage.max_grad_norm)
+            ),
+            num_mini_batches=int(
+                visual_conf.get("num_mini_batches", stage.num_mini_batches)
+            ),
+            num_learning_epochs=int(
+                visual_conf.get("num_learning_epochs", stage.num_learning_epochs)
+            ),
+            desired_kl=None,
+        )
+        self.training_elapsed_h = 0.0
+        self.logger.info(
+            "[VisualPPO] initialized recurrent depth actor + privileged critic; "
+            "CNN frozen, S0 preload required before training"
+        )
+
     def exploit(self, list_obs_data):
         """
         Exploit learned policy for action selection in evaluation mode.
@@ -331,6 +455,8 @@ class Agent(BaseAgent):
             return None
         if self.is_behavior_distill:
             return None
+        if self.is_visual_ppo:
+            return self.algorithm.learn(self.training_elapsed_h)
         return self.algorithm.learn()
 
     def predict(self, list_obs_data):
@@ -353,6 +479,12 @@ class Agent(BaseAgent):
             )
         (obs, critic_obs) = list_obs_data
         with torch.no_grad():
+            if self.is_visual_ppo:
+                self._last_rollout_hidden = self.algorithm.rollout_hidden_state()
+                (
+                    self._last_anchor_action,
+                    self._last_anchor_latent,
+                ) = self.algorithm.anchor_inference(obs)
             actions = self.algorithm.actor_critic.act(obs)
             values = self.algorithm.actor_critic.evaluate(critic_obs)
             log_probs = self.algorithm.actor_critic.get_actions_log_prob(actions)
@@ -407,7 +539,38 @@ class Agent(BaseAgent):
         else:
             model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
 
-        if self.is_lbc:
+        if self.is_visual_ppo:
+            phase_label = self.algorithm.current_phase
+            visual_rl_path = f"{path}/model.ckpt-{phase_label}-{str(id)}.pkl"
+            if not validate_probe_filename(visual_rl_path):
+                raise ValueError(
+                    "Visual PPO checkpoint filename is not probe-compatible: "
+                    f"{visual_rl_path}"
+                )
+            checksum = self.algorithm.save_training_bundle(
+                visual_rl_path,
+                platform_model_id=id,
+                phase_label=phase_label,
+                model_spec={
+                    "proprio_dim": self.stage.proprio_dim,
+                    "scan_dim": self.stage.scan_dim,
+                    "depth_height": self.stage.depth_height,
+                    "depth_width": self.stage.depth_width,
+                    "depth_channels": self.stage.depth_channels,
+                    "latent_dim": self.stage.latent_dim,
+                    "action_dim": self.stage.num_actions,
+                    "goal_dim": 0,
+                },
+            )
+            self.logger.info(
+                f"[visual_ppo] save bundle={visual_rl_path} "
+                f"(phase={phase_label}, elapsed_h="
+                f"{self.algorithm.elapsed_training_hours:.3f}, "
+                f"anchor={self.algorithm.action_anchor_weight:.3f}, "
+                f"paused={self.algorithm.actor_updates_paused}, "
+                f"sha256={checksum})"
+            )
+        elif self.is_lbc:
             ramp_label = self._current_ramp_label()
             vision_file_path = f"{path}/model.ckpt-{ramp_label}-{str(id)}.pkl"
             if not validate_probe_filename(vision_file_path):
@@ -458,7 +621,7 @@ class Agent(BaseAgent):
         # 阶段 4 视觉训练包已含冻结教师副本（modules.low_level），不再额外生成
         # locomotion 副本，避免产物目录出现 vision* + lbc-loco + locomotion 三个
         # 文件的混淆（locomotion 只是冻结教师，不是视觉学生）。
-        if not self.is_lbc:
+        if not (self.is_lbc or self.is_visual_ppo):
             self._save_side_locomotion(path, id)
 
     def save_vision_at_ramp_label(self, path, id, ramp_label: str):
@@ -519,6 +682,9 @@ class Agent(BaseAgent):
                              否则 fallback 到 model.ckpt-locomotion-{id}.pkl 拆分教师。
         LBC Loco (eval)    : 只加载 vision_encoder + teacher_actor（模拟真机视角）。
         """
+        if self.is_visual_ppo:
+            self._load_visual_ppo(path, id)
+            return
         if self.is_lbc:
             self._load_lbc_loco(path, id)
             return
@@ -526,6 +692,52 @@ class Agent(BaseAgent):
             self._load_behavior_distill_teacher(path, id)
             return
         self._load_flat(path, id)
+
+    def _load_visual_ppo(self, path=None, id="1"):
+        """Strictly load either the frozen Stage-4 S0 or a Stage-5 resume."""
+        if not path:
+            raise FileNotFoundError("[VisualPPO] preload path is empty")
+        candidates = visual_rl_checkpoint_candidates(path, id)
+        if str(id) == "latest":
+            candidates = [
+                *sorted(
+                    glob.glob(f"{path}/model.ckpt-*.pkl"),
+                    key=os.path.getmtime,
+                    reverse=True,
+                ),
+                *candidates,
+            ]
+        selected = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate and os.path.isfile(candidate)
+            ),
+            None,
+        )
+        if selected is None:
+            raise FileNotFoundError(
+                f"[VisualPPO] no visionfull/rl* checkpoint found in {path} "
+                f"for id={id}; tried={candidates}"
+            )
+        load_kind = self.algorithm.load_training_bundle(
+            selected,
+            expected_spec={
+                "proprio_dim": self.stage.proprio_dim,
+                "scan_dim": self.stage.scan_dim,
+                "latent_dim": self.stage.latent_dim,
+                "action_dim": self.stage.num_actions,
+                "goal_dim": 0,
+            },
+        )
+        self.training_elapsed_h = self.algorithm.elapsed_training_hours
+        self.cur_model_name = selected
+        self.logger.info(
+            f"[VisualPPO] loaded {load_kind} checkpoint={selected}, "
+            f"s0_sha256={self.algorithm.s0_checkpoint_sha256}, "
+            f"resume_iter={self.algorithm.current_iteration}, "
+            f"elapsed_h={self.algorithm.elapsed_training_hours:.3f}"
+        )
 
     def _load_behavior_distill_teacher(self, path=None, id="1"):
         """Load platform-selected flat standard pretrained model as frozen teacher.
