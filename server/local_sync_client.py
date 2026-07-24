@@ -29,6 +29,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+from conf.sync_env import load_env_file, setting
+
 
 SKIP_DIR_NAMES = {
     ".git",
@@ -392,15 +394,16 @@ def sync_files(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Sync this local directory to the IDE sync server.")
-    parser.add_argument("--url", default=os.environ.get("IDE_SYNC_URL", DEFAULT_SYNC_URL), help="IDE forwarded URL")
-    parser.add_argument("--token", default=os.environ.get("IDE_SYNC_TOKEN", DEFAULT_SYNC_TOKEN), help="Shared sync token")
-    parser.add_argument("--proxy-cookie", default=os.environ.get("IDE_PROXY_COOKIE", ""), help="Tencent proxy Cookie")
+    parser.add_argument("--env-file", default=os.environ.get("IDE_SYNC_ENV_FILE"), help="Optional dotenv credentials file")
+    parser.add_argument("--url", default=None, help="IDE forwarded URL")
+    parser.add_argument("--token", default=None, help="Shared sync token")
+    parser.add_argument("--proxy-cookie", default=None, help="Tencent proxy Cookie")
     parser.add_argument(
         "--proxy-cookie-name",
-        default=os.environ.get("IDE_PROXY_COOKIE_NAME", DEFAULT_PROXY_COOKIE_NAME),
+        default=None,
         help="Cookie name used when only the value is pasted",
     )
-    parser.add_argument("--cookie-file", default=str(DEFAULT_COOKIE_FILE), help="Cached Tencent proxy Cookie file")
+    parser.add_argument("--cookie-file", default=None, help="Cached Tencent proxy Cookie file")
     parser.add_argument("--no-save-cookie", action="store_true", help="Do not save pasted Cookie")
     parser.add_argument("--clear-cookie", action="store_true", help="Delete cached Cookie and exit")
     parser.add_argument("--no-cookie-prompt", action="store_true", help="Do not prompt for Cookie when missing")
@@ -422,6 +425,27 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    try:
+        env_values = load_env_file(args.env_file)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    sync_url = setting(args.url, "IDE_SYNC_URL", env_values, DEFAULT_SYNC_URL)
+    token = setting(args.token, "IDE_SYNC_TOKEN", env_values, DEFAULT_SYNC_TOKEN)
+    proxy_cookie = setting(args.proxy_cookie, "IDE_PROXY_COOKIE", env_values)
+    proxy_cookie_name = setting(
+        args.proxy_cookie_name,
+        "IDE_PROXY_COOKIE_NAME",
+        env_values,
+        DEFAULT_PROXY_COOKIE_NAME,
+    )
+    cookie_file_raw = setting(
+        args.cookie_file,
+        "IDE_PROXY_COOKIE_FILE",
+        env_values,
+        str(DEFAULT_COOKIE_FILE),
+    )
+
     root = Path(args.root).resolve()
     if args.check_local:
         if args.delete:
@@ -429,11 +453,11 @@ def main() -> int:
             return 2
         return check_local_scope(root, args.max_bytes)
 
-    if not args.token:
+    if not token:
         print("missing token: pass --token or set IDE_SYNC_TOKEN", file=sys.stderr)
         return 2
 
-    cookie_file = Path(args.cookie_file).expanduser()
+    cookie_file = Path(cookie_file_raw).expanduser()
     if args.clear_cookie:
         if cookie_file.exists():
             cookie_file.unlink()
@@ -446,10 +470,10 @@ def main() -> int:
 
     try:
         cookie_selection = load_proxy_cookie(
-            explicit_cookie=args.proxy_cookie,
+            explicit_cookie=proxy_cookie,
             fallback_cookie=USER_PROXY_COOKIE,
             cookie_file=cookie_file,
-            cookie_name=args.proxy_cookie_name,
+            cookie_name=proxy_cookie_name,
             no_save_cookie=args.no_save_cookie,
             no_cookie_prompt=args.no_cookie_prompt,
             refresh_cookie=args.refresh_cookie,
@@ -458,8 +482,8 @@ def main() -> int:
         print(str(exc), file=sys.stderr)
         return 2
     client = SyncClient(
-        normalize_base_url(args.url),
-        args.token,
+        normalize_base_url(sync_url),
+        token,
         args.timeout,
         cookie_selection.value,
     )
