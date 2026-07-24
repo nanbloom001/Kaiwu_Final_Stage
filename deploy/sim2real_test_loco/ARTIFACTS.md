@@ -3,6 +3,17 @@
 ## 概述
 Go2 lbc_loco 学生策略部署树（楼梯测试 + 固定命令模式）。目标 checkpoint `model.ckpt-vision-378413.pkl`，即 Sim2Real vision student（Actor80），已在 Go2/Jetson 上以固定 cmd [0.15,0,0] + D435i depth 验证可行走。
 
+## 与当前 Standard 训练包的边界
+
+`behavior_distill_v2`、`privileged_loco_teacher_v1` 和
+`kaiwu_train_v1`（包括 `daggerfull-16288`）都是训练/恢复制品，
+`capabilities.deployable=false`。它们可能包含 `height_scan256`、optimizer、
+冻结教师或其他真机不可提供的状态，当前 `export_loco_onnx.py` 不接受这些格式。
+
+默认部署路线仍只接受经过单独导出审查的 `format="lbc_loco"` 视觉策略候选；
+不得通过改名把上述训练包伪装成可部署 checkpoint。本次 R2 合入不改变 ONNX
+输入、关节顺序、动作缩放、控制频率或 Jetson 运行代码。
+
 ## 所需制品清单
 | 制品 | 类型 | 当前状态 | SHA256 | 说明 |
 |---|---|---|---|---|
