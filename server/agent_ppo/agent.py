@@ -35,6 +35,9 @@ from agent_ppo.checkpoint_io import (
     validate_low_level_spec,
     validate_probe_filename,
     vision_checkpoint_candidates,
+    visual_anchor_r2_checkpoint_candidates,
+    visual_anchor_r2_eval_candidates,
+    visual_anchor_r2_parent_candidates,
     visual_rl_checkpoint_candidates,
 )
 from tools.train_env_conf_validate import check_usr_conf
@@ -55,6 +58,9 @@ class Agent(BaseAgent):
 
         self.is_eval = is_eval
         self.stage = stage
+        # Cache usr_conf so later platform callbacks (load_model/save_model)
+        # can read [env_conf].seed and stage sub-tables without re-parsing TOML.
+        self.usr_conf = usr_conf
         env_conf = usr_conf["env"]
         self.num_envs = env_conf["num_envs"]
 
@@ -365,24 +371,55 @@ class Agent(BaseAgent):
                     "tbptt_sequence_length", stage.tbptt_sequence_length
                 )
             ),
-            critic_only_hours=float(visual_conf.get("critic_only_hours", 0.5)),
-            actor_only_end_hours=float(
-                visual_conf.get("actor_only_end_hours", 1.5)
+            # Anchor R2 schedule (§4.1/§5.3). TOML stores minutes; divide by 60
+            # to hours for the algorithm. Missing warmup LR -> None (algorithm
+            # falls back to critic_lr with a warning, never silently 3e-4).
+            schedule_mode=str(
+                visual_conf.get("schedule_mode", "visual_anchor_anneal_v2")
             ),
-            task_end_hours=float(visual_conf.get("task_end_hours", 3.0)),
-            action_anchor_start=float(
-                visual_conf.get("action_anchor_start", 1.0)
+            run_name=str(
+                visual_conf.get("run_name", "standard-anchor-r2")
             ),
-            action_anchor_mid=float(visual_conf.get("action_anchor_mid", 0.5)),
-            action_anchor_end=float(visual_conf.get("action_anchor_end", 0.2)),
-            latent_anchor_weight=float(
-                visual_conf.get("latent_anchor_weight", 0.1)
+            source_parent_model_id=visual_conf.get("initial_parent_model_id"),
+            anchor_schedule_hours=[
+                value / 60.0
+                for value in visual_conf.get("anchor_schedule_minutes", [])
+            ],
+            action_anchor_schedule=visual_conf.get("action_anchor_schedule"),
+            latent_anchor_schedule=visual_conf.get("latent_anchor_schedule"),
+            anchor_phase_labels=visual_conf.get("anchor_phase_labels"),
+            anchor_phase_end_hours=[
+                value / 60.0
+                for value in visual_conf.get("anchor_phase_end_minutes", [])
+            ],
+            critic_warmup_learning_rate=(
+                float(visual_conf["critic_warmup_learning_rate"])
+                if "critic_warmup_learning_rate" in visual_conf
+                else None
+            ),
+            task_end_hours=float(visual_conf.get("task_end_hours", 4.0)),
+            warning_only_safety=bool(
+                visual_conf.get("warning_only_safety", True)
             ),
             max_anchor_action_mse=float(
                 visual_conf.get("max_anchor_action_mse", 0.05)
             ),
             max_hard_termination_delta=float(
                 visual_conf.get("max_hard_termination_delta", 0.02)
+            ),
+            # Legacy scalar schedule kwargs kept for legacy_three_phase_v1
+            # resume compatibility; Anchor R2 ignores them.
+            critic_only_hours=float(visual_conf.get("critic_only_hours", 0.0)),
+            actor_only_end_hours=float(
+                visual_conf.get("actor_only_end_hours", 0.0)
+            ),
+            action_anchor_start=float(
+                visual_conf.get("action_anchor_start", 0.0)
+            ),
+            action_anchor_mid=float(visual_conf.get("action_anchor_mid", 0.0)),
+            action_anchor_end=float(visual_conf.get("action_anchor_end", 0.0)),
+            latent_anchor_weight=float(
+                visual_conf.get("latent_anchor_weight", 0.0)
             ),
             device=self.device,
             logger=self.logger,
@@ -404,10 +441,14 @@ class Agent(BaseAgent):
             ),
             desired_kl=None,
         )
+        # training_elapsed_h is the Agent-side mirror of the algorithm's anchor
+        # session clock (§4.3). The algorithm uses anchor_session_elapsed_hours
+        # to drive phase decisions; this attribute feeds learn(elapsed_h=...).
         self.training_elapsed_h = 0.0
         self.logger.info(
-            "[VisualPPO] initialized recurrent depth actor + privileged critic; "
-            "CNN frozen, S0 preload required before training"
+            f"[VisualPPO] initialized Anchor R2: run={self.algorithm.run_name}, "
+            f"schedule={self.algorithm.schedule_mode}, "
+            f"CNN frozen, S0 preload required before training"
         )
 
     def exploit(self, list_obs_data):
@@ -562,13 +603,18 @@ class Agent(BaseAgent):
                     "goal_dim": 0,
                 },
             )
+            # §5.6: save log prints phase, both anchors, anchor session clock,
+            # trainable modules, platform id and sha256. Only one bundle is
+            # written; no rlfull/locomotion/lbc_loco same-id copies.
             self.logger.info(
                 f"[visual_ppo] save bundle={visual_rl_path} "
-                f"(phase={phase_label}, elapsed_h="
-                f"{self.algorithm.elapsed_training_hours:.3f}, "
-                f"anchor={self.algorithm.action_anchor_weight:.3f}, "
-                f"paused={self.algorithm.actor_updates_paused}, "
-                f"sha256={checksum})"
+                f"(phase={phase_label}, "
+                f"action_anchor={self.algorithm.action_anchor_weight:.3f}, "
+                f"latent_anchor={self.algorithm.latent_anchor_weight_current:.3f}, "
+                f"anchor_session_h="
+                f"{self.algorithm.anchor_session_elapsed_hours:.3f}, "
+                f"trainable={self.algorithm.trainable_modules_snapshot()}, "
+                f"platform_id={id}, sha256={checksum})"
             )
         elif self.is_lbc:
             ramp_label = self._current_ramp_label()
@@ -694,19 +740,50 @@ class Agent(BaseAgent):
         self._load_flat(path, id)
 
     def _load_visual_ppo(self, path=None, id="1"):
-        """Strictly load either the frozen Stage-4 S0 or a Stage-5 resume."""
+        """Load the Anchor R2 S0 parent, an Anchor R2 resume, or a Camera eval ckpt.
+
+        Three paths (§5.4/§5.6):
+          * eval (is_eval): Camera eval candidates — Anchor R2 labels first,
+            then legacy R3/Stage-4 vision/S0 visionfull. Only VisionEncoder +
+            Actor are used by the deploy-shaped loader; Critic/S0 ignored.
+          * training first-run: exact S0 visionfull-28401 parent (no `latest`,
+            no same-id historical vis* file may preempt it).
+          * training resume: Anchor R2 label candidates within the requested ID.
+        ID constraint enforced in checkpoint_io.py candidate layer (§5.5 N8);
+        Agent only passes the selector and prints selector/filename-id/bundle-id.
+        """
         if not path:
             raise FileNotFoundError("[VisualPPO] preload path is empty")
-        candidates = visual_rl_checkpoint_candidates(path, id)
-        if str(id) == "latest":
-            candidates = [
-                *sorted(
-                    glob.glob(f"{path}/model.ckpt-*.pkl"),
-                    key=os.path.getmtime,
-                    reverse=True,
-                ),
-                *candidates,
-            ]
+        id_str = str(id)
+        expected_spec = {
+            "proprio_dim": self.stage.proprio_dim,
+            "scan_dim": self.stage.scan_dim,
+            "latent_dim": self.stage.latent_dim,
+            "action_dim": self.stage.num_actions,
+            "goal_dim": 0,
+        }
+        env_seed = self._visual_env_seed()
+
+        if self.is_eval:
+            candidates = visual_anchor_r2_eval_candidates(path, id)
+            resolved_id = self._resolve_filename_id(candidates, path, id_str)
+        elif id_str == "latest":
+            # `latest` only allowed for eval/diagnostic convenience; training
+            # entry rejects it. Resolve max filename ID within Anchor R2 labels.
+            from agent_ppo.checkpoint_io import _latest_visual_anchor_r2_candidates
+            resume_candidates = _latest_visual_anchor_r2_candidates(path)
+            parent_candidates = visual_anchor_r2_parent_candidates(path, id_str)
+            candidates = [*resume_candidates, *parent_candidates]
+            resolved_id = self._resolve_filename_id(candidates, path, id_str)
+        else:
+            # Training: Anchor R2 resume first, then exact S0 parent. The
+            # parent must come AFTER resume so a same-id resume wins, but the
+            # parent list itself puts visionfull-28401 first among S0 files.
+            resume_candidates = visual_anchor_r2_checkpoint_candidates(path, id)
+            parent_candidates = visual_anchor_r2_parent_candidates(path, id)
+            candidates = [*resume_candidates, *parent_candidates]
+            resolved_id = id_str
+
         selected = next(
             (
                 candidate
@@ -717,27 +794,69 @@ class Agent(BaseAgent):
         )
         if selected is None:
             raise FileNotFoundError(
-                f"[VisualPPO] no visionfull/rl* checkpoint found in {path} "
-                f"for id={id}; tried={candidates}"
+                f"[VisualPPO] no Anchor R2 / S0 checkpoint found in {path} "
+                f"for selector={id_str!r}; tried={candidates}"
             )
-        load_kind = self.algorithm.load_training_bundle(
+        load_mode = self.algorithm.load_training_bundle(
             selected,
-            expected_spec={
-                "proprio_dim": self.stage.proprio_dim,
-                "scan_dim": self.stage.scan_dim,
-                "latent_dim": self.stage.latent_dim,
-                "action_dim": self.stage.num_actions,
-                "goal_dim": 0,
-            },
+            expected_spec=expected_spec,
+            env_seed=env_seed,
         )
-        self.training_elapsed_h = self.algorithm.elapsed_training_hours
+        # Agent mirrors the algorithm's anchor session clock; elapsed_training_h
+        # is only a cumulative-training record, not a phase driver (§4.3).
+        self.training_elapsed_h = self.algorithm.anchor_session_elapsed_hours
         self.cur_model_name = selected
+        bundle_id = self.algorithm.loaded_platform_model_id or "unknown"
         self.logger.info(
-            f"[VisualPPO] loaded {load_kind} checkpoint={selected}, "
-            f"s0_sha256={self.algorithm.s0_checkpoint_sha256}, "
-            f"resume_iter={self.algorithm.current_iteration}, "
-            f"elapsed_h={self.algorithm.elapsed_training_hours:.3f}"
+            f"[VisualPPO] run={self.algorithm.run_name} "
+            f"schedule={self.algorithm.schedule_mode} "
+            f"requested_selector={id_str} "
+            f"resolved_filename_id={resolved_id} "
+            f"bundle_platform_model_id={bundle_id} "
+            f"loaded_path={selected} "
+            f"loaded_sha256={self.algorithm.s0_checkpoint_sha256} "
+            f"load_mode={load_mode} "
+            f"resume_anchor_session_h="
+            f"{self.algorithm.anchor_session_elapsed_hours:.3f} "
+            f"phase={self.algorithm.current_phase} "
+            f"trainable={self.algorithm.trainable_modules_snapshot()} "
+            f"action_anchor={self.algorithm.action_anchor_weight:.3f} "
+            f"latent_anchor={self.algorithm.latent_anchor_weight_current:.3f}"
         )
+
+    def _visual_env_seed(self):
+        """Read [env_conf].seed from the active TOML for RNG reinitialization."""
+        usr_conf = getattr(self, "usr_conf", None)
+        if not isinstance(usr_conf, dict):
+            return 0
+        env_conf = usr_conf.get("env_conf", {})
+        if not isinstance(env_conf, dict):
+            return 0
+        try:
+            return int(env_conf.get("seed", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _resolve_filename_id(self, candidates, path, id_str):
+        """Print selector/filename-id/bundle-id (§5.5/§5.6) and return filename id.
+
+        For `latest` and eval the resolved filename numeric ID is parsed from
+        the first existing candidate; it is independent of the bundle's inner
+        platform_model_id (logged separately by the caller).
+        """
+        from agent_ppo.checkpoint_io import _parse_anchor_r2_filename
+        for candidate in candidates:
+            if candidate and os.path.isfile(candidate):
+                parsed = _parse_anchor_r2_filename(candidate)
+                if parsed is not None:
+                    return str(parsed[1])
+                # Non-Anchor-R2 legacy file: extract trailing digits.
+                basename = os.path.basename(candidate)
+                tail = basename.rsplit("-", 1)[-1].split(".")[0]
+                if tail.isdigit():
+                    return tail
+                return "unknown"
+        return id_str
 
     def _load_behavior_distill_teacher(self, path=None, id="1"):
         """Load platform-selected flat standard pretrained model as frozen teacher.

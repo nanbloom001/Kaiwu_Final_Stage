@@ -223,13 +223,20 @@ class LBCLocoConfig(StageConfig):
 
 
 class StandardVisualPPOConfig(StageConfig):
-    """Stage 5: constrained recurrent PPO from the frozen visual S0."""
+    """Stage 5: Anchor R2 four-hour visual policy optimization.
+
+    当前活动任务是 Anchor R2（schedule ``visual_anchor_anneal_v2``，父模型
+    ``visionfull-28401``），不是已历史化的 R3 八小时 ``visual_recovery_split_v1``。
+    详见 shared/分析记录/2026-07-25_StandardAnchorR2四小时实施计划.md。
+    """
 
     name = "visual_policy_optimization"
     task_type = "standard"
     algorithm = "visual_ppo"
     model_class = "VisualActorCritic"
-    ckpt_name = "model.ckpt-rlfull"
+    # ckpt_name is a non-misleading prefix only; actual visual-PPO saves use the
+    # current phase label (anchorcritic/anchoractor/anchoranneal/anchorfinal).
+    ckpt_name = "model.ckpt-anchorfinal"
 
     proprio_dim = 45
     scan_dim = 256
@@ -245,9 +252,13 @@ class StandardVisualPPOConfig(StageConfig):
     tbptt_sequence_length = 16
     num_learning_epochs = 5
     num_mini_batches = 4
-    actor_lr = 3e-5
-    lstm_lr = 3e-5
-    critic_lr = 3e-4
+    # Class fallback learning rates (§4.2/§5.2). The active TOML is authoritative;
+    # these apply only when the TOML key is absent. critic_warmup_learning_rate is
+    # read solely from the TOML; missing it falls back to critic_lr (1e-4) with a
+    # warning, never silently to 3e-4.
+    actor_lr = 1e-5
+    lstm_lr = 5e-6
+    critic_lr = 1e-4
     lr = actor_lr
     max_grad_norm = 1.0
     model_save_interval = 500  # platform fallback; workflow saves by wall clock

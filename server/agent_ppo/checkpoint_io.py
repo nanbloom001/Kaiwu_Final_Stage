@@ -46,6 +46,16 @@ VISUAL_RL_PHASE_LABELS = (
     "rlfull",
 )
 
+# Anchor R2 四小时四阶段标签（§5.5）。纯小写字母，满足探活正则。
+# resume 候选优先级（同 ID 内）：anchorfinal -> anchoranneal -> anchoractor
+# -> anchorcritic。
+VISUAL_ANCHOR_R2_PHASE_LABELS = (
+    "anchorcritic",
+    "anchoractor",
+    "anchoranneal",
+    "anchorfinal",
+)
+
 _PROBE_NAME = re.compile(r"^model\.ckpt-[a-z]*-*[0-9]+\.[^.]+$")
 
 
@@ -168,6 +178,122 @@ def visual_rl_checkpoint_candidates(
         if candidate not in result:
             result.append(candidate)
     return result
+
+
+# Anchor R2 filename: model.ckpt-<label>-<digits>.pkl
+_ANCHOR_R2_FILENAME = re.compile(
+    r"^model\.ckpt-(?P<label>" + "|".join(VISUAL_ANCHOR_R2_PHASE_LABELS) + r")"
+    r"-(?P<id>[0-9]+)\.pkl$"
+)
+
+
+def _parse_anchor_r2_filename(filename: str) -> tuple[str, int] | None:
+    """Return (label, numeric_id) parsed from an Anchor R2 filename, else None."""
+    match = _ANCHOR_R2_FILENAME.match(os.path.basename(filename))
+    if match is None:
+        return None
+    return match.group("label"), int(match.group("id"))
+
+
+def visual_anchor_r2_checkpoint_candidates(
+    path: str, model_id: str | int
+) -> list[str]:
+    """Anchor R2 resume candidates for an explicit numeric selector (§5.5 N8).
+
+    ID constraint enforced at this candidate layer, not in the Agent:
+      1. Explicit numeric ID: filter by filename numeric ID equality FIRST,
+         then order by label priority (anchorfinal -> anchoranneal ->
+         anchoractor -> anchorcritic). Cross-ID fallback never happens.
+    Returns only existing files. Callers that also want the S0 parent
+    (visionfull-<id>) should append vision_checkpoint_candidates separately.
+    """
+    try:
+        requested_id = int(model_id)
+    except (TypeError, ValueError):
+        return []
+    label_priority = {
+        label: index
+        for index, label in enumerate(reversed(VISUAL_ANCHOR_R2_PHASE_LABELS))
+    }
+    discovered: list[tuple[int, str]] = []
+    for filename in glob.glob(os.path.join(path, "model.ckpt-*.pkl")):
+        parsed = _parse_anchor_r2_filename(filename)
+        if parsed is None:
+            continue
+        label, file_id = parsed
+        if file_id != requested_id:
+            # Cross-ID fallback is forbidden (§5.5 N8 rule 1).
+            continue
+        if not os.path.isfile(filename):
+            continue
+        discovered.append((label_priority[label], filename))
+    discovered.sort(key=lambda item: item[0])
+    return [filename for _, filename in discovered]
+
+
+def _latest_visual_anchor_r2_candidates(path: str) -> list[str]:
+    """Anchor R2 resume candidates for the ``latest`` selector (§5.5 N8 rule 2).
+
+    Resolve the maximum filename numeric ID among Anchor R2 labels FIRST, then
+    order by label priority within that single ID. A higher-priority label on a
+    smaller ID is never returned before the max ID.
+    """
+    ids: list[tuple[int, str]] = []
+    for filename in glob.glob(os.path.join(path, "model.ckpt-*.pkl")):
+        parsed = _parse_anchor_r2_filename(filename)
+        if parsed is None or not os.path.isfile(filename):
+            continue
+        ids.append((parsed[1], filename))
+    if not ids:
+        return []
+    max_id = max(file_id for file_id, _ in ids)
+    return visual_anchor_r2_checkpoint_candidates(path, max_id)
+
+
+def visual_anchor_r2_parent_candidates(path: str, model_id: str | int) -> list[str]:
+    """First-load S0 parent candidates for Anchor R2 (§5.5).
+
+    The exact ``visionfull-<id>`` file must come before any same-ID historical
+    ``vis*`` file so the first run loads the real S0 baseline. Anchor R2 resume
+    files (anchor*) are intentionally excluded here — they are resume candidates,
+    not a parent.
+    """
+    model_id = str(model_id)
+    preferred = [
+        os.path.join(path, f"model.ckpt-visionfull-{model_id}.pkl"),
+        os.path.join(path, f"model.ckpt-visionhalf-{model_id}.pkl"),
+        os.path.join(path, f"model.ckpt-visionteacher-{model_id}.pkl"),
+        os.path.join(path, f"model.ckpt-visionblocked-{model_id}.pkl"),
+        os.path.join(path, f"model.ckpt-{model_id}.pkl"),
+    ]
+    result: list[str] = []
+    for candidate in preferred:
+        if candidate not in result and os.path.isfile(candidate):
+            result.append(candidate)
+    return result
+
+
+def visual_anchor_r2_eval_candidates(path: str, model_id: str | int) -> list[str]:
+    """Camera-eval candidates for Anchor R2 (§5.5).
+
+    Tries Anchor R2 labels first (within the requested ID), then falls back to
+    superseded R3 (rl*), historical Stage-4 vision labels, and finally the
+    explicit S0 visionfull parent. The ID constraint (§5.5 N8 rule 1) is
+    enforced on the Anchor R2 label set; legacy labels fall through to their
+    own candidate functions which also scope by ID.
+    """
+    candidates = visual_anchor_r2_checkpoint_candidates(path, model_id)
+    # Superseded R3 / historical visual RL labels (rlcritic/rlactor/rlfull).
+    model_id_str = str(model_id)
+    for label in reversed(VISUAL_RL_PHASE_LABELS):
+        legacy = os.path.join(path, f"model.ckpt-{label}-{model_id_str}.pkl")
+        if legacy not in candidates and os.path.isfile(legacy):
+            candidates.append(legacy)
+    # Stage-4 vision labels + S0 visionfull parent.
+    for legacy in visual_anchor_r2_parent_candidates(path, model_id):
+        if legacy not in candidates:
+            candidates.append(legacy)
+    return candidates
 
 
 def validate_low_level_spec(bundle: dict[str, Any], expected: dict[str, int]) -> None:
