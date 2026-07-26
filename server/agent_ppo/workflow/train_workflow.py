@@ -105,6 +105,13 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
         return lbc_workflow(envs, agents, logger=logger, monitor=monitor, *args, **kwargs)
 
+    # hier-nav 高层 DAgger：转发到 nav_dagger_workflow（TBPTT 序列 BC，不走 PPO）
+    # hier-nav high-level DAgger: forward to nav_dagger_workflow (TBPTT BC, no PPO)
+    if getattr(agent, "is_nav_dagger", False):
+        from agent_ppo.workflow.nav_dagger_workflow import workflow as nav_dagger_workflow
+
+        return nav_dagger_workflow(envs, agents, logger=logger, monitor=monitor, *args, **kwargs)
+
     # Reference behavior distillation: flat standard teacher -> ActorCriticEncoder student
     # 参考模型行为蒸馏：扁平 standard teacher -> ActorCriticEncoder student
     if getattr(agent, "is_behavior_distill", False):
@@ -402,6 +409,45 @@ def run_episodes_(
     """
     transition = RolloutStorage.Transition()
     obs, critic_obs = last_obs, last_critic_obs
+    reset_mask = getattr(
+        agent,
+        "_rollout_reset_mask",
+        torch.ones(obs.shape[0], dtype=torch.bool, device=agent.device),
+    )
+    zero_telemetry = None
+    zero_step_dt_s = 0.02
+    if getattr(agent, "is_visual_ppo", False):
+        from agent_ppo.feature.zero_command_telemetry import ZeroCommandTelemetry
+
+        usr_conf = getattr(agent, "usr_conf", {})
+        if not isinstance(usr_conf, dict):
+            usr_conf = {}
+        stage_conf = usr_conf.get(getattr(agent.stage, "name", ""), {})
+        if not isinstance(stage_conf, dict):
+            stage_conf = {}
+        reward_conf = stage_conf.get("rewards", {}).get(
+            "zero_command_stability", {}
+        )
+        reward_params = reward_conf.get("params", {}) if isinstance(reward_conf, dict) else {}
+        if not isinstance(reward_params, dict):
+            reward_params = {}
+        zero_step_dt_s = float(
+            getattr(agent, "command_step_dt_s", 0.02)
+        )
+        existing = getattr(agent, "_zero_command_telemetry", None)
+        if (
+            existing is None
+            or existing.num_envs != int(obs.shape[0])
+            or existing.device != torch.device(agent.device)
+        ):
+            existing = ZeroCommandTelemetry(
+                int(obs.shape[0]),
+                agent.device,
+                command_threshold=float(reward_params.get("command_threshold", 0.05)),
+                grace_period_s=float(reward_params.get("grace_period_s", 0.4)),
+            )
+            agent._zero_command_telemetry = existing
+        zero_telemetry = existing
 
     # TODO: for hierarchical training, handle the mismatch between env action and
     # PPO storage action on your own.
@@ -411,6 +457,13 @@ def run_episodes_(
     # 策略执行循环
     with torch.inference_mode():
         for i in range(agent.num_steps_per_env):
+            if getattr(agent, "is_visual_ppo", False):
+                obs, critic_obs, anchor_weights, command_metrics = (
+                    agent.prepare_rollout_step(
+                        env, obs, critic_obs, reset_mask=reset_mask
+                    )
+                )
+                agent._last_command_metrics = command_metrics
             # Predict actions
             # 预测动作
             predict_data = (obs, critic_obs)
@@ -432,6 +485,13 @@ def run_episodes_(
             command_actions = torch.clip(joint_actions, -6.0, 6.0).to(agent.device)
             if i == 0:
                 logger.info(f"clipped_action:{command_actions}")
+            if zero_telemetry is not None:
+                zero_telemetry.observe(
+                    obs[:, 6:9],
+                    command_actions,
+                    reset_mask=reset_mask,
+                    dt_s=zero_step_dt_s,
+                )
 
             # Environment interaction
             # 环境交互
@@ -441,6 +501,9 @@ def run_episodes_(
             # Move tensors to device
             # 将张量移动到设备
             obs, critic_obs, rewards, dones = _move_tensors_to_device(obs, critic_obs, rewards, dones, agent.device)
+            if getattr(agent, "is_visual_ppo", False):
+                reset_mask = dones.reshape(-1).bool()
+                agent._rollout_reset_mask = reset_mask.detach().clone()
 
             # Update episode statistics (always, regardless of decimation)
             # 更新 episode 统计（始终执行，不受降频影响）
@@ -471,6 +534,8 @@ def run_episodes_(
                 infos,
                 agent,
             )
+            if getattr(agent, "is_visual_ppo", False):
+                transition.anchor_weights = anchor_weights
             storage.add_transitions(transition)
             if getattr(agent, "is_visual_ppo", False):
                 agent.algorithm.reset_recurrent_states(dones)
@@ -479,6 +544,8 @@ def run_episodes_(
         # Compute advantages and returns
         # 计算优势函数和回报
         storage_stats = _compute_advantages_and_returns(storage, agent, critic_obs, logger)
+        if zero_telemetry is not None:
+            agent._last_zero_command_telemetry = zero_telemetry.metrics()
         last_obs = torch.clone(obs)
 
     # Note: batch generation now handled by AlgorithmPPO.learn()

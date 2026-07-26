@@ -12,6 +12,7 @@ import os
 import glob
 import shutil
 import copy
+import hashlib
 
 import numpy as np
 import torch
@@ -34,11 +35,12 @@ from agent_ppo.checkpoint_io import (
     low_level_policy_state,
     validate_low_level_spec,
     validate_probe_filename,
-    vision_checkpoint_candidates,
-    visual_anchor_r2_checkpoint_candidates,
-    visual_anchor_r2_eval_candidates,
-    visual_anchor_r2_parent_candidates,
-    visual_rl_checkpoint_candidates,
+    validate_visual_eval_bundle_identity,
+    visual_command_parent_candidates,
+    visual_eval_checkpoint_diagnostics,
+    visual_eval_checkpoint_candidates,
+    visual_anchor_r2_training_candidates,
+    visual_latest_model_id,
 )
 from tools.train_env_conf_validate import check_usr_conf
 
@@ -49,6 +51,18 @@ class Agent(BaseAgent):
         self.device = device
         self.logger = logger
         self.monitor = monitor
+        self.worker_command_enabled = False
+        self.command_step_dt_s = 0.02
+        self._last_command_anchor_weights = None
+        self._last_command_metrics = {}
+        self._zero_command_telemetry = None
+        self._last_zero_command_telemetry = {}
+        self._visual_eval_diagnostic_steps = 0
+        # Camera tasks may be forced by the platform onto ``lbc_loco``.  Do
+        # not permit that compatibility path to infer before a named visual
+        # checkpoint has completed the strict load below.
+        self._eval_checkpoint_path = None
+        self._eval_requested_model_id = None
 
         usr_conf, usr_conf_file, is_eval, stage = Config.load_conf(self.logger)
         valid, message = check_usr_conf(usr_conf, is_eval, self.logger)
@@ -61,6 +75,10 @@ class Agent(BaseAgent):
         # Cache usr_conf so later platform callbacks (load_model/save_model)
         # can read [env_conf].seed and stage sub-tables without re-parsing TOML.
         self.usr_conf = usr_conf
+        # Keep the actual source path with the parsed configuration. The visual
+        # workflow logs this at startup so a platform-generated TOML cannot be
+        # confused with the repository training template.
+        self.usr_conf_file = usr_conf_file
         env_conf = usr_conf["env"]
         self.num_envs = env_conf["num_envs"]
 
@@ -91,10 +109,18 @@ class Agent(BaseAgent):
         self.is_lbc = self.algorithm_name == "lbc_loco"
         self.is_behavior_distill = self.algorithm_name == "behavior_distill"
         self.is_visual_ppo = self.algorithm_name == "visual_ppo"
+        self.is_nav_dagger = self.algorithm_name == "nav_dagger"
+        self.is_nav_eval = self.algorithm_name == "nav_eval"
 
         if self.is_lbc:
             # LBC 阶段：创建学生 + 教师；不初始化 PPO storage
             self._init_lbc_loco(num_proprio, num_scan, env_conf, stage, usr_conf)
+        elif self.is_nav_dagger:
+            # hier-nav DAgger：冻结低层 + HighLevelPolicy；不初始化 PPO storage
+            self._init_nav_dagger(stage, usr_conf)
+        elif self.is_nav_eval:
+            # hier-nav eval：只组装推理模块，永不构造训练 Algorithm
+            self._init_nav_eval(stage, usr_conf)
         elif self.is_visual_ppo:
             depth_size = (
                 stage.depth_height * stage.depth_width * stage.depth_channels
@@ -109,8 +135,14 @@ class Agent(BaseAgent):
         self.num_steps_per_env = stage.num_steps_per_env
         self.save_interval = stage.model_save_interval
 
-        # LBC / behavior_distill: 无 PPO storage 需要初始化
-        if not (self.is_lbc or self.is_behavior_distill):
+        # LBC / behavior_distill / nav: 无 PPO storage 需要初始化
+        # （nav 分支绝不调用不存在的 AlgorithmNavDagger.init_storage）
+        if not (
+            self.is_lbc
+            or self.is_behavior_distill
+            or self.is_nav_dagger
+            or self.is_nav_eval
+        ):
             # Initialize storage
             # 初始化存储
             self.algorithm.init_storage(
@@ -303,6 +335,116 @@ class Agent(BaseAgent):
         # 为与 PPO 路径下某些属性兼容，point self.model 到学生
         self.model = self.vision_encoder
 
+    # ------------------------------------------------------------------
+    # hier-nav（nav_dagger 训练 / nav_eval 推理）
+    # ------------------------------------------------------------------
+
+    def _build_nav_low_level_actor(self, stage):
+        """复刻低层 Actor77 结构（与 :287-301 教师 Actor 同形，key 对齐低层包）。"""
+        import torch.nn as _nn
+
+        activation_map = {"elu": _nn.ELU, "relu": _nn.ReLU, "tanh": _nn.Tanh}
+        Act = activation_map.get(
+            getattr(stage, "teacher_actor_activation", "elu"), _nn.ELU
+        )
+        actor_input_dim = stage.proprio_dim + stage.latent_dim
+        layers = []
+        prev = actor_input_dim
+        for hidden in list(stage.teacher_actor_hidden_dims):
+            layers.append(_nn.Linear(prev, hidden))
+            layers.append(Act())
+            prev = hidden
+        layers.append(_nn.Linear(prev, self.num_actions))
+        return _nn.Sequential(*layers).to(self.device)
+
+    def _init_nav_common(self, stage):
+        """nav 训练/评估共用：三模块组装 + 冻结双保险 + 显式观测维度。"""
+        from agent_ppo.feature import nav_contract
+        from agent_ppo.model.high_level_policy import HighLevelPolicy
+        from agent_ppo.model.vision_encoder import VisionEncoder
+
+        # 显式布局：policy goal4 与 critic goal3 不对称，不走基类通用公式
+        self.num_obs = nav_contract.POLICY_OBS_DIM        # 57905
+        self.num_critic_obs = nav_contract.CRITIC_OBS_DIM  # 319
+
+        self.vision_encoder = VisionEncoder(
+            image_shape=(stage.depth_height, stage.depth_width, stage.depth_channels),
+            proprio_dim=stage.proprio_dim,
+            cnn_output_dim=stage.cnn_output_dim,
+            rnn_hidden_dim=stage.lstm_hidden_size,
+            rnn_num_layers=stage.lstm_num_layers,
+            rnn_output_dim=stage.latent_dim,
+            use_lstm=True,
+        ).to(self.device)
+        self.low_level_actor = self._build_nav_low_level_actor(stage)
+        self.high_level = HighLevelPolicy(
+            input_dim=stage.nav_input_dim,
+            vocab_size=stage.nav_vocab_size,
+            rnn_hidden_dim=stage.nav_lstm_hidden_size,
+            rnn_num_layers=stage.nav_lstm_num_layers,
+        ).to(self.device)
+
+        # 冻结双保险（.eval + requires_grad=False；optimizer 侧另有参数集合断言）
+        for module in (self.vision_encoder, self.low_level_actor):
+            module.eval()
+            for param in module.parameters():
+                param.requires_grad_(False)
+
+        self.model = self.high_level
+        self._nav_eval_checkpoint_path = None
+        self._nav_eval_requested_model_id = None
+        self._nav_scheduler = None
+        self._nav_frame_count = 0
+
+        self.logger.info(f"[nav] VisionEncoder(frozen):\n{self.vision_encoder}")
+        self.logger.info(f"[nav] LowLevelActor(frozen):\n{self.low_level_actor}")
+        self.logger.info(f"[nav] HighLevelPolicy(trainable):\n{self.high_level}")
+
+    def _init_nav_dagger(self, stage, usr_conf):
+        from agent_ppo.algorithm.algorithm_nav_dagger import AlgorithmNavDagger
+
+        self._init_nav_common(stage)
+        nav_conf = (
+            usr_conf.get(stage.name, {}) if isinstance(usr_conf, dict) else {}
+        )
+        self._nav_low_level_parent_id = str(
+            nav_conf.get("low_level_parent_model_id", 34728)
+        )
+        self.algorithm = AlgorithmNavDagger(
+            vision_encoder=self.vision_encoder,
+            low_level_actor=self.low_level_actor,
+            high_level=self.high_level,
+            device=self.device,
+            learning_rate=stage.lr,
+            max_grad_norm=stage.max_grad_norm,
+            proprio_dim=stage.proprio_dim,
+            scan_dim=stage.scan_dim,
+            depth_shape=(stage.depth_height, stage.depth_width, stage.depth_channels),
+            low_level_parent_model_id=self._nav_low_level_parent_id,
+            logger=self.logger,
+        )
+        self.logger.info(
+            "[nav] AlgorithmNavDagger ready "
+            f"(low_level_parent={self._nav_low_level_parent_id}, "
+            "optimizer=high_level params only)"
+        )
+
+    def _init_nav_eval(self, stage, usr_conf):
+        """eval 专用装配：无 Algorithm、无 optimizer、无训练 schedule。
+
+        与训练类分离是历史事故的堵点：显式 policy_entry 命中训练 Algorithm
+        曾因缺训练 schedule 在 eval 崩溃。
+        """
+        self._init_nav_common(stage)
+        nav_conf = (
+            usr_conf.get("nav_dagger", {}) if isinstance(usr_conf, dict) else {}
+        )
+        self._nav_low_level_parent_id = str(
+            nav_conf.get("low_level_parent_model_id", 34728)
+        )
+        self.algorithm = None
+        self.logger.info("[nav] eval-only assembly (no training Algorithm constructed)")
+
     def _init_visual_ppo(self, num_proprio, num_scan, stage, usr_conf):
         """Initialize Stage-5 recurrent visual PPO from a frozen S0 preload."""
         from agent_ppo.algorithm.algorithm_visual_ppo import AlgorithmVisualPPO
@@ -380,7 +522,10 @@ class Agent(BaseAgent):
             run_name=str(
                 visual_conf.get("run_name", "standard-anchor-r2")
             ),
-            source_parent_model_id=visual_conf.get("initial_parent_model_id"),
+            source_parent_model_id=visual_conf.get(
+                "transition_parent_model_id",
+                visual_conf.get("initial_parent_model_id"),
+            ),
             anchor_schedule_hours=[
                 value / 60.0
                 for value in visual_conf.get("anchor_schedule_minutes", [])
@@ -406,6 +551,15 @@ class Agent(BaseAgent):
             ),
             max_hard_termination_delta=float(
                 visual_conf.get("max_hard_termination_delta", 0.02)
+            ),
+            max_action_amplitude=float(
+                visual_conf.get("max_action_amplitude", 6.0)
+            ),
+            command_anchor_action=float(
+                visual_conf.get("command_anchor_action", 0.35)
+            ),
+            command_anchor_latent=float(
+                visual_conf.get("command_anchor_latent", 0.10)
             ),
             # Legacy scalar schedule kwargs kept for legacy_three_phase_v1
             # resume compatibility; Anchor R2 ignores them.
@@ -441,14 +595,42 @@ class Agent(BaseAgent):
             ),
             desired_kl=None,
         )
+        command_conf = visual_conf.get("command_schedule", {})
+        if not isinstance(command_conf, dict):
+            command_conf = {}
+        self.command_step_dt_s = float(command_conf.get("step_dt_s", 0.02))
+        commands = usr_conf.get("commands", {})
+        self.worker_command_enabled = bool(
+            str(visual_conf.get("schedule_mode", ""))
+            == "visual_command_generalization_v1"
+            and commands.get("worker_progressive", {}).get("enabled", False)
+            and not self.is_eval
+        )
+        self._last_command_anchor_weights = torch.ones(
+            self.num_envs, 1, device=self.device
+        )
         # training_elapsed_h is the Agent-side mirror of the algorithm's anchor
         # session clock (§4.3). The algorithm uses anchor_session_elapsed_hours
         # to drive phase decisions; this attribute feeds learn(elapsed_h=...).
         self.training_elapsed_h = 0.0
         self.logger.info(
-            f"[VisualPPO] initialized Anchor R2: run={self.algorithm.run_name}, "
+            f"[VisualPPO] initialized visual schedule: run={self.algorithm.run_name}, "
             f"schedule={self.algorithm.schedule_mode}, "
             f"CNN frozen, S0 preload required before training"
+        )
+        depth_conf = usr_conf.get("camera", {}).get("depth_camera", {})
+        self.logger.info(
+            "[VisualPPO] configured environment contract: "
+            "command_sampler="
+            f"{'worker_observation_bridge' if self.worker_command_enabled else 'native'}, "
+            f"resampling_time={commands.get('resampling_time')}, "
+            f"ranges={commands.get('ranges')}, "
+            f"buckets_enabled={commands.get('buckets', {}).get('enabled')}, "
+            "worker_progressive_enabled="
+            f"{commands.get('worker_progressive', {}).get('enabled')}, "
+            "depth_augmentation_enabled="
+            f"{depth_conf.get('augmentation', {}).get('enabled')}, "
+            "command_runtime_owner=environment_worker"
         )
 
     def exploit(self, list_obs_data):
@@ -460,8 +642,67 @@ class Agent(BaseAgent):
         with torch.no_grad():
             if self.is_lbc:
                 return self._exploit_lbc_loco(obs)
+            if self.is_nav_dagger or self.is_nav_eval:
+                return self._exploit_nav(obs)
             actions = self.algorithm.actor_critic.act_inference(obs)
+            if self.is_visual_ppo:
+                self._log_visual_eval_runtime_diagnostics(obs, actions)
             return [ActData(action=actions)]
+
+    def _log_visual_eval_runtime_diagnostics(self, obs, actions) -> None:
+        """Print bounded input/output evidence for VisualPPO evaluation.
+
+        This is intentionally diagnostic-only.  Missing, non-finite, or
+        unusual values are reported for the operator to investigate; they do
+        not turn into a policy or checkpoint loading gate.
+        """
+        if not self.is_eval or self._visual_eval_diagnostic_steps >= 3:
+            return
+        self._visual_eval_diagnostic_steps += 1
+        if not isinstance(obs, torch.Tensor) or not isinstance(actions, torch.Tensor):
+            self.logger.warning(
+                "[VisualPPO eval] runtime diagnostics unavailable: "
+                "observation or action is not a tensor"
+            )
+            return
+
+        def _stats(values):
+            if values.numel() == 0:
+                return "unavailable"
+            finite = torch.isfinite(values)
+            finite_rate = float(finite.float().mean().item())
+            if not bool(finite.any()):
+                return f"shape={tuple(values.shape)}, finite_rate={finite_rate:.4f}"
+            valid = values[finite]
+            return (
+                f"shape={tuple(values.shape)}, finite_rate={finite_rate:.4f}, "
+                f"mean={float(valid.mean().item()):.5f}, "
+                f"std={float(valid.std(unbiased=False).item()):.5f}, "
+                f"min={float(valid.min().item()):.5f}, "
+                f"max={float(valid.max().item()):.5f}"
+            )
+
+        command = obs[:, 6:9] if obs.ndim == 2 and obs.shape[1] >= 9 else obs.new_empty(0)
+        depth_start = self.stage.num_proprio_obs + self.stage.num_scan
+        depth_size = (
+            self.stage.depth_height
+            * self.stage.depth_width
+            * self.stage.depth_channels
+        )
+        depth_end = depth_start + depth_size
+        depth = (
+            obs[:, depth_start:depth_end]
+            if obs.ndim == 2 and obs.shape[1] >= depth_end
+            else obs.new_empty(0)
+        )
+        self.logger.info(
+            "[VisualPPO eval] runtime diagnostics: "
+            f"step={self._visual_eval_diagnostic_steps}, "
+            f"depth_expected_shape=(B,{self.stage.depth_height},"
+            f"{self.stage.depth_width},{self.stage.depth_channels}), "
+            f"depth={_stats(depth)}, command={_stats(command)}, "
+            f"action={_stats(actions)}"
+        )
 
     def _exploit_lbc_loco(self, obs):
         """LBC Loco eval: 学生 VisionEncoder 闭环推理。
@@ -469,6 +710,12 @@ class Agent(BaseAgent):
         obs: flat tensor [B, proprio+scan+depth] = [B, 57901]
         Returns: [ActData(action=joint_actions[B, 12])]
         """
+        if self.is_eval and self._eval_checkpoint_path is None:
+            raise RuntimeError(
+                "[LBC-Loco eval] refusing inference because no checkpoint was "
+                "successfully loaded"
+            )
+
         obs_dict = self.algorithm._split_obs(obs)
 
         # 1. 学生: depth + proprio → LSTM → student_latent
@@ -496,9 +743,33 @@ class Agent(BaseAgent):
             return None
         if self.is_behavior_distill:
             return None
+        if self.is_nav_dagger or self.is_nav_eval:
+            # nav 训练在 nav_dagger_workflow 内直接调 algorithm；此处 no-op
+            # 仅用于推进平台 lifecycle（每 outer iteration 恰调用一次）。
+            return None
         if self.is_visual_ppo:
             return self.algorithm.learn(self.training_elapsed_h)
         return self.algorithm.learn()
+
+    def prepare_rollout_step(self, env, obs, critic_obs, reset_mask=None):
+        """Derive S0 anchor weights from worker-published policy commands."""
+        del env, reset_mask
+        if obs.ndim != 2 or obs.shape[1] < 9:
+            raise ValueError("visual policy observation has no command fields at [6:9]")
+        command = obs[:, 6:9]
+        from agent_ppo.feature.command_schedule import anchor_weights_from_commands
+
+        weights = anchor_weights_from_commands(command)
+        metrics = {
+            "command_runtime_owner": "worker_observation_bridge_v1",
+            "anchor_weight_mean": float(weights.mean().item()),
+            "command_observation_min": command.min(0).values.detach().cpu().tolist(),
+            "command_observation_max": command.max(0).values.detach().cpu().tolist(),
+            "command_observation_mean": command.mean(0).detach().cpu().tolist(),
+        }
+        self._last_command_anchor_weights = weights
+        self._last_command_metrics = metrics
+        return obs, critic_obs, weights, metrics
 
     def predict(self, list_obs_data):
         """
@@ -517,6 +788,11 @@ class Agent(BaseAgent):
             raise RuntimeError(
                 "agent.predict() is not used in behavior_distill stage; "
                 "behavior_distill_workflow calls algorithm.act_teacher/update directly."
+            )
+        if self.is_nav_dagger or self.is_nav_eval:
+            raise RuntimeError(
+                "agent.predict() is not used in nav stages; nav_dagger_workflow "
+                "calls algorithm.frame_begin/frame_end directly (eval uses exploit)."
             )
         (obs, critic_obs) = list_obs_data
         with torch.no_grad():
@@ -559,6 +835,84 @@ class Agent(BaseAgent):
         if p >= 0.10:
             return "visionhalf"
         return "visionteacher"
+
+    def _current_nav_label(self) -> str:
+        """按 ramp 进度返回 nav 阶段标签（navbc/navdagger/navfull，纯小写）。"""
+        p = float(getattr(self.algorithm, "ramp_probability", 0.0))
+        if p >= 1.0:
+            return "navfull"
+        if p >= 0.10:
+            return "navdagger"
+        return "navbc"
+
+    def _exploit_nav(self, obs):
+        """nav 评估推理：手工前向链，按冻结逐帧时序（nav_contract）。
+
+        帧序：inject 当帧 exec → 低层前向一次 → nav tick 时高层决策 →
+        step_exec（新目标下一帧生效）。未加载 checkpoint 时拒绝推理评分。
+        """
+        from agent_ppo.feature import nav_contract
+        from agent_ppo.feature.nav_scheduler import NavScheduler
+
+        if self._nav_eval_checkpoint_path is None:
+            raise RuntimeError(
+                "[nav eval] checkpoint not loaded; refusing to run inference "
+                "and produce scores with random parameters"
+            )
+        obs = obs.to(self.device)
+        if obs.ndim != 2 or obs.shape[1] != nav_contract.POLICY_OBS_DIM:
+            raise ValueError(
+                f"[nav eval] obs dim {tuple(obs.shape)} != "
+                f"[N, {nav_contract.POLICY_OBS_DIM}]"
+            )
+        n = obs.shape[0]
+        if self._nav_scheduler is None or self._nav_scheduler.num_envs != n:
+            self._nav_scheduler = NavScheduler(n, self.device)
+            self.vision_encoder.reset_hidden_state(n, self.device)
+            self.high_level.reset_hidden_state(n, self.device)
+            self._nav_frame_count = 0
+        sched = self._nav_scheduler
+
+        obs = obs.clone()
+        sched.inject(obs)
+
+        proprio = obs[:, : nav_contract.POLICY_PROPRIO_DIM]
+        goal4 = obs[:, nav_contract.GOAL4_OBS_START : nav_contract.GOAL4_OBS_END]
+        depth = obs[:, nav_contract.DEPTH_OBS_START :].reshape(
+            n,
+            self.stage.depth_height,
+            self.stage.depth_width,
+            self.stage.depth_channels,
+        )
+        latent = self.vision_encoder(depth, proprio, masks=None)
+        actions = self.low_level_actor(torch.cat((proprio, latent), dim=-1))
+
+        if self._nav_frame_count % nav_contract.NAV_PERIOD_FRAMES == 0:
+            cnn_feat_raw = self.vision_encoder.cnn(depth)
+            nav_inputs = torch.cat(
+                (
+                    cnn_feat_raw,
+                    goal4,
+                    sched.exec_cmd,
+                    sched.held_cmd,
+                    proprio[:, 0:3],
+                    proprio[:, 3:6],
+                ),
+                dim=-1,
+            )
+            logits = self.high_level(nav_inputs, dwell_mask=sched.dwell_mask())
+            tokens = logits.argmax(dim=-1)
+            finite = torch.isfinite(logits).all(dim=-1)
+            if not bool(finite.all()):
+                tokens = torch.where(
+                    finite,
+                    tokens,
+                    torch.full_like(tokens, nav_contract.ZERO_TOKEN_INDEX),
+                )
+            sched.request_tokens(tokens)
+        self._nav_frame_count += 1
+        sched.step_exec()
+        return [ActData(action=actions)]
 
     def save_model(self, path=None, id="1"):
         """
@@ -616,6 +970,28 @@ class Agent(BaseAgent):
                 f"trainable={self.algorithm.trainable_modules_snapshot()}, "
                 f"platform_id={id}, sha256={checksum})"
             )
+        elif self.is_nav_dagger:
+            nav_label = self._current_nav_label()
+            nav_file_path = f"{path}/model.ckpt-{nav_label}-{str(id)}.pkl"
+            if not validate_probe_filename(nav_file_path):
+                raise ValueError(
+                    f"Nav checkpoint filename not probe-compatible: {nav_file_path}"
+                )
+            checksum = self.algorithm.save_nav_bundle(
+                nav_file_path,
+                platform_model_id=id,
+                phase_label=nav_label,
+            )
+            self.logger.info(
+                f"[nav_dagger] save nav bundle={nav_file_path} "
+                f"(ramp_p={float(getattr(self.algorithm, 'ramp_probability', 0.0)):.3f}, "
+                f"label={nav_label}, "
+                f"low_level_digest={self.algorithm.low_level_state_digest}, "
+                f"platform_id={id}, sha256={checksum})"
+            )
+        elif self.is_nav_eval:
+            self.logger.info("[nav_eval] save_model is a no-op in eval assembly")
+            return
         elif self.is_lbc:
             ramp_label = self._current_ramp_label()
             vision_file_path = f"{path}/model.ckpt-{ramp_label}-{str(id)}.pkl"
@@ -667,7 +1043,12 @@ class Agent(BaseAgent):
         # 阶段 4 视觉训练包已含冻结教师副本（modules.low_level），不再额外生成
         # locomotion 副本，避免产物目录出现 vision* + lbc-loco + locomotion 三个
         # 文件的混淆（locomotion 只是冻结教师，不是视觉学生）。
-        if not (self.is_lbc or self.is_visual_ppo):
+        if not (
+            self.is_lbc
+            or self.is_visual_ppo
+            or self.is_nav_dagger
+            or self.is_nav_eval
+        ):
             self._save_side_locomotion(path, id)
 
     def save_vision_at_ramp_label(self, path, id, ramp_label: str):
@@ -731,6 +1112,9 @@ class Agent(BaseAgent):
         if self.is_visual_ppo:
             self._load_visual_ppo(path, id)
             return
+        if self.is_nav_dagger or self.is_nav_eval:
+            self._load_nav(path, id)
+            return
         if self.is_lbc:
             self._load_lbc_loco(path, id)
             return
@@ -738,6 +1122,142 @@ class Agent(BaseAgent):
             self._load_behavior_distill_teacher(path, id)
             return
         self._load_flat(path, id)
+
+    def _load_nav(self, path=None, id="1"):
+        """nav 加载分派：eval 走硬停止链；训练走首载低层父 / nav resume。
+
+        四条分支（计划 §8.2）：
+          1. 首载低层父：注入 id == low_level_parent_model_id → 只认低层父候选，
+             高层保持随机初始化，当场计算并缓存 low_level_state_digest。
+          2. 首次保存：save_nav_bundle 内重算 digest 硬比对（algorithm 侧）。
+          3. 同 schedule resume：全量恢复权重/optimizer/ramp；per-env 活状态
+             不恢复（全 reset）。
+          4. 换低层重训：新任务把 low_level_parent_model_id 配成新低层 ID，
+             回到分支 1（高层从头重训，不做跨包权重嫁接）。
+        """
+        if not path:
+            raise FileNotFoundError("[nav] preload path is empty")
+        if self.is_eval or self.is_nav_eval:
+            self._load_nav_for_eval(path, id)
+            return
+
+        id_str = str(id)
+        if id_str == "latest":
+            raise ValueError(
+                "[nav] training resume must use an explicit numeric model id, "
+                "not 'latest' (cross-ID accidents forbidden)"
+            )
+        if id_str == str(self._nav_low_level_parent_id):
+            hit = self.algorithm.load_parent_bundle(path, id_str)
+        else:
+            hit = self.algorithm.load_nav_resume(path, id_str)
+            if hit is None:
+                hit = self.algorithm.load_parent_bundle(path, id_str)
+        if hit is None:
+            from agent_ppo.checkpoint_io import nav_eval_checkpoint_diagnostics
+
+            raise FileNotFoundError(
+                f"[nav] no loadable checkpoint for id={id_str} under {path}; "
+                f"diagnostics={nav_eval_checkpoint_diagnostics(path, id_str)}"
+            )
+
+    def _load_nav_for_eval(self, path, id):
+        """nav eval 硬停止链 + 8 行自检日志；任一失败在第一次推理前 raise。"""
+        import hashlib as _hashlib
+
+        from agent_ppo.checkpoint_io import (
+            high_level_parts,
+            nav_eval_checkpoint_candidates,
+            nav_eval_checkpoint_diagnostics,
+            nav_latest_model_id,
+            validate_nav_eval_bundle,
+        )
+        from agent_ppo.feature import nav_contract
+
+        requested = str(id)
+        id_str = requested
+        if id_str == "latest":
+            resolved = nav_latest_model_id(path)
+            if resolved is None:
+                raise FileNotFoundError(
+                    "[nav-eval] no nav checkpoints for 'latest'; "
+                    f"diagnostics={nav_eval_checkpoint_diagnostics(path, id)}"
+                )
+            id_str = str(resolved)
+
+        candidates = nav_eval_checkpoint_candidates(path, id_str)
+        if not candidates:
+            raise FileNotFoundError(
+                f"[nav-eval] no same-ID nav checkpoint for id={id_str}; "
+                "nav eval never falls back to loco-only bundles; "
+                f"diagnostics={nav_eval_checkpoint_diagnostics(path, id_str)}"
+            )
+        ckpt_path = candidates[0]
+        bundle = torch.load(ckpt_path, weights_only=False, map_location=self.device)
+
+        expected_low = {
+            "proprio_dim": self.stage.proprio_dim,
+            "scan_dim": self.stage.scan_dim,
+            "latent_dim": self.stage.latent_dim,
+            "action_dim": self.stage.num_actions,
+            "goal_dim": 0,  # 低层 spec 恒为 0（nav goal4 只在 nav_goal_dim 上）
+        }
+        expected_high = {
+            "input_layout_version": nav_contract.INPUT_LAYOUT_VERSION,
+            "vocab": [list(v) for v in nav_contract.VOCAB],
+            "nav_period_frames": nav_contract.NAV_PERIOD_FRAMES,
+            "min_dwell_ticks": nav_contract.MIN_DWELL_TICKS,
+        }
+        info = validate_nav_eval_bundle(bundle, id_str, expected_low, expected_high)
+
+        modules = bundle["modules"]
+        ve_state = modules["vision_encoder"]["state_dict"]
+        actor_state = modules["low_level"]["actor_state_dict"]
+        hl_state, _hl_meta = high_level_parts(bundle)
+        # strict=True：任何 missing/unexpected keys 视同反序列化失败
+        self.vision_encoder.load_state_dict(ve_state, strict=True)
+        self.low_level_actor.load_state_dict(actor_state, strict=True)
+        self.high_level.load_state_dict(hl_state, strict=True)
+        self.vision_encoder.eval()
+        self.low_level_actor.eval()
+        self.high_level.eval()
+        self.vision_encoder.reset_hidden_state(self.num_envs, self.device)
+        self.high_level.reset_hidden_state(self.num_envs, self.device)
+        self._nav_scheduler = None
+        self._nav_frame_count = 0
+
+        hasher = _hashlib.sha256()
+        with open(ckpt_path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        file_sha256 = hasher.hexdigest()
+
+        self._nav_eval_checkpoint_path = ckpt_path
+        self._nav_eval_requested_model_id = requested
+
+        lineage = info["lineage"] or {}
+        self.logger.info(f"[nav-eval] requested_model_id={requested}")
+        self.logger.info(f"[nav-eval] selected_ckpt={ckpt_path}")
+        self.logger.info(f"[nav-eval] file_sha256={file_sha256}")
+        self.logger.info(
+            f"[nav-eval] platform_model_id={bundle.get('platform_model_id')}"
+        )
+        self.logger.info(
+            "[nav-eval] lineage={"
+            f"parent={lineage.get('source_parent_model_id')}, "
+            f"low_level_parent={lineage.get('low_level_parent_model_id')}, "
+            f"low_level_digest={lineage.get('low_level_state_digest')}"
+            "}"
+        )
+        self.logger.info(
+            f"[nav-eval] digest_check=PASS high_level=PRESENT "
+            f"(digest={info['low_level_state_digest']})"
+        )
+        self.logger.info(f"[nav-eval] policy_entry={self.algorithm_name}")
+        self.logger.info(
+            "[nav-eval] modules_loaded=vision_encoder,low_level_actor,high_level "
+            "uses_height_scan_at_inference=false"
+        )
 
     def _load_visual_ppo(self, path=None, id="1"):
         """Load the Anchor R2 S0 parent, an Anchor R2 resume, or a Camera eval ckpt.
@@ -765,23 +1285,38 @@ class Agent(BaseAgent):
         env_seed = self._visual_env_seed()
 
         if self.is_eval:
-            candidates = visual_anchor_r2_eval_candidates(path, id)
-            resolved_id = self._resolve_filename_id(candidates, path, id_str)
+            if id_str == "latest":
+                resolved_numeric_id = visual_latest_model_id(path)
+                if resolved_numeric_id is None:
+                    raise FileNotFoundError(
+                        f"[VisualPPO] latest selector found no visual checkpoint in {path}"
+                    )
+                resolved_id = str(resolved_numeric_id)
+                candidates = visual_eval_checkpoint_candidates(path, resolved_numeric_id)
+            else:
+                candidates = visual_eval_checkpoint_candidates(path, id)
+                resolved_id = self._resolve_filename_id(candidates, path, id_str)
         elif id_str == "latest":
-            # `latest` only allowed for eval/diagnostic convenience; training
-            # entry rejects it. Resolve max filename ID within Anchor R2 labels.
-            from agent_ppo.checkpoint_io import _latest_visual_anchor_r2_candidates
-            resume_candidates = _latest_visual_anchor_r2_candidates(path)
-            parent_candidates = visual_anchor_r2_parent_candidates(path, id_str)
-            candidates = [*resume_candidates, *parent_candidates]
-            resolved_id = self._resolve_filename_id(candidates, path, id_str)
+            raise ValueError(
+                "[VisualPPO] training preload selector 'latest' is forbidden; "
+                "use the explicit platform model ID"
+            )
         else:
-            # Training: Anchor R2 resume first, then exact S0 parent. The
-            # parent must come AFTER resume so a same-id resume wins, but the
-            # parent list itself puts visionfull-28401 first among S0 files.
-            resume_candidates = visual_anchor_r2_checkpoint_candidates(path, id)
-            parent_candidates = visual_anchor_r2_parent_candidates(path, id)
-            candidates = [*resume_candidates, *parent_candidates]
+            if self.algorithm.schedule_mode == "visual_command_generalization_v1":
+                candidates = visual_command_parent_candidates(path, id)
+            else:
+                configured_parent_id = self.usr_conf.get(
+                    Config.CURRENT.name, {}
+                ).get("initial_parent_model_id")
+                if configured_parent_id in (None, ""):
+                    configured_parent_id = (
+                        self.algorithm.source_parent_model_id or 28401
+                    )
+                candidates = visual_anchor_r2_training_candidates(
+                    path,
+                    id,
+                    initial_parent_model_id=str(configured_parent_id),
+                )
             resolved_id = id_str
 
         selected = next(
@@ -793,20 +1328,82 @@ class Agent(BaseAgent):
             None,
         )
         if selected is None:
+            if self.is_eval:
+                diagnostic = visual_eval_checkpoint_diagnostics(path, id_str)
+                self.logger.warning(
+                    "[VisualPPO eval] no same-ID visual checkpoint; "
+                    "cross-ID fallback remains disabled. "
+                    f"requested_id={diagnostic['requested_id']}, "
+                    f"same_id_expected={diagnostic['same_id_expected']}, "
+                    f"same_id_existing={diagnostic['same_id_existing']}, "
+                    f"other_visual_files={diagnostic['other_visual_files']}"
+                )
             raise FileNotFoundError(
                 f"[VisualPPO] no Anchor R2 / S0 checkpoint found in {path} "
                 f"for selector={id_str!r}; tried={candidates}"
             )
-        load_mode = self.algorithm.load_training_bundle(
-            selected,
-            expected_spec=expected_spec,
-            env_seed=env_seed,
-        )
+        if self.is_eval:
+            eval_info = self.algorithm.load_eval_bundle(
+                selected, expected_spec=expected_spec, num_envs=self.num_envs
+            )
+            load_mode = "visual_eval"
+        else:
+            eval_info = None
+            load_mode = self.algorithm.load_training_bundle(
+                selected,
+                expected_spec=expected_spec,
+                env_seed=env_seed,
+            )
         # Agent mirrors the algorithm's anchor session clock; elapsed_training_h
         # is only a cumulative-training record, not a phase driver (§4.3).
         self.training_elapsed_h = self.algorithm.anchor_session_elapsed_hours
         self.cur_model_name = selected
         bundle_id = self.algorithm.loaded_platform_model_id or "unknown"
+        lineage_for_log = "unknown"
+        if eval_info is not None:
+            expected_file_id = resolved_id if str(resolved_id).isdigit() else None
+            actual_bundle_id = eval_info.get("platform_model_id")
+            if expected_file_id is not None and actual_bundle_id in (None, ""):
+                self.logger.warning(
+                    "[VisualPPO eval] checkpoint has no platform_model_id; "
+                    "continuing with the operator-selected file: "
+                    f"filename_id={expected_file_id}, path={selected}"
+                )
+            elif (
+                expected_file_id is not None
+                and str(actual_bundle_id) != str(expected_file_id)
+            ):
+                self.logger.warning(
+                    "[VisualPPO eval] checkpoint platform ID differs from "
+                    "the selected filename; continuing because the operator "
+                    f"selected the preload: filename_id={expected_file_id}, "
+                    f"bundle_id={actual_bundle_id!r}, path={selected}"
+                )
+            visual_conf = self.usr_conf.get("visual_policy_optimization", {})
+            if not isinstance(visual_conf, dict):
+                visual_conf = {}
+            configured_parent = visual_conf.get("transition_parent_model_id")
+            lineage_parent = (
+                eval_info.get("lineage_transition_parent_platform_model_id")
+                or eval_info.get("lineage_source_parent_model_id")
+            )
+            lineage_for_log = lineage_parent or "unknown"
+            if lineage_parent in (None, ""):
+                self.logger.warning(
+                    "[VisualPPO eval] checkpoint has no parent lineage; "
+                    "continuing with the operator-selected preload: "
+                    f"configured_reference={configured_parent!r}, path={selected}"
+                )
+            elif (
+                configured_parent not in (None, "")
+                and str(lineage_parent) != str(configured_parent)
+            ):
+                self.logger.warning(
+                    "[VisualPPO eval] checkpoint lineage differs from the "
+                    "configured reference; continuing because the operator "
+                    f"selected the preload: configured={configured_parent!r}, "
+                    f"lineage_parent={lineage_parent!r}, path={selected}"
+                )
         self.logger.info(
             f"[VisualPPO] run={self.algorithm.run_name} "
             f"schedule={self.algorithm.schedule_mode} "
@@ -823,6 +1420,19 @@ class Agent(BaseAgent):
             f"action_anchor={self.algorithm.action_anchor_weight:.3f} "
             f"latent_anchor={self.algorithm.latent_anchor_weight_current:.3f}"
         )
+        if eval_info is not None:
+            self.logger.info(
+                "[VisualPPO eval] student bundle loaded: "
+                f"path={selected}, filename_id={resolved_id}, "
+                f"bundle_id={eval_info['platform_model_id'] or 'unknown'}, "
+                f"format={eval_info['format']}, schema={eval_info['schema_version']}, "
+                f"schedule={eval_info['schedule_mode'] or 'unknown'}, "
+                f"file_size_bytes={eval_info['file_size_bytes']}, "
+                f"sha256={eval_info['sha256']}, "
+                f"lineage_parent={lineage_for_log}, "
+                "modules=vision_encoder+low_level_actor+action_distribution, "
+                "uses_height_scan_at_inference=false"
+            )
 
     def _visual_env_seed(self):
         """Read [env_conf].seed from the active TOML for RNG reinitialization."""
@@ -1002,6 +1612,8 @@ class Agent(BaseAgent):
 
         # Eval 路径：模拟真机视角
         if is_eval:
+            self._eval_requested_model_id = str(id)
+            self._eval_checkpoint_path = None
             eval_path = self._find_vision_eval_ckpt(path, id)
             self._load_lbc_loco_for_eval(eval_path)
             self.cur_model_name = eval_path
@@ -1036,79 +1648,144 @@ class Agent(BaseAgent):
         )
 
     def _find_vision_eval_ckpt(self, path, id) -> str:
-        """评估时查找视觉 checkpoint：优先 vision* 视觉包，回退 lbc-loco。"""
-        candidates = vision_checkpoint_candidates(path, id)
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                return candidate
-        # 兼容：老 lbc-loco 顶层 key 格式
-        legacy = f"{path}/model.ckpt-lbc-loco-{str(id)}.pkl"
-        if os.path.exists(legacy):
-            return legacy
-        raise FileNotFoundError(
-            f"[LBC-Loco eval] No vision ckpt found in {path}/ for id={id}; "
-            f"eval simulates real-robot deployment and cannot fall back to "
-            f"teacher-only ckpt."
+        """Resolve one explicit-ID Camera bundle for the platform LBC entry."""
+        if not path:
+            raise FileNotFoundError(
+                "[LBC-Loco eval] checkpoint directory is empty; refusing "
+                "uninitialized Camera inference"
+            )
+
+        requested_id = str(id)
+        diagnostics = visual_eval_checkpoint_diagnostics(path, requested_id)
+        candidates = visual_eval_checkpoint_candidates(path, requested_id)
+        selected = candidates[0] if candidates else None
+        candidate_order = [
+            os.path.abspath(candidate)
+            for candidate in diagnostics["same_id_expected"]
+        ]
+        existing_candidates = [os.path.abspath(candidate) for candidate in candidates]
+        self.logger.info(
+            "[LBC-Loco eval] checkpoint candidates "
+            f"requested_id={requested_id}, "
+            f"candidate_order={candidate_order}, "
+            f"existing_candidates={existing_candidates}, "
+            f"other_visual_files={diagnostics['other_visual_files']}, "
+            f"selected={os.path.abspath(selected) if selected else None}"
         )
+        if selected is not None:
+            return selected
+        raise FileNotFoundError(
+            f"[LBC-Loco eval] No same-ID visual checkpoint found in {path}/ "
+            f"for requested_id={requested_id}; "
+            f"candidate_order={diagnostics['same_id_expected']}; "
+            "refusing uninitialized Camera inference."
+        )
+
+    @staticmethod
+    def _checkpoint_sha256(path: str) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _validate_lbc_eval_bundle_identity(self, ckpt, vision_path: str) -> dict:
+        """Reject a Camera bundle not attributable to the requested model ID."""
+        if self._eval_requested_model_id in (None, ""):
+            raise RuntimeError(
+                "[LBC-Loco eval] requested model ID was not set before load: "
+                f"path={vision_path}"
+            )
+        identity = validate_visual_eval_bundle_identity(
+            ckpt, self._eval_requested_model_id
+        )
+        identity["path"] = os.path.abspath(vision_path)
+        return identity
 
     def _load_lbc_loco_for_eval(self, vision_path):
         """Eval 模式：模拟真机视角，只加载 vision_encoder + teacher_actor。
 
         真机部署时 teacher_encoder（吃 height_scan）不存在，故 eval 也不加载它。
-        支持两种格式：
-          - kaiwu_train_v1 视觉包（modules.vision_encoder / modules.low_level）
-          - 老 lbc_loco 顶层 key（vision_encoder_state_dict / teacher_actor_state_dict）
+        评估只能接受带平台身份的 kaiwu_train_v1 视觉训练包；旧 lbc_loco
+        导出制品没有该身份契约，因此不能被用来代替平台请求的模型。
         """
         ckpt = torch.load(vision_path, weights_only=False, map_location=self.device)
-        fmt = ckpt.get("format")
-
-        if fmt == KAIWU_TRAIN_FORMAT:
-            # 新视觉训练包：从 modules 读取
-            modules = ckpt.get("modules", {})
-            vision_section = modules.get("vision_encoder", {})
-            ve_state = vision_section.get("state_dict")
-            if not isinstance(ve_state, dict):
-                raise KeyError(
-                    f"modules.vision_encoder.state_dict missing in {vision_path}"
-                )
-            self.vision_encoder.load_state_dict(ve_state)
-            self.vision_encoder.eval()
-            self.vision_encoder.reset_hidden_state(
-                batch_size=self.num_envs, device=self.device
-            )
-            low_level = modules.get("low_level", {})
-            act_state = low_level.get("actor_state_dict")
-            if not isinstance(act_state, dict):
-                raise KeyError(
-                    f"modules.low_level.actor_state_dict missing in {vision_path}"
-                )
-            self.teacher_actor.load_state_dict(act_state)
-            self.teacher_actor.eval()
-            self.logger.info(
-                f"[LBC-Loco eval] Loaded vision bundle {vision_path} "
-                f"(kaiwu_train_v1; teacher_encoder NOT loaded — pure vision view, "
-                f"no height_scan)"
-            )
-            return
-
-        # 兼容老 lbc_loco 顶层 key 格式
-        if fmt != self.algorithm_name:
+        if not isinstance(ckpt, dict):
             raise ValueError(
-                f"Ckpt format mismatch: expected '{self.algorithm_name}' or "
-                f"'{KAIWU_TRAIN_FORMAT}', got '{fmt}' at {vision_path}."
+                "[LBC-Loco eval] checkpoint payload is not a dict: "
+                f"{vision_path}"
             )
-        if "vision_encoder_state_dict" not in ckpt:
-            raise KeyError(f"vision_encoder_state_dict missing in {vision_path}")
-        self.vision_encoder.load_state_dict(ckpt["vision_encoder_state_dict"])
+        if not is_kaiwu_train_bundle(ckpt):
+            raise ValueError(
+                f"[LBC-Loco eval] expected {KAIWU_TRAIN_FORMAT} checkpoint, "
+                f"got format={ckpt.get('format')!r} at {vision_path}"
+            )
+
+        identity = self._validate_lbc_eval_bundle_identity(ckpt, vision_path)
+        validate_low_level_spec(
+            ckpt,
+            {
+                "proprio_dim": self.stage.num_proprio_obs,
+                "scan_dim": self.stage.num_scan,
+                "latent_dim": self.stage.latent_dim,
+                "action_dim": self.stage.num_actions,
+                "goal_dim": getattr(self.stage, "num_goal_obs", 0),
+            },
+        )
+        modules = ckpt.get("modules", {})
+        if not isinstance(modules, dict):
+            raise KeyError(f"[LBC-Loco eval] modules missing in {vision_path}")
+        # hier-nav 防呆：nav 组合包（含 modules.high_level）绝不允许被 lbc_loco
+        # 路径静默降级为 loco-only 评估（Camera 自动回退历史事故的堵点）。
+        if "high_level" in modules:
+            raise ValueError(
+                "[LBC-Loco eval] this bundle contains modules.high_level (a "
+                "hier-nav combined bundle). Refusing to silently drop the high "
+                "level and score loco-only; evaluate it via the nav_eval "
+                f"policy_entry instead. path={vision_path}"
+            )
+        vision_section = modules.get("vision_encoder", {})
+        ve_state = (
+            vision_section.get("state_dict")
+            if isinstance(vision_section, dict)
+            else None
+        )
+        if not isinstance(ve_state, dict):
+            raise KeyError(
+                "[LBC-Loco eval] modules.vision_encoder.state_dict missing in "
+                f"{vision_path}"
+            )
+        low_level = modules.get("low_level", {})
+        act_state = (
+            low_level.get("actor_state_dict")
+            if isinstance(low_level, dict)
+            else None
+        )
+        if not isinstance(act_state, dict):
+            raise KeyError(
+                "[LBC-Loco eval] modules.low_level.actor_state_dict missing in "
+                f"{vision_path}"
+            )
+
+        # Camera evaluation must remain deploy-shaped: do not load the
+        # privileged teacher encoder, critic, optimizer, or training state.
+        self.vision_encoder.load_state_dict(ve_state, strict=True)
         self.vision_encoder.eval()
-        self.vision_encoder.reset_hidden_state(batch_size=self.num_envs, device=self.device)
-        if "teacher_actor_state_dict" not in ckpt:
-            raise KeyError(f"teacher_actor_state_dict missing in {vision_path}")
-        self.teacher_actor.load_state_dict(ckpt["teacher_actor_state_dict"])
+        self.vision_encoder.reset_hidden_state(
+            batch_size=self.num_envs, device=self.device
+        )
+        self.teacher_actor.load_state_dict(act_state, strict=True)
         self.teacher_actor.eval()
+        checksum = self._checkpoint_sha256(vision_path)
+        self._eval_checkpoint_path = identity["path"]
         self.logger.info(
-            f"[LBC-Loco eval] Loaded legacy lbc_loco {vision_path} "
-            f"(teacher_encoder NOT loaded — simulates real-robot view)"
+            "[LBC-Loco eval] loaded visual student "
+            f"selected_path={identity['path']}, sha256={checksum}, "
+            f"bundle_id={identity['bundle_id']!r}, "
+            f"lineage_id={identity['lineage_id']!r}, "
+            f"lineage={identity['lineage']}, "
+            "modules=vision_encoder+low_level_actor, "
+            "teacher_encoder_not_loaded=true, uses_height_scan_at_inference=false"
         )
 
     @staticmethod
