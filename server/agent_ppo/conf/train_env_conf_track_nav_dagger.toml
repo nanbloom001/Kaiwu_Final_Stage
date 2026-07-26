@@ -142,6 +142,9 @@ enabled = false
 # Nav-DAgger-specific parameters (matching NavDaggerConfig; TOML > class default).
 # Nav DAgger 专用参数（对应 NavDaggerConfig；TOML 优先于类默认）。
 [nav_dagger]
+# 冻结低层父模型 ID（用户决定：command-34728）。注入 id == 此值时走首载分支
+# （只认低层父候选，高层随机初始化）；换低层重训时改此值即回到首载分支。
+low_level_parent_model_id = 34728
 learning_rate = 3e-4
 lr_min = 1e-5
 max_iterations = 20000
