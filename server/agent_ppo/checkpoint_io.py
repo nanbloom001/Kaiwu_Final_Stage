@@ -687,16 +687,14 @@ def nav_training_candidates(
     When the platform-injected id equals the configured low-level parent id,
     this is the bootstrap first load: return ONLY low-level parent candidates
     (the in-memory high_level stays randomly initialized). Otherwise return
-    same-ID nav resumes first, then same-ID low-level parents (cross-task
-    continuation via preload follows the anchor R2 precedent).
+    same-ID nav resumes ONLY — falling back to a same-ID low-level parent is
+    forbidden (it would silently discard high-level progress and produce a
+    self-contradictory lineage; switching parents must be done explicitly by
+    changing low_level_parent_model_id, which routes back to the first branch).
     """
-    parent = nav_parent_candidates(path, model_id)
     if str(model_id) == str(low_level_parent_model_id):
-        return parent
-    return [
-        *nav_checkpoint_candidates(path, model_id),
-        *parent,
-    ]
+        return nav_parent_candidates(path, model_id)
+    return nav_checkpoint_candidates(path, model_id)
 
 
 def nav_eval_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:

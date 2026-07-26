@@ -1150,14 +1150,17 @@ class Agent(BaseAgent):
         if id_str == str(self._nav_low_level_parent_id):
             hit = self.algorithm.load_parent_bundle(path, id_str)
         else:
+            # 非父 ID 只允许 nav resume；resume 未命中即硬失败——不得静默
+            # 回退到同 ID visual/command 父包（那会在配置未改的情况下从
+            # 任意低层包 bootstrap、丢弃高层进度并写出自相矛盾的 lineage；
+            # 换低层重训必须显式改 low_level_parent_model_id 回首载分支）。
             hit = self.algorithm.load_nav_resume(path, id_str)
-            if hit is None:
-                hit = self.algorithm.load_parent_bundle(path, id_str)
         if hit is None:
             from agent_ppo.checkpoint_io import nav_eval_checkpoint_diagnostics
 
             raise FileNotFoundError(
-                f"[nav] no loadable checkpoint for id={id_str} under {path}; "
+                f"[nav] no loadable checkpoint for id={id_str} under {path} "
+                f"(low_level_parent_model_id={self._nav_low_level_parent_id}); "
                 f"diagnostics={nav_eval_checkpoint_diagnostics(path, id_str)}"
             )
 

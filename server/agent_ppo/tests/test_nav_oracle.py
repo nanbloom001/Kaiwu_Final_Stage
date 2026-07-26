@@ -10,14 +10,15 @@ from agent_ppo.feature import nav_contract as nc
 from agent_ppo.feature.nav_oracle import NavOracle
 
 
-def _critic_obs(n=2, local_x=0.0, local_y=0.0, dist_m=0.0, front_height=0.0):
+def _critic_obs(n=2, local_x=0.0, local_y=0.0, dist_m=0.0, front_depression=0.0):
     obs = torch.zeros(n, nc.CRITIC_OBS_DIM)
     obs[:, nc.CRITIC_GOAL3_START + 0] = local_x / nc.GOAL_XY_SCALE_M
     obs[:, nc.CRITIC_GOAL3_START + 1] = local_y / nc.GOAL_XY_SCALE_M
     obs[:, nc.CRITIC_GOAL3_START + 2] = dist_m / nc.GOAL_DIST_SCALE_M
-    if front_height:
+    if front_depression:
         scan = obs[:, nc.CRITIC_SCAN_SLICE[0] : nc.CRITIC_SCAN_SLICE[1]].view(n, 16, 16)
-        scan[:, 5, 8] = front_height  # 前方窗口内一点
+        # 取窗惯例 grid[:, y, x]：窗口 = [:, 3:13, :10]（y 中间 3..13，x 前 10）
+        scan[:, 8, 5] = -front_depression  # 带符号判据：显著低于基线 = 障碍/墙
     return obs
 
 
@@ -42,9 +43,17 @@ class TestNavOracle(unittest.TestCase):
 
     def test_front_obstacle_forces_slow(self):
         tokens = self.oracle.act(
-            _critic_obs(local_x=5.0, dist_m=5.0, front_height=0.3)
+            _critic_obs(local_x=5.0, dist_m=5.0, front_depression=0.35)
         )
         self.assertTrue(bool((tokens == 1).all()))
+
+    def test_obstacle_outside_window_is_ignored(self):
+        obs = _critic_obs(local_x=5.0, dist_m=5.0)
+        scan = obs[:, nc.CRITIC_SCAN_SLICE[0] : nc.CRITIC_SCAN_SLICE[1]].view(2, 16, 16)
+        scan[:, 0, 15] = -0.5   # 窗口外（y=0 行 / x=15 列均在窗外）
+        scan[:, 8, 12] = -0.5   # x=12 在窗外
+        tokens = self.oracle.act(obs)
+        self.assertTrue(bool((tokens == 3).all()))  # 仍然 forward_fast
 
     def test_turning_bands(self):
         # 大角度 → 纯转向

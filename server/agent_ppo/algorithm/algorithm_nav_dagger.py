@@ -234,7 +234,7 @@ class AlgorithmNavDagger:
         # cnn_feat32_raw：同帧 depth 过冻结 CNN（不经 LSTM，冻结语义 v2）
         cnn_feat_raw = self.vision_encoder.cnn(parts["depth"])
 
-        nav_inputs = torch.cat(
+        nav_inputs_raw = torch.cat(
             (
                 cnn_feat_raw,
                 parts["goal4"],
@@ -245,10 +245,14 @@ class AlgorithmNavDagger:
             ),
             dim=-1,
         )
-        if nav_inputs.shape[-1] != nav_contract.NAV_INPUT_DIM:
+        if nav_inputs_raw.shape[-1] != nav_contract.NAV_INPUT_DIM:
             raise ValueError(
-                f"nav input dim {nav_inputs.shape[-1]} != {nav_contract.NAV_INPUT_DIM}"
+                f"nav input dim {nav_inputs_raw.shape[-1]} != {nav_contract.NAV_INPUT_DIM}"
             )
+        inputs_finite = torch.isfinite(nav_inputs_raw).all(dim=-1)
+        # NaN 消毒（CRITICAL 修复）：先消毒再前向/落库——非有限值一旦进入
+        # 高层 LSTM 或 TBPTT 重放会污染 hidden 且 NaN*0=NaN 使 valid 掩码失效。
+        nav_inputs = torch.nan_to_num(nav_inputs_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
         dwell_mask = self.scheduler.dwell_mask()
         logits = self.high_level(nav_inputs, dwell_mask=dwell_mask)
@@ -257,29 +261,40 @@ class AlgorithmNavDagger:
         oracle_tokens = self.oracle.act(critic_obs)
         oracle_valid = NavOracle.label_validity(critic_obs)
 
-        inputs_finite = torch.isfinite(nav_inputs).all(dim=-1)
         logits_finite = torch.isfinite(logits).all(dim=-1)
         student_ok = inputs_finite & logits_finite
         fallback = ~student_ok
         if bool(fallback.any()):
-            # 非有限 → 立即回退 Oracle 驱动并记录（该 tick 标签无效）
+            # 非有限 → 立即回退 Oracle 驱动并记录（该 tick 标签无效）；
+            # 同时重置这些 env 的高层 rollout hidden（消毒前的前向可能已受污染）
             self.nonfinite_fallback_count += int(fallback.sum().item())
+            fallback_ids = fallback.nonzero(as_tuple=False).squeeze(-1)
+            self.high_level.reset_hidden_state_for_envs(fallback_ids)
+
+        # 标签投影（CRITICAL 修复）：Oracle 不感知驻留纪律，其请求可能落在
+        # dwell 掩码之外——被屏蔽标签的 logit 为 -1e9，CE 会爆到 ~1e9 且梯度
+        # 退化。把标签投影为"教师在驻留纪律下实际会执行的动作"：允许则用
+        # Oracle 请求，否则保持更新前的 held token（zero 恒被允许，急停语义
+        # 不受影响）。
+        prev_held = self.scheduler.held_token.clone()
+        oracle_allowed = dwell_mask.gather(1, oracle_tokens.unsqueeze(1)).squeeze(1)
+        oracle_labels = torch.where(oracle_allowed, oracle_tokens, prev_held)
 
         # DAgger 混合（nav tick 粒度 per-env Bernoulli）
         student_drive = (
             torch.rand(num_envs, device=self.device) < float(self.ramp_probability)
         ) & student_ok
         executed = torch.where(student_drive, student_tokens, oracle_tokens)
-        prev_held = self.scheduler.held_token.clone()
         effective = self.scheduler.request_tokens(executed)
         switched = effective != prev_held
 
         valid = oracle_valid & inputs_finite & logits_finite
 
-        # 收集 TBPTT 样本（旧段 reset 信息随本 tick 落库后清零）
+        # 收集 TBPTT 样本（消毒后的输入 + 投影后的标签；
+        # 旧段 reset 信息随本 tick 落库后清零）
         self.tick_buffer.add(
             nav_inputs,
-            oracle_tokens,
+            oracle_labels,
             self._reset_since_last_tick,
             valid,
             dwell_mask,
@@ -287,7 +302,7 @@ class AlgorithmNavDagger:
         self._reset_since_last_tick = torch.zeros_like(self._reset_since_last_tick)
         self.total_nav_ticks += num_envs
 
-        disagreement = (student_tokens != oracle_tokens) & oracle_valid
+        disagreement = (student_tokens != oracle_labels) & oracle_valid
         return {
             "buffer_full": self.tick_buffer.is_full,
             "student_drive_ratio": float(student_drive.float().mean().item()),
@@ -322,7 +337,21 @@ class AlgorithmNavDagger:
         seq = self.tick_buffer.get()
         inputs = seq["inputs"]                    # [T, B, 48]
         tokens = seq["tokens"]                    # [T, B]
-        valid = seq["valid_masks"].float()        # [T, B]
+        valid_bool = seq["valid_masks"].bool()    # [T, B]
+        valid = valid_bool.float()
+
+        # 全段无有效样本：跳过更新（loss=0 反传仍会让 Adam 动量微动参数）
+        weight_sum_raw = valid.sum()
+        if float(weight_sum_raw.item()) <= 0.0:
+            self.tick_buffer.clear()
+            return {
+                "ce_loss": 0.0,
+                "top1_accuracy": 0.0,
+                "token_entropy": 0.0,
+                "grad_norm": 0.0,
+                "valid_ticks": 0.0,
+                "update_skipped_no_valid": 1.0,
+            }
 
         logits = self.high_level.forward_sequence(
             inputs, seq["initial_hidden"], seq["reset_masks"], seq["dwell_masks"]
@@ -332,8 +361,11 @@ class AlgorithmNavDagger:
         per_ce = F.cross_entropy(
             logits.reshape(T * B, V), tokens.reshape(T * B), reduction="none"
         ).reshape(T, B)
-        weight_sum = valid.sum().clamp_min(1.0)
-        loss = (per_ce * valid).sum() / weight_sum
+        # NaN 中和（CRITICAL 修复）：valid=0 的样本用 where 归零而非乘法
+        # （NaN * 0 = NaN 会击穿掩码并炸掉整段更新）。
+        per_ce = torch.where(valid_bool, per_ce, torch.zeros_like(per_ce))
+        weight_sum = weight_sum_raw.clamp_min(1.0)
+        loss = per_ce.sum() / weight_sum
         if not torch.isfinite(loss):
             raise FloatingPointError("nav DAgger sequence loss is non-finite")
 
@@ -545,13 +577,25 @@ class AlgorithmNavDagger:
         return None
 
     def load_nav_resume(self, path: str, model_id) -> str | None:
-        """nav resume（分支 3）：全量恢复；per-env 活状态不恢复（全 reset）。"""
+        """nav resume（分支 3）：全量恢复；per-env 活状态不恢复（全 reset）。
+
+        损坏的同 ID resume 候选是硬失败（宁硬停不静默）：若存在 nav 标签
+        文件但格式/stage_type 不符，raise 而非跳过——静默跳过叠加任何父包
+        回退会在无告警的情况下丢弃全部高层训练进度。
+        """
         for candidate in nav_checkpoint_candidates(path, model_id):
             bundle = torch.load(candidate, map_location=self.device, weights_only=False)
             if not is_kaiwu_train_bundle(bundle):
-                continue
+                raise ValueError(
+                    f"[nav] corrupted resume candidate (not a kaiwu_train_v1 "
+                    f"bundle): {candidate} — refusing to silently skip"
+                )
             if bundle.get("stage_type") != self.STAGE_TYPE:
-                continue
+                raise ValueError(
+                    f"[nav] resume candidate has stage_type="
+                    f"{bundle.get('stage_type')!r}, expected {self.STAGE_TYPE!r}: "
+                    f"{candidate} — refusing to silently skip"
+                )
             self._load_low_level_from_bundle(bundle)
 
             hl_state, hl_meta = high_level_parts(bundle)
@@ -591,7 +635,14 @@ class AlgorithmNavDagger:
             self.source_parent_model_id = lineage.get("source_parent_model_id")
             self.parent_checkpoint_sha256 = lineage.get("parent_checkpoint_sha256")
             stored_digest = lineage.get("low_level_state_digest")
-            if stored_digest and stored_digest != self.low_level_state_digest:
+            # 与 eval 侧对称：缺失 digest 同样硬失败（被剥除 digest 的包
+            # 不得无检通过 resume）。
+            if not stored_digest:
+                raise RuntimeError(
+                    f"[nav] resume bundle has no lineage.low_level_state_digest: "
+                    f"{candidate}"
+                )
+            if stored_digest != self.low_level_state_digest:
                 raise RuntimeError(
                     "nav resume low-level digest mismatch: "
                     f"lineage={stored_digest} recomputed={self.low_level_state_digest}"

@@ -40,7 +40,7 @@ class NavOracle:
         veer_threshold_rad: float = 0.12,
         slow_range_m: float = 1.5,
         mid_range_m: float = 3.0,
-        obstacle_height_m: float = 0.12,
+        obstacle_threshold_m: float = 0.3,
     ):
         self.stop_radius_m = stop_radius_m
         self.spin_threshold_rad = spin_threshold_rad
@@ -48,7 +48,7 @@ class NavOracle:
         self.veer_threshold_rad = veer_threshold_rad
         self.slow_range_m = slow_range_m
         self.mid_range_m = mid_range_m
-        self.obstacle_height_m = obstacle_height_m
+        self.obstacle_threshold_m = obstacle_threshold_m
 
     def act(self, critic_obs: torch.Tensor) -> torch.Tensor:
         if critic_obs.ndim != 2 or critic_obs.shape[1] < nav_contract.CRITIC_OBS_DIM:
@@ -69,10 +69,13 @@ class NavOracle:
 
         s_lo, s_hi = nav_contract.CRITIC_SCAN_SLICE
         scan = critic_obs[:, s_lo:s_hi].view(n, 16, 16)
-        # 前方近场窗口（与 reward_process 的"正前方脚下障碍"取窗惯例一致：
-        # x 方向取前 10 行，y 方向取中间 3..13 列）
-        front_window = scan[:, :10, 3:13]
-        front_obstacle = front_window.abs().amax(dim=(1, 2)) > self.obstacle_height_m
+        # 前方近场窗口——与 reward_process.py:321-322 的取窗惯例严格一致：
+        # grid.view(N,16,16)[:, y, x]，dim1=y（机身横向，取中间 3..13），
+        # dim2=x（机身前向，取前 10）。判据同样沿用仓内先例的带符号形式
+        # （reward_process.py:323 用 `< -0.3`：击中点显著低于基线 = 障碍/墙），
+        # 绝对量纲基线由平台 env cfg 决定，默认阈值待 S0a 探针核验后校准。
+        front_window = scan[:, 3:13, :10]
+        front_obstacle = front_window.amin(dim=(1, 2)) < -self.obstacle_threshold_m
 
         tokens = torch.full((n,), nav_contract.ZERO_TOKEN_INDEX, dtype=torch.long, device=device)
 

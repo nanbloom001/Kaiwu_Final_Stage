@@ -55,7 +55,10 @@ class NavGoalChain:
         self.filtered_xy = torch.zeros(n, 2, device=dev)
         self.has_sample = torch.zeros(n, dtype=torch.bool, device=dev)
 
-        self._resample_episode_params(torch.arange(n, device=dev), deterministic=False)
+        # 构造期用名义确定性参数（不消耗随机数）；训练模式的每 episode
+        # 随机化在首次 reset（episode_length_buf==0 检测）时按 deterministic
+        # 标志重采样。
+        self._resample_episode_params(torch.arange(n, device=dev), deterministic=True)
 
     # ------------------------------------------------------------------
 

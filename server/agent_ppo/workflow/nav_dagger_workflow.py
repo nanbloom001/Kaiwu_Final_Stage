@@ -34,6 +34,7 @@ from agent_ppo.feature import nav_contract
 _SOFT_STAY_WINDOW = 50
 _SOFT_STAY_DISAGREE_DELTA = 0.05    # disagreement 相对前窗口恶化超此值触发
 _SOFT_STAY_HARD_DELTA = 0.02        # hard_termination 相对前窗口恶化超此值触发
+_SOFT_STAY_PROGRESS_DELTA = 0.003   # goal progress (m/frame) 相对前窗口恶化超此值触发
 # 解冻的绝对质量门槛（不只是"不再恶化"）
 _SOFT_STAY_UNFREEZE_MIN_TOP1 = 0.85
 _SOFT_STAY_UNFREEZE_MAX_HARD = 0.05
@@ -143,6 +144,12 @@ def _soft_stay_check(window: dict, prev_window: dict | None) -> str | None:
             > prev_window.get("hard_termination_rate", 0.0) + _SOFT_STAY_HARD_DELTA
         ):
             return "hard_termination_worsened"
+        if (
+            window.get("goal_progress_m_per_frame", 0.0)
+            < prev_window.get("goal_progress_m_per_frame", 0.0)
+            - _SOFT_STAY_PROGRESS_DELTA
+        ):
+            return "goal_progress_worsened"
     return None
 
 
@@ -180,8 +187,15 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
     )
 
     # ---- 契约一致性启动断言（TOML 镜像 == nav_contract 权威值）----
-    toml_period = int(nav_conf.get("nav_period_frames", nav_contract.NAV_PERIOD_FRAMES))
-    toml_dwell = int(nav_conf.get("min_dwell_ticks", nav_contract.MIN_DWELL_TICKS))
+    # 镜像键必填：缺键会让 get(默认=契约值) 自比自、断言必过——静默绕过
+    for required_key in ("nav_period_frames", "min_dwell_ticks", "tbptt_sequence_length"):
+        if required_key not in nav_conf:
+            raise ValueError(
+                f"TOML [{section}] missing required contract-mirror key: "
+                f"{required_key} (must be present and equal to nav_contract)"
+            )
+    toml_period = int(nav_conf["nav_period_frames"])
+    toml_dwell = int(nav_conf["min_dwell_ticks"])
     if toml_period != nav_contract.NAV_PERIOD_FRAMES:
         raise ValueError(
             f"TOML nav_period_frames={toml_period} != contract "
@@ -225,8 +239,11 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
         except (KeyError, ValueError, RuntimeError) as exc:
             logger.warning(f"[NavDAgger] lr scheduler restore failed: {exc}")
 
-    # 续训：从保存的 ramp 比例反推 clock（断点续接，不按墙钟追赶）
-    if algorithm.resume_loaded:
+    # 续训：优先沿用 checkpoint 里保存的 ramp_clock_h（load_nav_resume 已恢复）；
+    # 仅当 clock 缺失/为零而比例已非零时才从比例反推（lbc 先例的 fallback 语义）
+    if algorithm.resume_loaded and (
+        algorithm.ramp_clock_h <= 0.0 and algorithm.ramp_probability > 0.0
+    ):
         algorithm.ramp_clock_h = _ramp_elapsed_from_probability(
             algorithm.ramp_probability, ramp_start_h, ramp_end_h
         )
@@ -244,8 +261,10 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
     if data is None:
         raise RuntimeError("env.reset returned None")
     obs, critic_obs = data
-    obs = torch.as_tensor(obs).to(agent.device)
-    critic_obs = torch.as_tensor(critic_obs).to(agent.device)
+    # clone：inject 会就地写观测副本；env 若返回同设备张量，.to(device) 是
+    # 恒等别名，必须显式拷贝（与 eval 路径的 obs.clone() 对称）
+    obs = torch.as_tensor(obs).to(agent.device).clone()
+    critic_obs = torch.as_tensor(critic_obs).to(agent.device).clone()
     logger.info(
         f"[NavDAgger] reset ok: obs={tuple(obs.shape)} critic={tuple(critic_obs.shape)}"
     )
@@ -277,7 +296,16 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 algorithm.ramp_probability = effective_p
 
             step_rows: list[dict] = []
+            # 全帧聚合指标（不能只在 tick 帧采样：换 token 后的失稳集中在
+            # tick+1..tick+9，恰好全是非 tick 帧）
+            hard_events = 0.0
+            timeout_events = 0.0
+            progress_sum = 0.0
+            progress_count = 0
+            total_env_frames = 0
+            g_dist_idx = nav_contract.CRITIC_GOAL3_START + 2
             for _ in range(num_steps_per_env):
+                pre_goal_dist = critic_obs[:, g_dist_idx] * nav_contract.GOAL_DIST_SCALE_M
                 result = algorithm.frame_begin(obs, critic_obs)
                 actions = torch.clip(result["actions"], -6.0, 6.0)
 
@@ -292,8 +320,8 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     privileged_obs,
                 ) = _extract_step(step_data)
 
-                next_obs = torch.as_tensor(next_obs).to(agent.device)
-                privileged_obs = torch.as_tensor(privileged_obs).to(agent.device)
+                next_obs = torch.as_tensor(next_obs).to(agent.device).clone()
+                privileged_obs = torch.as_tensor(privileged_obs).to(agent.device).clone()
                 terminated = torch.as_tensor(terminated).to(agent.device).bool()
                 truncated = torch.as_tensor(truncated).to(agent.device).bool()
                 dones = terminated | truncated
@@ -305,11 +333,22 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
                 algorithm.frame_end(dones)
 
+                # 全帧指标累计
+                num_envs_now = int(dones.shape[0])
+                total_env_frames += num_envs_now
+                hard_events += float(hard_termination.float().sum().item())
+                timeout_events += float(time_outs.float().sum().item())
+                post_goal_dist = (
+                    privileged_obs[:, g_dist_idx] * nav_contract.GOAL_DIST_SCALE_M
+                )
+                keep = ~dones
+                if bool(keep.any()):
+                    progress = pre_goal_dist[keep] - post_goal_dist[keep]
+                    progress_sum += float(progress.sum().item())
+                    progress_count += int(keep.sum().item())
+
                 if result["is_tick"]:
                     row = dict(result["tick_metrics"])
-                    row["hard_termination_rate"] = float(
-                        hard_termination.float().mean().item()
-                    )
                     if row.pop("buffer_full", False):
                         update_metrics = algorithm.finish_nav_sequence_update()
                         row.update(update_metrics)
@@ -329,7 +368,17 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
             agent.learn(list_sample_data=None)
 
             iteration_metrics = _mean_metrics(step_rows)
+            # 全帧聚合指标覆盖（soft-stay 消费全覆盖信号，非 tick 帧欠采样版）
+            iteration_metrics["hard_termination_rate"] = hard_events / max(
+                1, total_env_frames
+            )
+            iteration_metrics["timeout_rate"] = timeout_events / max(1, total_env_frames)
+            iteration_metrics["goal_progress_m_per_frame"] = progress_sum / max(
+                1, progress_count
+            )
             iter_metric_history.append(iteration_metrics)
+            if len(iter_metric_history) > 2 * _SOFT_STAY_WINDOW:
+                del iter_metric_history[: -2 * _SOFT_STAY_WINDOW]
 
             # ---- soft-stay：每 WINDOW 检查一次，两窗口对比 ----
             if len(iter_metric_history) >= 2 * _SOFT_STAY_WINDOW and (
@@ -344,6 +393,7 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     if reason is not None:
                         algorithm.soft_stay_frozen = True
                         algorithm.soft_stay_reason = reason
+                        algorithm.training_status = "soft_stay_frozen"
                         logger.warning(
                             f"[NavDAgger] soft-stay FROZEN at ramp="
                             f"{algorithm.ramp_probability:.3f} (reason={reason})"
@@ -353,6 +403,7 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     if no_new_failure and _quality_absolutely_ok(w2):
                         algorithm.soft_stay_frozen = False
                         algorithm.soft_stay_reason = ""
+                        algorithm.training_status = "running"
                         logger.info("[NavDAgger] soft-stay unfrozen; ramp resumes")
                 prev_window = w2
 
@@ -370,6 +421,8 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     f"entropy={m.get('token_entropy', float('nan')):.3f} "
                     f"switch={m.get('switch_rate', float('nan')):.3f} "
                     f"hard={m.get('hard_termination_rate', float('nan')):.4f} "
+                    f"timeout={m.get('timeout_rate', float('nan')):.4f} "
+                    f"progress={m.get('goal_progress_m_per_frame', float('nan')):.4f} "
                     f"nonfinite={algorithm.nonfinite_fallback_count} "
                     f"grad={m.get('grad_norm', float('nan')):.3f} "
                     f"lr={algorithm.optimizer.param_groups[0]['lr']:.2e} "
