@@ -13,6 +13,8 @@ import math
 import torch
 import torch.nn.functional as F
 
+from agent_ppo.conf.depth_config import resolve_depth_preprocess_conf
+
 
 def depth_camera_image(env) -> torch.Tensor:
     """从 TiledCamera 读取 flatten 归一化深度图，并按配置施加增强。
@@ -40,9 +42,7 @@ def depth_camera_image(env) -> torch.Tensor:
                       D435i 配置 (180×320) 下为 (num_envs, 57600)。
     """
 
-    preprocess_conf = getattr(env, "_depth_preprocess_conf", {})
-    if not isinstance(preprocess_conf, dict):
-        preprocess_conf = {}
+    preprocess_conf = resolve_depth_preprocess_conf(env)
     augmentation_conf = preprocess_conf.get("augmentation", {})
     if not isinstance(augmentation_conf, dict):
         augmentation_conf = {}
