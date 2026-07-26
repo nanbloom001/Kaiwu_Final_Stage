@@ -45,7 +45,6 @@ from agent_ppo.checkpoint_io import (
     compute_low_level_state_digest,
     high_level_parts,
     is_kaiwu_train_bundle,
-    low_level_teacher_parts,
     nav_checkpoint_candidates,
     nav_parent_candidates,
     validate_low_level_spec,
@@ -508,7 +507,14 @@ class AlgorithmNavDagger:
         if not isinstance(vision_state, dict):
             raise KeyError("modules.vision_encoder.state_dict missing")
         self.vision_encoder.load_state_dict(vision_state, strict=True)
-        _, actor_state = low_level_teacher_parts(bundle)
+        # 注意：visual_ppo 父包与 nav 包的 modules.low_level 只有 actor_state_dict
+        # （教师 DmEncoder 不属于低层部署形态），不能用 low_level_teacher_parts。
+        low_level = modules.get("low_level", {})
+        actor_state = (
+            low_level.get("actor_state_dict") if isinstance(low_level, dict) else None
+        )
+        if not isinstance(actor_state, dict):
+            raise KeyError("modules.low_level.actor_state_dict missing")
         self.low_level_actor.load_state_dict(actor_state, strict=True)
         self._freeze_low_level()
         self.low_level_state_digest = compute_low_level_state_digest(
