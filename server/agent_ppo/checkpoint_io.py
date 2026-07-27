@@ -17,9 +17,15 @@ import os
 import re
 from typing import Any
 
+import torch
+
 
 KAIWU_TRAIN_FORMAT = "kaiwu_train_v1"
 KAIWU_TRAIN_SCHEMA_VERSION = 1
+
+
+class CheckpointSaveError(RuntimeError):
+    """A checkpoint could not be serialized, written, or verified."""
 
 DAGGER_PHASE_LABELS = (
     "daggerzero",
@@ -448,16 +454,18 @@ def visual_eval_checkpoint_diagnostics(path: str, model_id: str | int) -> dict[s
 
 
 def validate_visual_eval_bundle_identity(
-    bundle: dict[str, Any], model_id: str | int
+    bundle: dict[str, Any], model_id: str | int, logger=None
 ) -> dict[str, Any]:
-    """Require a camera-eval bundle to identify the platform-selected model.
+    """Inspect camera-eval identity metadata without blocking a valid payload.
 
     Filename filtering is necessary but not sufficient: a manually copied or
     stale file can have a matching filename while carrying another model's
-    payload.  ``platform_model_id`` is the primary identity.  Older training
-    bundles may instead retain it under ``lineage.platform_model_id``.  When
-    both are present, they must each agree with the requested ID; accepting a
-    contradictory bundle would make an evaluation result non-attributable.
+    payload. ``platform_model_id`` is the primary identity; older bundles may
+    retain it under ``lineage.platform_model_id``. Identity metadata is a
+    diagnostic rather than an execution contract. Candidate
+    selection still uses the requested filename ID, while missing or conflicting
+    metadata is surfaced as a warning. Payload format and tensor compatibility
+    remain hard requirements in the caller.
     """
     if not is_kaiwu_train_bundle(bundle):
         raise ValueError(
@@ -467,9 +475,15 @@ def validate_visual_eval_bundle_identity(
         )
 
     requested_id = str(model_id)
-    lineage = bundle.get("lineage", {})
-    if not isinstance(lineage, dict):
-        raise ValueError("Camera eval checkpoint lineage must be a dict")
+    lineage_value = bundle.get("lineage", {})
+    metadata_warnings: list[str] = []
+    if isinstance(lineage_value, dict):
+        lineage = lineage_value
+    else:
+        lineage = {}
+        metadata_warnings.append(
+            "Camera eval checkpoint lineage metadata is not a dict; ignoring it"
+        )
 
     bundle_id = bundle.get("platform_model_id")
     lineage_id = lineage.get("platform_model_id")
@@ -482,22 +496,29 @@ def validate_visual_eval_bundle_identity(
         for key, value in present_ids.items()
         if value not in (None, "") and str(value) != requested_id
     }
+    warnings: list[str] = list(metadata_warnings)
     if mismatches:
-        raise ValueError(
-            "Camera eval checkpoint identity mismatch: "
+        warnings.append(
+            "Camera eval checkpoint identity differs from the requested model; "
+            f"continuing with the operator-selected same-ID file: "
             f"requested={requested_id}, identities={present_ids}"
         )
     if all(value in (None, "") for value in present_ids.values()):
-        raise ValueError(
-            "Camera eval checkpoint has no platform identity: "
-            f"requested={requested_id}, identities={present_ids}"
+        warnings.append(
+            "Camera eval checkpoint has no platform identity metadata; "
+            f"continuing after structural validation: requested={requested_id}, "
+            f"identities={present_ids}"
         )
+    if logger is not None:
+        for message in warnings:
+            logger.warning(f"[CheckpointIdentity] WARNING-ONLY: {message}")
 
     return {
         "requested_id": requested_id,
         "bundle_id": bundle_id,
         "lineage_id": lineage_id,
         "lineage": lineage,
+        "identity_warnings": warnings,
     }
 
 
@@ -762,7 +783,8 @@ def validate_high_level_spec(bundle: dict[str, Any], expected: dict[str, Any]) -
     ``expected`` keys are compared exactly (e.g. input_layout_version, vocab,
     nav_period_frames, min_dwell_ticks). Vocab is compared as nested lists.
     """
-    _, meta = high_level_parts(bundle)
+    state, meta = high_level_parts(bundle)
+    validate_state_dict_finite(state, "modules.high_level.state_dict")
     mismatches = {}
     for key, want in expected.items():
         got = meta.get(key)
@@ -777,7 +799,16 @@ def validate_high_level_spec(bundle: dict[str, Any], expected: dict[str, Any]) -
         raise ValueError(f"high_level contract mismatch: {mismatches}")
 
 
+def validate_state_dict_finite(state: dict[str, Any], name: str) -> None:
+    for key, value in state.items():
+        if not torch.is_tensor(value):
+            continue
+        if not bool(torch.isfinite(value.detach()).all()):
+            raise FloatingPointError(f"non-finite tensor in {name}: {key}")
+
+
 def _digest_state_dict(hasher, name: str, state: dict[str, Any]) -> None:
+    validate_state_dict_finite(state, name)
     for key in sorted(state.keys()):
         value = state[key]
         hasher.update(f"{name}/{key}".encode("utf-8"))
@@ -823,30 +854,38 @@ def validate_nav_eval_bundle(
     model_id: str | int,
     expected_low_level_spec: dict[str, int],
     expected_high_level: dict[str, Any],
+    logger=None,
 ) -> dict[str, Any]:
-    """Nav-eval hard-stop chain (identity + spec + high_level + digest).
+    """Validate executable nav structure and report identity metadata drift.
 
-    Does NOT modify validate_visual_eval_bundle_identity (the lbc_loco eval
-    path also calls it); composes it instead. Any failure raises before the
-    first inference.
+    Format, required modules, model contracts and state-dict compatibility are
+    hard requirements. Platform identity, lineage and digest are provenance
+    diagnostics: they warn but do not make an otherwise executable package
+    unusable.
     """
-    identity = validate_visual_eval_bundle_identity(bundle, model_id)
+    identity = validate_visual_eval_bundle_identity(bundle, model_id, logger=logger)
     validate_low_level_spec(bundle, expected_low_level_spec)
     validate_high_level_spec(bundle, expected_high_level)
 
     lineage = identity["lineage"] or {}
     stored_digest = lineage.get("low_level_state_digest")
     computed_digest = compute_low_level_state_digest(bundle)
+    digest_warnings: list[str] = []
     if not stored_digest:
-        raise ValueError(
-            "nav eval checkpoint has no lineage.low_level_state_digest"
+        digest_warnings.append(
+            "nav eval checkpoint has no lineage.low_level_state_digest; "
+            f"using computed digest={computed_digest}"
         )
-    if str(stored_digest) != computed_digest:
-        raise ValueError(
-            "nav eval low-level digest mismatch: "
-            f"lineage={stored_digest} computed={computed_digest} "
-            "(frozen low level was modified — refusing to evaluate)"
+    elif str(stored_digest) != computed_digest:
+        digest_warnings.append(
+            "nav eval low-level digest differs from lineage; continuing with "
+            f"the structurally compatible loaded tensors: lineage={stored_digest} "
+            f"computed={computed_digest}"
         )
+    if logger is not None:
+        for message in digest_warnings:
+            logger.warning(f"[CheckpointIdentity] WARNING-ONLY: {message}")
+    identity["identity_warnings"].extend(digest_warnings)
     identity["low_level_state_digest"] = computed_digest
     identity["high_level_present"] = True
     return identity

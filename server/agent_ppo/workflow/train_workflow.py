@@ -97,6 +97,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     """
     agent = agents[0]
     env = envs[0]
+    logger.info(
+        "[LifecycleProbe] train_workflow enter "
+        f"pid={os.getpid()} stage={getattr(agent.stage, 'name', 'unknown')} "
+        f"algorithm={getattr(agent, 'algorithm_name', 'unknown')} "
+        f"flags=lbc:{getattr(agent, 'is_lbc', False)},"
+        f"nav:{getattr(agent, 'is_nav_dagger', False)},"
+        f"visual:{getattr(agent, 'is_visual_ppo', False)},"
+        f"distill:{getattr(agent, 'is_behavior_distill', False)}"
+    )
 
     # LBC 阶段：转发到 lbc_workflow（纯监督蒸馏，不走 PPO）
     # LBC stage: forward to lbc_workflow (pure supervised distillation)
@@ -108,8 +117,11 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     # hier-nav 高层 DAgger：转发到 nav_dagger_workflow（TBPTT 序列 BC，不走 PPO）
     # hier-nav high-level DAgger: forward to nav_dagger_workflow (TBPTT BC, no PPO)
     if getattr(agent, "is_nav_dagger", False):
+        logger.info("[LifecycleProbe] train_workflow nav_import begin")
         from agent_ppo.workflow.nav_dagger_workflow import workflow as nav_dagger_workflow
 
+        logger.info("[LifecycleProbe] train_workflow nav_import complete")
+        logger.info("[LifecycleProbe] train_workflow dispatch=nav_dagger")
         return nav_dagger_workflow(envs, agents, logger=logger, monitor=monitor, *args, **kwargs)
 
     # Reference behavior distillation: flat standard teacher -> ActorCriticEncoder student

@@ -3,8 +3,12 @@
 # Replay buffer configurations
 # 样本池容量
 preload_model_dir = "/data/pre_model/ckpt"
-preload_model_id = 28401
+preload_model_id = 34728
 preload_model = true
+# Repository-side stage bootstrap. This is read before the stage-specific
+# training TOML path is constructed; the same TOML cannot select itself.
+# S0a probing must change this together with preload_model_id in one commit.
+policy_entry = "nav_dagger"
 replay_buffer_capacity = 4096
 
 # The ratio of the sample pool capacity that triggers training
@@ -45,11 +49,11 @@ reverb_error_buffer = 8
 # Learner训练时样本批处理大小
 train_batch_size = 2048
 
-# Model-pool fallback dump frequency in BaseAgent.learn() callbacks.
-# BehaviorDistill performs its reviewed periodic save every 100 outer iterations;
-# keep this platform fallback at the proven Standard default to avoid duplicate
-# saves at the same boundary.
-dump_model_freq = 1000
+# Model-pool publication frequency in successful BaseAgent.learn() callbacks.
+# Nav DAgger advances this lifecycle once per successful low-level batch frame;
+# its workflow has no periodic custom-save path. With the current 128-env
+# Camera Track throughput, 3600 callbacks is roughly five minutes.
+dump_model_freq = 3600
 
 # The Learner pushes model updates, and the frequency at which Actors fetch the model (in minutes).
 # Learner推送模型参数文件至模型池，以及Actor从模型池获取模型参数文件的频次（单位：分钟）
@@ -74,4 +78,4 @@ modelpool_max_save_model_count = 1
 # 注意，禁止修改原始模型文件名，否则将导致模型预加载流程失败。
 
 eval_model_dir = "/data/projects/legged_robot_competition_26/ckpt"
-eval_model_id = "28401"
+eval_model_id = "34728"

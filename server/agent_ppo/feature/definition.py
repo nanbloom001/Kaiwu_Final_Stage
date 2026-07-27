@@ -45,6 +45,7 @@ class RolloutStorage:
             self.hidden_states = None
             self.anchor_actions = None
             self.anchor_latents = None
+            self.anchor_weights = None
             self.hard_terminations = None
 
         def clear(self):
@@ -304,6 +305,7 @@ class RecurrentRolloutStorage(RolloutStorage):
         self.anchor_latents = torch.zeros(
             *shape, int(anchor_latent_dim), device=self.device
         )
+        self.anchor_weights = torch.ones(*shape, 1, device=self.device)
         self.hard_terminations = torch.zeros(*shape, 1, device=self.device).byte()
         self.recurrent_hidden_h = None
         self.recurrent_hidden_c = None
@@ -330,10 +332,15 @@ class RecurrentRolloutStorage(RolloutStorage):
             raise ValueError("Recurrent visual PPO transition is missing S0 anchors")
         if transition.hard_terminations is None:
             raise ValueError("Recurrent visual PPO transition is missing hard terminations")
+        if transition.anchor_weights is None:
+            raise ValueError("Recurrent visual PPO transition is missing anchor weights")
         self.anchor_actions[self.step].copy_(transition.anchor_actions)
         self.anchor_latents[self.step].copy_(transition.anchor_latents)
         self.hard_terminations[self.step].copy_(
             transition.hard_terminations.view(-1, 1)
+        )
+        self.anchor_weights[self.step].copy_(
+            transition.anchor_weights.view(-1, 1)
         )
         super().add_transitions(transition)
 
@@ -424,4 +431,5 @@ class RecurrentRolloutStorage(RolloutStorage):
                     continuation_masks,
                     stack_chunks(self.anchor_actions),
                     stack_chunks(self.anchor_latents),
+                    stack_chunks(self.anchor_weights),
                 )

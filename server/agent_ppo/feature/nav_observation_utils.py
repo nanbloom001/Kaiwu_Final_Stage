@@ -125,3 +125,101 @@ def depth_camera_image(env) -> torch.Tensor:
             ).squeeze(1)
 
     return depth.reshape(N, -1)  # [N, H*W]
+
+
+def nav_scanner_privileged_features(env) -> torch.Tensor:
+    """Return worker-only maze wall features from ``nav_scanner``.
+
+    Layout is ``[available, front_score, left_score, right_score]``.  The
+    feature math intentionally mirrors ``terrain_gate._nav_wall_features`` but
+    lives in the nav observation module so the DAgger contract does not depend
+    on the retired terrain-gate state machine. Missing or malformed sensors are
+    a hard error: silently training the Oracle without wall visibility creates
+    a teacher that cannot solve the maze.
+    """
+
+    try:
+        sensor = env.scene.sensors["nav_scanner"]
+        data = sensor.data
+        raw = data.pos_w[:, 2:3] - data.ray_hits_w[..., 2]
+    except (AttributeError, KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(
+            "nav_scanner is required for nav DAgger privileged Oracle features"
+        ) from exc
+    if raw.ndim != 2 or raw.shape[0] != env.num_envs:
+        raise ValueError(
+            f"nav_scanner ray tensor must be [N,R], got {tuple(raw.shape)}"
+        )
+    # RayCaster may encode a legitimate "no hit" ray as non-finite. Treat it
+    # as open space, matching the repository's existing terrain-gate sensor
+    # conversion; malformed shape/missing sensor still hard-stop below.
+    raw = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+
+    rows, cols = _nav_scanner_grid_shape(sensor, raw.shape[1])
+
+    grid = (-raw).view(raw.shape[0], rows, cols)
+    floor = torch.quantile(grid.flatten(1), 0.20, dim=1).view(-1, 1, 1)
+    relative = torch.clamp(grid - floor, min=0.0)
+    body_start = max(0, rows // 2 - 3)
+    body_end = min(rows, rows // 2 + 3)
+    front_cols = min(6, cols)
+    side_width = max(1, min(3, rows // 2))
+
+    def _wall_score(sector):
+        return torch.sigmoid((sector - 0.24) / 0.08).mean(dim=(1, 2))
+
+    front = _wall_score(relative[:, body_start:body_end, :front_cols])
+    left = _wall_score(relative[:, :side_width, :front_cols])
+    right = _wall_score(relative[:, -side_width:, :front_cols])
+    available = torch.ones_like(front)
+    return torch.stack((available, front, left, right), dim=-1)
+
+
+def _nav_scanner_grid_shape(sensor, num_rays: int) -> tuple[int, int]:
+    """Infer the flattened RayCaster grid using the platform pattern contract."""
+
+    pattern = getattr(getattr(sensor, "cfg", None), "pattern_cfg", None)
+    size = getattr(pattern, "size", None)
+    resolution_x = getattr(pattern, "resolution_x", None)
+    resolution_y = getattr(pattern, "resolution_y", None)
+    resolution = getattr(pattern, "resolution", None)
+    ordering = getattr(pattern, "ordering", "xy")
+    if size is not None and len(size) == 2:
+        if resolution_x is None or resolution_y is None:
+            resolution_x = resolution_y = resolution
+        if resolution_x is not None and resolution_y is not None:
+            try:
+                resolution_x = float(resolution_x)
+                resolution_y = float(resolution_y)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("nav_scanner pattern resolution is not numeric") from exc
+            if resolution_x <= 0.0 or resolution_y <= 0.0:
+                raise ValueError("nav_scanner pattern resolution must be positive")
+            count_x = int(math.floor(float(size[0]) / resolution_x + 1.0e-9)) + 1
+            count_y = int(math.floor(float(size[1]) / resolution_y + 1.0e-9)) + 1
+            if ordering == "xy":
+                rows, cols = count_y, count_x
+            elif ordering == "yx":
+                rows, cols = count_x, count_y
+            else:
+                raise ValueError(f"unsupported ordering {ordering!r}")
+            if rows * cols != num_rays:
+                raise ValueError(
+                    "nav_scanner pattern metadata disagrees with ray tensor: "
+                    f"shape=({rows},{cols}), rays={num_rays}, size={size}, "
+                    f"resolution_x={resolution_x}, resolution_y={resolution_y}, "
+                    f"ordering={ordering}"
+                )
+            return rows, cols
+
+    # Compatibility for older platform patterns whose cfg metadata is absent.
+    known_shapes = {256: (16, 16), 143: (13, 11), 273: (21, 13)}
+    if num_rays in known_shapes:
+        return known_shapes[num_rays]
+    side = int(num_rays ** 0.5)
+    if side * side == num_rays:
+        return side, side
+    raise ValueError(
+        f"unsupported nav_scanner ray count {num_rays}; "
+        "pattern metadata is unavailable and no known grid shape matches"
+    )

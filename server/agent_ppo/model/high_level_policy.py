@@ -37,8 +37,8 @@ class HighLevelPolicy(nn.Module):
         self,
         input_dim: int = nav_contract.NAV_INPUT_DIM,
         vocab_size: int = nav_contract.VOCAB_SIZE,
-        rnn_hidden_dim: int = 64,
-        rnn_num_layers: int = 2,
+        rnn_hidden_dim: int = nav_contract.NAV_LSTM_HIDDEN_SIZE,
+        rnn_num_layers: int = nav_contract.NAV_LSTM_NUM_LAYERS,
     ):
         super().__init__()
         self.input_dim = input_dim

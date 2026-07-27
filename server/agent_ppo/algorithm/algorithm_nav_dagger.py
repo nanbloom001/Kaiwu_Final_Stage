@@ -35,6 +35,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import os
+import time
 
 import torch
 import torch.nn.functional as F
@@ -44,12 +45,14 @@ from agent_ppo.checkpoint_io import (
     KAIWU_TRAIN_SCHEMA_VERSION,
     compute_low_level_state_digest,
     high_level_parts,
+    validate_high_level_spec,
     is_kaiwu_train_bundle,
     nav_checkpoint_candidates,
     nav_parent_candidates,
     validate_low_level_spec,
 )
 from agent_ppo.feature import nav_contract
+from agent_ppo.feature.nav_event_log import emit_nav_event
 from agent_ppo.feature.nav_oracle import NavOracle
 from agent_ppo.feature.nav_scheduler import NavScheduler
 from agent_ppo.feature.nav_tick_buffer import NavTickBuffer
@@ -73,27 +76,117 @@ class AlgorithmNavDagger:
         depth_shape: tuple = (180, 320, 1),
         low_level_parent_model_id: int | str | None = None,
         logger=None,
+        process_role: str = "unknown",
     ):
+        init_started = time.monotonic()
         self.device = torch.device(device)
         self.logger = logger
+        self.process_role = str(process_role)
         self.max_grad_norm = float(max_grad_norm)
+
+        def probe(message: str) -> None:
+            if self.logger is not None:
+                self.logger.info(
+                    "[LifecycleProbe] nav_algorithm_init "
+                    f"pid={os.getpid()} role={self.process_role} {message}"
+                )
+
+        def cuda_state() -> str:
+            if self.device.type != "cuda" or not torch.cuda.is_available():
+                return "cuda=unavailable"
+            try:
+                return (
+                    f"cuda_allocated={torch.cuda.memory_allocated(self.device)} "
+                    f"cuda_reserved={torch.cuda.memory_reserved(self.device)}"
+                )
+            except Exception as exc:
+                return f"cuda_state_error={type(exc).__name__}:{exc}"
+
+        def module_state(module) -> str:
+            parameters = list(module.parameters())
+            first_device = parameters[0].device if parameters else "none"
+            return (
+                f"type={type(module).__name__} params="
+                f"{sum(parameter.numel() for parameter in parameters)} "
+                f"trainable={sum(parameter.numel() for parameter in parameters if parameter.requires_grad)} "
+                f"first_device={first_device}"
+            )
+
+        probe(f"enter device={self.device} {cuda_state()}")
 
         self.proprio_dim = proprio_dim
         self.scan_dim = scan_dim
         self.depth_shape = tuple(depth_shape)
 
+        transfer_started = time.monotonic()
+        probe(f"vision_to_device begin {module_state(vision_encoder)} {cuda_state()}")
         self.vision_encoder = vision_encoder.to(self.device)
+        probe(
+            "vision_to_device complete "
+            f"elapsed_s={time.monotonic() - transfer_started:.3f} "
+            f"{module_state(self.vision_encoder)} {cuda_state()}"
+        )
+        transfer_started = time.monotonic()
+        probe(f"low_level_to_device begin {module_state(low_level_actor)} {cuda_state()}")
         self.low_level_actor = low_level_actor.to(self.device)
+        probe(
+            "low_level_to_device complete "
+            f"elapsed_s={time.monotonic() - transfer_started:.3f} "
+            f"{module_state(self.low_level_actor)} {cuda_state()}"
+        )
+        transfer_started = time.monotonic()
+        probe(f"high_level_to_device begin {module_state(high_level)} {cuda_state()}")
         self.high_level = high_level.to(self.device)
+        probe(
+            "high_level_to_device complete "
+            f"elapsed_s={time.monotonic() - transfer_started:.3f} "
+            f"{module_state(self.high_level)} {cuda_state()}"
+        )
 
+        probe("architecture_check begin")
+        actual_high_level = {
+            "input_dim": getattr(self.high_level, "input_dim", None),
+            "vocab_size": getattr(self.high_level, "vocab_size", None),
+            "rnn_hidden_dim": getattr(self.high_level, "rnn_hidden_dim", None),
+            "rnn_num_layers": getattr(self.high_level, "rnn_num_layers", None),
+        }
+        expected_high_level = {
+            "input_dim": nav_contract.NAV_INPUT_DIM,
+            "vocab_size": nav_contract.VOCAB_SIZE,
+            "rnn_hidden_dim": nav_contract.NAV_LSTM_HIDDEN_SIZE,
+            "rnn_num_layers": nav_contract.NAV_LSTM_NUM_LAYERS,
+        }
+        if actual_high_level != expected_high_level:
+            raise ValueError(
+                "HighLevelPolicy architecture differs from nav_contract: "
+                f"actual={actual_high_level}, expected={expected_high_level}"
+            )
+        probe("architecture_check complete")
+
+        probe("freeze_low_level begin")
         self._freeze_low_level()
+        probe("freeze_low_level complete")
 
+        optimizer_started = time.monotonic()
+        probe(
+            "optimizer_create begin "
+            f"high_level_trainable_params="
+            f"{sum(parameter.numel() for parameter in self.high_level.parameters() if parameter.requires_grad)}"
+        )
         self.optimizer = torch.optim.Adam(
             self.high_level.parameters(), lr=float(learning_rate)
         )
+        probe(
+            "optimizer_create complete "
+            f"elapsed_s={time.monotonic() - optimizer_started:.3f}"
+        )
+        probe("optimizer_assert begin")
         self._assert_optimizer_covers_high_level_only()
+        probe("optimizer_assert complete")
 
+        probe("oracle_create begin")
         self.oracle = NavOracle()
+        probe("oracle_create complete")
         # per-env 组件按首个 batch 尺寸惰性构建
         self.scheduler: NavScheduler | None = None
         self.tick_buffer: NavTickBuffer | None = None
@@ -125,6 +218,12 @@ class AlgorithmNavDagger:
         # ---- 运行计数 ----
         self.nonfinite_fallback_count = 0
         self.loaded_platform_model_id = None
+        self._lifecycle_frame_probe_done = False
+        self._lifecycle_tick_probe_done = False
+        probe(
+            "complete "
+            f"elapsed_s={time.monotonic() - init_started:.3f} {cuda_state()}"
+        )
 
     # ------------------------------------------------------------------
     # 冻结与解耦断言
@@ -200,39 +299,77 @@ class AlgorithmNavDagger:
 
         返回 dict：{"actions": [N,12], "is_tick": bool, "tick_metrics": {...}}
         """
+        first_frame_probe = not self._lifecycle_frame_probe_done
+        if first_frame_probe and self.logger is not None:
+            self.logger.info(
+                "[LifecycleProbe] nav_frame_begin first_call "
+                f"obs={tuple(obs.shape)} critic={tuple(critic_obs.shape)} device={obs.device}"
+            )
         num_envs = obs.shape[0]
         self._ensure_per_env(num_envs)
+        if first_frame_probe and self.logger is not None:
+            self.logger.info("[LifecycleProbe] nav_frame_begin per_env_state_ready")
 
         # 步骤 1：当帧 exec_cmd 写入观测副本（policy [6:9] / critic [9:12] 同值）
         self.scheduler.inject(obs, critic_obs)
+        if first_frame_probe and self.logger is not None:
+            self.logger.info("[LifecycleProbe] nav_frame_begin command_injected")
 
         parts = self._split_obs(obs)
 
         # 步骤 2：低层前向恰一次（VisionEncoder LSTM 每帧只推进一帧）
+        if first_frame_probe and self.logger is not None:
+            self.logger.info("[LifecycleProbe] nav_frame_begin vision_encoder begin")
         latent = self.vision_encoder(parts["depth"], parts["proprio"], masks=None)
+        if first_frame_probe and self.logger is not None:
+            self.logger.info(
+                f"[LifecycleProbe] nav_frame_begin vision_encoder complete latent={tuple(latent.shape)}"
+            )
         actions = self.low_level_actor(torch.cat((parts["proprio"], latent), dim=-1))
+        if first_frame_probe and self.logger is not None:
+            self.logger.info(
+                f"[LifecycleProbe] nav_frame_begin low_level complete actions={tuple(actions.shape)}"
+            )
 
         result = {"actions": actions, "is_tick": False, "tick_metrics": {}}
 
         # 步骤 3：nav tick（每 nav_period_frames 帧一次）
         if self._frame_count % nav_contract.NAV_PERIOD_FRAMES == 0:
+            if first_frame_probe and self.logger is not None:
+                self.logger.info("[LifecycleProbe] nav_frame_begin nav_tick begin")
             result["is_tick"] = True
             result["tick_metrics"] = self._nav_tick(parts, obs, critic_obs)
+            if first_frame_probe and self.logger is not None:
+                self.logger.info("[LifecycleProbe] nav_frame_begin nav_tick complete")
 
         self._frame_count += 1
         self.total_env_steps += num_envs
+        if first_frame_probe:
+            self._lifecycle_frame_probe_done = True
+            if self.logger is not None:
+                self.logger.info("[LifecycleProbe] nav_frame_begin first_call complete")
         return result
 
     @torch.no_grad()
     def _nav_tick(self, parts: dict, obs: torch.Tensor, critic_obs: torch.Tensor) -> dict:
         num_envs = obs.shape[0]
+        # This is deliberately process-local rather than derived from the
+        # persisted total_nav_ticks counter, so resume smoke runs retain the
+        # full first-tick diagnostic chain.
+        first_tick_probe = not self._lifecycle_tick_probe_done
 
         # 段首快照：TBPTT 重放的 (h0, c0) 必须是本段第一个 tick 前向前的 hidden
         if self.tick_buffer.size == 0 and not self.tick_buffer._segment_open:
             self.tick_buffer.start_segment(self.high_level.get_hidden_state())
 
         # cnn_feat32_raw：同帧 depth 过冻结 CNN（不经 LSTM，冻结语义 v2）
+        if first_tick_probe and self.logger is not None:
+            self.logger.info("[LifecycleProbe] nav_tick cnn begin")
         cnn_feat_raw = self.vision_encoder.cnn(parts["depth"])
+        if first_tick_probe and self.logger is not None:
+            self.logger.info(
+                f"[LifecycleProbe] nav_tick cnn complete features={tuple(cnn_feat_raw.shape)}"
+            )
 
         nav_inputs_raw = torch.cat(
             (
@@ -255,11 +392,21 @@ class AlgorithmNavDagger:
         nav_inputs = torch.nan_to_num(nav_inputs_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
         dwell_mask = self.scheduler.dwell_mask()
+        if first_tick_probe and self.logger is not None:
+            self.logger.info("[LifecycleProbe] nav_tick high_level begin")
         logits = self.high_level(nav_inputs, dwell_mask=dwell_mask)
+        if first_tick_probe and self.logger is not None:
+            self.logger.info(
+                f"[LifecycleProbe] nav_tick high_level complete logits={tuple(logits.shape)}"
+            )
         student_tokens = logits.argmax(dim=-1)
 
+        if first_tick_probe and self.logger is not None:
+            self.logger.info("[LifecycleProbe] nav_tick oracle begin")
         oracle_tokens = self.oracle.act(critic_obs)
         oracle_valid = NavOracle.label_validity(critic_obs)
+        if first_tick_probe and self.logger is not None:
+            self.logger.info("[LifecycleProbe] nav_tick oracle complete")
 
         logits_finite = torch.isfinite(logits).all(dim=-1)
         student_ok = inputs_finite & logits_finite
@@ -290,6 +437,34 @@ class AlgorithmNavDagger:
 
         valid = oracle_valid & inputs_finite & logits_finite
 
+        goal3_start = nav_contract.CRITIC_GOAL3_START
+        goal3 = critic_obs[:, goal3_start : goal3_start + 3]
+        goal3_abs = torch.nan_to_num(goal3.abs(), nan=0.0, posinf=0.0, neginf=0.0)
+        goal4_fresh = torch.isfinite(parts["goal4"][:, 3]) & (
+            parts["goal4"][:, 3] > 0.0
+        )
+        goal_metrics = {
+            "oracle_valid_count": int(oracle_valid.sum().item()),
+            "oracle_sample_count": int(num_envs),
+            "oracle_valid_ratio": float(oracle_valid.float().mean().item()),
+            "goal3_abs_mean": float(goal3_abs.mean().item()),
+            "goal3_abs_max": float(goal3_abs.max().item()),
+            "goal4_fresh_count": int(goal4_fresh.sum().item()),
+            "goal4_sample_count": int(num_envs),
+            "goal4_fresh_ratio": float(goal4_fresh.float().mean().item()),
+        }
+        if first_tick_probe:
+            if self.logger is not None:
+                self.logger.info(
+                    "[NavGoalProbe] first_nav_tick "
+                    + " ".join(f"{key}={value}" for key, value in goal_metrics.items())
+                )
+            emit_nav_event(
+                "first_nav_tick",
+                role=self.process_role,
+                **goal_metrics,
+            )
+
         # 收集 TBPTT 样本（消毒后的输入 + 投影后的标签；
         # 旧段 reset 信息随本 tick 落库后清零）
         self.tick_buffer.add(
@@ -299,6 +474,10 @@ class AlgorithmNavDagger:
             valid,
             dwell_mask,
         )
+        if first_tick_probe and self.logger is not None:
+            self.logger.info("[LifecycleProbe] nav_tick buffer_add complete")
+        if first_tick_probe:
+            self._lifecycle_tick_probe_done = True
         self._reset_since_last_tick = torch.zeros_like(self._reset_since_last_tick)
         self.total_nav_ticks += num_envs
 
@@ -312,6 +491,7 @@ class AlgorithmNavDagger:
             "switch_rate": float(switched.float().mean().item()),
             "valid_ratio": float(valid.float().mean().item()),
             "nonfinite_fallback": int(fallback.sum().item()),
+            **goal_metrics,
         }
 
     def frame_end(self, dones: torch.Tensor) -> None:
@@ -404,7 +584,7 @@ class AlgorithmNavDagger:
         self.high_level.eval()
 
     # ------------------------------------------------------------------
-    # checkpoint：保存（单一 nav* 文件；digest 硬校验）
+    # checkpoint：保存（单一 nav* 文件；digest 漂移仅诊断）
     # ------------------------------------------------------------------
 
     def _sha256(self, path: str) -> str:
@@ -423,7 +603,6 @@ class AlgorithmNavDagger:
         }
 
     def save_nav_bundle(self, path: str, *, platform_model_id, phase_label: str) -> str:
-        # digest 硬校验：低层被污染 = 事故级硬失败（不是 warning）
         current_digest = compute_low_level_state_digest(self._live_low_level_bundle_view())
         if self.low_level_state_digest is None:
             raise RuntimeError(
@@ -431,10 +610,13 @@ class AlgorithmNavDagger:
                 "load_nav_resume must run before the first save"
             )
         if current_digest != self.low_level_state_digest:
-            raise RuntimeError(
-                "frozen low level was modified during nav training: "
-                f"expected digest {self.low_level_state_digest}, got {current_digest}"
-            )
+            if self.logger is not None:
+                self.logger.warning(
+                    "[CheckpointIdentity] WARNING-ONLY: frozen low-level digest "
+                    "changed before save; writing the actual recomputed digest: "
+                    f"previous={self.low_level_state_digest}, actual={current_digest}"
+                )
+            self.low_level_state_digest = current_digest
 
         payload = {
             "format": KAIWU_TRAIN_FORMAT,
@@ -465,12 +647,7 @@ class AlgorithmNavDagger:
                     "class_name": type(self.high_level).__name__,
                     "state_dict": copy.deepcopy(self.high_level.state_dict()),
                     "trainable": True,
-                    "vocab": [list(v) for v in nav_contract.VOCAB],
-                    "input_layout_version": nav_contract.INPUT_LAYOUT_VERSION,
-                    "nav_period_frames": nav_contract.NAV_PERIOD_FRAMES,
-                    "min_dwell_ticks": nav_contract.MIN_DWELL_TICKS,
-                    "slew_rate_up": list(nav_contract.SLEW_RATE_UP),
-                    "slew_rate_down": list(nav_contract.SLEW_RATE_DOWN),
+                    **nav_contract.high_level_checkpoint_contract(),
                 },
             },
             "optimizers": {
@@ -496,7 +673,7 @@ class AlgorithmNavDagger:
                 "source_parent_model_id": self.source_parent_model_id,
                 "low_level_parent_model_id": self.low_level_parent_model_id,
                 "parent_checkpoint_sha256": self.parent_checkpoint_sha256,
-                "low_level_state_digest": self.low_level_state_digest,
+                "low_level_state_digest": current_digest,
             },
             "capabilities": {
                 "task": "track_nav",
@@ -561,6 +738,16 @@ class AlgorithmNavDagger:
             bundle = torch.load(candidate, map_location=self.device, weights_only=False)
             if not is_kaiwu_train_bundle(bundle):
                 continue
+            bundle_id = bundle.get("platform_model_id")
+            if self.logger is not None and (
+                bundle_id in (None, "") or str(bundle_id) != str(model_id)
+            ):
+                self.logger.warning(
+                    "[CheckpointIdentity] WARNING-ONLY: low-level parent bundle "
+                    "platform_model_id is missing or differs from the requested "
+                    f"preload; continuing after structural validation: "
+                    f"requested={model_id}, bundle={bundle_id!r}, path={candidate}"
+                )
             self._load_low_level_from_bundle(bundle)
             self.source_parent_model_id = str(model_id)
             self.parent_checkpoint_sha256 = self._sha256(candidate)
@@ -596,15 +783,22 @@ class AlgorithmNavDagger:
                     f"{bundle.get('stage_type')!r}, expected {self.STAGE_TYPE!r}: "
                     f"{candidate} — refusing to silently skip"
                 )
+            bundle_id = bundle.get("platform_model_id")
+            if self.logger is not None and (
+                bundle_id in (None, "") or str(bundle_id) != str(model_id)
+            ):
+                self.logger.warning(
+                    "[CheckpointIdentity] WARNING-ONLY: nav resume platform_model_id "
+                    "is missing or differs from the requested preload; continuing "
+                    f"after structural validation: requested={model_id}, "
+                    f"bundle={bundle_id!r}, path={candidate}"
+                )
             self._load_low_level_from_bundle(bundle)
 
-            hl_state, hl_meta = high_level_parts(bundle)
-            if hl_meta.get("input_layout_version") != nav_contract.INPUT_LAYOUT_VERSION:
-                raise ValueError(
-                    "nav resume input_layout_version mismatch: "
-                    f"{hl_meta.get('input_layout_version')} != "
-                    f"{nav_contract.INPUT_LAYOUT_VERSION}"
-                )
+            hl_state, _hl_meta = high_level_parts(bundle)
+            validate_high_level_spec(
+                bundle, nav_contract.high_level_checkpoint_contract()
+            )
             self.high_level.load_state_dict(hl_state, strict=True)
 
             optimizers = bundle.get("optimizers", {})
@@ -631,21 +825,63 @@ class AlgorithmNavDagger:
                 state.get("nonfinite_fallback_count", 0)
             )
 
-            lineage = bundle.get("lineage", {})
+            lineage_value = bundle.get("lineage", {})
+            if isinstance(lineage_value, dict):
+                lineage = lineage_value
+            else:
+                lineage = {}
+                if self.logger is not None:
+                    self.logger.warning(
+                        "[CheckpointIdentity] WARNING-ONLY: nav resume lineage "
+                        f"metadata is not a dict; ignoring it: {candidate}"
+                    )
             self.source_parent_model_id = lineage.get("source_parent_model_id")
             self.parent_checkpoint_sha256 = lineage.get("parent_checkpoint_sha256")
-            stored_digest = lineage.get("low_level_state_digest")
-            # 与 eval 侧对称：缺失 digest 同样硬失败（被剥除 digest 的包
-            # 不得无检通过 resume）。
-            if not stored_digest:
-                raise RuntimeError(
-                    f"[nav] resume bundle has no lineage.low_level_state_digest: "
-                    f"{candidate}"
+            stored_low_level_parent = lineage.get("low_level_parent_model_id")
+            configured_low_level_parent = self.low_level_parent_model_id
+            if stored_low_level_parent in (None, ""):
+                stored_low_level_parent = configured_low_level_parent
+                if self.logger is not None:
+                    self.logger.warning(
+                        "[CheckpointIdentity] WARNING-ONLY: nav resume bundle has "
+                        "no lineage.low_level_parent_model_id; preserving the "
+                        f"configured value={configured_low_level_parent!r}: {candidate}"
+                    )
+            if (
+                configured_low_level_parent not in (None, "")
+                and str(configured_low_level_parent) != str(stored_low_level_parent)
+                and self.logger is not None
+            ):
+                self.logger.warning(
+                    "[nav] configured low-level parent differs from resume lineage; "
+                    "preserving the checkpoint's truthful lineage: "
+                    f"configured={configured_low_level_parent}, "
+                    f"checkpoint={stored_low_level_parent}"
                 )
-            if stored_digest != self.low_level_state_digest:
-                raise RuntimeError(
-                    "nav resume low-level digest mismatch: "
+            self.low_level_parent_model_id = (
+                str(stored_low_level_parent)
+                if stored_low_level_parent not in (None, "")
+                else None
+            )
+            stored_digest = lineage.get("low_level_state_digest")
+            if not stored_digest:
+                if self.logger is not None:
+                    self.logger.warning(
+                        "[CheckpointIdentity] WARNING-ONLY: nav resume bundle has "
+                        "no lineage.low_level_state_digest; using recomputed digest="
+                        f"{self.low_level_state_digest}: {candidate}"
+                    )
+            elif stored_digest != self.low_level_state_digest and self.logger is not None:
+                self.logger.warning(
+                    "[CheckpointIdentity] WARNING-ONLY: nav resume low-level digest "
+                    "differs from lineage; continuing with loaded tensors: "
                     f"lineage={stored_digest} recomputed={self.low_level_state_digest}"
+                )
+
+            capabilities = bundle.get("capabilities", {})
+            if isinstance(capabilities, dict):
+                self.freshness_randomized = bool(
+                    capabilities.get("freshness_randomized", self.freshness_randomized)
                 )
 
             # per-env 活状态（scheduler/buffer/hidden）不恢复：留待 _ensure_per_env

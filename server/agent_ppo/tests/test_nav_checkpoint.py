@@ -3,7 +3,7 @@
 """nav checkpoint 命名空间与 AlgorithmNavDagger 存取回路测试。
 
 覆盖：首载低层父 / 保存单一 nav 文件（无别名）/ resume / 跨 ID 拒绝 /
-visual latest 不受 nav 文件污染 / digest 篡改硬失败。
+visual latest 不受 nav 文件污染 / digest 漂移 warning-only。
 """
 
 import os
@@ -24,6 +24,17 @@ from agent_ppo.model.vision_encoder import VisionEncoder
 PARENT_ID = "34728"
 
 
+class _Logger:
+    def __init__(self):
+        self.warnings = []
+
+    def info(self, _message):
+        pass
+
+    def warning(self, message):
+        self.warnings.append(str(message))
+
+
 def _mk_actor():
     return nn.Sequential(
         nn.Linear(77, 512), nn.ELU(),
@@ -33,13 +44,14 @@ def _mk_actor():
     )
 
 
-def _mk_algorithm():
+def _mk_algorithm(logger=None):
     return AlgorithmNavDagger(
         vision_encoder=VisionEncoder(),
         low_level_actor=_mk_actor(),
         high_level=HighLevelPolicy(),
         device="cpu",
         low_level_parent_model_id=PARENT_ID,
+        logger=logger,
     )
 
 
@@ -121,6 +133,33 @@ class TestNavCheckpointRoundtrip(unittest.TestCase):
         # per-env 活状态不恢复
         self.assertIsNone(algo2.scheduler)
 
+    def test_resume_rejects_high_level_contract_tamper(self):
+        algo = _mk_algorithm()
+        algo.load_parent_bundle(self.dir, PARENT_ID)
+        nav_path = os.path.join(self.dir, "model.ckpt-navbc-779.pkl")
+        algo.save_nav_bundle(nav_path, platform_model_id="779", phase_label="navbc")
+        bundle = torch.load(nav_path, weights_only=False)
+        bundle["modules"]["high_level"]["cmd_clamp_max"] = [9.0, 9.0, 9.0]
+        torch.save(bundle, nav_path)
+        with self.assertRaises(ValueError):
+            _mk_algorithm().load_nav_resume(self.dir, "779")
+
+    def test_resume_preserves_checkpoint_parent_lineage(self):
+        algo = _mk_algorithm()
+        algo.load_parent_bundle(self.dir, PARENT_ID)
+        nav_path = os.path.join(self.dir, "model.ckpt-navbc-780.pkl")
+        algo.save_nav_bundle(nav_path, platform_model_id="780", phase_label="navbc")
+
+        resumed = AlgorithmNavDagger(
+            vision_encoder=VisionEncoder(),
+            low_level_actor=_mk_actor(),
+            high_level=HighLevelPolicy(),
+            device="cpu",
+            low_level_parent_model_id="99999",
+        )
+        resumed.load_nav_resume(self.dir, "780")
+        self.assertEqual(resumed.low_level_parent_model_id, PARENT_ID)
+
     def test_save_before_load_is_forbidden(self):
         algo = _mk_algorithm()
         with self.assertRaises(RuntimeError):
@@ -130,18 +169,39 @@ class TestNavCheckpointRoundtrip(unittest.TestCase):
                 phase_label="navbc",
             )
 
-    def test_digest_tamper_hard_fails_on_save(self):
-        algo = _mk_algorithm()
+    def test_digest_tamper_warns_and_saves_actual_digest(self):
+        logger = _Logger()
+        algo = _mk_algorithm(logger=logger)
         algo.load_parent_bundle(self.dir, PARENT_ID)
         # 污染冻结低层（模拟事故）
         with torch.no_grad():
             next(algo.low_level_actor.parameters()).add_(1.0)
-        with self.assertRaises(RuntimeError):
-            algo.save_nav_bundle(
-                os.path.join(self.dir, "model.ckpt-navbc-778.pkl"),
-                platform_model_id="778",
-                phase_label="navbc",
-            )
+        path = os.path.join(self.dir, "model.ckpt-navbc-778.pkl")
+        algo.save_nav_bundle(
+            path,
+            platform_model_id="778",
+            phase_label="navbc",
+        )
+        saved = torch.load(path, weights_only=False)
+        actual = cio.compute_low_level_state_digest(saved)
+        self.assertEqual(saved["lineage"]["low_level_state_digest"], actual)
+        self.assertEqual(algo.low_level_state_digest, actual)
+        self.assertTrue(any("WARNING-ONLY" in item for item in logger.warnings))
+
+    def test_resume_digest_mismatch_warns_and_uses_loaded_tensors(self):
+        algo = _mk_algorithm()
+        algo.load_parent_bundle(self.dir, PARENT_ID)
+        path = os.path.join(self.dir, "model.ckpt-navbc-781.pkl")
+        algo.save_nav_bundle(path, platform_model_id="781", phase_label="navbc")
+        bundle = torch.load(path, weights_only=False)
+        bundle["lineage"]["low_level_state_digest"] = "0" * 64
+        torch.save(bundle, path)
+
+        logger = _Logger()
+        resumed = _mk_algorithm(logger=logger)
+        self.assertEqual(resumed.load_nav_resume(self.dir, "781"), path)
+        self.assertTrue(resumed.resume_loaded)
+        self.assertTrue(any("digest" in item for item in logger.warnings))
 
     def test_training_candidates_branching(self):
         # 首载：id == 父 ID → 只有低层父候选

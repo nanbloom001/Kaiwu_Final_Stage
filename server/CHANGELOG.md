@@ -4,20 +4,156 @@
 
 ## [未发布]
 
-- **[Standard 视觉策略受约束 RL]** 新增独立的
+- **[Nav 保存失败分类与同步路径加固]** Nav 平台 lifecycle 回调现在会区分
+  普通回调异常和 `CheckpointSaveError`：前者仍记录后继续，后者代表
+  checkpoint 序列化、写入或非空校验失败，必须终止训练，避免长训在无可恢复
+  模型的情况下继续。优雅退出的 final save 仍保持 best-effort，不覆盖平台原始
+  退出原因。IDE 同步服务的 workspace 校验改为真实路径校验，阻止符号链接
+  越界和通过别名绕过 `isaac_env/base_env.py` 保护。根目录同时忽略本地
+  `.worktrees/` 与 `.zcode/`，避免嵌套工作树和工具状态被误暂存。
+
+- **[hier-nav 平台模型发布生命周期修复]** 经可成功完成的 Track LBC 归档核验，平台
+  模型 ID 和 `dump_model_freq` 按 `BaseAgent.learn()` 回调推进，而不是按 Nav 的 outer
+  iteration 或业务侧 `save_model()` 写盘推进。历史 LBC 的 `10000 × 24 = 240000`
+  个低层帧与 `282409 - 42399 = 240010` 个平台步基本一致；失败 Nav 则从父 ID
+  `34728` 仅推进到 `34788`，与约 60 个 outer iteration 一致。Nav workflow 现于
+  每个成功低层批量帧完成后调用一次 lifecycle callback，TBPTT 梯度更新频率不变；
+  生产 `dump_model_freq` 调整为 3600，按当前 128 环境 Camera Track 吞吐约每五分钟
+  触发一次平台标准 checkpoint。常规 checkpoint 完全交由平台发布，删除 10 轮首存、
+  5 分钟业务侧墙钟保存和 30 轮兜底；正常结束、平台正常停止与 SIGTERM 共用一次
+  幂等 final best-effort 保存。新增成功/失败 callback、累计低层步、累计环境帧和
+  下次 dump 距离 telemetry；Nav 保存日志会区分 `/data/ckpt` 运行中 checkpoint 与
+  `/data/user_ckpt_dir` 最终平台归档候选，并打印 size、SHA256、距离上次保存的墙钟
+  时间和 lifecycle 数。单次回调失败记录后继续且不计入发布进度。完整链路 smoke 使用
+  测试专用 160 回调 dump，避免 per-frame lifecycle 下每帧重复落盘。该更正取代下方
+  旧条目的周期自定义保存策略，不改网络、checkpoint schema、标签或平台拥有的
+  `isaac_env/base_env.py`。
+
+- **[hier-nav Track 生命周期与监控修复]** 首轮平台 Track smoke 证明
+  `nav_dagger` 能真实更新，但 256 环境任务在首次常规 checkpoint 前收到外部
+  SIGTERM，且通用 monitor builder 显示 Standard/PPO 风格面板。正式配置固定为
+  128 环境；checkpoint 改为本会话 10 个 outer iteration 后首存、之后每 5 分钟
+  墙钟保存，并保留每 30 iteration 的兜底。自定义 monitor builder 现在显式展示
+  Track 0-9 难度的完成/失败/超时和总分/能耗/姿态/时间分，以及 Nav DAgger 的
+  CE、Oracle 模仿率、目标有效率、进度与终止指标。平台拥有的
+  `isaac_env/base_env.py` 不参与本修复。任务 `234739` 进一步证明自定义 Track/Nav
+  面板已成功追加，但平台默认环境模板仍按 `Config.CURRENT` 的字面 Standard fallback
+  注册；本专用分支现将静态默认改为 `NavDaggerConfig`，使监控注册期和运行期都从
+  `task_type=track` 开始。运行时 `configure_app.toml` 选择及一致性校验继续保留。
+
+- **[hier-nav checkpoint 与完整 smoke 可诊断性]** checkpoint 候选仍按平台请求 ID
+  精确选择，但包内 `platform_model_id`、lineage、父 ID 和低层 digest 缺失或不一致
+  改为醒目 warning，不再阻断结构兼容的操作者选定包。反序列化失败、必需模块缺失、
+  high/low-level 契约或 state-dict key/shape 不兼容、非有限张量仍硬停止。保存前若
+  低层 digest 漂移，会记录 warning 并把实际重算 digest 写入新包，避免传播虚假
+  lineage。新增 `agent_ppo.tools.nav_full_smoke`，用 test-only 环境变量在内存中将
+  `num_envs` 临时改为 1-256，生产 TOML 不落盘修改；支持 `start/status/stop`、独立
+  进程组、首个有效 TBPTT update 自动停止。`NAV_SMOKE_EVENT_LOG` 启用单次
+  `O_APPEND` JSONL 事件，消除多进程 stdout 交错对自动判定的影响。首个 nav tick
+  及每轮同时记录 Oracle goal 有效率、goal3 幅度和 goal4 freshness；全无效目标只
+  产生 `first_update_skipped`，不能被 smoke 误判为完成训练。
+
+- **[hier-nav 开发容器启动链修复]** 使用真实 `commandfull-34728` 在开发容器运行
+  完整 `train_test.py`，确认开悟 local-wrapper 会在 preload 之前先调用一次
+  `save_model(id=0)`。nav 现在跳过这次尚无父血缘的 bootstrap save，不写随机包，
+  随后仍由正常 preload 建立低层状态。worker 的 nav scanner 解析改为依据平台
+  `AnisotropicGridPatternCfg` 推导矩形网格，支持当前 `21x13=273` rays，并校验
+  pattern metadata 与 tensor 总数；不再把非平方的合法 scanner 误判为环境错误。
+  修复后的开发容器 `train_test.py` 已在 47.11 秒内成功；该入口强制单环境且不执行
+  真实 preload/nav workflow，所以正式任务的父包加载、256 环境和首个训练 update
+  仍需单独 smoke，不把工具级成功扩大解释为完整训练成功。
+  随后使用隔离启动器关闭 test 模式、临时降为 8 环境，完整运行到 14 个 outer
+  iteration（18808 env steps / 1888 nav ticks）；Adam state 已建立，第 10 轮
+  `ce=1.6981, top1=0.133, grad=0.700, nonfinite=0`。最终临时包的 34728 lineage、父包
+  SHA256 与低层 digest 均现场核验一致，证明真实 preload、rollout、TBPTT update 和
+  checkpoint lifecycle 已走通；停止后远端 TOML 已按哈希恢复为 256 环境。
+  checkpoint 身份/digest 门禁的 warning-only 收敛与可复用 smoke 启动器已在后续
+  修改中实现，见上条。
+
+- **[开发容器诊断 RPC]** 现有 `conf/tongbu.py` 复用唯一
+  `IDE_SYNC_TOKEN` 新增 `exec_b64_v1`，可在项目根内执行有超时和
+  输出上限的诊断命令；不引入第二套 admin 鉴权。新增
+  `container_rpc_client.py` 复用本地 `.env` 与腾讯代理 Cookie，并新增
+  `nav_init_gpu_probe.py` 在开发容器真实 GPU 中逐步构造高低层模块。
+  RPC cwd 经纯词法归一化后必须位于工作区内，同时修复了
+  `Path.absolute()` 不折叠 `..` 的旧路径边界。
+
+- **[hier-nav 启动生命周期诊断]** 针对平台任务 `navdagger-r1`
+  只完成 Agent 构造、但没有 checkpoint 身份日志、`NavDAgger` iteration 或
+  `env.reset` 证据的启动停滞，在 Agent 进入/离开 `BaseAgent.__init__`、
+  平台 `load_model` 进入/完成、通用 workflow 分发、nav workflow 进入及
+  `env.reset` 前后增加一次性 `LifecycleProbe` 日志，并继续覆盖首帧 command
+  注入、冻结视觉编码器/低层 Actor、高层 CNN/LSTM、Oracle、tick buffer、
+  首次 `env.step`、首次 TBPTT 更新、平台 lifecycle callback 及首次保存。
+  在 aisrv 仅完成三套网络打印、未到 `AlgorithmNavDagger ready` 的平台证据后，
+  构造期进一步拆分为三模块逐个 `.to(device)`、架构校验、冻结、Adam 创建、
+  optimizer 参数集合断言和 Oracle 创建；每个边界打印进程角色、耗时、模块设备
+  与无同步的 CUDA allocated/reserved 统计。
+  checkpoint 目录清单采用 best-effort 读取，诊断本身不会因模型池并发替换
+  文件而阻断加载。该变更不改训练、checkpoint 或平台 `base_env.py` 行为；
+  用于下一次 smoke 通过最后一条成功日志把停点定位到单一边界。
+
+- **[hier-nav MVP 审查修复]** 训练 stage 现在从
+  `conf/configure_app.toml [app].policy_entry` 在拼接 stage-specific TOML 路径前选择，
+  正式训练固定 `nav_dagger` + 低层父 `34728`；Track+Camera 评估即使平台
+  未转发 `policy_entry`，worker 也会推导 `nav_eval`，aisrv 被强制送入
+  `lbc_loco` 时会按同 ID nav 包升级为完整高低层装配。`nav_scanner` 在
+  worker observation process 内压缩为前/左/右墙特权特征，critic 契约扩为
+  323 维，Oracle 会朝更开阔侧确定性转向；缺 sensor/结构错误直接停止，合法的 no-hit
+  ray 按开阔空间处理，不再
+  静默训练无法走迷宫的教师。删除无消费者的 `[terrain.level_mix]`，改用
+  `num_parallel_tracks=10` 原生轨道并打印实际 level/type histogram。nav checkpoint
+  现严格锁定词表、输入切片、网络维度、UWB 测量链、slew/clamp 和 zero
+  急停语义；resume 保留包内真实低层父血缘。soft-stay 的 hard/timeout 比例改为按
+  已完成 episode 计算，不再被环境帧数稀释。全程不修改平台拥有的
+  `isaac_env/base_env.py`。
+
+- **[Camera 评估 checkpoint 严格加载]** 平台即使因 Camera task 强制走
+  `lbc_loco` 入口，也会使用与 VisualPPO 相同的
+  `visual_eval_checkpoint_candidates()` 同 ID 顺序（`command* -> anchor* ->
+  rl* -> vision*`）选择训练包。LBC eval 记录完整候选、选中绝对路径、SHA256、
+  bundle ID 和 lineage，只加载 `vision_encoder` 与 low-level Actor；非
+  `kaiwu_train_v1`、缺失/冲突的 `platform_model_id`/`lineage.platform_model_id`、
+  state_dict/model spec 不兼容或反序列化异常都会终止评估。未成功加载时 inference
+  显式拒绝运行，禁止以随机初始化参数产生评分；不再创建或回退同 ID 的
+  `lbc-loco` 别名，且不修改平台拥有的 `isaac_env/base_env.py`。
+
+- **[Standard 命令泛化与评估入口修复]** 新增
+  `standard-command-r1` / `visual_command_generalization_v1`：从固定评估选出的 Anchor
+  R2 视觉学生继续训练，CNN 冻结，Actor/LSTM/Critic 训练，S0 action/latent anchor 固定为
+  `0.35/0.10`。运行使用 256 环境、四小时平台墙钟、28401 source command 域与按墙钟
+  `0→50→100%` 混入 target profile 的 command scheduler；target 包含 zero、低速/正常
+  前进、前进+yaw、纯 yaw 和横移。保存只生成 `kaiwu_train_v1` 的
+  `commandbase`/`commandblend`/`commandfull` 文件，数字 ID 完全由平台注入，训练包仍
+  `deployable=false`。command scheduler 已从无法穿过进程代理的 aisrv 迁入 Isaac worker，
+  由 `LBCObservationProcess`/`PolicyObservationProcess` 与 `CriticObservationProcess` 在
+  `default_observation()` 前调用同一个 env-owned 幂等 bridge。bridge 只通过公开
+  `command_manager.get_command("base_velocity")` 取得 live tensor，写入后立即回读，并用
+  `common_step_counter` 保证 policy/critic 同一步只调度一次；`episode_length_buf == 0` 的环境
+  会重新采样。写入失败时先恢复原生命令并禁用本任务的自定义调度，恢复或回读也失败才硬停止。
+  每个新任务的 worker ramp 都从 0 分钟开始，checkpoint 不保存或恢复每环境 command、hold、
+  bucket 或 worker RNG。aisrv 只从 policy observation `[6:9]` 计算 anchor 权重，不再输出伪
+  effective 指标。全程不修改平台拥有的 `base_env.py`，不访问私有 `_command`；原生 sampler
+  固定为合法的 `[300,300]` 防止短周期覆盖。血缘/ID 差异、动作幅度、KL、timeout 和
+  hard termination 都只记录 warning。P0 评估入口与 command writer 的平台 smoke
+  **尚待验证**：最终评估 TOML 必须显式选择 `visual_policy_optimization`，且 aisrv/learner
+  不得出现旧的 `CommandAdapter command_hook=unavailable`。同步端现精确保护平台拥有的
+  `isaac_env/base_env.py`，拒绝写入或删除该文件，同时继续同步其余 `isaac_env` 文件。
+
+- **[Standard Anchor R2 视觉学生退火]** 将
   `visual_policy_optimization` 阶段，从冻结的
   `visionfull-28401`（`S0_visual_lbc`）初始化视觉编码器与 Actor，不复用
-  D4/D5 的配置、checkpoint 或调度。一次 3 小时平台任务依次执行 30 分钟
-  Critic 预热、60 分钟 Actor 微调和 90 分钟 LSTM/output-head 微调；CNN
-  始终冻结。训练采用 48 步 recurrent rollout、16 步 TBPTT、S0 action/latent
-  锚定、命令 bucket 和 hard-termination 安全暂停。新增
-  `standard_visual_ppo` 训练恢复包以及 `rlcritic`/`rlactor`/`rlfull`
-  探活标签；训练包仍为 `deployable=false`，Camera 评估路径只加载视觉编码器
-  与低层 Actor。已完成 Python/TOML/静态契约测试；真实 PyTorch tensor smoke、
-  平台预加载、command 实际值和首个 checkpoint 保存仍须在短平台启动中确认。
-  D1–D5 的历史 TOML、测试和归档 Tag 继续保留作复盘；它们不再是可直接运行的
-  活动入口。D1–D3 的视觉迁移经验与 D4/D5 的失败结论继续保留在
-  Changelog/分析文档中，但不作为当前阶段的实现来源。
+  D4/D5 或 R3 的配置、checkpoint 和调度。一次 4 小时平台任务依次执行
+  45 分钟 Critic 预热、45 分钟 Actor 微调、90 分钟 Actor/LSTM 联合退火和
+  60 分钟低锚定稳定；CNN 与冻结 S0 始终不进入 optimizer。训练采用 48 步
+  recurrent rollout、16 步 TBPTT、原生 28401 command/terrain 域和 warning-only
+  漂移诊断。`kaiwu_train_v1` 恢复包新增独立 Anchor 会话时钟，并使用
+  `anchorcritic`/`anchoractor`/`anchoranneal`/`anchorfinal` 探活标签；Camera 评估
+  仍只加载视觉编码器与低层 Actor。平台提供的 `base_env.py` 保持固定 SHA256，
+  旧环境需要的评估推导和深度预处理配置在 `agent_ppo` 内兼容。D1–D5、HJC 旧
+  LBC 和无活动 `StageConfig` 的 Track TOML 及其专用测试已删除；历史证据继续
+  保留在 Git 历史、Changelog、分析文档和归档 Tag。真实 PyTorch tensor smoke、
+  平台预加载及首个 checkpoint 保存仍须在 3–10 分钟平台启动中确认。
 
 - **[Standard 视觉长训计数修复]** 视觉 LBC 的平台 lifecycle 从每个 inner
   environment step 调用一次改为每个完整 outer iteration 调用一次，恢复与上一阶段

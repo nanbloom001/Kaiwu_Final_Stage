@@ -1,5 +1,8 @@
 .DS_Store
 .nfs*
+.env
+/.worktrees/
+/.zcode/
 __pycache__/
 *.py[cod]
 kaiwu_ide_crack/

@@ -34,6 +34,7 @@ except ModuleNotFoundError:  # Python < 3.11 platform images
     import toml
 
 _PROBE_DONE = False
+_LAST_HISTOGRAM_STEP = None
 
 
 @lru_cache(maxsize=8)
@@ -69,6 +70,16 @@ def _enabled() -> bool:
         return False
 
 
+def _active_probe_conf() -> dict:
+    try:
+        from agent_ppo.conf.conf import Config
+
+        stage = Config.CURRENT
+        return _load_probe_conf(stage.task_type, stage.name)
+    except Exception:
+        return {}
+
+
 def _tensor_summary(name: str, value) -> str:
     if value is None:
         return f"{name}=ABSENT"
@@ -81,6 +92,15 @@ def _tensor_summary(name: str, value) -> str:
         f"{name}[shape={tuple(value.shape)}, dtype={value.dtype}, "
         f"finite={finite}, sample={sample}]"
     )
+
+
+def _integer_histogram(name: str, value) -> str:
+    if not torch.is_tensor(value) or value.numel() == 0:
+        return f"{name}=ABSENT"
+    flat = value.detach().long().reshape(-1).cpu()
+    if bool((flat < 0).any()):
+        return f"{name}=INVALID_NEGATIVE"
+    return f"{name}={torch.bincount(flat).tolist()}"
 
 
 def _sensor_summary(sensors, name: str) -> str:
@@ -111,13 +131,44 @@ def _sensor_summary(sensors, name: str) -> str:
 
 
 def probe_once(env) -> None:
-    """Log a one-shot environment inventory; never raises."""
+    """Log inventory once and real terrain histograms at a bounded interval."""
 
-    global _PROBE_DONE
-    if _PROBE_DONE or not _enabled():
+    global _PROBE_DONE, _LAST_HISTOGRAM_STEP
+    if not _enabled():
         return
-    _PROBE_DONE = True
+    conf = _active_probe_conf()
     try:
+        if _PROBE_DONE:
+            interval = max(int(conf.get("histogram_interval_steps", 500)), 1)
+            step = getattr(env, "common_step_counter", None)
+            if torch.is_tensor(step):
+                step = int(step.item())
+            elif step is not None:
+                step = int(step)
+            if (
+                step is None
+                or step <= 0
+                or step % interval != 0
+                or step == _LAST_HISTOGRAM_STEP
+            ):
+                return
+            terrain = getattr(getattr(env, "scene", None), "terrain", None)
+            print(
+                "[nav_probe] "
+                f"step={step} | "
+                + _integer_histogram(
+                    "terrain_types_histogram", getattr(terrain, "terrain_types", None)
+                )
+                + " | "
+                + _integer_histogram(
+                    "terrain_levels_histogram", getattr(terrain, "terrain_levels", None)
+                ),
+                flush=True,
+            )
+            _LAST_HISTOGRAM_STEP = step
+            return
+
+        _PROBE_DONE = True
         lines = []
 
         num_envs = getattr(env, "num_envs", None)
@@ -153,6 +204,12 @@ def probe_once(env) -> None:
             except Exception:
                 names = ["<unreadable>"]
             lines.append(f"terrain_types_sample={names[:12]}")
+        lines.append(_integer_histogram("terrain_types_histogram", terrain_types))
+        lines.append(
+            _integer_histogram(
+                "terrain_levels_histogram", getattr(terrain, "terrain_levels", None)
+            )
+        )
         origins = getattr(terrain, "terrain_origins", None)
         if torch.is_tensor(origins):
             lines.append(f"terrain_origins.shape={tuple(origins.shape)}")

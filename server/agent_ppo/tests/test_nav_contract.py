@@ -52,8 +52,9 @@ class TestNavContract(unittest.TestCase):
         self.assertEqual(nc.POLICY_OBS_DIM, 57905)
         self.assertEqual(nc.GOAL4_OBS_START, 301)
         self.assertEqual(nc.DEPTH_OBS_START, 305)
-        self.assertEqual(nc.CRITIC_OBS_DIM, 319)
+        self.assertEqual(nc.CRITIC_OBS_DIM, 323)
         self.assertEqual(nc.CRITIC_GOAL3_START, 316)
+        self.assertEqual(nc.CRITIC_NAV_PRIV_SLICE, (319, 323))
         self.assertEqual(nc.POLICY_CMD_SLICE, (6, 9))
         self.assertEqual(nc.CRITIC_CMD_SLICE, (9, 12))
 
@@ -62,6 +63,20 @@ class TestNavContract(unittest.TestCase):
         self.assertEqual(nc.TBPTT_T, 16)
         self.assertEqual(nc.MIN_DWELL_TICKS, 10)
         self.assertAlmostEqual(nc.NAV_TICK_HZ, 5.0)
+
+    def test_checkpoint_contract_covers_inference_semantics(self):
+        contract = nc.high_level_checkpoint_contract()
+        for key in (
+            "nav_input_dim",
+            "token_names",
+            "vocab_size",
+            "cmd_clamp_min",
+            "cmd_clamp_max",
+            "zero_token_bypasses_slew",
+            "input_slices",
+            "uwb_measurement_contract",
+        ):
+            self.assertIn(key, contract)
 
     def test_golden_vectors_match_committed_file(self):
         regenerated = nc.generate_golden_vectors(400)

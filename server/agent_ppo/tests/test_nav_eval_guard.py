@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-"""nav eval 硬门测试：validate_nav_eval_bundle 负例 + agent 布线源码断言。
+"""nav eval 结构硬门与身份 warning-only 回归测试。
 
 源码文本断言沿用 server/tests/test_visual_policy_optimization.py 的先例
 （对不便在本地完整构造的 Agent 类，断言关键防线存在于源码中）。
@@ -33,12 +33,7 @@ EXPECTED_LOW = {
     "action_dim": 12,
     "goal_dim": 0,
 }
-EXPECTED_HIGH = {
-    "input_layout_version": nc.INPUT_LAYOUT_VERSION,
-    "vocab": [list(v) for v in nc.VOCAB],
-    "nav_period_frames": nc.NAV_PERIOD_FRAMES,
-    "min_dwell_ticks": nc.MIN_DWELL_TICKS,
-}
+EXPECTED_HIGH = nc.high_level_checkpoint_contract()
 
 
 def _mk_nav_bundle_file(directory, model_id="777"):
@@ -77,11 +72,12 @@ class TestValidateNavEvalBundle(unittest.TestCase):
         self.assertTrue(info["high_level_present"])
         self.assertEqual(len(info["low_level_state_digest"]), 64)
 
-    def test_wrong_id_hard_stops(self):
-        with self.assertRaises(ValueError):
-            cio.validate_nav_eval_bundle(
-                self.bundle, "888", EXPECTED_LOW, EXPECTED_HIGH
-            )
+    def test_wrong_id_warns_and_structurally_valid_bundle_continues(self):
+        info = cio.validate_nav_eval_bundle(
+            self.bundle, "888", EXPECTED_LOW, EXPECTED_HIGH
+        )
+        self.assertTrue(info["identity_warnings"])
+        self.assertIn("identity differs", info["identity_warnings"][0])
 
     def test_missing_high_level_hard_stops(self):
         bundle = dict(self.bundle)
@@ -91,13 +87,17 @@ class TestValidateNavEvalBundle(unittest.TestCase):
         with self.assertRaises(KeyError):
             cio.validate_nav_eval_bundle(bundle, "777", EXPECTED_LOW, EXPECTED_HIGH)
 
-    def test_tampered_low_level_digest_hard_stops(self):
+    def test_tampered_low_level_digest_warns(self):
         bundle = torch.load(self.path, weights_only=False)
         actor_state = bundle["modules"]["low_level"]["actor_state_dict"]
         first_key = next(iter(actor_state))
         actor_state[first_key] = actor_state[first_key] + 1.0
-        with self.assertRaises(ValueError):
-            cio.validate_nav_eval_bundle(bundle, "777", EXPECTED_LOW, EXPECTED_HIGH)
+        info = cio.validate_nav_eval_bundle(
+            bundle, "777", EXPECTED_LOW, EXPECTED_HIGH
+        )
+        self.assertTrue(
+            any("digest differs" in message for message in info["identity_warnings"])
+        )
 
     def test_vocab_mismatch_hard_stops(self):
         wrong_high = dict(EXPECTED_HIGH)
@@ -105,12 +105,48 @@ class TestValidateNavEvalBundle(unittest.TestCase):
         with self.assertRaises(ValueError):
             cio.validate_nav_eval_bundle(self.bundle, "777", EXPECTED_LOW, wrong_high)
 
-    def test_missing_lineage_digest_hard_stops(self):
+    def test_nonfinite_required_tensor_hard_stops(self):
+        bundle = torch.load(self.path, weights_only=False)
+        state = bundle["modules"]["high_level"]["state_dict"]
+        first_key = next(iter(state))
+        state[first_key] = state[first_key].clone()
+        state[first_key].view(-1)[0] = float("nan")
+        with self.assertRaises(FloatingPointError):
+            cio.validate_nav_eval_bundle(bundle, "777", EXPECTED_LOW, EXPECTED_HIGH)
+
+    def test_command_handoff_contract_mismatch_hard_stops(self):
+        for key, bad_value in (
+            ("cmd_clamp_max", [9.0, 9.0, 9.0]),
+            ("zero_token_bypasses_slew", False),
+            ("nav_input_dim", 47),
+        ):
+            wrong_high = dict(EXPECTED_HIGH)
+            wrong_high[key] = bad_value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                cio.validate_nav_eval_bundle(
+                    self.bundle, "777", EXPECTED_LOW, wrong_high
+                )
+
+    def test_missing_lineage_digest_warns(self):
         bundle = torch.load(self.path, weights_only=False)
         bundle["lineage"] = dict(bundle["lineage"])
         bundle["lineage"]["low_level_state_digest"] = None
-        with self.assertRaises(ValueError):
-            cio.validate_nav_eval_bundle(bundle, "777", EXPECTED_LOW, EXPECTED_HIGH)
+        info = cio.validate_nav_eval_bundle(
+            bundle, "777", EXPECTED_LOW, EXPECTED_HIGH
+        )
+        self.assertTrue(
+            any("has no lineage" in message for message in info["identity_warnings"])
+        )
+
+    def test_non_dict_lineage_warns(self):
+        bundle = torch.load(self.path, weights_only=False)
+        bundle["lineage"] = "legacy-metadata"
+        info = cio.validate_nav_eval_bundle(
+            bundle, "777", EXPECTED_LOW, EXPECTED_HIGH
+        )
+        self.assertTrue(
+            any("not a dict" in message for message in info["identity_warnings"])
+        )
 
     def test_eval_candidates_never_fall_back_to_loco_labels(self):
         # 同目录放一个 command 低层包；nav eval 候选不得包含它
@@ -136,6 +172,7 @@ class TestAgentWiringSource(unittest.TestCase):
         self.assertIn('self.is_nav_eval = self.algorithm_name == "nav_eval"', _AGENT_SRC)
         self.assertIn("_init_nav_dagger", _AGENT_SRC)
         self.assertIn("_load_nav_for_eval", _AGENT_SRC)
+        self.assertIn("_promote_forced_lbc_eval_to_nav", _AGENT_SRC)
 
     def test_storage_exclusion_covers_nav(self):
         self.assertIn("or self.is_nav_dagger", _AGENT_SRC)
