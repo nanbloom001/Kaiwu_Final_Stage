@@ -17,7 +17,11 @@ import torch
 import torch.nn as nn
 
 from agent_ppo import checkpoint_io as cio
-from agent_ppo.algorithm.algorithm_nav_dagger import AlgorithmNavDagger
+from agent_ppo.algorithm.algorithm_nav_dagger import (
+    AlgorithmNavDagger,
+    _control_alignment_metrics,
+    _switch_response_metrics,
+)
 from agent_ppo.feature import nav_contract as nc
 from agent_ppo.model.high_level_policy import HighLevelPolicy
 from agent_ppo.model.vision_encoder import VisionEncoder
@@ -91,6 +95,43 @@ class TestOracleLabelProjection(unittest.TestCase):
         self.assertEqual(int(algo.tick_buffer.tokens[2, 0].item()), 0)
         self.assertEqual(int(algo.scheduler.held_token[0].item()), 0)
 
+    def test_ramp_zero_reports_student_but_oracle_drives(self):
+        algo = _mk_algorithm()
+        algo.ramp_probability = 0.0
+        result = algo.frame_begin(_obs(), _critic(local_x=5.0, dist_m=5.0))
+        metrics = result["tick_metrics"]
+        self.assertEqual(metrics["student_drive_ratio"], 0.0)
+        self.assertEqual(metrics["oracle_drive_ratio"], 1.0)
+        for prefix in ("student", "oracle", "requested", "effective"):
+            total = sum(
+                metrics[f"{prefix}_token_{name}_ratio"]
+                for name in nc.TOKEN_NAMES
+            )
+            self.assertAlmostEqual(total, 1.0)
+        self.assertIn("student_token_zero_ratio", metrics)
+
+    def test_token_switch_response_is_reported_one_nav_period_later(self):
+        algo = _mk_algorithm()
+        algo.ramp_probability = 0.0
+        first = algo.frame_begin(_obs(), _critic(local_x=5.0, dist_m=5.0))
+        self.assertEqual(first["tick_metrics"]["switch_response_sample_count"], 0)
+        for _ in range(nc.NAV_PERIOD_FRAMES):
+            algo.frame_end(torch.zeros(N, dtype=torch.bool))
+            result = algo.frame_begin(_obs(), _critic(local_x=5.0, dist_m=5.0))
+        self.assertTrue(result["is_tick"])
+        self.assertEqual(result["tick_metrics"]["switch_response_sample_count"], N)
+
+    def test_reset_cancels_pending_switch_response(self):
+        algo = _mk_algorithm()
+        algo.ramp_probability = 0.0
+        algo.frame_begin(_obs(), _critic(local_x=5.0, dist_m=5.0))
+        algo.frame_end(torch.ones(N, dtype=torch.bool))
+        for _ in range(nc.NAV_PERIOD_FRAMES):
+            result = algo.frame_begin(_obs(), _critic(local_x=5.0, dist_m=5.0))
+            algo.frame_end(torch.zeros(N, dtype=torch.bool))
+        self.assertTrue(result["is_tick"])
+        self.assertEqual(result["tick_metrics"]["switch_response_sample_count"], 0)
+
 
 class TestNaNTickNeutralization(unittest.TestCase):
     def test_one_nan_tick_does_not_crash_the_segment(self):
@@ -114,6 +155,63 @@ class TestNaNTickNeutralization(unittest.TestCase):
         self.assertTrue(metrics["ce_loss"] == metrics["ce_loss"])  # not NaN
         self.assertLess(metrics["ce_loss"], 1.0e6)  # 未被掩码标签的 1e9 级 CE 污染
         self.assertGreater(algo.nonfinite_fallback_count, 0)
+
+    def test_control_alignment_metrics_distinguish_worker_and_exec(self):
+        worker = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])
+        exec_cmd = torch.tensor([[0.5, 0.0, 0.0], [0.5, 0.0, 0.0]])
+        held = exec_cmd.clone()
+        critic = torch.zeros(2, nc.CRITIC_OBS_DIM)
+        critic[:, 0] = 0.45
+        actions = torch.ones(2, 12)
+        metrics = _control_alignment_metrics(worker, exec_cmd, held, critic, actions)
+        self.assertEqual(metrics["worker_exec_cmd_match_ratio"], 0.0)
+        self.assertAlmostEqual(metrics["worker_exec_cmd_linf_mean"], 0.5)
+        self.assertEqual(metrics["exec_vx_closer_ratio"], 1.0)
+        self.assertEqual(metrics["low_level_action_nonfinite_count"], 0)
+
+    def test_nonfinite_action_is_counted_without_changing_action_value(self):
+        worker = torch.zeros(1, 3)
+        exec_cmd = torch.zeros(1, 3)
+        critic = torch.zeros(1, nc.CRITIC_OBS_DIM)
+        actions = torch.tensor([[float("nan")] + [0.0] * 11])
+        metrics = _control_alignment_metrics(worker, exec_cmd, exec_cmd, critic, actions)
+        self.assertEqual(metrics["low_level_action_nonfinite_count"], 1)
+        self.assertEqual(metrics["low_level_action_abs_mean"], 0.0)
+
+    def test_switch_response_detects_large_constant_actions(self):
+        switched = torch.tensor([True, False])
+        previous_actions = torch.ones(2, 12)
+        current_actions = torch.ones(2, 12)
+        previous_vx = torch.tensor([0.1, 0.2])
+        current_vx = torch.tensor([0.1, 0.8])
+        metrics = _switch_response_metrics(
+            switched,
+            previous_actions,
+            current_actions,
+            previous_vx,
+            current_vx,
+        )
+        self.assertEqual(metrics["switch_response_sample_count"], 1)
+        self.assertEqual(metrics["switch_response_no_action_ratio"], 1.0)
+        self.assertEqual(metrics["switch_response_no_velocity_ratio"], 1.0)
+
+    def test_switch_response_reports_action_and_velocity_change(self):
+        switched = torch.tensor([True])
+        previous_actions = torch.zeros(1, 12)
+        current_actions = torch.full((1, 12), 0.1)
+        metrics = _switch_response_metrics(
+            switched,
+            previous_actions,
+            current_actions,
+            torch.tensor([0.0]),
+            torch.tensor([0.2]),
+        )
+        self.assertAlmostEqual(
+            metrics["switch_response_action_delta_abs_mean"], 0.1
+        )
+        self.assertAlmostEqual(metrics["switch_response_vx_delta_abs_mean"], 0.2)
+        self.assertEqual(metrics["switch_response_no_action_ratio"], 0.0)
+        self.assertEqual(metrics["switch_response_no_velocity_ratio"], 0.0)
 
     def test_all_invalid_segment_skips_update(self):
         algo = _mk_algorithm()

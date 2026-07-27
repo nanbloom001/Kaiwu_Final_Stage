@@ -5,9 +5,11 @@
 ###########################################################################
 """NavOracle — 特权规则策略（DAgger 教师），只消费 critic_obs。
 
-输入：critic_obs [N, 319] = [critic_proprio(60) | height_scan(256) | goal3(3)]
+输入：critic_obs [N, 323] = [critic_proprio(60) | height_scan(256) |
+     goal3(3) | nav_priv(4)]
   - 真值 goal3（critic[316:319]，无噪声、无 S&H）→ 方位角与距离
-  - 特权 height_scan（critic[60:316]，16×16 近场网格）→ 前方障碍减速
+  - 特权 height_scan（critic[60:316]，16×16 近场网格）→ 近场减速
+  - nav_priv（available/front/left/right wall score）→ 确定性绕墙
   - 真值 lin_vel（critic[0:3]）暂未使用（保留接口）
 
 输出：词表 token [N] long（`nav_contract.VOCAB` 编号）。
@@ -17,7 +19,8 @@
   2. |angle| > spin_threshold      → 纯转向 spin_left/right
   3. |angle| > turn_threshold      → 慢速转向 creep_left/right
   4. |angle| > veer_threshold      → 前进转向 forward_left/right
-  5. 直行：前方近场障碍高 or dist 小 → forward_slow；
+  5. 直行且 nav 前墙阻塞 → 朝墙分数更低的一侧 creep 转向；
+  6. 直行：前方近场障碍高 or dist 小 → forward_slow；
      dist < mid_range → forward_mid；否则 forward_fast
 
 Oracle 是特权训练工具：真值/height_scan 只在训练侧存在，学生（HighLevelPolicy）
@@ -41,6 +44,8 @@ class NavOracle:
         slow_range_m: float = 1.5,
         mid_range_m: float = 3.0,
         obstacle_threshold_m: float = 0.3,
+        nav_front_block_threshold: float = 0.35,
+        nav_side_margin: float = 0.03,
     ):
         self.stop_radius_m = stop_radius_m
         self.spin_threshold_rad = spin_threshold_rad
@@ -49,6 +54,12 @@ class NavOracle:
         self.slow_range_m = slow_range_m
         self.mid_range_m = mid_range_m
         self.obstacle_threshold_m = obstacle_threshold_m
+        self.nav_front_block_threshold = nav_front_block_threshold
+        self.nav_side_margin = nav_side_margin
+        # Read-only diagnostics from the most recent act() call. The rule
+        # outputs themselves remain unchanged; aisrv consumes this snapshot
+        # only for monitor/logging metrics.
+        self.last_metrics: dict[str, float] = {}
 
     def act(self, critic_obs: torch.Tensor) -> torch.Tensor:
         if critic_obs.ndim != 2 or critic_obs.shape[1] < nav_contract.CRITIC_OBS_DIM:
@@ -77,6 +88,15 @@ class NavOracle:
         front_window = scan[:, 3:13, :10]
         front_obstacle = front_window.amin(dim=(1, 2)) < -self.obstacle_threshold_m
 
+        p_lo, p_hi = nav_contract.CRITIC_NAV_PRIV_SLICE
+        nav_priv = critic_obs[:, p_lo:p_hi]
+        nav_available = nav_priv[:, 0] > 0.5
+        nav_front_blocked = nav_available & (
+            nav_priv[:, 1] > self.nav_front_block_threshold
+        )
+        left_score = nav_priv[:, 2]
+        right_score = nav_priv[:, 3]
+
         tokens = torch.full((n,), nav_contract.ZERO_TOKEN_INDEX, dtype=torch.long, device=device)
 
         arrived = dist_m < self.stop_radius_m
@@ -94,19 +114,66 @@ class NavOracle:
         tokens[veer & left] = 4       # forward_left
         tokens[veer & ~left] = 5      # forward_right
 
-        slow = straight & (front_obstacle | (dist_m < self.slow_range_m))
-        mid = straight & ~slow & (dist_m < self.mid_range_m)
-        fast = straight & ~slow & ~mid
+        avoid = straight & nav_front_blocked
+        # Lower wall score is the more open side. Near-ties use the goal side;
+        # a perfectly straight goal deterministically chooses left. The 2 s
+        # dwell contract prevents per-tick left/right oscillation.
+        prefer_left = left_score + self.nav_side_margin < right_score
+        near_tie = (left_score - right_score).abs() <= self.nav_side_margin
+        avoid_left = prefer_left | (near_tie & (angle >= 0))
+        tokens[avoid & avoid_left] = 6   # creep_left
+        tokens[avoid & ~avoid_left] = 7  # creep_right
+
+        clear_straight = straight & ~avoid
+        slow = clear_straight & (front_obstacle | (dist_m < self.slow_range_m))
+        mid = clear_straight & ~slow & (dist_m < self.mid_range_m)
+        fast = clear_straight & ~slow & ~mid
         tokens[slow] = 1              # forward_slow
         tokens[mid] = 2               # forward_mid
         tokens[fast] = 3              # forward_fast
 
         # 有效性：goal3 全零（真值缺席）视为无效标签 → zero + 调用方置 valid=0
+        mode_masks = {
+            "arrived": arrived,
+            "spin": spin,
+            "creep": creep,
+            "veer": veer,
+            "wall_avoid": avoid,
+            "forward_slow": slow,
+            "forward_mid": mid,
+            "forward_fast": fast,
+        }
+        mode_values = torch.stack(
+            [mask.float() for mask in mode_masks.values()], dim=1
+        ).mean(dim=0).detach().cpu().tolist()
+        goal_stats = torch.stack(
+            (dist_m, angle.abs(), nav_priv[:, 1], left_score, right_score), dim=1
+        ).detach().float().cpu()
+        self.last_metrics = {
+            **{
+                f"oracle_mode_{name}_ratio": float(value)
+                for name, value in zip(mode_masks, mode_values)
+            },
+            "oracle_goal_dist_mean": float(goal_stats[:, 0].mean().item()),
+            "oracle_goal_dist_min": float(goal_stats[:, 0].min().item()),
+            "oracle_goal_dist_max": float(goal_stats[:, 0].max().item()),
+            "oracle_goal_angle_abs_mean": float(goal_stats[:, 1].mean().item()),
+            "oracle_front_score_mean": float(goal_stats[:, 2].mean().item()),
+            "oracle_left_score_mean": float(goal_stats[:, 3].mean().item()),
+            "oracle_right_score_mean": float(goal_stats[:, 4].mean().item()),
+            "oracle_front_blocked_ratio": float(nav_front_blocked.float().mean().item()),
+            "oracle_front_obstacle_ratio": float(front_obstacle.float().mean().item()),
+        }
         return tokens
 
     @staticmethod
     def label_validity(critic_obs: torch.Tensor) -> torch.Tensor:
         """[N] bool：Oracle 标签是否有效（真值 goal 存在且输入有限）。"""
+        if critic_obs.ndim != 2 or critic_obs.shape[1] < nav_contract.CRITIC_OBS_DIM:
+            raise ValueError(
+                f"NavOracle expects critic obs [N, >={nav_contract.CRITIC_OBS_DIM}], "
+                f"got {tuple(critic_obs.shape)}"
+            )
         g_lo = nav_contract.CRITIC_GOAL3_START
         goal3 = critic_obs[:, g_lo : g_lo + 3]
         finite = torch.isfinite(critic_obs).all(dim=-1)

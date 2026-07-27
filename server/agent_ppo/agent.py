@@ -13,6 +13,7 @@ import glob
 import shutil
 import copy
 import hashlib
+import time
 
 import numpy as np
 import torch
@@ -25,6 +26,7 @@ import torch.optim as optim
 
 from kaiwudrl.interface.agent import BaseAgent
 from agent_ppo.feature.definition import ActData
+from agent_ppo.feature.nav_event_log import emit_nav_event
 from agent_ppo.conf.conf import Config
 from agent_ppo.model.actor_critic_encoder import ActorCriticEncoder
 from agent_ppo.algorithm.algorithm_ppo import AlgorithmPPO
@@ -47,8 +49,10 @@ from tools.train_env_conf_validate import check_usr_conf
 
 class Agent(BaseAgent):
     def __init__(self, agent_type="player", device="cuda", logger=None, monitor=None):
+        lifecycle_started = time.monotonic()
         self.cur_model_name = "ActorCriticEncoder"
         self.device = device
+        self._process_role = str(agent_type)
         self.logger = logger
         self.monitor = monitor
         self.worker_command_enabled = False
@@ -63,8 +67,22 @@ class Agent(BaseAgent):
         # checkpoint has completed the strict load below.
         self._eval_checkpoint_path = None
         self._eval_requested_model_id = None
+        self._lifecycle_probe_exploit_logged = False
+        self._lifecycle_probe_predict_logged = False
+        self._lifecycle_probe_learn_logged = False
+        self._lifecycle_probe_save_logged = False
+
+        self.logger.info(
+            "[LifecycleProbe] agent_init enter "
+            f"pid={os.getpid()} ppid={os.getppid()} agent_type={agent_type} device={device}"
+        )
 
         usr_conf, usr_conf_file, is_eval, stage = Config.load_conf(self.logger)
+        self.logger.info(
+            "[LifecycleProbe] agent_init config_resolved "
+            f"pid={os.getpid()} stage={stage.name} is_eval={is_eval} "
+            f"conf={usr_conf_file}"
+        )
         valid, message = check_usr_conf(usr_conf, is_eval, self.logger)
         if not valid:
             self.logger.error(f"check_usr_conf is {valid}, message is {message}, please check {usr_conf_file}")
@@ -156,7 +174,25 @@ class Agent(BaseAgent):
             if self.is_visual_ppo:
                 self.algorithm.initialize_recurrent_states(self.num_envs)
 
+        self.logger.info(
+            "[LifecycleProbe] agent_init before_base_agent "
+            f"pid={os.getpid()} stage={stage.name} algorithm={self.algorithm_name} "
+            f"is_eval={self.is_eval} model_type={type(self.model).__name__} "
+            f"model_params={sum(parameter.numel() for parameter in self.model.parameters())}"
+        )
         super().__init__(agent_type, device, logger, monitor)
+        self.logger.info(
+            "[LifecycleProbe] agent_init complete "
+            f"pid={os.getpid()} stage={stage.name} algorithm={self.algorithm_name} "
+            f"elapsed_s={time.monotonic() - lifecycle_started:.3f}"
+        )
+        emit_nav_event(
+            "agent_ready",
+            role=self._process_role,
+            stage=stage.name,
+            algorithm=self.algorithm_name,
+            num_envs=self.num_envs,
+        )
 
     def _init_flat(self, num_proprio, num_scan, stage):
         """
@@ -359,15 +395,27 @@ class Agent(BaseAgent):
 
     def _init_nav_common(self, stage):
         """nav 训练/评估共用：三模块组装 + 冻结双保险 + 显式观测维度。"""
+        common_started = time.monotonic()
+
+        def probe(message):
+            self.logger.info(
+                "[LifecycleProbe] nav_init_common "
+                f"pid={os.getpid()} role={self._process_role} {message}"
+            )
+
+        probe("imports begin")
         from agent_ppo.feature import nav_contract
         from agent_ppo.model.high_level_policy import HighLevelPolicy
         from agent_ppo.model.vision_encoder import VisionEncoder
+        probe("imports complete")
 
         # 显式布局：policy goal4 与 critic goal3 不对称，不走基类通用公式
         self.num_obs = nav_contract.POLICY_OBS_DIM        # 57905
-        self.num_critic_obs = nav_contract.CRITIC_OBS_DIM  # 319
+        self.num_critic_obs = nav_contract.CRITIC_OBS_DIM  # 323
 
-        self.vision_encoder = VisionEncoder(
+        step_started = time.monotonic()
+        probe("vision_construct begin")
+        vision_encoder = VisionEncoder(
             image_shape=(stage.depth_height, stage.depth_width, stage.depth_channels),
             proprio_dim=stage.proprio_dim,
             cnn_output_dim=stage.cnn_output_dim,
@@ -375,20 +423,48 @@ class Agent(BaseAgent):
             rnn_num_layers=stage.lstm_num_layers,
             rnn_output_dim=stage.latent_dim,
             use_lstm=True,
-        ).to(self.device)
+        )
+        probe(
+            "vision_construct complete "
+            f"elapsed_s={time.monotonic() - step_started:.3f}"
+        )
+
+        step_started = time.monotonic()
+        probe("vision_to_device begin")
+        self.vision_encoder = vision_encoder.to(self.device)
+        probe(
+            "vision_to_device complete "
+            f"elapsed_s={time.monotonic() - step_started:.3f}"
+        )
+
+        step_started = time.monotonic()
+        probe("low_level_construct begin")
         self.low_level_actor = self._build_nav_low_level_actor(stage)
+        probe(
+            "low_level_construct complete "
+            f"elapsed_s={time.monotonic() - step_started:.3f}"
+        )
+
+        step_started = time.monotonic()
+        probe("high_level_construct begin")
         self.high_level = HighLevelPolicy(
             input_dim=stage.nav_input_dim,
             vocab_size=stage.nav_vocab_size,
             rnn_hidden_dim=stage.nav_lstm_hidden_size,
             rnn_num_layers=stage.nav_lstm_num_layers,
         ).to(self.device)
+        probe(
+            "high_level_construct complete "
+            f"elapsed_s={time.monotonic() - step_started:.3f}"
+        )
 
         # 冻结双保险（.eval + requires_grad=False；optimizer 侧另有参数集合断言）
+        probe("freeze begin")
         for module in (self.vision_encoder, self.low_level_actor):
             module.eval()
             for param in module.parameters():
                 param.requires_grad_(False)
+        probe("freeze complete")
 
         self.model = self.high_level
         self._nav_eval_checkpoint_path = None
@@ -399,16 +475,36 @@ class Agent(BaseAgent):
         self.logger.info(f"[nav] VisionEncoder(frozen):\n{self.vision_encoder}")
         self.logger.info(f"[nav] LowLevelActor(frozen):\n{self.low_level_actor}")
         self.logger.info(f"[nav] HighLevelPolicy(trainable):\n{self.high_level}")
+        probe(
+            "complete "
+            f"elapsed_s={time.monotonic() - common_started:.3f}"
+        )
 
     def _init_nav_dagger(self, stage, usr_conf):
         from agent_ppo.algorithm.algorithm_nav_dagger import AlgorithmNavDagger
 
+        nav_init_started = time.monotonic()
+        self.logger.info(
+            "[LifecycleProbe] nav_init_dagger enter "
+            f"pid={os.getpid()} role={self._process_role} device={self.device}"
+        )
+        self.logger.info("[LifecycleProbe] nav_init_common begin")
         self._init_nav_common(stage)
+        self.logger.info(
+            "[LifecycleProbe] nav_init_common complete "
+            f"elapsed_s={time.monotonic() - nav_init_started:.3f}"
+        )
         nav_conf = (
             usr_conf.get(stage.name, {}) if isinstance(usr_conf, dict) else {}
         )
         self._nav_low_level_parent_id = str(
             nav_conf.get("low_level_parent_model_id", 34728)
+        )
+        algorithm_started = time.monotonic()
+        self.logger.info(
+            "[LifecycleProbe] nav_algorithm_construct begin "
+            f"pid={os.getpid()} role={self._process_role} "
+            f"low_level_parent={self._nav_low_level_parent_id}"
         )
         self.algorithm = AlgorithmNavDagger(
             vision_encoder=self.vision_encoder,
@@ -422,6 +518,12 @@ class Agent(BaseAgent):
             depth_shape=(stage.depth_height, stage.depth_width, stage.depth_channels),
             low_level_parent_model_id=self._nav_low_level_parent_id,
             logger=self.logger,
+            process_role=self._process_role,
+        )
+        self.logger.info(
+            "[LifecycleProbe] nav_algorithm_construct complete "
+            f"pid={os.getpid()} role={self._process_role} "
+            f"elapsed_s={time.monotonic() - algorithm_started:.3f}"
         )
         self.logger.info(
             "[nav] AlgorithmNavDagger ready "
@@ -639,6 +741,13 @@ class Agent(BaseAgent):
         在评估模式下利用已学习的策略进行动作选择。
         """
         (obs) = list_obs_data
+        if not self._lifecycle_probe_exploit_logged:
+            self._lifecycle_probe_exploit_logged = True
+            self.logger.info(
+                "[LifecycleProbe] exploit first_call "
+                f"pid={os.getpid()} stage={self.stage.name} is_eval={self.is_eval} "
+                f"obs_shape={getattr(obs, 'shape', None)}"
+            )
         with torch.no_grad():
             if self.is_lbc:
                 return self._exploit_lbc_loco(obs)
@@ -739,13 +848,20 @@ class Agent(BaseAgent):
         LBC 阶段：训练在 lbc_workflow 中直接调用 algorithm.update(obs)，
                   不经 agent.learn；此处 no-op 作为安全保护。
         """
+        if (self.is_nav_dagger or self.is_nav_eval) and not self._lifecycle_probe_learn_logged:
+            self._lifecycle_probe_learn_logged = True
+            self.logger.info(
+                "[LifecycleProbe] nav_agent_learn first_call "
+                f"pid={os.getpid()} stage={self.stage.name} "
+                f"sample_data_is_none={list_sample_data is None}"
+            )
         if self.is_lbc:
             return None
         if self.is_behavior_distill:
             return None
         if self.is_nav_dagger or self.is_nav_eval:
             # nav 训练在 nav_dagger_workflow 内直接调 algorithm；此处 no-op
-            # 仅用于推进平台 lifecycle（每 outer iteration 恰调用一次）。
+            # 仅用于推进平台 lifecycle（每个成功低层批量帧恰调用一次）。
             return None
         if self.is_visual_ppo:
             return self.algorithm.learn(self.training_elapsed_h)
@@ -779,6 +895,12 @@ class Agent(BaseAgent):
         LBC 阶段：由 lbc_workflow 直接调用 algorithm.act_teacher/update，
                   此处不使用。调用时抛出明确错误。
         """
+        if not self._lifecycle_probe_predict_logged:
+            self._lifecycle_probe_predict_logged = True
+            self.logger.info(
+                "[LifecycleProbe] predict first_call "
+                f"pid={os.getpid()} stage={self.stage.name} algorithm={self.algorithm_name}"
+            )
         if self.is_lbc:
             raise RuntimeError(
                 "agent.predict() is not used in LBC stage; lbc_workflow calls "
@@ -928,6 +1050,26 @@ class Agent(BaseAgent):
         id 由平台框架注入（调用 agent.save_model() 时不传 id）；不得用 iteration
         人工计算 id，否则平台模型池 ID / 文件名 / 任务页记录会不一致。
         """
+        if (self.is_nav_dagger or self.is_nav_eval) and not self._lifecycle_probe_save_logged:
+            self._lifecycle_probe_save_logged = True
+            self.logger.info(
+                "[LifecycleProbe] nav_save_model first_call "
+                f"pid={os.getpid()} requested_id={id} path={path} "
+                f"parent_loaded={getattr(self.algorithm, 'low_level_state_digest', None) is not None}"
+            )
+        # Local-wrapper lifecycle saves ID 0 before invoking preload_model_file().
+        # A nav bundle is invalid until its frozen low-level parent has supplied
+        # the lineage digest, so acknowledge only this bootstrap callback.
+        if (
+            self.is_nav_dagger
+            and str(id) == "0"
+            and not getattr(self.algorithm, "low_level_state_digest", None)
+        ):
+            self.logger.warning(
+                "[nav_dagger] skip framework bootstrap save id=0 before parent preload; "
+                "no checkpoint was written"
+            )
+            return
         ckpt_name = getattr(Config.CURRENT, "ckpt_name", "") or ""
         if ckpt_name:
             model_file_path = f"{path}/{ckpt_name}-{str(id)}.pkl"
@@ -988,6 +1130,13 @@ class Agent(BaseAgent):
                 f"label={nav_label}, "
                 f"low_level_digest={self.algorithm.low_level_state_digest}, "
                 f"platform_id={id}, sha256={checksum})"
+            )
+            emit_nav_event(
+                "checkpoint_saved",
+                role=self._process_role,
+                platform_model_id=str(id),
+                path=nav_file_path,
+                sha256=checksum,
             )
         elif self.is_nav_eval:
             self.logger.info("[nav_eval] save_model is a no-op in eval assembly")
@@ -1109,19 +1258,67 @@ class Agent(BaseAgent):
                              否则 fallback 到 model.ckpt-locomotion-{id}.pkl 拆分教师。
         LBC Loco (eval)    : 只加载 vision_encoder + teacher_actor（模拟真机视角）。
         """
+        self.logger.info(
+            "[LifecycleProbe] load_model enter "
+            f"pid={os.getpid()} stage={self.stage.name} algorithm={self.algorithm_name} "
+            f"is_eval={self.is_eval} requested_id={id} path={path}"
+        )
+        if self.is_nav_dagger or self.is_nav_eval:
+            emit_nav_event(
+                "preload_selected",
+                role=self._process_role,
+                requested_id=str(id),
+                path=path,
+            )
+        if self.is_nav_dagger or self.is_nav_eval:
+            same_id_files = []
+            if path:
+                candidates = sorted(
+                    set(
+                        glob.glob(os.path.join(path, f"model.ckpt-*-{id}.*"))
+                        + glob.glob(os.path.join(path, f"model.ckpt-{id}.*"))
+                    )
+                )
+                for candidate in candidates:
+                    try:
+                        if os.path.isfile(candidate):
+                            same_id_files.append(
+                                {
+                                    "name": os.path.basename(candidate),
+                                    "size": os.path.getsize(candidate),
+                                }
+                            )
+                    except OSError as exc:
+                        self.logger.warning(
+                            "[LifecycleProbe] nav_load_model inventory_entry_failed "
+                            f"path={candidate} error={type(exc).__name__}:{exc}"
+                        )
+            self.logger.info(
+                "[LifecycleProbe] nav_load_model inventory "
+                f"pid={os.getpid()} requested_id={id} same_id_files={same_id_files}"
+            )
         if self.is_visual_ppo:
             self._load_visual_ppo(path, id)
-            return
-        if self.is_nav_dagger or self.is_nav_eval:
+        elif self.is_nav_dagger or self.is_nav_eval:
             self._load_nav(path, id)
-            return
-        if self.is_lbc:
+        elif self.is_lbc:
             self._load_lbc_loco(path, id)
-            return
-        if self.is_behavior_distill:
+        elif self.is_behavior_distill:
             self._load_behavior_distill_teacher(path, id)
-            return
-        self._load_flat(path, id)
+        else:
+            self._load_flat(path, id)
+        self.logger.info(
+            "[LifecycleProbe] load_model complete "
+            f"pid={os.getpid()} stage={self.stage.name} requested_id={id} "
+            f"selected={self.cur_model_name}"
+        )
+        if self.is_nav_dagger or self.is_nav_eval:
+            emit_nav_event(
+                "preload_complete",
+                role=self._process_role,
+                requested_id=str(id),
+                selected=self.cur_model_name,
+            )
 
     def _load_nav(self, path=None, id="1"):
         """nav 加载分派：eval 走硬停止链；训练走首载低层父 / nav resume。
@@ -1163,6 +1360,7 @@ class Agent(BaseAgent):
                 f"(low_level_parent_model_id={self._nav_low_level_parent_id}); "
                 f"diagnostics={nav_eval_checkpoint_diagnostics(path, id_str)}"
             )
+        self.cur_model_name = hit
 
     def _load_nav_for_eval(self, path, id):
         """nav eval 硬停止链 + 8 行自检日志；任一失败在第一次推理前 raise。"""
@@ -1205,13 +1403,10 @@ class Agent(BaseAgent):
             "action_dim": self.stage.num_actions,
             "goal_dim": 0,  # 低层 spec 恒为 0（nav goal4 只在 nav_goal_dim 上）
         }
-        expected_high = {
-            "input_layout_version": nav_contract.INPUT_LAYOUT_VERSION,
-            "vocab": [list(v) for v in nav_contract.VOCAB],
-            "nav_period_frames": nav_contract.NAV_PERIOD_FRAMES,
-            "min_dwell_ticks": nav_contract.MIN_DWELL_TICKS,
-        }
-        info = validate_nav_eval_bundle(bundle, id_str, expected_low, expected_high)
+        expected_high = nav_contract.high_level_checkpoint_contract()
+        info = validate_nav_eval_bundle(
+            bundle, id_str, expected_low, expected_high, logger=self.logger
+        )
 
         modules = bundle["modules"]
         ve_state = modules["vision_encoder"]["state_dict"]
@@ -1237,6 +1432,7 @@ class Agent(BaseAgent):
 
         self._nav_eval_checkpoint_path = ckpt_path
         self._nav_eval_requested_model_id = requested
+        self.cur_model_name = ckpt_path
 
         lineage = info["lineage"] or {}
         self.logger.info(f"[nav-eval] requested_model_id={requested}")
@@ -1253,7 +1449,7 @@ class Agent(BaseAgent):
             "}"
         )
         self.logger.info(
-            f"[nav-eval] digest_check=PASS high_level=PRESENT "
+            f"[nav-eval] digest_check=OBSERVED high_level=PRESENT "
             f"(digest={info['low_level_state_digest']})"
         )
         self.logger.info(f"[nav-eval] policy_entry={self.algorithm_name}")
@@ -1615,6 +1811,17 @@ class Agent(BaseAgent):
 
         # Eval 路径：模拟真机视角
         if is_eval:
+            # The Arena has historically forced every Camera evaluation onto
+            # the lbc_loco entry. If the requested ID is a nav bundle, promote
+            # this in-memory assembly to the full nav evaluator instead of
+            # dropping modules.high_level or asking the operator to create an
+            # alias. The worker independently selects NavEvalConfig from the
+            # Track+Camera eval TOML, so both sides retain the 57905-D contract.
+            from agent_ppo.checkpoint_io import nav_eval_checkpoint_candidates
+
+            if nav_eval_checkpoint_candidates(path, id):
+                self._promote_forced_lbc_eval_to_nav(path, id)
+                return
             self._eval_requested_model_id = str(id)
             self._eval_checkpoint_path = None
             eval_path = self._find_vision_eval_ckpt(path, id)
@@ -1649,6 +1856,32 @@ class Agent(BaseAgent):
             f"[LBC-Loco] No ckpt found in {path}/ for id={id}: "
             f"no vision* resume bundle and no daggerfull/locomotion parent."
         )
+
+    def _promote_forced_lbc_eval_to_nav(self, path, model_id) -> None:
+        """Upgrade a platform-forced Camera/LBC eval to full hier-nav."""
+
+        from agent_ppo.conf.conf import NavEvalConfig
+
+        self.logger.warning(
+            "[nav-eval] platform selected lbc_loco for a same-ID nav bundle; "
+            "promoting to the full nav_eval assembly"
+        )
+        self.stage = NavEvalConfig
+        self.algorithm_name = "nav_eval"
+        self.is_lbc = False
+        self.is_visual_ppo = False
+        self.is_nav_dagger = False
+        self.is_nav_eval = True
+        # Drop the LBC-only teacher graph before allocating the nav modules;
+        # keeping both assemblies resident can waste substantial Camera-eval
+        # GPU memory even though the old graph is no longer callable.
+        self.algorithm = None
+        for stale_name in ("teacher_encoder", "teacher_actor"):
+            if hasattr(self, stale_name):
+                delattr(self, stale_name)
+        self._init_nav_eval(NavEvalConfig, self.usr_conf)
+        self._load_nav_for_eval(path, model_id)
+        self.cur_model_name = self._nav_eval_checkpoint_path
 
     def _find_vision_eval_ckpt(self, path, id) -> str:
         """Resolve one explicit-ID Camera bundle for the platform LBC entry."""
@@ -1700,7 +1933,7 @@ class Agent(BaseAgent):
                 f"path={vision_path}"
             )
         identity = validate_visual_eval_bundle_identity(
-            ckpt, self._eval_requested_model_id
+            ckpt, self._eval_requested_model_id, logger=self.logger
         )
         identity["path"] = os.path.abspath(vision_path)
         return identity

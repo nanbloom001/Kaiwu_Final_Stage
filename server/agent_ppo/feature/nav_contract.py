@@ -107,6 +107,8 @@ INPUT_LAYOUT_VERSION = 2  # v2 = cnn_feat32_raw 语义（v1 的 LSTM latent 分�
 
 CNN_FEAT_DIM = 32
 NAV_INPUT_DIM = 48
+NAV_LSTM_HIDDEN_SIZE = 64
+NAV_LSTM_NUM_LAYERS = 2
 
 # 48 维内部切片（起, 止）
 CNN_FEAT_SLICE = (0, 32)      # cnn_feat32_raw = vision_encoder.cnn(depth)
@@ -130,7 +132,10 @@ POLICY_OBS_DIM = 57905        # 45 + 256 + 4 + 57600
 
 CRITIC_PROPRIO_DIM = 60
 CRITIC_GOAL3_START = 316      # critic obs 中真值 goal3 的起点
-CRITIC_OBS_DIM = 319          # 60 + 256 + 3
+CRITIC_NAV_PRIV_START = 319   # [available, front_score, left_score, right_score]
+CRITIC_NAV_PRIV_DIM = 4
+CRITIC_NAV_PRIV_SLICE = (CRITIC_NAV_PRIV_START, CRITIC_NAV_PRIV_START + CRITIC_NAV_PRIV_DIM)
+CRITIC_OBS_DIM = 323          # 60 + 256 + goal3(3) + nav_scanner privilege(4)
 
 POLICY_CMD_SLICE = (6, 9)     # 低层 policy 观测的指令位
 CRITIC_CMD_SLICE = (9, 12)    # critic 60 维 proprio 布局的指令位
@@ -184,6 +189,57 @@ UWB_DROPOUT_RATE_PER_S = 0.05         # 丢帧段泊松到达率（每秒）
 UWB_DROPOUT_DURATION_S = (0.3, 2.0)   # 丢帧段时长均匀采样
 GOAL_XY_SCALE_M = 10.0                # encode: local_xy / 10, clamp ±1
 GOAL_DIST_SCALE_M = 20.0              # encode: dist / 20, clamp [0,1]
+
+
+def high_level_checkpoint_contract() -> dict:
+    """Return every inference-affecting high-level checkpoint invariant."""
+
+    return {
+        "input_layout_version": INPUT_LAYOUT_VERSION,
+        "nav_input_dim": NAV_INPUT_DIM,
+        "policy_obs_dim": POLICY_OBS_DIM,
+        "critic_obs_dim": CRITIC_OBS_DIM,
+        "vocab": [list(v) for v in VOCAB],
+        "token_names": list(TOKEN_NAMES),
+        "vocab_size": len(VOCAB),
+        "nav_lstm_hidden_size": NAV_LSTM_HIDDEN_SIZE,
+        "nav_lstm_num_layers": NAV_LSTM_NUM_LAYERS,
+        "nav_period_frames": NAV_PERIOD_FRAMES,
+        "min_dwell_ticks": MIN_DWELL_TICKS,
+        "control_freq_hz": CONTROL_FREQ_HZ,
+        "frame_dt_s": FRAME_DT_S,
+        "slew_rate_up": list(SLEW_RATE_UP),
+        "slew_rate_down": list(SLEW_RATE_DOWN),
+        "cmd_clamp_min": list(CMD_CLAMP_MIN),
+        "cmd_clamp_max": list(CMD_CLAMP_MAX),
+        "zero_token_bypasses_slew": ZERO_TOKEN_BYPASSES_SLEW,
+        "cnn_feature_semantics": "vision_encoder.cnn(depth)_raw_v1",
+        "input_slices": {
+            "cnn": list(CNN_FEAT_SLICE),
+            "goal4": list(GOAL4_SLICE),
+            "exec_cmd": list(EXEC_CMD_SLICE),
+            "held_cmd": list(HELD_CMD_SLICE),
+            "ang_vel": list(ANG_VEL_SLICE),
+            "projected_gravity": list(PROJ_GRAV_SLICE),
+        },
+        "uwb_measurement_contract": {
+            "rate_range_hz": list(UWB_RATE_RANGE_HZ),
+            "bearing_noise_std_rad": UWB_BEARING_NOISE_STD_RAD,
+            "distance_noise_std_m": UWB_DISTANCE_NOISE_STD_M,
+            "bearing_bias_std_rad": UWB_BEARING_BIAS_STD_RAD,
+            "bearing_bias_clip_rad": UWB_BEARING_BIAS_CLIP_RAD,
+            "distance_bias_std_m": UWB_DISTANCE_BIAS_STD_M,
+            "distance_bias_clip_m": UWB_DISTANCE_BIAS_CLIP_M,
+            "heading_noise_std_rad": UWB_HEADING_NOISE_STD_RAD,
+            "filter_tau_s": UWB_FILTER_TAU_S,
+            "stale_timeout_s": UWB_STALE_TIMEOUT_S,
+            "hold_timeout_s": UWB_HOLD_TIMEOUT_S,
+            "dropout_rate_per_s": UWB_DROPOUT_RATE_PER_S,
+            "dropout_duration_s": list(UWB_DROPOUT_DURATION_S),
+            "goal_xy_scale_m": GOAL_XY_SCALE_M,
+            "goal_dist_scale_m": GOAL_DIST_SCALE_M,
+        },
+    }
 
 # =========================================================================
 # Golden vectors —— NavScheduler / C++ 部署镜像的逐帧行为基准

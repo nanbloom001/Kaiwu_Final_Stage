@@ -9,8 +9,10 @@ obs layout（权威定义见 feature/nav_contract.py）：
 
     policy: [proprio(45) | height_scan(256) | goal4(4) | depth(57600)] = 57905 D
             goal4 经 UWB 模拟测量链（NavGoalChain，Actor 只准看测量值）
-    critic: [critic_proprio(60) | height_scan(256) | goal3(3)] = 319 D
+    critic: [critic_proprio(60) | height_scan(256) | goal3(3)
+             | nav_priv(4)] = 323 D
             goal3 为真值编码（特权，仅供 Oracle / 监控）
+            nav_priv 为 nav_scanner 压缩墙体特征（特权，仅供 Oracle）
 
 注意：
   - nav 阶段 worker 原生指令为死值（TOML: curriculum=false、resampling 300s、
@@ -92,7 +94,7 @@ class NavPolicyObservationProcess(ObservationProcess):
 
 
 class NavCriticObservationProcess(ObservationProcess):
-    """Nav 阶段 critic 观测（319 D，含真值 goal3，特权）。"""
+    """Nav 阶段 critic 观测（323 D，含真值 goal3/nav scanner 特权）。"""
 
     target_group = "critic"
 
@@ -115,11 +117,22 @@ class NavCriticObservationProcess(ObservationProcess):
                 f"({obs.shape[0]}, 3)"
             )
 
-        full = self.concatenate_terms(obs, goal3.to(obs.dtype))
+        nav_priv = nav_observation_utils.nav_scanner_privileged_features(env)
+        if nav_priv.shape != (obs.shape[0], nav_contract.CRITIC_NAV_PRIV_DIM):
+            raise ValueError(
+                "NavCriticObservationProcess: nav privilege shape "
+                f"{tuple(nav_priv.shape)} != ({obs.shape[0]}, "
+                f"{nav_contract.CRITIC_NAV_PRIV_DIM})"
+            )
+
+        full = self.concatenate_terms(
+            self.concatenate_terms(obs, goal3.to(obs.dtype)),
+            nav_priv.to(obs.dtype),
+        )
         if full.shape[-1] != nav_contract.CRITIC_OBS_DIM:
             raise ValueError(
                 f"NavCriticObservationProcess: assembled critic obs dim "
                 f"{full.shape[-1]} != {nav_contract.CRITIC_OBS_DIM} "
-                "(60 critic_proprio | 256 scan | 3 goal3)"
+                "(60 critic_proprio | 256 scan | 3 goal3 | 4 nav privilege)"
             )
         return full

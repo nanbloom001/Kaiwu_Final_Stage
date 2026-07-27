@@ -13,7 +13,8 @@
 #      Track/Camera env & termination config (already platform-validated) is kept
 #      and the scalar reward is simply ignored by the workflow.
 #   2. Policy obs = [proprio(45) | height_scan(256) | goal4(4) | depth(57600)] = 57905D
-#      Critic obs = [critic_proprio(60) | height_scan(256) | goal3(3)] = 319D
+#      Critic obs = [critic_proprio(60) | height_scan(256) | goal3(3)
+#                    | nav_priv(4)] = 323D
 #      (assembled by NavPolicy/NavCriticObservationProcess; see feature/nav_contract.py)
 #   3. Worker-native velocity commands are dead in this stage: curriculum=false,
 #      resampling_time=[300,300], worker_progressive disabled. The executed command
@@ -21,7 +22,7 @@
 # 关键点：
 #   1. Nav DAgger 不是 RL —— 不写 [rewards] 覆盖段；保留已过平台验证的
 #      Track/Camera 默认环境与终止配置，workflow 忽略标量 reward。
-#   2. Policy obs 57905D / Critic obs 319D（布局见 feature/nav_contract.py）。
+#   2. Policy obs 57905D / Critic obs 323D（布局见 feature/nav_contract.py）。
 #   3. worker 原生速度指令在本阶段为死值：curriculum=false、
 #      resampling_time=[300,300]、worker_progressive 关闭；实际执行指令由
 #      NavScheduler 在 aisrv 侧写入 obs[:,6:9] / critic_obs[:,9:12]。
@@ -29,9 +30,12 @@
 # Basic Configuration
 # 基础配置
 [env]
-# Fixed by user decision: 256 (do NOT silently lower on OOM — stop and report).
-# 用户决定固定 256（OOM 时不得静默降低——停止并报告实测结果）
-num_envs = 256
+# Fixed after the first platform Track smoke: 128 keeps the validated Camera
+# capacity while reducing lifecycle latency and GPU pressure. Do not override
+# this silently at runtime.
+# 首轮平台 Track smoke 后固定为 128：保持已验证的 Camera 容量，同时降低
+# lifecycle 延迟和 GPU 压力；运行时不得静默改写。
+num_envs = 128
 # Max episode duration (seconds). Fixed by user decision.
 # 最大 episode 时长（秒）。用户决定固定 120。
 episode_length_s = 120.0
@@ -44,10 +48,10 @@ task = "track"
 # Nav 需要 TiledCamera 深度相机 → 带相机任务变体（与 lbc_loco 相同）。
 task_name = "Unitree-Go2-Velocity-Camera"
 seed = 0
-# Nav must be selected via explicit policy entry (never via task-name fallback,
-# which would route Camera tasks to lbc_loco and silently drop the high level).
-# Nav 必须显式 policy_entry 选择（禁止走 task-name 回退——那会把 Camera 任务
-# 打给 lbc_loco 并静默丢弃高层）。
+# Consistency mirror. The actual pre-TOML training selector is
+# conf/configure_app.toml [app].policy_entry; this value must match it.
+# 一致性镜像：真正在读取本 TOML 之前生效的训练选择器位于
+# conf/configure_app.toml [app].policy_entry，两者必须一致。
 policy_entry = "nav_dagger"
 
 [custom_parameters]
@@ -60,7 +64,6 @@ continuous_training = true
 [terrain]
 # Terrain mode, valid values: "standard" | "track".
 mode = "track"
-num_rows = 10
 num_cols = 10
 difficulty_range = [0.0, 1.0]
 # Nav stage: no worker-command-dependent curriculum (worker cmd is dead here).
@@ -68,19 +71,17 @@ difficulty_range = [0.0, 1.0]
 curriculum = false
 max_init_terrain_level = 0
 
-# Difficulty spectrum mixing (structure follows the historical track_nav TOML).
-# 难度谱混合（结构沿用历史 track_nav TOML）。
-[terrain.level_mix]
-enabled = true
-levels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-weights = [0.14, 0.13, 0.11, 0.10, 0.10, 0.09, 0.09, 0.08, 0.08, 0.08]
-pool_size = 100
-
 [terrain.track]
 # Round-1 short chain, maze must be the final segment (user decision).
 # 首轮短链，maze 必须在最后一段（用户决定）。
 track_length = 2
 sub_terrains = ["pyramid_slope", "open_entry_maze"]
+# Platform-supported difficulty axis: ten parallel track columns. The old
+# [terrain.level_mix] table was not consumed anywhere and has been removed.
+# 128 envs are assigned by the native importer; verify the actual long-run
+# distribution from nav_probe terrain_types_histogram rather than claiming
+# unsupported exact weights.
+num_parallel_tracks = 10
 
 # Domain Randomization — round 1 off (control variables; isolate nav learning).
 # 域随机化 —— 首轮关闭（控制变量，隔离导航学习本身）。
@@ -134,10 +135,13 @@ gaussian_noise_scale = 0.02
 roll_range_deg = 10.0
 pitch_shift_pix = 10
 
-# S0 read-only environment probe (log-once). Enable for S0b dimension probing.
-# S0 只读环境探针（log-once）。S0b 维度探测时可开启。
+# Read-only worker probe: full inventory once, then actual terrain level/type
+# histograms every 500 steps. It never mutates the environment.
+# worker 只读探针：首次打印完整盘点，之后每 500 step 打印真实难度/轨道分布，
+# 不修改环境。
 [nav_probe]
-enabled = false
+enabled = true
+histogram_interval_steps = 500
 
 # Nav-DAgger-specific parameters (matching NavDaggerConfig; TOML > class default).
 # Nav DAgger 专用参数（对应 NavDaggerConfig；TOML 优先于类默认）。
@@ -150,9 +154,11 @@ lr_min = 1e-5
 max_iterations = 20000
 max_grad_norm = 1.0
 log_interval = 10
-# save_interval unit = completed outer iterations (wall-clock ~10min per save).
-# save_interval 单位 = 已完成 outer iteration 数（约 10 分钟一存）。
-save_interval = 90
+# Routine model-pool publication is controlled only by configure_app.toml
+# dump_model_freq and the per-frame BaseAgent.learn lifecycle callback. The
+# workflow performs one best-effort final save only when training exits.
+# 常规模型池发布只由 configure_app.toml 的 dump_model_freq 和逐帧
+# BaseAgent.learn 生命周期回调控制；workflow 仅在训练退出时执行一次最终保存。
 # One outer iteration = 160 low-level frames = 16 nav ticks = exactly one TBPTT
 # segment (T=16, nav_period_frames=10). Keep the three numbers consistent.
 # 一个 outer iteration = 160 低层帧 = 16 个 nav tick = 恰好一个 TBPTT 段
