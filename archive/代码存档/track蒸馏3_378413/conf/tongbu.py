@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 
 BODY_LIMIT = int(os.environ.get("IDE_SYNC_MAX_BODY", 64 * 1024 * 1024))
-SECRET_KEY = "fwwb-new-codex-sync-20260512-5a7f58a98ddf4e9c9b4c9e1b6a2d8f41"
+SECRET_KEY = "REDACTED_ARCHIVE_SYNC_TOKEN"
 BIND_ADDRESS = "0.0.0.0"
 BIND_PORT = 8765
 EXTERNAL_ENDPOINT = "https://tencentarena.com/p5/ide/18005/proxy/8765"

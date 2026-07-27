@@ -28,7 +28,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 
 MAX_BODY_BYTES = int(os.environ.get("IDE_SYNC_MAX_BODY", 64 * 1024 * 1024))
-DEFAULT_SYNC_TOKEN = "fwwb-new-codex-sync-20260512-5a7f58a98ddf4e9c9b4c9e1b6a2d8f41"
+DEFAULT_SYNC_TOKEN = "REDACTED_ARCHIVE_SYNC_TOKEN"
 FIXED_HOST = "0.0.0.0"
 FIXED_PORT = 8765
 FIXED_PUBLIC_URL = "https://tencentarena.com/p/common/competition/ide/516/11585/18005/proxy/8765"
