@@ -4,7 +4,7 @@
 
 - Parent model: Stage3J-1 NoGate Rough-Stability 30min Best.
 - Stage name: `navj8`.
-- Config: `agent_ppo/conf/train_env_conf_track_navj8.toml`.
+- Historical config: `train_env_conf_track_navj8.toml` (removed from the active tree; recover from Git history).
 - Goal: reduce the train/evaluation difficulty-distribution gap by replaying more L7-L9 samples.
 
 ## Only Training Change

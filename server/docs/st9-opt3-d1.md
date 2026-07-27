@@ -27,7 +27,7 @@ conf/algo_conf_legged_robot_competition_26.toml
 ## 修改文件
 
 - `agent_ppo/conf/conf.py`：正式入口切换到已有 `TrackLBCLocoConfig`。
-- `agent_ppo/conf/train_env_conf_track_track_lbc_loco.toml`：复制 ST7-Opt3 完整 Track 配置，只追加 LBC、深度增强和已有标定相机配置。
+- 历史 `train_env_conf_track_track_lbc_loco.toml`：当时复制 ST7-Opt3 完整 Track 配置并追加 LBC、深度增强和相机配置；现已从活动目录移除，可从 Git 历史恢复。
 - `agent_ppo/feature/lbc_observation_process.py`：在实际 LBC 观测链中生成一次 noisy goal，不覆盖 `proprio[6:9]`。
 - `agent_ppo/feature/goal_noise.py`：复用 ST7-Opt3 实现，集中配置解析并导出监控指标。
 - `agent_ppo/feature/policy_observation_process.py`：改用共用配置解析器，PPO 行为不变。
@@ -75,7 +75,9 @@ python3 -m py_compile \
 git diff --check
 ```
 
-已做 TOML 结构对照：移除 D1 专属段并恢复 `num_envs` 后，与 `train_env_conf_track_nav.toml` 的 `goal_noise`/reward/地形/速度配置完全一致。
+当时已做 TOML 结构对照：移除 D1 专属段并恢复 `num_envs` 后，与历史
+`train_env_conf_track_nav.toml` 的 `goal_noise`/reward/地形/速度配置完全一致；
+两份配置现均只保留在 Git 历史中。
 
 本地 Python 环境不含 Isaac Lab/PyTorch，因此状态机多帧 tensor 验证和教师 checkpoint shape 验证必须在平台的 20–30 分钟短任务中完成。启动硬检查会在教师未加载、shape 不匹配或 optimizer 包含教师参数时直接报错。
 
