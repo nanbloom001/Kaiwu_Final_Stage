@@ -1354,9 +1354,6 @@ class Robot:
         self._task_type = "track"  # 默认 track，reset 时从 usr_conf["terrain"]["task"] 更新
 
         self.is_eval = False
-        self._continuous_training = False
-        self._command_bucket_conf = None
-        self._command_bucket_steps_remaining = None
         self.eval_write_json_file = False
         self.env_nums = 4096
 
@@ -1553,17 +1550,6 @@ class Robot:
         #   - 训练时: 在非 maze 段中随机生成
         #   - 评估时: 固定在赛道起点生成
         self._gym_env.unwrapped._is_eval = bool(self.is_eval)
-        self._gym_env.unwrapped._is_training = not bool(self.is_eval)
-        depth_camera_conf = (
-            self.usr_conf.get("camera", {}).get("depth_camera", {})
-            if isinstance(self.usr_conf, dict)
-            else {}
-        )
-        self._gym_env.unwrapped._depth_preprocess_conf = (
-            dict(depth_camera_conf)
-            if isinstance(depth_camera_conf, dict)
-            else {}
-        )
 
         # 设置地形块边界终止开关（仅评估模式 + 配置启用时生效）
         # 训练时默认关闭，避免正常速度跟踪被频繁截断
@@ -2185,8 +2171,8 @@ class Robot:
         """子进程在 reset 入口按 usr_conf 推导并覆盖 Config.CURRENT。
 
         IsaacEnv 用 multiprocessing spawn 子进程跑 Robot，子进程的
-        Config.CURRENT 不会同步 aisrv 进程里 _infer_stage_from_task_name 的覆盖结果。
-        这里复用 agent_<algo>.conf.conf._infer_stage_from_task_name，子进程独立推导一次，
+        Config.CURRENT 不会同步 aisrv 进程里 _infer_stage_for_eval 的覆盖结果。
+        这里复用 agent_<algo>.conf.conf._infer_stage_for_eval，子进程独立推导一次，
         让 register_observation_processes / RewardProcess 等拿到正确实现。
 
         与 KAIWU_ALGORITHM 解耦：从环境变量决定加载哪个算法的 conf 模块（agent_ppo
@@ -2199,10 +2185,7 @@ class Robot:
 
             mod = importlib.import_module(module_name)
             Config = getattr(mod, "Config", None)
-            infer = getattr(mod, "_infer_stage_from_task_name", None)
-            if infer is None:
-                # Backward compatibility for older algorithm packages.
-                infer = getattr(mod, "_infer_stage_for_eval", None)
+            infer = getattr(mod, "_infer_stage_for_eval", None)
             if Config is None or infer is None:
                 return
 
@@ -2217,123 +2200,6 @@ class Robot:
             # 会用对应 PolicyObservationProcess，最坏情况 obs 维度不匹配在下游报错，
             # 不会静默错乱。
             self.logger.warning(f"[eval/subprocess] stage override failed: {e}")
-
-    def _configure_command_buckets(self, usr_conf):
-        """Enable explicit Standard command buckets for Stage-5 visual PPO."""
-        bucket_conf = usr_conf.get("commands", {}).get("buckets", {})
-        if self.is_eval or not bool(bucket_conf.get("enabled", False)):
-            self._command_bucket_conf = None
-            self._command_bucket_steps_remaining = None
-            return
-        weights = [
-            float(bucket_conf.get("zero_weight", 0.25)),
-            float(bucket_conf.get("low_forward_weight", 0.25)),
-            float(bucket_conf.get("normal_forward_weight", 0.25)),
-            float(bucket_conf.get("forward_yaw_weight", 0.15)),
-            float(bucket_conf.get("lateral_weight", 0.10)),
-        ]
-        if any(value < 0.0 for value in weights) or sum(weights) <= 0.0:
-            raise ValueError(f"Invalid command bucket weights: {weights}")
-        self._command_bucket_conf = dict(bucket_conf)
-        self._command_bucket_conf["_weights"] = weights
-        self._command_bucket_steps_remaining = None
-        self._apply_command_buckets(force_all=True)
-        self.logger.info(
-            "[command buckets] enabled: "
-            f"weights={weights}, hold_s="
-            f"{bucket_conf.get('hold_time_s', [3.0, 6.0])}"
-        )
-
-    def _apply_command_buckets(self, force_all=False):
-        """Write bounded command3 samples directly into the Isaac command term."""
-        if self._command_bucket_conf is None:
-            return
-        env_unwrapped = self._gym_env.unwrapped
-        command_term = env_unwrapped.command_manager.get_term("base_velocity")
-        command = getattr(command_term, "_command", None)
-        if not isinstance(command, torch.Tensor):
-            command = getattr(command_term, "command", None)
-        if not isinstance(command, torch.Tensor) or command.ndim != 2 or command.shape[1] < 3:
-            raise RuntimeError("base_velocity command tensor is unavailable")
-
-        num_envs = command.shape[0]
-        if self._command_bucket_steps_remaining is None:
-            self._command_bucket_steps_remaining = torch.zeros(
-                num_envs, dtype=torch.long, device=command.device
-            )
-        elif not force_all:
-            self._command_bucket_steps_remaining.sub_(1)
-
-        if force_all:
-            env_ids = torch.arange(num_envs, device=command.device)
-        else:
-            env_ids = torch.nonzero(
-                self._command_bucket_steps_remaining <= 0,
-                as_tuple=False,
-            ).flatten()
-        if env_ids.numel() == 0:
-            return
-
-        conf = self._command_bucket_conf
-        weights = torch.tensor(
-            conf["_weights"], dtype=torch.float32, device=command.device
-        )
-        bucket_ids = torch.multinomial(
-            weights / weights.sum(),
-            num_samples=env_ids.numel(),
-            replacement=True,
-        )
-        sampled = torch.zeros(
-            env_ids.numel(), 3, dtype=command.dtype, device=command.device
-        )
-
-        def uniform(mask, low, high):
-            count = int(mask.sum().item())
-            if count == 0:
-                return None
-            return low + (high - low) * torch.rand(
-                count, dtype=command.dtype, device=command.device
-            )
-
-        low_mask = bucket_ids == 1
-        if low_mask.any():
-            sampled[low_mask, 0] = uniform(low_mask, 0.10, 0.30)
-        normal_mask = bucket_ids == 2
-        if normal_mask.any():
-            sampled[normal_mask, 0] = uniform(normal_mask, 0.30, 0.70)
-        yaw_mask = bucket_ids == 3
-        if yaw_mask.any():
-            sampled[yaw_mask, 0] = uniform(yaw_mask, 0.15, 0.50)
-            yaw_magnitude = uniform(yaw_mask, 0.15, 0.30)
-            yaw_sign = torch.where(
-                torch.rand_like(yaw_magnitude) < 0.5,
-                -torch.ones_like(yaw_magnitude),
-                torch.ones_like(yaw_magnitude),
-            )
-            sampled[yaw_mask, 2] = yaw_magnitude * yaw_sign
-        lateral_mask = bucket_ids == 4
-        if lateral_mask.any():
-            lateral_magnitude = uniform(lateral_mask, 0.10, 0.20)
-            lateral_sign = torch.where(
-                torch.rand_like(lateral_magnitude) < 0.5,
-                -torch.ones_like(lateral_magnitude),
-                torch.ones_like(lateral_magnitude),
-            )
-            sampled[lateral_mask, 1] = lateral_magnitude * lateral_sign
-
-        command[env_ids, :3] = sampled
-        hold_range = conf.get("hold_time_s", [3.0, 6.0])
-        hold_min = float(hold_range[0])
-        hold_max = float(hold_range[1])
-        step_dt = float(getattr(env_unwrapped, "step_dt", 0.02))
-        min_steps = max(1, int(round(hold_min / step_dt)))
-        max_steps = max(min_steps, int(round(hold_max / step_dt)))
-        self._command_bucket_steps_remaining[env_ids] = torch.randint(
-            min_steps,
-            max_steps + 1,
-            (env_ids.numel(),),
-            device=command.device,
-        )
 
     def reset(self, usr_conf):
         """Reset the environment.
@@ -2354,7 +2220,7 @@ class Robot:
             # ---------- Subprocess Config.CURRENT override ----------
             # IsaacEnv 在 aisrv 进程之外 spawn 独立 worker 进程，子进程 import
             # 时 Config.CURRENT 仍是 conf.py 顶部硬编码值（HierarchicalNavConfig）。
-            # aisrv 进程的 _infer_stage_from_task_name 覆盖只在 aisrv 内生效，无法
+            # aisrv 进程的 _infer_stage_for_eval 覆盖只在 aisrv 内生效，无法
             # 跨进程传递。子进程在 reset 入口按 usr_conf 自行推导一次，确保
             # register_observation_processes 拿到正确 PolicyObservationProcess
             # （lbc_nav → LBCObservationProcess 等）。
@@ -2366,16 +2232,6 @@ class Robot:
             env_section = usr_conf.get("env", {})
             terrain_section = usr_conf.get("terrain", {})
             task_name = env_conf.get("task_name", "Unitree-Go2-Velocity")
-            custom_parameters = usr_conf.get("custom_parameters", {})
-            self._continuous_training = (
-                bool(custom_parameters.get("continuous_training", False))
-                and not self.is_eval
-            )
-            self.logger.info(
-                "[episode lifecycle] "
-                f"continuous_training={self._continuous_training}, "
-                f"is_eval={bool(self.is_eval)}, task_name={task_name}"
-            )
 
             entry_point_key = "play_env_cfg_entry_point" if self.is_eval else "env_cfg_entry_point"
 
@@ -2452,7 +2308,6 @@ class Robot:
 
             # ---------- Create environment ----------
             self._create_env(task_name, env_cfg, reward_configs=reward_configs)
-            self._configure_command_buckets(usr_conf)
 
             # ---------- Evaluation mode setup ----------
             if self.is_eval:
@@ -2538,7 +2393,6 @@ class Robot:
 
             # ---------- TiledCamera: step 前更新摄像机位置 ----------
             self._update_camera_poses()
-            self._apply_command_buckets()
 
             # RslRlVecEnvWrapper.step returns (obs, rewards, dones, extras)
             obs_raw, rewards, dones, extras = self.env.step(actions)
@@ -2764,13 +2618,7 @@ class Robot:
             terminated_flat = terminated.flatten()
             all_terminated = bool(terminated_flat.all())
             terminated_count = int(terminated_flat.sum())
-            # frame_no 是自本次 env.reset() 起的全局 workflow 计数，不是每个
-            # Isaac Lab 子环境的 episode_length_buf。长时间流式蒸馏依靠底层
-            # per-env auto-reset，不能在 1250 帧后永久把 infos["all_done"] 置真。
-            reached_max_length = (
-                not getattr(self, "_continuous_training", False)
-                and self.frame_no > self.max_episode_length
-            )
+            reached_max_length = self.frame_no > self.max_episode_length
 
             # 评估模式：所有 env 都完成过一次 episode 即触发 all_done
             eval_all_envs_done = (

@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+- **[工作区归档与平台 base env 复原]** 活动树中的
+  `isaac_env/base_env.py` 已恢复为平台原始版本，SHA256 为
+  `75ebdaf6888e94262598a26db1586b2598cb474422e3382b6bba9e96ddbb6e67`；此前写在该
+  文件中的 command bucket、continuous-training 和深度配置补丁不再保留，相关能力必须
+  继续由 `agent_ppo` 扩展点实现。历史实验源码和分析记录纳入 Git，checkpoint、ZIP、
+  ONNX、视频、缓存和 `.env` 继续仅作本地制品并由精确规则忽略。
+
 - **[Nav 保存失败分类与同步路径加固]** Nav 平台 lifecycle 回调现在会区分
   普通回调异常和 `CheckpointSaveError`：前者仍记录后继续，后者代表
   checkpoint 序列化、写入或非空校验失败，必须终止训练，避免长训在无可恢复

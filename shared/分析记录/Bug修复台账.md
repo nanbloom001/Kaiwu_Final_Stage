@@ -358,6 +358,11 @@
   `75ebdaf6888e94262598a26db1586b2598cb474422e3382b6bba9e96ddbb6e67`。
 - 回滚：回滚 `agent_ppo` 功能时也不能重新开放 base_env 上传。
 - 再遇检查：容器重启前后 SHA → sync protected list → 功能是否仍依赖 base_env diff。
+- 2026-07-27 更正与收口：分支工作树中仍残留过一份含 command bucket、
+  continuous-training 和深度配置的已提交定制版本。现已将活动
+  `server/isaac_env/base_env.py` 恢复为归档原始文件，逐字节 SHA256 为
+  `75ebdaf6888e94262598a26db1586b2598cb474422e3382b6bba9e96ddbb6e67`；功能实现继续留在
+  `agent_ppo`。状态为本地已验证，平台文件保护的既有平台验证结论不变。
 
 ## BUG-20260725-004：Camera 评估被平台切到 `lbc_loco`，指定视觉模型没有加载
 
