@@ -22,9 +22,12 @@ from agent_ppo.conf.conf import (
 )
 from agent_ppo.workflow.nav_dagger_workflow import (
     _aggregate_goal_metrics,
+    _aggregate_switch_response_metrics,
     _callbacks_until_next_dump,
     _episode_outcome_rates,
     _quality_window_metrics,
+    _quality_absolutely_ok,
+    _soft_stay_check,
 )
 
 
@@ -150,14 +153,38 @@ class TestNavStageSelection(unittest.TestCase):
             "ce_loss",
             "top1_accuracy",
             "goal_progress_m_per_frame",
+            "worker_exec_cmd_linf_mean",
+            "worker_exec_cmd_match_ratio",
+            "actual_lin_vel_x_mean",
+            "exec_vx_tracking_error_mean",
+            "worker_vx_tracking_error_mean",
+            "low_level_action_delta_abs_mean",
+            "low_level_action_nonfinite_count",
+            "switch_response_sample_count",
+            "switch_response_vx_sample_count",
+            "switch_response_action_delta_abs_mean",
+            "switch_response_vx_delta_abs_mean",
+            "switch_response_no_action_ratio",
+            "switch_response_no_velocity_ratio",
+            "scheduler_dwell_ticks_mean",
+            "scheduler_dwell_ticks_max",
             "platform_lifecycle_callbacks",
             "platform_lifecycle_failures",
             "total_low_level_steps",
             "total_env_frames",
             "callbacks_until_next_dump",
+            "student_drive_ratio",
+            "oracle_front_score_mean",
+            "oracle_left_score_mean",
+            "oracle_right_score_mean",
+            "low_level_action_abs_max",
         ):
             self.assertIn(metric, monitor_source)
+        for prefix in ("student", "oracle", "requested", "effective"):
+            self.assertIn(f'f"{prefix}_token_{{name}}_ratio"', monitor_source)
+        self.assertIn('f"oracle_mode_{name}_ratio"', monitor_source)
         self.assertNotIn("step_score_track_l", monitor_source)
+        self.assertNotIn("hard_termination_rate", monitor_source)
         self.assertNotIn('name_en="value_loss"', monitor_source)
 
 
@@ -179,33 +206,63 @@ class TestNavPlatformDumpCadence(unittest.TestCase):
 class TestEpisodeOutcomeMetrics(unittest.TestCase):
     def test_rates_use_completed_episodes_not_frames(self):
         metrics = _episode_outcome_rates(2, 6, 8)
-        self.assertEqual(metrics["hard_termination_rate"], 0.25)
+        self.assertEqual(metrics["non_timeout_termination_rate"], 0.25)
         self.assertEqual(metrics["timeout_rate"], 0.75)
+        self.assertEqual(metrics["ended_episode_count"], 8)
 
     def test_no_completed_episode_has_no_fake_zero_rate(self):
         metrics = _episode_outcome_rates(0, 0, 0)
-        self.assertNotIn("hard_termination_rate", metrics)
+        self.assertNotIn("non_timeout_termination_rate", metrics)
+        self.assertNotIn("completed_episode_count", metrics)
         self.assertNotIn("timeout_rate", metrics)
 
     def test_window_aggregates_sparse_episode_counts(self):
         rows = [
             {
                 "top1_accuracy": 0.8,
-                "hard_termination_count": 1,
+                "non_timeout_termination_count": 1,
                 "timeout_count": 3,
-                "completed_episode_count": 4,
+                "ended_episode_count": 4,
             },
             {
                 "top1_accuracy": 1.0,
-                "hard_termination_count": 1,
+                "non_timeout_termination_count": 1,
                 "timeout_count": 3,
-                "completed_episode_count": 4,
+                "ended_episode_count": 4,
             },
         ]
         metrics = _quality_window_metrics(rows)
         self.assertAlmostEqual(metrics["top1_accuracy"], 0.9)
-        self.assertEqual(metrics["hard_termination_rate"], 0.25)
+        self.assertEqual(metrics["non_timeout_termination_rate"], 0.25)
         self.assertEqual(metrics["timeout_rate"], 0.75)
+
+    def test_soft_stay_uses_per_frame_hazard_not_episode_composition(self):
+        previous = {
+            "non_timeout_termination_rate": 0.0,
+            "non_timeout_termination_per_frame": 0.001,
+        }
+        current = {
+            "non_timeout_termination_rate": 1.0,
+            "non_timeout_termination_per_frame": 0.001,
+        }
+        self.assertIsNone(_soft_stay_check(current, previous))
+
+        current["non_timeout_termination_per_frame"] = 0.03
+        self.assertEqual(
+            _soft_stay_check(current, previous),
+            "non_timeout_termination_worsened",
+        )
+
+    def test_soft_stay_unfreeze_requires_per_frame_quality(self):
+        self.assertTrue(
+            _quality_absolutely_ok(
+                {
+                    "top1_accuracy": 0.9,
+                    "non_timeout_termination_rate": 1.0,
+                    "non_timeout_termination_per_frame": 0.01,
+                }
+            )
+        )
 
     def test_goal_validity_aggregates_counts_across_ticks(self):
         metrics = _aggregate_goal_metrics(
@@ -227,6 +284,28 @@ class TestEpisodeOutcomeMetrics(unittest.TestCase):
         self.assertEqual(metrics["goal_valid_count"], 14)
         self.assertEqual(metrics["goal_valid_rate"], 14 / 16)
         self.assertEqual(metrics["goal4_fresh_rate"], 10 / 16)
+
+    def test_switch_response_aggregation_ignores_zero_sample_ticks(self):
+        metrics = _aggregate_switch_response_metrics(
+            [
+                {
+                    "switch_response_sample_count": 0,
+                    "switch_response_no_action_ratio": 0.0,
+                },
+                {
+                    "switch_response_sample_count": 4,
+                    "switch_response_vx_sample_count": 4,
+                    "switch_response_action_delta_abs_mean": 0.0,
+                    "switch_response_vx_delta_abs_mean": 0.01,
+                    "switch_response_no_action_ratio": 1.0,
+                    "switch_response_no_velocity_ratio": 0.75,
+                },
+            ]
+        )
+        self.assertEqual(metrics["switch_response_sample_count"], 4)
+        self.assertEqual(metrics["switch_response_vx_sample_count"], 4)
+        self.assertEqual(metrics["switch_response_no_action_ratio"], 1.0)
+        self.assertEqual(metrics["switch_response_no_velocity_ratio"], 0.75)
 
 
 class TestNavSmokeConfigOverride(unittest.TestCase):

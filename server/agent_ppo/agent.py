@@ -1197,6 +1197,13 @@ class Agent(BaseAgent):
                 lifecycle_delta_since_prev_save=lifecycle_delta,
                 wall_s_since_prev_save=wall_since_previous,
             )
+            emit_nav_event(
+                "checkpoint_saved",
+                role=self._process_role,
+                platform_model_id=str(id),
+                path=nav_file_path,
+                sha256=checksum,
+            )
         elif self.is_nav_eval:
             self.logger.info("[nav_eval] save_model is a no-op in eval assembly")
             return
@@ -1419,6 +1426,7 @@ class Agent(BaseAgent):
                 f"(low_level_parent_model_id={self._nav_low_level_parent_id}); "
                 f"diagnostics={nav_eval_checkpoint_diagnostics(path, id_str)}"
             )
+        self.cur_model_name = hit
 
     def _load_nav_for_eval(self, path, id):
         """nav eval 硬停止链 + 8 行自检日志；任一失败在第一次推理前 raise。"""
@@ -1490,6 +1498,7 @@ class Agent(BaseAgent):
 
         self._nav_eval_checkpoint_path = ckpt_path
         self._nav_eval_requested_model_id = requested
+        self.cur_model_name = ckpt_path
 
         lineage = info["lineage"] or {}
         self.logger.info(f"[nav-eval] requested_model_id={requested}")

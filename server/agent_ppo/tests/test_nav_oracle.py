@@ -124,6 +124,29 @@ class TestNavOracle(unittest.TestCase):
         self.assertFalse(bool(mixed[0]))
         self.assertTrue(bool(mixed[1]))
 
+    def test_rule_branch_diagnostics_cover_each_output_family(self):
+        cases = [
+            _critic_obs(dist_m=0.2),
+            _critic_obs(local_x=0.1, local_y=2.0, dist_m=2.0),
+            _critic_obs(local_x=2.0, local_y=1.2, dist_m=2.3),
+            _critic_obs(local_x=3.0, local_y=0.6, dist_m=3.1),
+            _critic_obs(local_x=5.0, dist_m=5.0, nav_priv=[1.0, 0.8, 0.1, 0.9]),
+            _critic_obs(local_x=5.0, dist_m=1.0),
+            _critic_obs(local_x=2.0, dist_m=2.0),
+            _critic_obs(local_x=5.0, dist_m=5.0),
+        ]
+        for obs in cases:
+            self.oracle.act(obs)
+            modes = [
+                self.oracle.last_metrics[f"oracle_mode_{name}_ratio"]
+                for name in (
+                    "arrived", "spin", "creep", "veer", "wall_avoid",
+                    "forward_slow", "forward_mid", "forward_fast",
+                )
+            ]
+            self.assertAlmostEqual(sum(modes), 1.0)
+        self.assertGreater(self.oracle.last_metrics["oracle_goal_dist_max"], 0.0)
+
         obs = _critic_obs(local_x=2.0, dist_m=2.0)
         obs[0, nc.CRITIC_GOAL3_START] = float("inf")
         mixed = NavOracle.label_validity(obs)

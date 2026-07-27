@@ -12,6 +12,20 @@
   越界和通过别名绕过 `isaac_env/base_env.py` 保护。根目录同时忽略本地
   `.worktrees/` 与 `.zcode/`，避免嵌套工作树和工具状态被误暂存。
 
+- **[hier-nav 控制链可观测性]** Nav DAgger 新增 student/oracle/requested/
+  effective token 分布、驻留状态、Oracle 规则分支、worker/held/exec command、
+  低层 action 与真实速度的对齐统计。首个 nav tick 输出完整控制链快照，
+  后续日志可区分高层 token 没生效、scheduler 驻留、低层无响应和
+  worker reward 仍读取另一套 command 等场景。切换响应按一个 nav period
+  后的 action/vx 变化统计；action 覆盖全部 token 切换，vx 只统计目标 vx
+  确实变化的切换，避免把纯转向误报为速度无响应。reset 会取消未完成样本。
+
+- **[hier-nav 终止指标口径修正]** aisrv 只能确认 non-timeout termination，
+  不再将其命名为 hard failure 或 completed episode；真实完成/异常/超时仍以
+  Track scorer 指标为准。soft-stay 继续使用历史的每环境帧风险分母，
+  episode 归一化比例只用于面板，不改变既有阈值数量级。身份与 digest
+  元数据仍按当前宽松策略 warning-only，结构、非有限权重和写盘失败仍硬停。
+
 - **[hier-nav 平台模型发布生命周期修复]** 经可成功完成的 Track LBC 归档核验，平台
   模型 ID 和 `dump_model_freq` 按 `BaseAgent.learn()` 回调推进，而不是按 Nav 的 outer
   iteration 或业务侧 `save_model()` 写盘推进。历史 LBC 的 `10000 × 24 = 240000`

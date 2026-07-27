@@ -58,6 +58,143 @@ from agent_ppo.feature.nav_scheduler import NavScheduler
 from agent_ppo.feature.nav_tick_buffer import NavTickBuffer
 
 STAGE_TYPE = "nav_dagger_v1"
+_COMMAND_MATCH_TOLERANCE = 1.0e-5
+_ACTION_RESPONSE_MIN = 1.0e-3
+_VELOCITY_RESPONSE_MIN_MPS = 0.02
+
+
+def _token_ratio_metrics(prefix: str, tokens: torch.Tensor) -> dict[str, float]:
+    """Return a stable dashboard series for every token in the frozen vocabulary."""
+
+    tokens = tokens.detach().long().reshape(-1)
+    count = max(1, int(tokens.numel()))
+    return {
+        f"{prefix}_token_{name}_ratio": float((tokens == index).sum().item()) / count
+        for index, name in enumerate(nav_contract.TOKEN_NAMES)
+    }
+
+
+def _dominant_token(tokens: torch.Tensor) -> str:
+    counts = torch.bincount(
+        tokens.detach().long().reshape(-1), minlength=nav_contract.VOCAB_SIZE
+    )
+    return nav_contract.TOKEN_NAMES[int(counts.argmax().item())]
+
+
+def _control_alignment_metrics(
+    worker_cmd: torch.Tensor,
+    exec_cmd: torch.Tensor,
+    held_cmd: torch.Tensor,
+    critic_obs: torch.Tensor,
+    actions: torch.Tensor,
+) -> dict[str, float]:
+    """Quantify which command the low-level motion actually follows.
+
+    ``worker_cmd`` is captured from the worker-produced observation before the
+    aisrv patch. ``exec_cmd`` is the NavScheduler command seen by the frozen
+    low-level policy. The environment reward still consumes ``worker_cmd``.
+    """
+
+    worker_cmd = worker_cmd.detach()
+    exec_cmd = exec_cmd.detach()
+    delta = (worker_cmd - exec_cmd).abs()
+    linf = delta.amax(dim=-1)
+
+    lin_lo, lin_hi = nav_contract.CRITIC_LIN_VEL_SLICE
+    actual_vx = critic_obs[:, lin_lo:lin_hi].detach()[:, 0]
+    worker_vx_error = (actual_vx - worker_cmd[:, 0]).abs()
+    exec_vx_error = (actual_vx - exec_cmd[:, 0]).abs()
+    finite_actions = torch.nan_to_num(actions.detach(), nan=0.0, posinf=0.0, neginf=0.0)
+    nonfinite_action_count = int((~torch.isfinite(actions.detach())).sum().item())
+
+    metrics = {
+        "worker_exec_cmd_linf_mean": float(linf.mean().item()),
+        "worker_exec_cmd_linf_max": float(linf.max().item()),
+        "worker_exec_cmd_match_ratio": float(
+            (linf <= _COMMAND_MATCH_TOLERANCE).float().mean().item()
+        ),
+        "worker_cmd_vx_mean": float(worker_cmd[:, 0].mean().item()),
+        "worker_cmd_vy_mean": float(worker_cmd[:, 1].mean().item()),
+        "worker_cmd_wz_mean": float(worker_cmd[:, 2].mean().item()),
+        "exec_cmd_vx_mean": float(exec_cmd[:, 0].mean().item()),
+        "exec_cmd_vy_mean": float(exec_cmd[:, 1].mean().item()),
+        "exec_cmd_wz_mean": float(exec_cmd[:, 2].mean().item()),
+        "held_cmd_vx_mean": float(held_cmd[:, 0].mean().item()),
+        "held_cmd_vy_mean": float(held_cmd[:, 1].mean().item()),
+        "held_cmd_wz_mean": float(held_cmd[:, 2].mean().item()),
+        "actual_lin_vel_x_mean": float(actual_vx.mean().item()),
+        "worker_vx_tracking_error_mean": float(worker_vx_error.mean().item()),
+        "exec_vx_tracking_error_mean": float(exec_vx_error.mean().item()),
+        "exec_vx_closer_ratio": float(
+            (exec_vx_error < worker_vx_error).float().mean().item()
+        ),
+        "low_level_action_abs_mean": float(finite_actions.abs().mean().item()),
+        "low_level_action_abs_max": float(finite_actions.abs().max().item()),
+        "low_level_action_nonfinite_count": nonfinite_action_count,
+    }
+    return metrics
+
+
+def _switch_response_metrics(
+    previous_switched: torch.Tensor,
+    previous_actions: torch.Tensor,
+    current_actions: torch.Tensor,
+    previous_actual_vx: torch.Tensor,
+    current_actual_vx: torch.Tensor,
+    previous_vx_switched: torch.Tensor | None = None,
+) -> dict[str, float]:
+    """Measure low-level response one nav period after a token switch."""
+
+    mask = previous_switched.detach().bool().reshape(-1)
+    sample_count = int(mask.sum().item())
+    vx_mask = (
+        mask
+        if previous_vx_switched is None
+        else previous_vx_switched.detach().bool().reshape(-1)
+    )
+    vx_sample_count = int(vx_mask.sum().item())
+    if sample_count == 0:
+        return {
+            "switch_response_sample_count": 0,
+            "switch_response_vx_sample_count": 0,
+            "switch_response_action_delta_abs_mean": 0.0,
+            "switch_response_vx_delta_abs_mean": 0.0,
+            "switch_response_no_action_ratio": 0.0,
+            "switch_response_no_velocity_ratio": 0.0,
+        }
+
+    previous_actions = torch.nan_to_num(
+        previous_actions.detach(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    current_actions = torch.nan_to_num(
+        current_actions.detach(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    previous_actual_vx = torch.nan_to_num(
+        previous_actual_vx.detach(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    current_actual_vx = torch.nan_to_num(
+        current_actual_vx.detach(), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    action_delta = (current_actions - previous_actions).abs().mean(dim=-1)[mask]
+    velocity_delta = (current_actual_vx - previous_actual_vx).abs()[vx_mask]
+    return {
+        "switch_response_sample_count": sample_count,
+        "switch_response_vx_sample_count": vx_sample_count,
+        "switch_response_action_delta_abs_mean": float(action_delta.mean().item()),
+        "switch_response_vx_delta_abs_mean": (
+            float(velocity_delta.mean().item()) if vx_sample_count > 0 else 0.0
+        ),
+        "switch_response_no_action_ratio": float(
+            (action_delta < _ACTION_RESPONSE_MIN).float().mean().item()
+        ),
+        "switch_response_no_velocity_ratio": (
+            float(
+                (velocity_delta < _VELOCITY_RESPONSE_MIN_MPS).float().mean().item()
+            )
+            if vx_sample_count > 0
+            else 0.0
+        ),
+    }
 
 
 class AlgorithmNavDagger:
@@ -217,6 +354,12 @@ class AlgorithmNavDagger:
         self.freshness_randomized = True  # 测量链自首训生效（nav_goal_encoder）
         # ---- 运行计数 ----
         self.nonfinite_fallback_count = 0
+        self._previous_actions: torch.Tensor | None = None
+        self._previous_action_valid: torch.Tensor | None = None
+        self._previous_nav_tick_actions: torch.Tensor | None = None
+        self._previous_nav_tick_actual_vx: torch.Tensor | None = None
+        self._previous_nav_tick_switched: torch.Tensor | None = None
+        self._previous_nav_tick_vx_switched: torch.Tensor | None = None
         self.loaded_platform_model_id = None
         self._lifecycle_frame_probe_done = False
         self._lifecycle_tick_probe_done = False
@@ -286,6 +429,18 @@ class AlgorithmNavDagger:
         self._reset_since_last_tick = torch.zeros(
             num_envs, dtype=torch.bool, device=self.device
         )
+        self._previous_actions = None
+        self._previous_action_valid = torch.zeros(
+            num_envs, dtype=torch.bool, device=self.device
+        )
+        self._previous_nav_tick_actions = None
+        self._previous_nav_tick_actual_vx = None
+        self._previous_nav_tick_switched = torch.zeros(
+            num_envs, dtype=torch.bool, device=self.device
+        )
+        self._previous_nav_tick_vx_switched = torch.zeros(
+            num_envs, dtype=torch.bool, device=self.device
+        )
         self.high_level.reset_hidden_state(num_envs, self.device)
         self.vision_encoder.reset_hidden_state(num_envs, self.device)
 
@@ -310,6 +465,11 @@ class AlgorithmNavDagger:
         if first_frame_probe and self.logger is not None:
             self.logger.info("[LifecycleProbe] nav_frame_begin per_env_state_ready")
 
+        # Preserve the worker-produced command before the aisrv patch. This is
+        # the command consumed by worker-side command-tracking rewards.
+        p_lo, p_hi = nav_contract.POLICY_CMD_SLICE
+        worker_cmd = obs[:, p_lo:p_hi].detach().clone()
+
         # 步骤 1：当帧 exec_cmd 写入观测副本（policy [6:9] / critic [9:12] 同值）
         self.scheduler.inject(obs, critic_obs)
         if first_frame_probe and self.logger is not None:
@@ -326,6 +486,21 @@ class AlgorithmNavDagger:
                 f"[LifecycleProbe] nav_frame_begin vision_encoder complete latent={tuple(latent.shape)}"
             )
         actions = self.low_level_actor(torch.cat((parts["proprio"], latent), dim=-1))
+        if (
+            self._previous_actions is None
+            or tuple(self._previous_actions.shape) != tuple(actions.shape)
+        ):
+            action_delta = torch.zeros_like(actions)
+            action_delta_valid = torch.zeros(
+                actions.shape[0], dtype=torch.bool, device=actions.device
+            )
+        else:
+            action_delta = actions - self._previous_actions
+            action_delta_valid = self._previous_action_valid
+        self._previous_actions = actions.detach().clone()
+        self._previous_action_valid = torch.ones(
+            actions.shape[0], dtype=torch.bool, device=actions.device
+        )
         if first_frame_probe and self.logger is not None:
             self.logger.info(
                 f"[LifecycleProbe] nav_frame_begin low_level complete actions={tuple(actions.shape)}"
@@ -338,7 +513,15 @@ class AlgorithmNavDagger:
             if first_frame_probe and self.logger is not None:
                 self.logger.info("[LifecycleProbe] nav_frame_begin nav_tick begin")
             result["is_tick"] = True
-            result["tick_metrics"] = self._nav_tick(parts, obs, critic_obs)
+            result["tick_metrics"] = self._nav_tick(
+                parts,
+                obs,
+                critic_obs,
+                worker_cmd=worker_cmd,
+                actions=actions,
+                action_delta=action_delta,
+                action_delta_valid=action_delta_valid,
+            )
             if first_frame_probe and self.logger is not None:
                 self.logger.info("[LifecycleProbe] nav_frame_begin nav_tick complete")
 
@@ -351,7 +534,17 @@ class AlgorithmNavDagger:
         return result
 
     @torch.no_grad()
-    def _nav_tick(self, parts: dict, obs: torch.Tensor, critic_obs: torch.Tensor) -> dict:
+    def _nav_tick(
+        self,
+        parts: dict,
+        obs: torch.Tensor,
+        critic_obs: torch.Tensor,
+        *,
+        worker_cmd: torch.Tensor,
+        actions: torch.Tensor,
+        action_delta: torch.Tensor,
+        action_delta_valid: torch.Tensor,
+    ) -> dict:
         num_envs = obs.shape[0]
         # This is deliberately process-local rather than derived from the
         # persisted total_nav_ticks counter, so resume smoke runs retain the
@@ -435,6 +628,45 @@ class AlgorithmNavDagger:
         effective = self.scheduler.request_tokens(executed)
         switched = effective != prev_held
 
+        lin_lo, lin_hi = nav_contract.CRITIC_LIN_VEL_SLICE
+        actual_vx = critic_obs[:, lin_lo:lin_hi].detach()[:, 0]
+        if (
+            self._previous_nav_tick_actions is None
+            or self._previous_nav_tick_actual_vx is None
+            or self._previous_nav_tick_switched is None
+            or self._previous_nav_tick_vx_switched is None
+        ):
+            response_metrics = _switch_response_metrics(
+                torch.zeros(num_envs, dtype=torch.bool, device=self.device),
+                actions,
+                actions,
+                actual_vx,
+                actual_vx,
+                previous_vx_switched=torch.zeros(
+                    num_envs, dtype=torch.bool, device=self.device
+                ),
+            )
+        else:
+            response_metrics = _switch_response_metrics(
+                self._previous_nav_tick_switched,
+                self._previous_nav_tick_actions,
+                actions,
+                self._previous_nav_tick_actual_vx,
+                actual_vx,
+                previous_vx_switched=self._previous_nav_tick_vx_switched,
+            )
+        vocab = torch.as_tensor(
+            nav_contract.VOCAB, dtype=actions.dtype, device=self.device
+        )
+        vx_switched = switched & (
+            (vocab[effective, 0] - vocab[prev_held, 0]).abs()
+            > _COMMAND_MATCH_TOLERANCE
+        )
+        self._previous_nav_tick_actions = actions.detach().clone()
+        self._previous_nav_tick_actual_vx = actual_vx.detach().clone()
+        self._previous_nav_tick_switched = switched.detach().clone()
+        self._previous_nav_tick_vx_switched = vx_switched.detach().clone()
+
         valid = oracle_valid & inputs_finite & logits_finite
 
         goal3_start = nav_contract.CRITIC_GOAL3_START
@@ -482,9 +714,13 @@ class AlgorithmNavDagger:
         self.total_nav_ticks += num_envs
 
         disagreement = (student_tokens != oracle_labels) & oracle_valid
-        return {
+        metrics = {
             "buffer_full": self.tick_buffer.is_full,
             "student_drive_ratio": float(student_drive.float().mean().item()),
+            "oracle_drive_ratio": float((~student_drive).float().mean().item()),
+            "requested_effective_mismatch_ratio": float(
+                (executed != effective).float().mean().item()
+            ),
             "disagreement_rate": float(
                 disagreement.float().sum().item() / max(1.0, oracle_valid.float().sum().item())
             ),
@@ -493,6 +729,56 @@ class AlgorithmNavDagger:
             "nonfinite_fallback": int(fallback.sum().item()),
             **goal_metrics,
         }
+        metrics.update(_token_ratio_metrics("student", student_tokens))
+        metrics.update(_token_ratio_metrics("oracle", oracle_tokens))
+        metrics.update(_token_ratio_metrics("requested", executed))
+        metrics.update(_token_ratio_metrics("effective", effective))
+        metrics.update(
+            _control_alignment_metrics(
+                worker_cmd,
+                self.scheduler.exec_cmd,
+                self.scheduler.held_cmd,
+                critic_obs,
+                actions,
+            )
+        )
+        valid_delta_mask = action_delta_valid.to(device=action_delta.device).bool()
+        valid_delta = valid_delta_mask.float().sum().clamp_min(1.0)
+        masked_action_delta = action_delta[valid_delta_mask]
+        if masked_action_delta.numel() == 0:
+            masked_action_delta = action_delta.new_zeros((1, action_delta.shape[-1]))
+        metrics["low_level_action_delta_abs_mean"] = float(
+            masked_action_delta.abs().sum().item()
+            / valid_delta.item()
+            / max(1, action_delta.shape[-1])
+        )
+        metrics["scheduler_dwell_ticks_mean"] = float(
+            self.scheduler.dwell_ticks.float().mean().item()
+        )
+        metrics["scheduler_dwell_ticks_max"] = float(
+            self.scheduler.dwell_ticks.max().item()
+        )
+        metrics.update(response_metrics)
+        metrics.update(getattr(self.oracle, "last_metrics", {}))
+        if first_tick_probe and self.logger is not None:
+            self.logger.info(
+                "[NavControlProbe] first_nav_tick "
+                f"driver_student={metrics['student_drive_ratio']:.3f} "
+                f"driver_oracle={metrics['oracle_drive_ratio']:.3f} "
+                f"student_dom={_dominant_token(student_tokens)} "
+                f"oracle_dom={_dominant_token(oracle_tokens)} "
+                f"requested_dom={_dominant_token(executed)} "
+                f"effective_dom={_dominant_token(effective)} "
+                f"worker_cmd={metrics['worker_cmd_vx_mean']:.3f},"
+                f"{metrics['worker_cmd_vy_mean']:.3f},"
+                f"{metrics['worker_cmd_wz_mean']:.3f} "
+                f"exec_cmd={metrics['exec_cmd_vx_mean']:.3f},"
+                f"{metrics['exec_cmd_vy_mean']:.3f},"
+                f"{metrics['exec_cmd_wz_mean']:.3f} "
+                f"actual_vx={metrics['actual_lin_vel_x_mean']:.3f} "
+                f"action_abs={metrics['low_level_action_abs_mean']:.3f}"
+            )
+        return metrics
 
     def frame_end(self, dones: torch.Tensor) -> None:
         """步骤 5 后：done 三方清零（低层 hidden / 高层 hidden / scheduler），
@@ -505,6 +791,12 @@ class AlgorithmNavDagger:
             self.vision_encoder.reset_hidden_state_for_envs(ids)
             self.high_level.reset_hidden_state_for_envs(ids)
             self.scheduler.reset(ids)
+            if self._previous_action_valid is not None:
+                self._previous_action_valid[ids] = False
+            if self._previous_nav_tick_switched is not None:
+                self._previous_nav_tick_switched[ids] = False
+            if self._previous_nav_tick_vx_switched is not None:
+                self._previous_nav_tick_vx_switched[ids] = False
             self._reset_since_last_tick = self._reset_since_last_tick | dones
         self.scheduler.step_exec()
 

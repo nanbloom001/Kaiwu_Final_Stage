@@ -35,7 +35,7 @@ from agent_ppo.feature.nav_event_log import emit_nav_event
 # soft-stay 阈值（每 _SOFT_STAY_WINDOW iterations 检查一次，连续两个窗口）
 _SOFT_STAY_WINDOW = 50
 _SOFT_STAY_DISAGREE_DELTA = 0.05    # disagreement 相对前窗口恶化超此值触发
-_SOFT_STAY_HARD_DELTA = 0.02        # hard_termination 相对前窗口恶化超此值触发
+_SOFT_STAY_HARD_DELTA = 0.02        # 非超时终止率相对前窗口恶化超此值触发
 _SOFT_STAY_PROGRESS_DELTA = 0.003   # goal progress (m/frame) 相对前窗口恶化超此值触发
 # 解冻的绝对质量门槛（不只是"不再恶化"）
 _SOFT_STAY_UNFREEZE_MIN_TOP1 = 0.85
@@ -85,20 +85,35 @@ def _mean_metrics(rows: list) -> dict:
     return {k: sum(vs) / len(vs) for k, vs in values.items() if vs}
 
 
-def _episode_outcome_rates(
-    hard_events: float, timeout_events: float, completed_episodes: float
-) -> dict:
-    """Episode outcome rates; never divide terminations by environment frames."""
-
-    completed = float(completed_episodes)
-    result = {
-        "hard_termination_count": float(hard_events),
-        "timeout_count": float(timeout_events),
-        "completed_episode_count": completed,
+def _dominant_metric_token(metrics: dict, prefix: str) -> tuple[str, float]:
+    candidates = {
+        name: float(metrics.get(f"{prefix}_token_{name}_ratio", 0.0))
+        for name in nav_contract.TOKEN_NAMES
     }
-    if completed > 0.0:
-        result["hard_termination_rate"] = float(hard_events) / completed
-        result["timeout_rate"] = float(timeout_events) / completed
+    name = max(candidates, key=candidates.get)
+    return name, candidates[name]
+
+
+def _episode_outcome_rates(
+    non_timeout_events: float, timeout_events: float, ended_episodes: float
+) -> dict:
+    """Episode-end diagnostics without claiming success/failure semantics.
+
+    The worker proxy exposes ``terminated``/``truncated`` but not the Track
+    scorer's goal-reached mask. A non-timeout termination can therefore be a
+    successful Track exit or an abnormal termination; only EnvMonitor owns that
+    distinction.
+    """
+
+    ended = float(ended_episodes)
+    result = {
+        "non_timeout_termination_count": float(non_timeout_events),
+        "timeout_count": float(timeout_events),
+        "ended_episode_count": ended,
+    }
+    if ended > 0.0:
+        result["non_timeout_termination_rate"] = float(non_timeout_events) / ended
+        result["timeout_rate"] = float(timeout_events) / ended
     return result
 
 
@@ -106,10 +121,12 @@ def _quality_window_metrics(rows: list[dict]) -> dict:
     """Average dense metrics and aggregate sparse episode outcomes."""
 
     metrics = _mean_metrics(rows)
-    hard = sum(float(row.get("hard_termination_count", 0.0)) for row in rows)
+    non_timeout = sum(
+        float(row.get("non_timeout_termination_count", 0.0)) for row in rows
+    )
     timeout = sum(float(row.get("timeout_count", 0.0)) for row in rows)
-    completed = sum(float(row.get("completed_episode_count", 0.0)) for row in rows)
-    metrics.update(_episode_outcome_rates(hard, timeout, completed))
+    ended = sum(float(row.get("ended_episode_count", 0.0)) for row in rows)
+    metrics.update(_episode_outcome_rates(non_timeout, timeout, ended))
     return metrics
 
 
@@ -126,6 +143,44 @@ def _aggregate_goal_metrics(rows: list[dict]) -> dict:
         "goal4_sample_count": fresh_samples,
         "goal4_fresh_rate": fresh / fresh_samples if fresh_samples > 0 else float("nan"),
     }
+
+
+def _aggregate_switch_response_metrics(rows: list[dict]) -> dict:
+    """Aggregate sparse post-switch diagnostics by response sample count."""
+
+    action_total = sum(
+        float(row.get("switch_response_sample_count", 0.0)) for row in rows
+    )
+    vx_total = sum(
+        float(row.get("switch_response_vx_sample_count", 0.0)) for row in rows
+    )
+    result = {
+        "switch_response_sample_count": action_total,
+        "switch_response_vx_sample_count": vx_total,
+    }
+    action_metrics = (
+        "switch_response_action_delta_abs_mean",
+        "switch_response_no_action_ratio",
+    )
+    vx_metrics = (
+        "switch_response_vx_delta_abs_mean",
+        "switch_response_no_velocity_ratio",
+    )
+    for name in action_metrics:
+        weighted = sum(
+            float(row.get(name, 0.0))
+            * float(row.get("switch_response_sample_count", 0.0))
+            for row in rows
+        )
+        result[name] = weighted / action_total if action_total > 0.0 else 0.0
+    for name in vx_metrics:
+        weighted = sum(
+            float(row.get(name, 0.0))
+            * float(row.get("switch_response_vx_sample_count", 0.0))
+            for row in rows
+        )
+        result[name] = weighted / vx_total if vx_total > 0.0 else 0.0
+    return result
 
 
 def _ramp_probability(elapsed_h: float, ramp_start_h: float, ramp_end_h: float) -> float:
@@ -213,12 +268,13 @@ def _soft_stay_check(window: dict, prev_window: dict | None) -> str | None:
         ):
             return "disagreement_worsened"
         if (
-            "hard_termination_rate" in window
-            and "hard_termination_rate" in prev_window
-            and window["hard_termination_rate"]
-            > prev_window["hard_termination_rate"] + _SOFT_STAY_HARD_DELTA
+            "non_timeout_termination_per_frame" in window
+            and "non_timeout_termination_per_frame" in prev_window
+            and window["non_timeout_termination_per_frame"]
+            > prev_window["non_timeout_termination_per_frame"]
+            + _SOFT_STAY_HARD_DELTA
         ):
-            return "hard_termination_worsened"
+            return "non_timeout_termination_worsened"
         if (
             window.get("goal_progress_m_per_frame", 0.0)
             < prev_window.get("goal_progress_m_per_frame", 0.0)
@@ -231,8 +287,9 @@ def _soft_stay_check(window: dict, prev_window: dict | None) -> str | None:
 def _quality_absolutely_ok(window: dict) -> bool:
     return (
         window.get("top1_accuracy", 0.0) >= _SOFT_STAY_UNFREEZE_MIN_TOP1
-        and "hard_termination_rate" in window
-        and window["hard_termination_rate"] <= _SOFT_STAY_UNFREEZE_MAX_HARD
+        and "non_timeout_termination_per_frame" in window
+        and window["non_timeout_termination_per_frame"]
+        <= _SOFT_STAY_UNFREEZE_MAX_HARD
     )
 
 
@@ -417,9 +474,9 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
             step_rows: list[dict] = []
             # 全帧聚合指标（不能只在 tick 帧采样：换 token 后的失稳集中在
             # tick+1..tick+9，恰好全是非 tick 帧）
-            hard_events = 0.0
+            non_timeout_events = 0.0
             timeout_events = 0.0
-            completed_episodes = 0.0
+            ended_episodes = 0.0
             progress_sum = 0.0
             progress_count = 0
             total_env_frames = 0
@@ -466,16 +523,18 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 else:
                     time_outs = truncated
                 timeout_termination = time_outs & dones
-                hard_termination = terminated & ~time_outs
+                non_timeout_termination = terminated & ~time_outs
 
                 algorithm.frame_end(dones)
 
                 # 全帧指标累计
                 num_envs_now = int(dones.shape[0])
                 total_env_frames += num_envs_now
-                hard_events += float(hard_termination.float().sum().item())
+                non_timeout_events += float(
+                    non_timeout_termination.float().sum().item()
+                )
                 timeout_events += float(timeout_termination.float().sum().item())
-                completed_episodes += float(dones.float().sum().item())
+                ended_episodes += float(dones.float().sum().item())
                 post_goal_dist = (
                     privileged_obs[:, g_dist_idx] * nav_contract.GOAL_DIST_SCALE_M
                 )
@@ -526,7 +585,7 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     and platform_lifecycle_failures == 0
                 )
                 agent._nav_lifecycle_attempt_callbacks = (
-                    platform_lifecycle_callbacks + 1
+                    platform_lifecycle_callbacks + platform_lifecycle_failures + 1
                 )
                 if first_lifecycle_attempt:
                     logger.info("[LifecycleProbe] nav_first_lifecycle_callback begin")
@@ -594,15 +653,16 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
             iteration_metrics = _mean_metrics(step_rows)
             iteration_metrics.update(_aggregate_goal_metrics(step_rows))
+            iteration_metrics.update(_aggregate_switch_response_metrics(step_rows))
             # 全帧聚合指标覆盖（soft-stay 消费全覆盖信号，非 tick 帧欠采样版）
             iteration_metrics.update(
                 _episode_outcome_rates(
-                    hard_events, timeout_events, completed_episodes
+                    non_timeout_events, timeout_events, ended_episodes
                 )
             )
-            # Retain the per-frame exposure denominator as an explicitly named
-            # diagnostic. Soft-stay never consumes these hazard values.
-            iteration_metrics["hard_termination_per_frame"] = hard_events / max(
+            # Keep the historical per-frame hazard denominator for soft-stay;
+            # episode-normalized rates above are dashboard diagnostics only.
+            iteration_metrics["non_timeout_termination_per_frame"] = non_timeout_events / max(
                 1, total_env_frames
             )
             iteration_metrics["timeout_per_frame"] = timeout_events / max(
@@ -672,11 +732,26 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     f"disagree={m.get('disagreement_rate', float('nan')):.3f} "
                     f"entropy={m.get('token_entropy', float('nan')):.3f} "
                     f"switch={m.get('switch_rate', float('nan')):.3f} "
-                    f"hard={m.get('hard_termination_rate', float('nan')):.4f} "
+                    f"non_timeout={m.get('non_timeout_termination_rate', float('nan')):.4f} "
                     f"timeout={m.get('timeout_rate', float('nan')):.4f} "
                     f"goal_valid={m.get('goal_valid_rate', float('nan')):.3f} "
                     f"goal_fresh={m.get('goal4_fresh_rate', float('nan')):.3f} "
                     f"progress={m.get('goal_progress_m_per_frame', float('nan')):.4f} "
+                    f"driver_student={m.get('student_drive_ratio', float('nan')):.3f} "
+                    f"driver_oracle={m.get('oracle_drive_ratio', float('nan')):.3f} "
+                    f"worker_cmd_vx={m.get('worker_cmd_vx_mean', float('nan')):.3f} "
+                    f"exec_cmd_vx={m.get('exec_cmd_vx_mean', float('nan')):.3f} "
+                    f"actual_vx={m.get('actual_lin_vel_x_mean', float('nan')):.3f} "
+                    f"cmd_linf={m.get('worker_exec_cmd_linf_mean', float('nan')):.3f} "
+                    f"exec_err={m.get('exec_vx_tracking_error_mean', float('nan')):.3f} "
+                    f"worker_err={m.get('worker_vx_tracking_error_mean', float('nan')):.3f} "
+                    f"action_abs={m.get('low_level_action_abs_mean', float('nan')):.3f} "
+                    f"action_delta={m.get('low_level_action_delta_abs_mean', float('nan')):.3f} "
+                    f"switch_action_delta={m.get('switch_response_action_delta_abs_mean', float('nan')):.3f} "
+                    f"switch_vx_delta={m.get('switch_response_vx_delta_abs_mean', float('nan')):.3f} "
+                    f"student_dom={_dominant_metric_token(m, 'student')[0]} "
+                    f"oracle_dom={_dominant_metric_token(m, 'oracle')[0]} "
+                    f"effective_dom={_dominant_metric_token(m, 'effective')[0]} "
                     f"nonfinite={algorithm.nonfinite_fallback_count} "
                     f"grad={m.get('grad_norm', float('nan')):.3f} "
                     f"lr={algorithm.optimizer.param_groups[0]['lr']:.2e} "
@@ -686,6 +761,40 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     f"until_dump={m['callbacks_until_next_dump']} "
                     f"iter_time={time.monotonic() - iter_start:.2f}s"
                 )
+                if m.get("worker_exec_cmd_linf_mean", 0.0) > 0.05:
+                    logger.warning(
+                        "[NavControlProbe] worker command differs from Nav exec command; "
+                        f"linf_mean={m['worker_exec_cmd_linf_mean']:.3f} "
+                        f"match={m.get('worker_exec_cmd_match_ratio', float('nan')):.3f}"
+                    )
+                if (
+                    m.get("switch_response_sample_count", 0.0) > 0.0
+                    and m.get("switch_response_no_action_ratio", 0.0) >= 0.8
+                ):
+                    logger.warning(
+                        "[NavControlProbe] token changed but low-level action did not "
+                        "respond within one nav period; "
+                        f"samples={int(m['switch_response_sample_count'])} "
+                        f"no_action_ratio={m['switch_response_no_action_ratio']:.3f} "
+                        f"action_delta={m['switch_response_action_delta_abs_mean']:.6f} "
+                        f"vx_delta={m['switch_response_vx_delta_abs_mean']:.4f}"
+                    )
+                if (
+                    m.get("switch_response_vx_sample_count", 0.0) > 0.0
+                    and m.get("switch_response_no_velocity_ratio", 0.0) >= 0.8
+                ):
+                    logger.warning(
+                        "[NavControlProbe] token changed but true vx did not respond "
+                        "within one nav period; "
+                        f"samples={int(m['switch_response_sample_count'])} "
+                        f"no_velocity_ratio={m['switch_response_no_velocity_ratio']:.3f} "
+                        f"vx_delta={m['switch_response_vx_delta_abs_mean']:.4f}"
+                    )
+                if m.get("low_level_action_nonfinite_count", 0.0) > 0.0:
+                    logger.warning(
+                        "[NavControlProbe] low-level action contains non-finite values; "
+                        f"count={int(m['low_level_action_nonfinite_count'])}"
+                    )
             if monitor is not None:
                 try:
                     monitor.put_data(

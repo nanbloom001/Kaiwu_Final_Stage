@@ -56,6 +56,10 @@ class NavOracle:
         self.obstacle_threshold_m = obstacle_threshold_m
         self.nav_front_block_threshold = nav_front_block_threshold
         self.nav_side_margin = nav_side_margin
+        # Read-only diagnostics from the most recent act() call. The rule
+        # outputs themselves remain unchanged; aisrv consumes this snapshot
+        # only for monitor/logging metrics.
+        self.last_metrics: dict[str, float] = {}
 
     def act(self, critic_obs: torch.Tensor) -> torch.Tensor:
         if critic_obs.ndim != 2 or critic_obs.shape[1] < nav_contract.CRITIC_OBS_DIM:
@@ -129,6 +133,37 @@ class NavOracle:
         tokens[fast] = 3              # forward_fast
 
         # 有效性：goal3 全零（真值缺席）视为无效标签 → zero + 调用方置 valid=0
+        mode_masks = {
+            "arrived": arrived,
+            "spin": spin,
+            "creep": creep,
+            "veer": veer,
+            "wall_avoid": avoid,
+            "forward_slow": slow,
+            "forward_mid": mid,
+            "forward_fast": fast,
+        }
+        mode_values = torch.stack(
+            [mask.float() for mask in mode_masks.values()], dim=1
+        ).mean(dim=0).detach().cpu().tolist()
+        goal_stats = torch.stack(
+            (dist_m, angle.abs(), nav_priv[:, 1], left_score, right_score), dim=1
+        ).detach().float().cpu()
+        self.last_metrics = {
+            **{
+                f"oracle_mode_{name}_ratio": float(value)
+                for name, value in zip(mode_masks, mode_values)
+            },
+            "oracle_goal_dist_mean": float(goal_stats[:, 0].mean().item()),
+            "oracle_goal_dist_min": float(goal_stats[:, 0].min().item()),
+            "oracle_goal_dist_max": float(goal_stats[:, 0].max().item()),
+            "oracle_goal_angle_abs_mean": float(goal_stats[:, 1].mean().item()),
+            "oracle_front_score_mean": float(goal_stats[:, 2].mean().item()),
+            "oracle_left_score_mean": float(goal_stats[:, 3].mean().item()),
+            "oracle_right_score_mean": float(goal_stats[:, 4].mean().item()),
+            "oracle_front_blocked_ratio": float(nav_front_blocked.float().mean().item()),
+            "oracle_front_obstacle_ratio": float(front_obstacle.float().mean().item()),
+        }
         return tokens
 
     @staticmethod

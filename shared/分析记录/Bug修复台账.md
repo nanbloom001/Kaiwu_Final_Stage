@@ -781,6 +781,42 @@
   实现，不得回到 lexical-only 检查。再遇最短路径：原始 path → canonical path →
   根目录边界 → 保护相对路径。
 
+## BUG-20260727-007：Nav 高低层控制链缺少可区分的统计口径
+
+- 状态：本地已验证，平台待验证。
+- 影响：hier-nav DAgger 训练监控、高层控制是否真正传到低层的故障定位。
+- 首次发现：分支 `codex/hier-nav-control-observability`；平台任务和模型 ID 不适用。
+- 症状：原面板只能看到 CE、超时和模糊的 episode 终止数，无法区分
+  Oracle 没有生成合理 token、驻留/调度压制了指令、低层未响应，还是 worker
+  reward 仍在读取另一套 command。`terminated` 又被误命名为 hard failure，
+  它实际也可能是 Track 成功退出。
+- 根因：aisrv 中的 `NavScheduler.inject()` 只改写 policy/critic observation，
+  不会反向改写 worker `command_manager`；原有统计没有同时保留 worker command、
+  exec command、真实速度和 action 响应，也没有 Track scorer 与 aisrv 终止口径边界。
+- 排除项：本修复不修改 `isaac_env/base_env.py`，不新增 aisrv→worker IPC，不调整
+  Oracle 规则、奖励、DAgger ramp 或网络。
+- 修复：`algorithm_nav_dagger.py` 新增四组 token 分布、driver/驻留、
+  worker/held/exec command、真实 vx、tracking error、action 幅度/变化/非有限与
+  token 切换后一个 nav period 的 action/vx 响应。`nav_oracle.py` 记录现有规则
+  分支和 goal/墙体统计，不改 token 输出。workflow 把内部指标改名为
+  `ended_episode_count` 与 `non_timeout_termination_*`，面板保留 Track scorer 原始指标。
+- 验证：target commit `f7145da` 曾通过 94 项 Nav 测试；合并与误报修正后
+  完整 `agent_ppo/tests/test_nav_*.py` 为 `116 passed, 3 subtests passed`，
+  修改 Python 文件 `py_compile` 与 `git diff --check` 通过。容器同步、平台
+  smoke、评估和真机均未执行。
+- 防复发：回归测试覆盖 ramp=0 Oracle driver、四组 token 比例、worker/exec 对齐、
+  非有限 action、Oracle 分支、切换响应的稀疏加权聚合、reset 取消样本以及
+  终止指标命名。最短检查路径：Oracle token/mode → requested/effective →
+  dwell → worker/exec/actual vx → action response → Track scorer。
+- 合并审查更正：纯 yaw 或相同 vx 的 token 切换本来就不要求 vx 变化；
+  `switch_response_no_velocity_ratio` 现只在目标 vx 确实变化的样本上计算，
+  action 响应仍覆盖所有 token 切换，避免误报低层失联。
+- 血缘：target commit `f7145da`；合并 commit 待生成；父模型、checkpoint 和
+  SHA256 不适用。
+- 遗留风险：所有新指标仍需平台 monitor 实际上报验证。身份与 digest
+  元数据不一致按当前策略 warning-only；结构不兼容、非有限权重、写盘失败
+  仍必须硬停。回滚可撤销 `f7145da` 的诊断指标，不触碰 `base_env.py`。
+
 ## 3. 已知高频误判
 
 以下现象可能伴随真实 Bug，但不能单独作为根因：

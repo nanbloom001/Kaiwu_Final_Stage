@@ -190,6 +190,10 @@ class TestAgentWiringSource(unittest.TestCase):
         # cnn_feat32_raw 语义：eval 前向必须走 vision_encoder.cnn(depth)
         self.assertIn("self.vision_encoder.cnn(depth)", _AGENT_SRC)
 
+    def test_nav_load_records_selected_checkpoint(self):
+        self.assertIn("self.cur_model_name = hit", _AGENT_SRC)
+        self.assertIn("self.cur_model_name = ckpt_path", _AGENT_SRC)
+
 
 if __name__ == "__main__":
     unittest.main()
