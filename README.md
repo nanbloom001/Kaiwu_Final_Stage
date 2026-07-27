@@ -131,6 +131,7 @@ Git LFS pointer 只是制品引用，不是真实 checkpoint、ONNX 或动态库
 - [默认部署制品清单](./deploy/sim2real_test_loco/ARTIFACTS.md)
 - [server–deploy 接口契约](./shared/interfaces/server-deploy-contract.md)
 - [模型、训练与部署分析](./shared/分析记录/)
+- [Bug 修复台账](./shared/分析记录/Bug修复台账.md)
 - [仓库协作与版本管理规范](./CONTRIBUTING.md)
 - [AI Agent 操作规则](./AGENTS.md)
 

@@ -20,6 +20,7 @@
 
 - [`../AGENTS.md`](../AGENTS.md)：AI Agent 开始任务和推送前必须遵守的仓库入口规则。
 - [`../CONTRIBUTING.md`](../CONTRIBUTING.md)：面向成员与 AI Agent 的完整协作、同步、提交、PR、Tag、制品和回滚规范。
+- [`分析记录/Bug修复台账.md`](./分析记录/Bug修复台账.md)：跨阶段 Bug 的症状、根因、修复、验证层级与复发检查入口；每次行为修复必须追加记录。
 - [`project-context/repository-layout.md`](./project-context/repository-layout.md)：四层目录结构说明。
 - [`project-context/branch-migration-register.md`](./project-context/branch-migration-register.md)：旧分支源 SHA 锚点 + 迁移分类登记（回滚锚点）。
 - [`分析记录/版本训练演进与改动规模详解.md`](./分析记录/版本训练演进与改动规模详解.md)：复赛、决赛、蒸馏/Sim2Real 与导航训练分支的版本演进记录。
@@ -30,7 +31,9 @@
 - [`分析记录/2026-07-22_10288到latent32结构蒸馏执行计划.md`](./分析记录/2026-07-22_10288到latent32结构蒸馏执行计划.md)：细化第一轮 301→77 结构迁移的纯 BC、分比例 DAgger、学生闭环、checkpoint 和失败回滚流程。
 - [`分析记录/2026-07-23_STD-DAGGER-R2执行卡.md`](./分析记录/2026-07-23_STD-DAGGER-R2执行卡.md)：已完成的三小时特权网络结构蒸馏、平台结果、污染保护和 checkpoint 记录。
 - [`分析记录/2026-07-23_Standard深度视觉蒸馏10小时长训计划.md`](./分析记录/2026-07-23_Standard深度视觉蒸馏10小时长训计划.md)：已完成的十小时视觉蒸馏方案、实际平台结果和阶段 4 遗留诊断。
-- [`分析记录/2026-07-24_Standard视觉学生独立化与发布冻结计划.md`](./分析记录/2026-07-24_Standard视觉学生独立化与发布冻结计划.md)：阶段 5 的 S0 冻结、command 包络决策门、部署打包、recurrent visual PPO 和真机分级计划。
+- [`分析记录/2026-07-24_Standard视觉学生独立化与发布冻结计划.md`](./分析记录/2026-07-24_Standard视觉学生独立化与发布冻结计划.md)：阶段 5 历史初稿；当前训练调度已由双四小时与 Anchor R2 实施计划取代。
+- [`分析记录/2026-07-25_Standard视觉学生双四小时训练计划.md`](./分析记录/2026-07-25_Standard视觉学生双四小时训练计划.md)：将视觉学生独立退火与 command 泛化拆为两个独立四小时任务。
+- [`分析记录/2026-07-25_StandardAnchorR2四小时实施计划.md`](./分析记录/2026-07-25_StandardAnchorR2四小时实施计划.md)：当前 `standard-anchor-r2` 的代码、配置、清理、短启动与验收契约。
 - [`分析记录/2026-07-24_main归档与Standard视觉主线合并记录.md`](./分析记录/2026-07-24_main归档与Standard视觉主线合并记录.md)：旧 main 的归档、R2/视觉主线合并顺序，以及可复用事实与失败路线的边界。
 - [`分析记录/2026-07-23_Standard桥接蒸馏昨夜至今迭代复盘.md`](./分析记录/2026-07-23_Standard桥接蒸馏昨夜至今迭代复盘.md)：记录 R1、HJC minimal、环境/同步/lifecycle 修复到 R2 的完整时间线、踩坑和下一轮检查清单。
 - [`分析记录/2026-07-23_STD-BRIDGE-R1执行卡.md`](./分析记录/2026-07-23_STD-BRIDGE-R1执行卡.md)：历史 R1 设计稿，已由 R2 取代。

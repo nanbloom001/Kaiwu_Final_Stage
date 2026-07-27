@@ -12,3 +12,11 @@ kaiwu_ide_crack/
 /unitree_isaaclab_deploy/
 /代码存档/
 /分析记录/
+
+# Historical source snapshots stay versioned, but large/generated artifacts do not.
+/archive/代码存档/**/*.pkl
+/archive/代码存档/**/*.onnx
+/archive/代码存档/**/*.zip
+
+# Local evaluation recordings are evidence artifacts, not source files.
+/shared/视频存档/

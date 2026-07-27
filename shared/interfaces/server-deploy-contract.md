@@ -83,7 +83,7 @@ iteration_semantics = "completed_outer_iterations_v1"
 修复前没有 `iteration_semantics` 的视觉包按旧的零基 loop index 读取，并在恢复时
 加一转换，避免重复最后一轮。
 
-受约束视觉 PPO 路径（阶段 5）继续使用相同顶层格式，并增加：
+Anchor R2（阶段 5 的历史父阶段）使用相同顶层格式，并增加：
 
 ```text
 format = "kaiwu_train_v1"
@@ -96,8 +96,13 @@ modules.critic.state_dict
 modules.action_distribution.std
 modules.s0_anchor.vision_encoder_state_dict / actor_state_dict
 optimizers.visual_ppo
-training_state.current_iteration / elapsed_training_hours / phase_label
-training_state.action_anchor_weight
+training_state.current_iteration / anchor_session_elapsed_hours
+training_state.elapsed_training_hours / phase_label
+training_state.schedule_mode = "visual_anchor_anneal_v2"
+training_state.run_name = "standard-anchor-r2"
+training_state.source_parent_model_id = 28401
+training_state.action_anchor_weight / latent_anchor_weight
+training_state.trainable_modules = cnn/actor/lstm/critic
 training_state.actor_updates_paused / pause_reason
 training_state.baseline_hard_termination_rate
 training_state.rng_state
@@ -111,16 +116,78 @@ capabilities.deployable = false
 阶段文件名固定为：
 
 ```text
-model.ckpt-rlcritic-<平台ID>.pkl
-model.ckpt-rlactor-<平台ID>.pkl
-model.ckpt-rlfull-<平台ID>.pkl
+model.ckpt-anchorcritic-<平台ID>.pkl
+model.ckpt-anchoractor-<平台ID>.pkl
+model.ckpt-anchoranneal-<平台ID>.pkl
+model.ckpt-anchorfinal-<平台ID>.pkl
 ```
 
-恢复时以 `elapsed_training_hours` 重新计算阶段；若保存的 `phase_label` 与墙钟阶段
-不一致，以墙钟阶段为准并记录 warning。live LSTM hidden 不跨运行保存，恢复后
-必须 reset 环境并清零学生和 S0 anchor hidden。评估仍走部署形态的 Camera
-loader，只读取 `modules.vision_encoder` 与 `modules.low_level.actor_state_dict`，
-不加载 Critic 或 S0 anchor。
+同一 `visual_anchor_anneal_v2` 断点恢复时以
+`anchor_session_elapsed_hours` 续接阶段；`elapsed_training_hours` 只记录累计训练时长，
+不得决定阶段。从 S0 或其他 schedule 迁移时，Anchor session clock、Critic、optimizer
+和安全窗口从零开始。live LSTM hidden 不跨运行保存，恢复后必须 reset 环境并清零
+学生和 S0 anchor hidden。评估必须在最终 Camera TOML 中显式设置
+`[env_conf].policy_entry = "visual_policy_optimization"`，只读取
+`modules.vision_encoder`、`modules.low_level.actor_state_dict` 与动作分布，不加载 Critic
+或 S0 anchor。Camera `task_name` 只是旧 LBC 回退的依据，不能覆盖显式视觉 PPO 入口。
+
+#### `visual_command_generalization_v1`：当前命令泛化训练恢复包
+
+`standard-command-r1` 从 Anchor R2 固定评估选择的包迁移。它不改变 Actor77、深度输入、
+LSTM reset 或部署合同；S0 只在训练时计算固定的 action/latent anchor `0.35/0.10`。包仍为
+不可部署训练恢复包：
+
+```text
+format = "kaiwu_train_v1"
+schema_version = 1
+stage_type = "standard_visual_ppo"
+model_spec = proprio45 / scan256 / depth180x320x1 / latent32 / action12 / goal0
+modules.vision_encoder.state_dict
+modules.low_level.actor_state_dict
+modules.critic.state_dict
+modules.action_distribution.std
+modules.s0_anchor.vision_encoder_state_dict / actor_state_dict
+optimizers.visual_ppo
+training_state.current_iteration / iteration_semantics / total_steps
+training_state.schedule_mode = "visual_command_generalization_v1"
+training_state.run_name = "standard-command-r1"
+training_state.command_session_elapsed_hours
+training_state.command_target_probability
+training_state.requested_source_probability / effective_source_probability
+training_state.effective_target_probability
+training_state.source_target_counts / target_bucket_counts / command_out_of_range_count
+training_state.command_hook_status / command_hook_verification
+training_state.command_hook_failure_count / command_hook_last_failure_reason
+training_state.command_profile_mix_history
+training_state.action_anchor_weight = 0.35
+training_state.latent_anchor_weight = 0.10
+training_state.rng_state
+lineage.transition_parent_platform_model_id / transition_parent_sha256
+lstm_reset_contract.live_hidden_saved = false
+capabilities.requires_depth = true
+capabilities.requires_height_scan_for_actor = false
+capabilities.deployable = false
+```
+
+`command_session_elapsed_hours` 与 command hold/bucket/RNG 只在同一 schedule 的恢复中续接；
+从 Anchor R2 迁移时它们清零，模型和 optimizer 仍按 transition resume 恢复。计数比例按
+command 重采样事件记录，不得冒充 env-step 比例。没有公开 command setter 或读回校验失败时，
+`effective_target_probability=0`，不得通过改 policy observation 伪造命令实际已写入环境。
+一次失败后的有效 setter/readback 成功会恢复 live hook 状态为 `active`，同时保留累计失败
+计数和最后失败原因。
+
+文件名仅为同一 payload 的以下训练恢复包，不生成 `locomotion` 或 `lbc_loco` 同 ID 副本：
+
+```text
+model.ckpt-commandbase-<平台ID>.pkl
+model.ckpt-commandblend-<平台ID>.pkl
+model.ckpt-commandfull-<平台ID>.pkl
+```
+
+阶段标签只用小写英文，平台 ID 仅由框架传入。评估显式给出 ID 时，loader 只能在该 ID 的
+`command*`、`anchor*` 与兼容视觉标签中排序；没有同 ID 文件只输出候选诊断并拒绝跨 ID
+静默回退。训练代码不会由本地未保存文件覆盖评估模型包。`command*` 继续
+`deployable=false`，部署端仍只接受经过独立导出和审查的 `lbc_loco` 制品。
 
 文件数字 ID 完全使用开悟框架传入值，不由业务代码从 iteration 或父模型 ID
 计算。R2 每次保存同一 payload 的阶段文件和评估兼容别名：
