@@ -1,7 +1,6 @@
-# Standard Stage 5: Anchor R2 four-hour visual policy optimization.
-# Parent checkpoint: model.ckpt-visionfull-28401.pkl.
-# Schedule: visual_anchor_anneal_v2 (anchorcritic -> anchoractor -> anchoranneal -> anchorfinal).
-# 任务：standard-anchor-r2；详见 shared/分析记录/2026-07-25_StandardAnchorR2四小时实施计划.md。
+# Standard Stage 5: four-hour visual command generalization.
+# Parent checkpoint: the operator-selected best Anchor R2 bundle.
+# 任务：standard-command-r1；详见 Standard命令泛化下半四小时实施计划.md。
 
 [env]
 num_envs = 256
@@ -10,6 +9,7 @@ task = "standard"
 
 [env_conf]
 task_name = "Unitree-Go2-Velocity-Camera"
+policy_entry = "visual_policy_optimization"
 seed = 0
 
 [custom_parameters]
@@ -64,11 +64,11 @@ add_noise = false
 [init_state]
 pos = [0.0, 0.0, 0.35]
 
-# Anchor R2 uses Isaac's native command resampler. No custom bucket override,
-# no progressive command scheduler. base_velocity is sampled uniformly by Isaac
-# and never rewritten by agent_ppo code.
+# The platform-native sampler is a source-domain fallback. The environment
+# worker performs the actual 1.5--10 second resampling; 300 seconds prevents
+# the native sampler from overwriting a held worker command.
 [commands]
-resampling_time = [6.0, 10.0]
+resampling_time = [300.0, 300.0]
 
 [commands.ranges]
 lin_vel_x = [0.3, 1.3]
@@ -78,7 +78,7 @@ ang_vel_yaw = [-0.3, 0.3]
 # commands.limit.ang_vel_z and commands.ranges.ang_vel_yaw are the platform's
 # two legacy key names for the same Z-axis yaw command; keep both as-is.
 [commands.limit]
-lin_vel_x = [0.3, 1.3]
+lin_vel_x = [0.0, 1.3]
 lin_vel_y = [-0.2, 0.2]
 ang_vel_z = [-0.3, 0.3]
 
@@ -86,12 +86,13 @@ ang_vel_z = [-0.3, 0.3]
 enabled = false
 
 [commands.worker_progressive]
-enabled = false
+enabled = true
+log_interval_steps = 500
 
 [visual_policy_optimization]
-run_name = "standard-anchor-r2"
-schedule_mode = "visual_anchor_anneal_v2"
-initial_parent_model_id = 28401
+run_name = "standard-command-r1"
+schedule_mode = "visual_command_generalization_v1"
+transition_parent_model_id = 28401
 
 max_iterations = 50000
 num_steps_per_env = 48
@@ -109,32 +110,18 @@ critic_warmup_learning_rate = 3.0e-4
 max_grad_norm = 1.0
 init_noise_std = 0.15
 
-# Four-hour wall-clock schedule (§4.1). Values are in MINUTES; Agent divides
-# by 60 before passing anchor_schedule_hours to the algorithm. All A -> B
-# ranges are linear interpolation over wall-clock within each phase.
-#   [0,45)    anchorcritic   action 1.00          latent 0.25
-#   [45,90)   anchoractor    action 1.00 -> 0.75  latent 0.25
-#   [90,180)  anchoranneal   action 0.75 -> 0.35  latent 0.25 -> 0.10
-#   [180,+inf) anchorfinal   action 0.35          latent 0.10
-anchor_schedule_minutes = [0.0, 45.0, 90.0, 180.0]
-action_anchor_schedule = [1.00, 1.00, 0.75, 0.35]
-latent_anchor_schedule = [0.25, 0.25, 0.25, 0.10]
-anchor_phase_labels = [
-  "anchorcritic",
-  "anchoractor",
-  "anchoranneal",
-  "anchorfinal",
-]
-anchor_phase_end_minutes = [45.0, 90.0, 180.0]
+# Anchor R2's final weights stay fixed throughout command generalization.
+command_anchor_action = 0.35
+command_anchor_latent = 0.10
 
 # task_end_hours is recorded for backward compatibility only; the platform
 # task page controls the actual four-hour deadline.
 task_end_hours = 4.0
 save_interval_minutes = 10.0
 resume_first_save_minutes = 2.0
-# Anchor milestone saves: first three are phase boundaries, 230 min is a
+# Command milestone saves: first three are phase boundaries, 230 min is a
 # pre-reclamation safety save (platform may reclaim near 240 min).
-anchor_checkpoint_minutes = [45.0, 90.0, 180.0, 230.0]
+command_checkpoint_minutes = [30.0, 120.0, 180.0, 230.0]
 
 # Safety thresholds (§5.3): Anchor R2 is warning-only. Violations emit a
 # warning and request a diagnostic checkpoint; they never pause actor updates
@@ -142,7 +129,18 @@ anchor_checkpoint_minutes = [45.0, 90.0, 180.0, 230.0]
 warning_only_safety = true
 max_anchor_action_mse = 0.05
 max_hard_termination_delta = 0.02
+max_action_amplitude = 6.0
 log_interval = 10
+
+[visual_policy_optimization.command_schedule]
+step_dt_s = 0.02
+source_hold_s = [6.0, 10.0]
+target_hold_s = [3.0, 6.0]
+zero_hold_s = [1.5, 3.0]
+source_vx = [0.3, 1.3]
+source_vy = [-0.2, 0.2]
+source_wz = [-0.3, 0.3]
+target_bucket_weights = [0.15, 0.20, 0.30, 0.15, 0.10, 0.10]
 
 [camera.depth_camera]
 offset_pos = [0.339871, 0.034697, 0.075010]
@@ -156,9 +154,7 @@ gaussian_noise_scale = 0.02
 roll_range_deg = 10.0
 pitch_shift_pix = 10
 
-# Standard locomotion reward surface — FROZEN for Anchor R2 (§3). Do not add,
-# remove, or reweight any [rewards.*] block. reward_process.py must remain
-# byte-identical; a snapshot test (§8.1) guards this.
+# Anchor R2 reward surface plus the bounded zero-command stability term.
 [rewards.track_lin_vel_xy]
 weight = 3.0
 [rewards.track_lin_vel_xy.params]
@@ -190,6 +186,12 @@ max_diff = 0.2
 [rewards.trot_gait]
 weight = -1.0
 
+[rewards.zero_command_stability]
+weight = -0.05
+[rewards.zero_command_stability.params]
+command_threshold = 0.05
+grace_period_s = 0.4
+
 [rewards.hip_to_default]
 weight = -0.1
 
@@ -202,7 +204,7 @@ weight = -1.0e-6
 [rewards.joint_position_penalty]
 weight = -0.1
 [rewards.joint_position_penalty.params]
-stand_still_scale = 5.0
+stand_still_scale = 2.0
 velocity_threshold = 0.1
 
 [rewards.feet_air_time]

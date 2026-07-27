@@ -63,9 +63,6 @@ continuous_training = true
 # 地形模式，合法值："standard" | "track"
 # S0a 临时：standard → track（短链探测）
 mode = "track"
-# Number of difficulty tiers (curriculum levels along X), valid range [1, 10].
-# 难度级别数（沿 X 轴的课程档位），合法范围 [1, 10]
-num_rows = 10
 # Parallel plots within the same difficulty tier along Y, valid range [1, 40].
 # 同一难度下的并行地块数（沿 Y 轴），合法范围 [1, 40]
 # S0a 临时：20 → 10（对齐历史 track_nav 配置）
@@ -77,21 +74,15 @@ difficulty_range = [0.0, 1.0]
 # 是否启用地形课程学习（按表现晋级/降级难度）
 # S0a 临时：true → false（track 探测不使用课程）
 curriculum = false
-# Max init difficulty tier for robot placement, valid range: [0, 9].
-# S0a 临时：9 → 0（track 探测用 level_mix 谱控制难度）
+# Track starts at the first segment; difficulty is carried by native parallel
+# track columns and verified from the runtime terrain_types histogram.
 max_init_terrain_level = 0
-
-# S0a 临时新增：难度谱混合（结构照历史 track_nav TOML）
-[terrain.level_mix]
-enabled = true
-levels = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-weights = [0.14, 0.13, 0.11, 0.10, 0.10, 0.09, 0.09, 0.08, 0.08, 0.08]
-pool_size = 100
 
 # S0a 临时新增：短链（maze 必须最后）
 [terrain.track]
 track_length = 2
 sub_terrains = ["pyramid_slope", "open_entry_maze"]
+num_parallel_tracks = 10
 
 # Pre-expose side walls on high-difficulty standard terrain (consistent with Stage 1 locomotion).
 # 高难度 standard 地形侧墙预暴露（与 Stage 1 locomotion 保持一致）

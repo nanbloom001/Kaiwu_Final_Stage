@@ -22,6 +22,88 @@ from tools.base_env.base_reward import RewardProcessBase
 
 
 class RewardProcess(RewardProcessBase):
+    @staticmethod
+    def _zero_stability_huber(value, scale: float):
+        """Per-environment robust normalized penalty for zero-command stability."""
+        normalized = torch.abs(value) / float(scale)
+        penalty = torch.where(
+            normalized <= 1.0,
+            normalized.square(),
+            2.0 * normalized - 1.0,
+        )
+        return penalty.mean(dim=-1) if penalty.ndim > 1 else penalty
+
+    def _reward_zero_command_stability(
+        self,
+        command_name: str = "base_velocity",
+        command_threshold: float = 0.05,
+        grace_period_s: float = 0.4,
+    ):
+        """Penalize residual motion only after a verified zero-command grace period.
+
+        The complete velocity command is tested, so a pure-yaw command remains
+        a motion command and is never treated as a stop request. Action values
+        come from the environment action manager after workflow clipping.
+        """
+        asset = self._get_robot_asset()
+        command = self.env.command_manager.get_command(command_name)[:, :3]
+        zero_mask = torch.linalg.vector_norm(command, dim=1) < command_threshold
+        device = command.device
+        num_envs = command.shape[0]
+        elapsed = getattr(self.env, "_zero_command_elapsed_s", None)
+        if not isinstance(elapsed, torch.Tensor) or elapsed.shape != (num_envs,):
+            elapsed = torch.zeros(num_envs, device=device, dtype=command.dtype)
+            self.env._zero_command_elapsed_s = elapsed
+        dt_s = float(
+            getattr(
+                self.env,
+                "step_dt",
+                getattr(self.env, "physics_dt", 0.02),
+            )
+        )
+        elapsed[zero_mask] += max(0.0, dt_s)
+        elapsed[~zero_mask] = 0.0
+        term_mgr = getattr(self.env, "termination_manager", None)
+        terminated = getattr(term_mgr, "terminated", None)
+        if isinstance(terminated, torch.Tensor) and terminated.shape == elapsed.shape:
+            elapsed[terminated.bool()] = 0.0
+        active = zero_mask & (elapsed >= float(grace_period_s))
+        if not bool(active.any()):
+            return torch.zeros(num_envs, device=device, dtype=command.dtype)
+
+        lin_vel = asset.data.root_lin_vel_b
+        ang_vel = asset.data.root_ang_vel_b
+        action_manager = getattr(self.env, "action_manager", None)
+        current_action = getattr(action_manager, "action", None)
+        previous_action = getattr(action_manager, "prev_action", None)
+        if not isinstance(current_action, torch.Tensor) or not isinstance(previous_action, torch.Tensor):
+            action_delta = torch.zeros(num_envs, device=device, dtype=command.dtype)
+            action_second_delta = action_delta
+        else:
+            previous_previous = getattr(self.env, "_zero_stability_previous_action", None)
+            if (
+                not isinstance(previous_previous, torch.Tensor)
+                or previous_previous.shape != previous_action.shape
+            ):
+                previous_previous = previous_action.clone()
+            action_delta = self._zero_stability_huber(
+                current_action - previous_action, 0.25
+            )
+            action_second_delta = self._zero_stability_huber(
+                current_action - 2.0 * previous_action + previous_previous, 0.25
+            )
+            self.env._zero_stability_previous_action = previous_action.clone()
+
+        penalty = (
+            self._zero_stability_huber(lin_vel[:, :2], 0.05)
+            + 0.5 * self._zero_stability_huber(lin_vel[:, 2], 0.03)
+            + 0.5 * self._zero_stability_huber(ang_vel[:, :2], 0.10)
+            + 0.25 * self._zero_stability_huber(ang_vel[:, 2], 0.10)
+            + 0.10 * action_delta
+            + 0.05 * action_second_delta
+        )
+        return torch.where(active, penalty, torch.zeros_like(penalty))
+
     def _reward_flat_orientation(self):
         asset = self._get_robot_asset()
         return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
@@ -38,7 +120,9 @@ class RewardProcess(RewardProcessBase):
         first_contact = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids] == 0.0
         last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
         reward = torch.sum((last_air_time - threshold) * first_contact, dim=1)
-        is_moving = torch.norm(self.env.command_manager.get_command(command_name)[:, :2], dim=1) > 0.1
+        is_moving = torch.linalg.vector_norm(
+            self.env.command_manager.get_command(command_name)[:, :3], dim=1
+        ) > 0.1
         return reward * is_moving.float()
 
     def _reward_air_time_variance_penalty(self):
@@ -85,7 +169,13 @@ class RewardProcess(RewardProcessBase):
         contact = (air_time == 0.0).float()
         front_sync = contact[:, 0] * contact[:, 1] + (1 - contact[:, 0]) * (1 - contact[:, 1])
         back_sync = contact[:, 2] * contact[:, 3] + (1 - contact[:, 2]) * (1 - contact[:, 3])
-        return front_sync * back_sync
+        command = self.env.command_manager.get_command("base_velocity")
+        moving = torch.linalg.vector_norm(command[:, :3], dim=1) > 0.1
+        return torch.where(
+            moving,
+            front_sync * back_sync,
+            torch.zeros_like(front_sync),
+        )
 
     def _reward_feet_slide(self):
         sensor_cfg = self._get_foot_sensor_cfg()

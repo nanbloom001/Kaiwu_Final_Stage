@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-"""Anchor R2 recurrent visual PPO for the frozen Standard visual baseline.
+"""Recurrent visual PPO for the frozen Standard visual baseline.
 
-当前活动 schedule 是 ``visual_anchor_anneal_v2``（四小时四阶段 anchor 退火），
-父模型 ``visionfull-28401``。旧的 R1 三阶段 ``legacy_three_phase_v1`` 和 R3
-``visual_recovery_split_v1`` 作为显式分支保留以便恢复历史 checkpoint，但 Anchor R2
-必须走 ``visual_anchor_anneal_v2`` 显式分支，不依赖 fallback。
+``visual_anchor_anneal_v2`` is the Anchor R2 schedule.  The follow-up
+``visual_command_generalization_v1`` schedule keeps the final anchor weights
+fixed while the environment worker mixes commands before observation assembly.
 """
 
 from __future__ import annotations
@@ -39,12 +38,14 @@ SUPPORTED_SCHEDULE_MODES = (
     "anchor_anneal_v1",
     "visual_recovery_split_v1",
     "visual_anchor_anneal_v2",
+    "visual_command_generalization_v1",
 )
 
 # Fixed load_mode values used in the startup log (§6). Returned by
 # load_training_bundle to tell the Agent which of the three restore paths ran.
 LOAD_MODE_S0 = "s0"
 LOAD_MODE_ANCHOR_RESUME = "anchor_resume"
+LOAD_MODE_TRANSITION_RESUME = "transition_resume"
 LOAD_MODE_SCHEDULE_MIGRATION = "schedule_migration"
 
 # Legacy phase vocabulary kept for resume compatibility only.
@@ -83,6 +84,9 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         warning_only_safety: bool,
         max_anchor_action_mse: float,
         max_hard_termination_delta: float,
+        max_action_amplitude: float = 6.0,
+        command_anchor_action: float = 0.35,
+        command_anchor_latent: float = 0.10,
         # Legacy R1 scalar schedule (kept for legacy_three_phase_v1 resume only).
         critic_only_hours: float = 0.0,
         actor_only_end_hours: float = 0.0,
@@ -121,6 +125,9 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         self.warning_only_safety = bool(warning_only_safety)
         self.max_anchor_action_mse = float(max_anchor_action_mse)
         self.max_hard_termination_delta = float(max_hard_termination_delta)
+        self.max_action_amplitude = float(max_action_amplitude)
+        self.command_anchor_action = float(command_anchor_action)
+        self.command_anchor_latent = float(command_anchor_latent)
 
         # Legacy scalar schedule (used only when schedule_mode resolves to the
         # legacy branch; Anchor R2 ignores these).
@@ -137,7 +144,11 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         self.anchor_session_elapsed_hours = 0.0
         self.elapsed_training_hours = 0.0
         self.current_iteration = 0
-        self.current_phase = "anchorcritic"
+        self.current_phase = (
+            "commandbase"
+            if self.schedule_mode == "visual_command_generalization_v1"
+            else "anchorcritic"
+        )
         self.action_anchor_weight = 0.0
         self.latent_anchor_weight_current = 0.0
         # Anchor R2 is warning-only: violations never pause actor updates or
@@ -165,8 +176,8 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             anchor_phase_labels=anchor_phase_labels,
             anchor_phase_end_hours=anchor_phase_end_hours,
         )
-        # _configure_command_schedule fixes target_probability=0 for Anchor R2
-        # (no progressive command data required).
+        # Configure command metadata. Actual source/target ownership belongs to
+        # the worker-side CommandSchedule and is not restored from checkpoints.
         self._configure_command_schedule()
         # Initial phase/weights derived from session clock = 0.
         self.current_phase = self._phase_for_elapsed(self.anchor_session_elapsed_hours)
@@ -221,6 +232,13 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 f"Unsupported schedule_mode={self.schedule_mode!r}; "
                 f"expected one of {SUPPORTED_SCHEDULE_MODES}"
             )
+        if self.schedule_mode == "visual_command_generalization_v1":
+            self.anchor_schedule_hours = None
+            self.action_anchor_schedule = [self.command_anchor_action]
+            self.latent_anchor_schedule = [self.command_anchor_latent]
+            self.anchor_phase_labels = ["commandbase", "commandblend", "commandfull"]
+            self.anchor_phase_end_hours = [0.5, 3.0]
+            return
         # Anchor R2: array-driven schedule is mandatory.
         if self.schedule_mode == "visual_anchor_anneal_v2":
             if anchor_schedule_hours is None:
@@ -315,6 +333,9 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             # Historical R3 behavior retained for resume compatibility.
             self.command_target_probability = 0.0
             return
+        if self.schedule_mode == "visual_command_generalization_v1":
+            self.command_target_probability = 0.0
+            return
         self.command_target_probability = 0.0
 
     def _phase_for_elapsed(self, elapsed_h: float) -> str:
@@ -327,6 +348,12 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             [h3, +inf) = anchorfinal
         Legacy modes keep the scalar-breakpoint rlcritic/rlactor/rlfull mapping.
         """
+        if self.schedule_mode == "visual_command_generalization_v1":
+            if elapsed_h < 0.5:
+                return "commandbase"
+            if elapsed_h < 3.0:
+                return "commandblend"
+            return "commandfull"
         if self.schedule_mode == "visual_anchor_anneal_v2":
             ends = self.anchor_phase_end_hours
             if elapsed_h < ends[0]:
@@ -350,6 +377,12 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         ``t >= last knot`` clamps to the final value (no extrapolation, no
         fallback to legacy phases).
         """
+        if self.schedule_mode == "visual_command_generalization_v1":
+            return (
+                self.command_anchor_action
+                if kind == "action"
+                else self.command_anchor_latent
+            )
         if self.schedule_mode == "visual_anchor_anneal_v2":
             hours = self.anchor_schedule_hours
             values = (
@@ -399,7 +432,9 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             anchorfinal:   Actor/std=true,  RNN/output=true,  CNN=false, Critic=true
         CNN is permanently frozen regardless of phase.
         """
-        if self.schedule_mode == "visual_anchor_anneal_v2":
+        if self.schedule_mode == "visual_command_generalization_v1":
+            actor_enabled, recurrent_enabled = True, True
+        elif self.schedule_mode == "visual_anchor_anneal_v2":
             table = {
                 "anchorcritic": (False, False),
                 "anchoractor": (True, False),
@@ -569,6 +604,15 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 f"anchor_action_mse={self.last_anchor_action_mse:.4f}>"
                 f"{self.max_anchor_action_mse:.4f}"
             )
+        if self.storage is not None and self.storage.actions.numel() > 0:
+            action_amplitude = float(self.storage.actions.detach().abs().max().item())
+            if not np.isfinite(action_amplitude):
+                reasons.append("action_amplitude=nonfinite")
+            elif action_amplitude > self.max_action_amplitude:
+                reasons.append(
+                    f"action_amplitude={action_amplitude:.4f}>"
+                    f"{self.max_action_amplitude:.4f}"
+                )
         if reasons:
             self.last_diagnostic_save_requested = True
             if self.warning_only_safety:
@@ -595,9 +639,8 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         elapsed_h = (
             self.anchor_session_elapsed_hours if elapsed_h is None else float(elapsed_h)
         )
-        # elapsed_training_hours records cumulative training time only; the
-        # anchor session clock drives Anchor R2 phase decisions (§4.3).
-        self.elapsed_training_hours = elapsed_h
+        # elapsed_training_hours is maintained by the workflow as a cumulative
+        # record. Only the anchor session clock drives phase decisions.
         self.anchor_session_elapsed_hours = elapsed_h
         self.current_phase = self._phase_for_elapsed(elapsed_h)
         self.action_anchor_weight = self._anchor_weight_for_elapsed(
@@ -639,6 +682,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 masks_batch,
                 anchor_actions_batch,
                 anchor_latents_batch,
+                anchor_weights_batch,
             ) = sample
 
             self.actor_critic.update_distribution(
@@ -664,13 +708,28 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             value_loss = self._compute_value_loss(
                 values, returns_batch, target_values_batch
             )
-            action_anchor_loss = F.smooth_l1_loss(
-                action_mean, anchor_actions_batch
+            anchor_weights_batch = anchor_weights_batch.to(
+                device=action_mean.device, dtype=action_mean.dtype
             )
-            latent_anchor_loss = F.smooth_l1_loss(
-                latent, anchor_latents_batch
+            weight_sum = anchor_weights_batch.sum().clamp_min(1.0)
+            action_anchor_per_sample = F.smooth_l1_loss(
+                action_mean, anchor_actions_batch, reduction="none"
+            ).mean(dim=-1, keepdim=True)
+            latent_anchor_per_sample = F.smooth_l1_loss(
+                latent, anchor_latents_batch, reduction="none"
+            ).mean(dim=-1, keepdim=True)
+            action_mse_per_sample = (
+                (action_mean - anchor_actions_batch).pow(2).mean(dim=-1, keepdim=True)
             )
-            anchor_action_mse = F.mse_loss(action_mean, anchor_actions_batch)
+            action_anchor_loss = (
+                action_anchor_per_sample * anchor_weights_batch
+            ).sum() / weight_sum
+            latent_anchor_loss = (
+                latent_anchor_per_sample * anchor_weights_batch
+            ).sum() / weight_sum
+            anchor_action_mse = (
+                action_mse_per_sample * anchor_weights_batch
+            ).sum() / weight_sum
 
             loss = (
                 policy_loss
@@ -744,8 +803,12 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 "latent_anchor_weight": self.latent_anchor_weight_current,
                 "actor_updates_paused": float(self.actor_updates_paused),
                 "anchor_schedule_frozen": float(self.anchor_schedule_frozen),
-                "elapsed_training_hours": elapsed_h,
+                "elapsed_training_hours": self.elapsed_training_hours,
                 "applied_updates": float(applied_updates),
+                "anchor_weight_mean": float(
+                    self.storage.anchor_weights[: self.storage.step].mean().item()
+                    if self.storage.step else 1.0
+                ),
             }
         )
         self.last_anchor_action_mse = metrics["anchor_action_mse"]
@@ -853,6 +916,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             "optimizers": {"visual_ppo": self.optimizer.state_dict()},
             "training_state": {
                 "current_iteration": self.current_iteration,
+                "iteration_semantics": "completed_outer_iterations_v1",
                 # Anchor session clock drives Anchor R2 phase decisions (§4.3).
                 # anchor_elapsed_hours is a legacy-reader alias with the same
                 # value; loader prefers anchor_session_elapsed_hours.
@@ -863,6 +927,9 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 "schedule_mode": self.schedule_mode,
                 "run_name": self.run_name,
                 "source_parent_model_id": self.source_parent_model_id,
+                "transition_parent_platform_model_id": (
+                    self.loaded_platform_model_id
+                ),
                 "action_anchor_weight": self.action_anchor_weight,
                 "latent_anchor_weight": self.latent_anchor_weight_current,
                 "trainable_modules": self.trainable_modules_snapshot(),
@@ -870,15 +937,22 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 "anchor_schedule_frozen": self.anchor_schedule_frozen,
                 "pause_reason": self.pause_reason,
                 "warning_only_safety": self.warning_only_safety,
+                "max_action_amplitude": self.max_action_amplitude,
                 "baseline_hard_termination_sum": self.baseline_hard_termination_sum,
                 "baseline_hard_termination_windows": self.baseline_hard_termination_windows,
                 "baseline_hard_termination_rate": self.baseline_hard_termination_rate,
                 "last_anchor_action_mse": self.last_anchor_action_mse,
+                "command_session_elapsed_hours": self.anchor_session_elapsed_hours,
+                "command_runtime_owner": "worker_observation_bridge_v1",
+                "command_resume_policy": "new_task_restart",
                 "rng_state": self._capture_rng_state(),
             },
             "lineage": {
                 "s0_checkpoint_sha256": self.s0_checkpoint_sha256,
                 "source_parent_model_id": self.source_parent_model_id,
+                "transition_parent_platform_model_id": (
+                    self.loaded_platform_model_id
+                ),
             },
             "lstm_reset_contract": {
                 "live_hidden_saved": False,
@@ -898,6 +972,57 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         if not os.path.isfile(path) or os.path.getsize(path) <= 0:
             raise IOError(f"Visual PPO checkpoint write failed: {path}")
         return self._sha256(path)
+
+    def load_eval_bundle(
+        self,
+        path: str,
+        *,
+        expected_spec: dict[str, int],
+        num_envs: int,
+    ) -> dict[str, Any]:
+        """Load only the deploy-shaped visual student for evaluation."""
+        checkpoint = torch.load(path, weights_only=False, map_location=self.device)
+        if not is_kaiwu_train_bundle(checkpoint):
+            raise ValueError(f"Expected kaiwu_train_v1 checkpoint: {path}")
+        validate_low_level_spec(checkpoint, expected_spec)
+        modules = checkpoint.get("modules", {})
+        vision_state = modules.get("vision_encoder", {}).get("state_dict")
+        actor_state = modules.get("low_level", {}).get("actor_state_dict")
+        if not isinstance(vision_state, dict) or not isinstance(actor_state, dict):
+            raise KeyError(
+                "VisualPPO eval requires modules.vision_encoder.state_dict "
+                "and modules.low_level.actor_state_dict"
+            )
+        self.actor_critic.vision_encoder.load_state_dict(vision_state, strict=True)
+        self.actor_critic.actor.load_state_dict(actor_state, strict=True)
+        std_value = modules.get("action_distribution", {}).get("std")
+        if std_value is not None and hasattr(self.actor_critic, "std"):
+            self.actor_critic.std.data.copy_(std_value.to(self.device))
+        self.actor_critic.eval()
+        self.actor_critic.vision_encoder.reset_hidden_state(num_envs, self.device)
+        self.loaded_platform_model_id = checkpoint.get("platform_model_id")
+        state = checkpoint.get("training_state", {})
+        self.loaded_schedule_mode = (
+            state.get("schedule_mode") if isinstance(state, dict) else None
+        )
+        lineage = checkpoint.get("lineage", {})
+        if not isinstance(lineage, dict):
+            lineage = {}
+        checksum = self._sha256(path)
+        self.s0_checkpoint_sha256 = checksum
+        return {
+            "format": checkpoint.get("format"),
+            "schema_version": checkpoint.get("schema_version"),
+            "platform_model_id": self.loaded_platform_model_id,
+            "schedule_mode": self.loaded_schedule_mode,
+            "sha256": checksum,
+            "file_size_bytes": os.path.getsize(path),
+            "lineage_source_parent_model_id": lineage.get("source_parent_model_id"),
+            "lineage_transition_parent_platform_model_id": lineage.get(
+                "transition_parent_platform_model_id"
+            ),
+            "uses_height_scan_at_inference": False,
+        }
 
     def load_training_bundle(
         self,
@@ -957,7 +1082,13 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         self.anchor_encoder.load_state_dict(anchor_vision, strict=True)
         self.anchor_actor.load_state_dict(anchor_actor, strict=True)
 
-        if same_mode:
+        transition_resume = (
+            self.schedule_mode == "visual_command_generalization_v1"
+            and is_visual_ppo_bundle
+            and saved_schedule_mode == "visual_anchor_anneal_v2"
+        )
+
+        if same_mode or transition_resume:
             # Full resume: restore critic, std, optimizer, anchor clock, RNG.
             critic_state = modules.get("critic", {}).get("state_dict")
             if not isinstance(critic_state, dict):
@@ -972,12 +1103,15 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             self.optimizer.load_state_dict(optimizer_state)
             state = checkpoint.get("training_state", {})
             self.current_iteration = int(state.get("current_iteration", 0))
-            # Clock read priority (§5.4): anchor_session_elapsed_hours
-            # -> anchor_elapsed_hours (legacy alias) -> 0.0.
-            clock = state.get("anchor_session_elapsed_hours")
-            if clock is None:
-                clock = state.get("anchor_elapsed_hours")
-            self.anchor_session_elapsed_hours = float(clock or 0.0)
+            if self.schedule_mode == "visual_command_generalization_v1":
+                # Preserve the learned PPO state but start a fresh command
+                # session for every independently configured platform task.
+                self.anchor_session_elapsed_hours = 0.0
+            else:
+                clock = state.get("anchor_session_elapsed_hours")
+                if clock is None:
+                    clock = state.get("anchor_elapsed_hours")
+                self.anchor_session_elapsed_hours = float(clock or 0.0)
             self.elapsed_training_hours = float(
                 state.get("elapsed_training_hours", self.anchor_session_elapsed_hours)
             )
@@ -1007,7 +1141,8 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             self.last_anchor_action_mse = float(
                 state.get("last_anchor_action_mse", 0.0)
             )
-            # RNG: only same-mode resume restores the saved RNG (§5.4 N1).
+            # Model/optimizer RNG resumes in aisrv. Worker command state is
+            # intentionally task-local and starts from t=0 in the new worker.
             self._restore_rng_state(state.get("rng_state"), self.logger)
             self.s0_checkpoint_sha256 = str(
                 checkpoint.get("lineage", {}).get(
@@ -1017,13 +1152,18 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             self.loaded_platform_model_id = checkpoint.get("platform_model_id")
             self.loaded_schedule_mode = saved_schedule_mode
             self.resume_loaded = True
-            load_mode = LOAD_MODE_ANCHOR_RESUME
+            load_mode = (
+                LOAD_MODE_TRANSITION_RESUME
+                if transition_resume
+                else LOAD_MODE_ANCHOR_RESUME
+            )
         else:
             # S0 first-load or schedule migration: fresh critic/optimizer/clock.
             # RNG is reinitialized from env_seed (§5.4 N1). S0 has no independent
             # RNG state; frozen S0 only runs eval() and consumes no RNG.
             self._reseed(env_seed)
             self.anchor_session_elapsed_hours = 0.0
+            self.elapsed_training_hours = 0.0
             self.actor_updates_paused = False
             self.anchor_schedule_frozen = False
             self.pause_reason = None
