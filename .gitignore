@@ -13,10 +13,9 @@ kaiwu_ide_crack/
 /代码存档/
 /分析记录/
 
-# Historical source snapshots stay versioned, but large/generated artifacts do not.
-/archive/代码存档/**/*.pkl
-/archive/代码存档/**/*.onnx
-/archive/代码存档/**/*.zip
+# Local historical snapshots and downloaded model packages are not active source.
+# Curated analysis and provenance records remain versioned under shared/分析记录/.
+/archive/代码存档/
 
 # Local evaluation recordings are evidence artifacts, not source files.
 /shared/视频存档/
