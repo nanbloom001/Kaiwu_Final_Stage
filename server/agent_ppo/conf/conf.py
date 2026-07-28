@@ -330,6 +330,7 @@ class NavDaggerConfig(StageConfig):
     log_interval = 10
     num_steps_per_env = 160          # 160 低层帧 = 16 nav tick = 一个 TBPTT 段
     tbptt_sequence_length = 16
+    platform_archive_interval_minutes = 5.0
     lr_scheduler_iterations = 14000
     ramp_start_h = 0.50
     ramp_end_h = 4.00

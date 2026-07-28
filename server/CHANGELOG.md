@@ -53,6 +53,23 @@
   low-level Actor 则在有限值检查后继续以 `strict=True` 加载。真正 Nav 高层、伪造
   adapter-only 标记或包含额外动作策略字段的包仍拒绝静默降级。
   checkpoint schema、训练状态、Standard/Track low-level-only 续训和候选文件名均不改变。
+- **[Nav 运行中平台归档恢复]** 平台任务 `234786` 的最终模型
+  `navbc-52313` 证明现有 checkpoint 名称、三模块内容和最终归档链均有效；运行中的
+  `/data/ckpt` 文件不会单独生成前端所需的 `id_list`、`kaiwu.json` 和 ZIP。Nav workflow
+  因此恢复历史成功阶段使用的无参数 `agent.save_model()`，在完整 TBPTT iteration 边界每
+  五分钟请求一次用户可见平台归档，路径与数字 ID 仍只由平台 wrapper 注入；正常结束和
+  SIGTERM final save 保持独立幂等。`dump_model_freq=3600` 继续只负责内部运行 checkpoint。
+  自动 dump 诊断同时改为计入已加载模型 ID，父 `34728` 的首个真实边界现在正确显示为
+  1272 次 callback 后的 `36000`，不再在会话 callback=3600 输出假边界。平台任务
+  `234805` 已完成运行中端到端验证：无参数周期保存获得
+  `/data/user_ckpt_dir/...navbc-39528.pkl`，24 秒后生成平台 ZIP，且模型 `39528`
+  已在网页模型列表可见；紧接着的 `/data/ckpt/...navbc-39600.pkl` 仅是独立的
+  运行恢复 checkpoint。
+
+- **[Nav 监控面板名称兼容性]** 将三个控制链面板的中文显示名从含 `/` 的
+  `requested/effective`、`worker/exec` 表述改为平台字符白名单内的纯中文短名称。
+  英文面板 ID 和指标 key 保持不变，避免 monitor builder 配置校验失败后整份 Track/Nav
+  自定义面板被跳过。
 
 - **[工作区归档与平台 base env 复原]** 活动树中的
   `isaac_env/base_env.py` 已恢复为平台原始版本，SHA256 为
@@ -66,7 +83,9 @@
   checkpoint 序列化、写入或非空校验失败，必须终止训练，避免长训在无可恢复
   模型的情况下继续。优雅退出的 final save 仍保持 best-effort，不覆盖平台原始
   退出原因。IDE 同步服务的 workspace 校验改为真实路径校验，阻止符号链接
-  越界和通过别名绕过 `isaac_env/base_env.py` 保护。根目录同时忽略本地
+  越界和通过别名绕过 `isaac_env/base_env.py` 保护；同时显式兼容平台将
+  `agent_diy`、`agent_ppo`、`conf` 映射到 `/workspace/code` 的固定目录结构，映射目录
+  内再次越界的符号链接仍会被拒绝。根目录同时忽略本地
   `.worktrees/` 与 `.zcode/`，避免嵌套工作树和工具状态被误暂存。
 
 - **[hier-nav 控制链可观测性]** Nav DAgger 新增 student/oracle/requested/

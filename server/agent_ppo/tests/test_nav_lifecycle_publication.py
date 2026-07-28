@@ -78,6 +78,7 @@ class _FakeAlgorithm:
         self.ramp_end_h = 4.0
         self.ramp_clock_h = 0.0
         self.ramp_probability = 0.0
+        self.loaded_platform_model_id = "34728"
         self.soft_stay_frozen = False
         self.soft_stay_reason = ""
         self.training_status = "running"
@@ -164,6 +165,7 @@ class _FakeAgent:
         self.learn_successes = 0
         self.save_calls = 0
         self.fail_save = fail_save
+        self.save_path_category = "final_platform_archive_candidate"
 
     def learn(self, list_sample_data=None):
         self.learn_attempts += 1
@@ -179,6 +181,9 @@ class _FakeAgent:
         if self.fail_save:
             raise RuntimeError("synthetic save failure")
         self.save_calls += 1
+        self._nav_last_save_path = "/data/user_ckpt_dir/model.ckpt-navbc-1.pkl"
+        self._nav_last_save_path_category = self.save_path_category
+        self._nav_last_save_platform_id = "1"
 
 
 def _nav_conf(max_iterations):
@@ -197,6 +202,7 @@ def _nav_conf(max_iterations):
             "lr_scheduler_iterations": 100,
             "ramp_start_h": 0.5,
             "ramp_end_h": 4.0,
+            "platform_archive_interval_minutes": 5.0,
         }
     }
 
@@ -210,12 +216,14 @@ class TestNavLifecyclePublication(unittest.TestCase):
         fail_learn_attempt=None,
         fail_checkpoint_attempt=None,
         dump_model_freq=3600,
+        base_platform_model_id="34728",
     ):
         agent = _FakeAgent(
             max_iterations,
             fail_learn_attempt,
             fail_checkpoint_attempt,
         )
+        agent.algorithm.loaded_platform_model_id = base_platform_model_id
         env = _FakeEnv(fail_step=fail_step)
         logger = _Logger()
         monitor = _Monitor()
@@ -326,7 +334,10 @@ class TestNavLifecyclePublication(unittest.TestCase):
         )
 
     def test_dump_boundary_uses_successful_callback_count(self):
-        agent, _env, logger, monitor = self._run(dump_model_freq=160)
+        agent, _env, logger, monitor = self._run(
+            dump_model_freq=160,
+            base_platform_model_id="0",
+        )
         self.assertEqual(agent.learn_successes, 160)
         metrics = next(iter(monitor.rows[-1].values()))
         self.assertEqual(metrics["callbacks_until_next_dump"], 0)
@@ -343,6 +354,85 @@ class TestNavLifecyclePublication(unittest.TestCase):
         self.assertEqual(workflow_module._callbacks_until_next_dump(3600, 3600), 0)
         self.assertEqual(workflow_module._callbacks_until_next_dump(3601, 3600), 3599)
         self.assertEqual(workflow_module._callbacks_until_next_dump(7200, 3600), 0)
+
+    def test_callbacks_until_next_dump_includes_loaded_platform_id(self):
+        base_id = 34728
+        self.assertEqual(
+            workflow_module._callbacks_until_next_dump(0, 3600, base_id), 1272
+        )
+        self.assertEqual(
+            workflow_module._callbacks_until_next_dump(1271, 3600, base_id), 1
+        )
+        self.assertEqual(
+            workflow_module._callbacks_until_next_dump(1272, 3600, base_id), 0
+        )
+        self.assertEqual(
+            workflow_module._callbacks_until_next_dump(1273, 3600, base_id), 3599
+        )
+
+    def test_periodic_archive_due_uses_wall_clock_boundary(self):
+        self.assertFalse(workflow_module._periodic_archive_due(299.99, 0.0, 300.0))
+        self.assertTrue(workflow_module._periodic_archive_due(300.0, 0.0, 300.0))
+
+    def test_periodic_archive_does_not_mark_final_save_done(self):
+        agent = _FakeAgent()
+        logger = _Logger()
+        agent._nav_final_save_done = False
+        agent._nav_periodic_archive_requests = 0
+
+        workflow_module._save_periodic_platform_archive(
+            agent, logger, completed_iteration=23
+        )
+
+        self.assertEqual(agent.save_calls, 1)
+        self.assertEqual(agent._nav_periodic_archive_requests, 1)
+        self.assertFalse(agent._nav_final_save_done)
+        self.assertTrue(
+            any(
+                level == "info" and "periodic platform archive request complete" in message
+                for level, message in logger.messages
+            )
+        )
+        self.assertFalse(any(level == "error" for level, _message in logger.messages))
+
+    def test_periodic_archive_warns_when_platform_injects_running_path(self):
+        agent = _FakeAgent()
+        agent.save_path_category = "running_checkpoint"
+        logger = _Logger()
+
+        workflow_module._save_periodic_platform_archive(
+            agent, logger, completed_iteration=23
+        )
+
+        self.assertEqual(agent.save_calls, 1)
+        self.assertTrue(
+            any(
+                level == "error" and "did not receive the user archive path" in message
+                for level, message in logger.messages
+            )
+        )
+
+    def test_periodic_archive_failure_stops_training(self):
+        agent = _FakeAgent(fail_save=True)
+        logger = _Logger()
+
+        with self.assertRaisesRegex(
+            CheckpointSaveError, "periodic platform archive request failed"
+        ):
+            workflow_module._save_periodic_platform_archive(
+                agent, logger, completed_iteration=23
+            )
+
+    def test_workflow_requests_periodic_archive_only_at_iteration_boundary(self):
+        with mock.patch.object(
+            workflow_module, "_periodic_archive_due", return_value=True
+        ):
+            agent, _env, _logger, _monitor = self._run(max_iterations=2)
+
+        self.assertEqual(agent.algorithm.finish_update_calls, 2)
+        self.assertEqual(agent._nav_periodic_archive_requests, 2)
+        self.assertEqual(agent.save_calls, 3)  # two periodic archives + final archive
+        self.assertTrue(agent._nav_final_save_done)
 
     def test_final_checkpoint_is_idempotent_and_records_reason(self):
         agent = _FakeAgent()

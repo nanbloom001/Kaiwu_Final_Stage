@@ -49,10 +49,11 @@ reverb_error_buffer = 8
 # Learner训练时样本批处理大小
 train_batch_size = 2048
 
-# Model-pool publication frequency in successful BaseAgent.learn() callbacks.
-# P1.5 also performs explicit two-minute/ten-minute platform archive requests.
-# This lifecycle fallback remains deliberately sparse so it cannot dominate the
-# wall-clock checkpoint cadence.
+# Internal running-checkpoint cadence in successful BaseAgent.learn() callbacks.
+# These files are written under /data/ckpt for runtime recovery/model sync and
+# are not evidence of a user-visible training artifact. P1.5 and Nav separately
+# request user-visible platform archives on ten- and five-minute wall clocks,
+# respectively, without supplying a path or model ID.
 dump_model_freq = 3600
 
 # The Learner pushes model updates, and the frequency at which Actors fetch the model (in minutes).
