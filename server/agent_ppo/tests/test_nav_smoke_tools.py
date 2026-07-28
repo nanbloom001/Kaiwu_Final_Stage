@@ -100,10 +100,38 @@ class TestNavFullSmokeLauncher(unittest.TestCase):
             paths["pid"].write_text("4321\n", encoding="utf-8")
             args = mock.Mock(runtime_dir=directory, grace_seconds=0.0)
             with mock.patch.object(nav_full_smoke, "_alive", return_value=True), mock.patch.object(
+                nav_full_smoke, "_owned_smoke_pids", return_value=[]
+            ), mock.patch.object(
                 nav_full_smoke, "_owned_smoke_process", return_value=False
             ), mock.patch.object(nav_full_smoke.os, "killpg") as killpg:
                 self.assertEqual(nav_full_smoke._stop(args), 2)
             killpg.assert_not_called()
+
+    def test_stop_cleans_owned_child_groups_after_parent_pid_exits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = nav_full_smoke._paths(Path(directory))
+            paths["pid"].write_text("4321\n", encoding="utf-8")
+            args = mock.Mock(runtime_dir=directory, grace_seconds=0.0)
+            with mock.patch.object(
+                nav_full_smoke,
+                "_owned_smoke_pids",
+                side_effect=[[5001, 5002], [5001, 5002], [5001, 5002]],
+            ), mock.patch.object(
+                nav_full_smoke.os,
+                "getpgid",
+                side_effect=lambda pid: {5001: 5000, 5002: 6000}[pid],
+            ), mock.patch.object(nav_full_smoke.os, "killpg") as killpg:
+                self.assertEqual(nav_full_smoke._stop(args), 0)
+            self.assertEqual(killpg.call_count, 4)
+            killpg.assert_has_calls(
+                [
+                    mock.call(5000, nav_full_smoke.signal.SIGTERM),
+                    mock.call(6000, nav_full_smoke.signal.SIGTERM),
+                    mock.call(5000, nav_full_smoke.signal.SIGKILL),
+                    mock.call(6000, nav_full_smoke.signal.SIGKILL),
+                ],
+                any_order=True,
+            )
 
     def test_start_uses_detached_process_group_without_editing_toml(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -119,6 +147,7 @@ class TestNavFullSmokeLauncher(unittest.TestCase):
                 self.assertEqual(nav_full_smoke._start(args), 0)
             kwargs = popen.call_args.kwargs
             self.assertTrue(kwargs["start_new_session"])
+            self.assertEqual(kwargs["cwd"], str(Path.cwd()))
             command = popen.call_args.args[0]
             self.assertIn("_run", command)
             self.assertIn("--num-envs", command)

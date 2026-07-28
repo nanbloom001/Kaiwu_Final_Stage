@@ -30,6 +30,8 @@ except ModuleNotFoundError:
 
 SERVER = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVER))
+import agent_ppo.tests._nav_test_stubs  # noqa: E402,F401
+
 CONFIG = (
     SERVER
     / "agent_ppo"

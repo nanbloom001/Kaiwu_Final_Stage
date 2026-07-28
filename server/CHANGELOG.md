@@ -4,6 +4,56 @@
 
 ## [未发布]
 
+- **[P1.5 连续指令扩域与响应器联合训练]** 新增 `p15resp8h` / `p15_response`：
+  从 `commandfull-34728` 在 Standard + Camera、128 环境继续训练，CNN 冻结，前 7 小时
+  联合更新低层 Actor/LSTM/Critic 与独立 `ResponseAdapter`，最后 1 小时只校准
+  Adapter。worker 以 5 Hz 独立采样 `[vx,wz]` 目标、50 Hz slew 写入 live command；
+  课程按 0.5/1.25/2/7 小时墙钟扩域并持续回放父指令域。跨进程 privileged wire 为
+  `critic316 | response_aux30 = 346`，aisrv 在进入 Critic/PPO storage 前立即拆分，
+  Actor observation 保持 57901、Critic/storage 保持 316。新增版本化
+  `FeedbackEmulator`、future-label buffer、四足逐腿统计和三项轻量步态保持 penalty；
+  前两小时把已注册的 physics-material event 固定为 `[1.0,1.0]`，之后仅将摩擦扩为
+  `[0.6,1.2]`，质量、push 和强增强保持关闭。
+  checkpoint 升级为 `kaiwu_train_v1/schema_version=2`，同时保存低层、adapter-only
+  高层组件、双 optimizer/scheduler/RNG、独立训练计数、bounded warm-resume buffer 与
+  实际 command/feedback 配置 digest，并记录 `FeedbackEmulator` 实现 SHA256；fresh/resume
+  均从第 10 分钟开始按 10 分钟墙钟周期保存，课程边界不再插入额外模型。
+  预审修复后 rollout 调整为 80 帧，ResponseAdapter 使用 8 帧 burn-in、逐环境 reset mask
+  和同一 low-level version 序列；版本切换与进程 resume 都会清空未完成 future history，
+  已完成 records 可继续回放。短时反馈固定为 SportMode `vx/vy` + IMU `wz`，UWB 退出
+  0.2/0.6/1.0 秒输入；terrain 距离 curriculum 关闭并增加 level×command histogram。
+  capability15 改为显式 piecewise-union 编码。schema2 缺 scheduler/RNG 时不再冒充完整
+  resume，而是 warning-only 降级为 warm start；新增显式 low-level-only loader。
+  逐腿 air/swing 指标改用有效样本分母，family telemetry 分开报告重采样事件与按帧占用。
+  graceful final save 增加一次短重试，SIGTERM 会链式调用平台已有 handler 后进入幂等收尾。
+  开发容器 full-smoke 启动器保留调用时的 server 根目录，避免 IDE 中 `agent_ppo`
+  符号链接解析到 `/workspace/code` 后丢失项目内 `kaiwudrl` 与 `tools`。
+  容器 smoke 进一步发现 TOML 的 80 帧 rollout 未被 Agent 采用：运行时仍继承 StageConfig
+  的 48 帧，导致 51 帧 future-label history 在每次低层更新时被清空。现已在
+  `P15ResponseConfig` 固定 80 帧，并增加 append/history/version-reset/有效 horizon 遥测。
+  full-smoke 收尾改为按 `--runtime-dir` 扫描 `/proc` 中的所有已证明子进程组，
+  避免框架另建进程组后父 PID 先退出、工具却误报已完全停止；该逻辑已在开发容器以
+  两个独立临时进程组完成 `/proc` 集成验证，停止后无匹配进程残留，支持回归集
+  `165 passed`。
+  首次平台任务在 256 环境 reset 时于 ray-caster 初始化暴露 CUDA illegal-memory；P1.5
+  的 80 帧 rollout 使批量帧预算从父阶段 `256x48=12288` 增至 `256x80=20480`。
+  生产环境数因此固定为 128，使预算降至 `128x80=10240`，同时保留 future-label、
+  burn-in 和 TBPTT 合同；不修改平台 `base_env.py`、scanner、相机或地形。
+  正式训练不设置表现门禁；非有限 minibatch、command 写入失败和保存失败按既定宽松策略
+  跳过/告警/重试，不主动提前结束八小时任务；iteration-cap 最终保存失败也会在 60 秒后
+  再试一次。真实 34728 已在开发容器完成 8 环境 GPU rollout、低层 PPO、
+  Adapter 更新、schema2 保存与完整进程 resume；平台短 smoke 与八小时长训待执行。
+
+- **[P1.5 adapter-only Camera 评估修复]** P1.5 schema2 将辅助
+  `ResponseAdapter` 保存为 `modules.high_level.component_status="adapter_only"`，此前
+  Camera 评估兼容入口把任何 `modules.high_level` 都误判为 hier-nav 动作策略，导致
+  `responsecalib-37953` 在低层权重加载前硬停止。LBC-Loco Camera 路径现在要求
+  `stage_type=p15_response_adapter`、精确的 adapter-only 容器结构和
+  `CommandResponseAdapter(32,64,16)` spec；辅助 Adapter 权重本身不加载，视觉编码器与
+  low-level Actor 则在有限值检查后继续以 `strict=True` 加载。真正 Nav 高层、伪造
+  adapter-only 标记或包含额外动作策略字段的包仍拒绝静默降级。
+  checkpoint schema、训练状态、Standard/Track low-level-only 续训和候选文件名均不改变。
+
 - **[工作区归档与平台 base env 复原]** 活动树中的
   `isaac_env/base_env.py` 已恢复为平台原始版本，SHA256 为
   `75ebdaf6888e94262598a26db1586b2598cb474422e3382b6bba9e96ddbb6e67`；此前写在该

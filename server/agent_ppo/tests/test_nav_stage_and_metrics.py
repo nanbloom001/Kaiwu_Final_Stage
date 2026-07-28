@@ -17,6 +17,7 @@ from agent_ppo.conf.conf import (
     LBCLocoConfig,
     NavDaggerConfig,
     NavEvalConfig,
+    P15ResponseConfig,
     _configured_training_stage,
     _infer_stage_from_task_name,
 )
@@ -43,10 +44,16 @@ class _Logger:
 
 
 class TestNavStageSelection(unittest.TestCase):
-    def test_active_branch_bootstraps_worker_and_aisrv_to_nav(self):
-        self.assertIs(Config.CURRENT, NavDaggerConfig)
+    def test_active_branch_bootstraps_worker_and_aisrv_from_configure_app(self):
+        config_path = pathlib.Path(__file__).resolve().parents[2] / "conf" / "configure_app.toml"
+        policy_entry = toml.load(config_path)["app"]["policy_entry"]
+        expected = {
+            "nav_dagger": NavDaggerConfig,
+            "p15_response": P15ResponseConfig,
+        }[policy_entry]
+        self.assertIs(Config.CURRENT, expected)
 
-    def test_literal_stage_default_is_track_before_runtime_bootstrap(self):
+    def test_literal_stage_default_matches_active_branch(self):
         conf_path = pathlib.Path(__file__).resolve().parent.parent / "conf" / "conf.py"
         tree = ast.parse(conf_path.read_text(encoding="utf-8"))
         config_class = next(
@@ -64,7 +71,13 @@ class TestNavStageSelection(unittest.TestCase):
             )
         )
         self.assertIsInstance(current_assignment.value, ast.Name)
-        self.assertEqual(current_assignment.value.id, "NavDaggerConfig")
+        config_path = pathlib.Path(__file__).resolve().parents[2] / "conf" / "configure_app.toml"
+        policy_entry = toml.load(config_path)["app"]["policy_entry"]
+        expected_name = {
+            "nav_dagger": "NavDaggerConfig",
+            "p15_response": "P15ResponseConfig",
+        }[policy_entry]
+        self.assertEqual(current_assignment.value.id, expected_name)
 
     def test_training_bootstrap_selects_nav_before_stage_toml(self):
         logger = _Logger()
@@ -144,6 +157,9 @@ class TestNavStageSelection(unittest.TestCase):
             / "conf"
             / "monitor_builder.py"
         ).read_text(encoding="utf-8")
+        nav_panel_source = monitor_source.split("NAV_PANEL_SPECS = (", 1)[1].split(
+            "\n)\n\nORACLE_MODE_NAMES", 1
+        )[0]
         for metric in (
             "completed_count_track_l",
             "abnormal_count_track_l",
@@ -184,7 +200,7 @@ class TestNavStageSelection(unittest.TestCase):
             self.assertIn(f'f"{prefix}_token_{{name}}_ratio"', monitor_source)
         self.assertIn('f"oracle_mode_{name}_ratio"', monitor_source)
         self.assertNotIn("step_score_track_l", monitor_source)
-        self.assertNotIn("hard_termination_rate", monitor_source)
+        self.assertNotIn("hard_termination_rate", nav_panel_source)
         self.assertNotIn('name_en="value_loss"', monitor_source)
 
 

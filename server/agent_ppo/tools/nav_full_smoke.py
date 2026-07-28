@@ -57,21 +57,51 @@ def _alive(pid: int | None) -> bool:
         return False
 
 
-def _owned_smoke_process(pid: int | None) -> bool:
+def _proc_command(pid: int | None) -> tuple[str, ...]:
     if not _alive(pid):
-        return False
+        return ()
     cmdline_path = Path(f"/proc/{pid}/cmdline")
     if not cmdline_path.exists():
         # The launcher is intended for the Linux Kaiwu container. Refuse
         # ownership-sensitive operations when procfs cannot prove identity.
-        return False
+        return ()
     try:
-        command = cmdline_path.read_bytes().replace(b"\x00", b" ").decode(
-            "utf-8", errors="replace"
+        return tuple(
+            part.decode("utf-8", errors="replace")
+            for part in cmdline_path.read_bytes().split(b"\x00")
+            if part
         )
     except OSError:
+        return ()
+
+
+def _owned_smoke_process(pid: int | None, runtime_dir: Path | None = None) -> bool:
+    command = _proc_command(pid)
+    if not command:
         return False
-    return "nav_full_smoke.py" in command and " _run " in f" {command} "
+    joined = " ".join(command)
+    if "nav_full_smoke.py" not in joined or "_run" not in command:
+        return False
+    if runtime_dir is None:
+        return True
+    expected = str(runtime_dir.resolve())
+    return any(
+        command[index] == "--runtime-dir" and command[index + 1] == expected
+        for index in range(len(command) - 1)
+    )
+
+
+def _owned_smoke_pids(runtime_dir: Path) -> list[int]:
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return []
+    result = []
+    for entry in proc_root.iterdir():
+        if entry.name.isdigit():
+            pid = int(entry.name)
+            if _owned_smoke_process(pid, runtime_dir):
+                result.append(pid)
+    return result
 
 
 def _events(path: Path) -> list[dict]:
@@ -186,8 +216,16 @@ def _run(runtime_dir: Path, num_envs: int, stop_after_first_update: bool) -> int
 def _start(args) -> int:
     runtime_dir = Path(args.runtime_dir).resolve()
     paths = _paths(runtime_dir)
+    launch_cwd = Path.cwd()
+    if not (launch_cwd / "train_test.py").is_file():
+        print(
+            "nav full smoke must be started from the server project root "
+            "containing train_test.py",
+            file=sys.stderr,
+        )
+        return 2
     existing = _read_pid(paths["pid"])
-    if _owned_smoke_process(existing):
+    if _owned_smoke_pids(runtime_dir):
         print(f"nav smoke already running: pid={existing}")
         return 2
     runtime_dir.mkdir(parents=True, exist_ok=True)
@@ -210,7 +248,9 @@ def _start(args) -> int:
         command.append("--keep-running")
     process = subprocess.Popen(
         command,
-        cwd=str(Path(__file__).resolve().parents[2]),
+        # In the IDE, agent_ppo is a symlink into /workspace/code. Resolving
+        # __file__ therefore loses the project-local kaiwudrl/tools tree.
+        cwd=str(launch_cwd),
         stdin=subprocess.DEVNULL,
         stdout=output,
         stderr=subprocess.STDOUT,
@@ -235,7 +275,7 @@ def _status(args) -> int:
     summary = {
         "pid": pid,
         "pid_alive": _alive(pid),
-        "running": _owned_smoke_process(pid),
+        "running": bool(_owned_smoke_pids(runtime_dir)),
         "event_count": len(rows),
         "target_reached": _target_reached(rows),
         "last_event": last,
@@ -246,28 +286,50 @@ def _status(args) -> int:
 
 
 def _stop(args) -> int:
-    paths = _paths(Path(args.runtime_dir).resolve())
+    runtime_dir = Path(args.runtime_dir).resolve()
+    paths = _paths(runtime_dir)
     pid = _read_pid(paths["pid"])
-    if not _alive(pid):
+    owned_pids = _owned_smoke_pids(runtime_dir)
+    if not owned_pids:
+        if _alive(pid) and not _owned_smoke_process(pid, runtime_dir):
+            print(
+                f"refusing to stop pid={pid}: procfs does not identify it as "
+                "agent_ppo.tools.nav_full_smoke _run",
+                file=sys.stderr,
+            )
+            return 2
         print("nav smoke is not running")
         return 0
-    if not _owned_smoke_process(pid):
-        print(
-            f"refusing to stop pid={pid}: procfs does not identify it as "
-            "agent_ppo.tools.nav_full_smoke _run",
-            file=sys.stderr,
-        )
-        return 2
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return 0
+    process_groups = set()
+    for owned_pid in owned_pids:
+        try:
+            process_groups.add(os.getpgid(owned_pid))
+        except ProcessLookupError:
+            continue
+    for process_group in process_groups:
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
     deadline = time.monotonic() + args.grace_seconds
-    while _alive(pid) and time.monotonic() < deadline:
+    while _owned_smoke_pids(runtime_dir) and time.monotonic() < deadline:
         time.sleep(0.2)
-    if _alive(pid):
-        os.killpg(pid, signal.SIGKILL)
-    print(f"stopped nav full smoke process group: pgid={pid}")
+    remaining_pids = _owned_smoke_pids(runtime_dir)
+    remaining_groups = set()
+    for remaining_pid in remaining_pids:
+        try:
+            remaining_groups.add(os.getpgid(remaining_pid))
+        except ProcessLookupError:
+            continue
+    for process_group in remaining_groups:
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    print(
+        "stopped nav full smoke process groups: "
+        f"pgids={sorted(process_groups | remaining_groups)}"
+    )
     return 0
 
 

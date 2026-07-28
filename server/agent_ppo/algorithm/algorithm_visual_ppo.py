@@ -39,6 +39,7 @@ SUPPORTED_SCHEDULE_MODES = (
     "visual_recovery_split_v1",
     "visual_anchor_anneal_v2",
     "visual_command_generalization_v1",
+    "p15_response_adapter_v1",
 )
 
 # Fixed load_mode values used in the startup log (§6). Returned by
@@ -144,11 +145,13 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         self.anchor_session_elapsed_hours = 0.0
         self.elapsed_training_hours = 0.0
         self.current_iteration = 0
-        self.current_phase = (
-            "commandbase"
-            if self.schedule_mode == "visual_command_generalization_v1"
-            else "anchorcritic"
-        )
+        self.skipped_nonfinite_updates = 0
+        if self.schedule_mode == "p15_response_adapter_v1":
+            self.current_phase = "responsebase"
+        elif self.schedule_mode == "visual_command_generalization_v1":
+            self.current_phase = "commandbase"
+        else:
+            self.current_phase = "anchorcritic"
         self.action_anchor_weight = 0.0
         self.latent_anchor_weight_current = 0.0
         # Anchor R2 is warning-only: violations never pause actor updates or
@@ -232,12 +235,24 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 f"Unsupported schedule_mode={self.schedule_mode!r}; "
                 f"expected one of {SUPPORTED_SCHEDULE_MODES}"
             )
-        if self.schedule_mode == "visual_command_generalization_v1":
+        if self.schedule_mode in {
+            "visual_command_generalization_v1",
+            "p15_response_adapter_v1",
+        }:
             self.anchor_schedule_hours = None
             self.action_anchor_schedule = [self.command_anchor_action]
             self.latent_anchor_schedule = [self.command_anchor_latent]
-            self.anchor_phase_labels = ["commandbase", "commandblend", "commandfull"]
-            self.anchor_phase_end_hours = [0.5, 3.0]
+            if self.schedule_mode == "p15_response_adapter_v1":
+                self.anchor_phase_labels = [
+                    "responsebase",
+                    "responseexpand",
+                    "responsefull",
+                    "responsecalib",
+                ]
+                self.anchor_phase_end_hours = [0.5, 2.0, 7.0]
+            else:
+                self.anchor_phase_labels = ["commandbase", "commandblend", "commandfull"]
+                self.anchor_phase_end_hours = [0.5, 3.0]
             return
         # Anchor R2: array-driven schedule is mandatory.
         if self.schedule_mode == "visual_anchor_anneal_v2":
@@ -354,6 +369,14 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             if elapsed_h < 3.0:
                 return "commandblend"
             return "commandfull"
+        if self.schedule_mode == "p15_response_adapter_v1":
+            if elapsed_h < 0.5:
+                return "responsebase"
+            if elapsed_h < 2.0:
+                return "responseexpand"
+            if elapsed_h < 7.0:
+                return "responsefull"
+            return "responsecalib"
         if self.schedule_mode == "visual_anchor_anneal_v2":
             ends = self.anchor_phase_end_hours
             if elapsed_h < ends[0]:
@@ -377,7 +400,10 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         ``t >= last knot`` clamps to the final value (no extrapolation, no
         fallback to legacy phases).
         """
-        if self.schedule_mode == "visual_command_generalization_v1":
+        if self.schedule_mode in {
+            "visual_command_generalization_v1",
+            "p15_response_adapter_v1",
+        }:
             return (
                 self.command_anchor_action
                 if kind == "action"
@@ -432,8 +458,15 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             anchorfinal:   Actor/std=true,  RNN/output=true,  CNN=false, Critic=true
         CNN is permanently frozen regardless of phase.
         """
-        if self.schedule_mode == "visual_command_generalization_v1":
-            actor_enabled, recurrent_enabled = True, True
+        if self.schedule_mode in {
+            "visual_command_generalization_v1",
+            "p15_response_adapter_v1",
+        }:
+            enabled = not (
+                self.schedule_mode == "p15_response_adapter_v1"
+                and phase == "responsecalib"
+            )
+            actor_enabled, recurrent_enabled = enabled, enabled
         elif self.schedule_mode == "visual_anchor_anneal_v2":
             table = {
                 "anchorcritic": (False, False),
@@ -455,8 +488,12 @@ class AlgorithmVisualPPO(AlgorithmPPO):
 
         for parameter in self.actor_critic.actor.parameters():
             parameter.requires_grad_(actor_enabled)
+        critic_enabled = not (
+            self.schedule_mode == "p15_response_adapter_v1"
+            and phase == "responsecalib"
+        )
         for parameter in self.actor_critic.critic.parameters():
-            parameter.requires_grad_(True)
+            parameter.requires_grad_(critic_enabled)
         if hasattr(self.actor_critic, "std"):
             self.actor_critic.std.requires_grad_(actor_enabled)
         if hasattr(self.actor_critic, "log_std"):
@@ -739,6 +776,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 + self.latent_anchor_weight_current * latent_anchor_loss
             )
             if not torch.isfinite(loss):
+                self.skipped_nonfinite_updates += 1
                 if self.logger:
                     self.logger.warning(
                         f"[VisualPPO] nonfinite loss in minibatch {sample_index}; "
@@ -755,6 +793,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             )
             if not finite:
                 self.optimizer.zero_grad()
+                self.skipped_nonfinite_updates += 1
                 if self.logger:
                     self.logger.warning(
                         f"[VisualPPO] nonfinite gradient in minibatch {sample_index}; "
@@ -805,6 +844,9 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 "anchor_schedule_frozen": float(self.anchor_schedule_frozen),
                 "elapsed_training_hours": self.elapsed_training_hours,
                 "applied_updates": float(applied_updates),
+                "skipped_nonfinite_updates": float(
+                    self.skipped_nonfinite_updates
+                ),
                 "anchor_weight_mean": float(
                     self.storage.anchor_weights[: self.storage.step].mean().item()
                     if self.storage.step else 1.0
@@ -946,6 +988,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 "command_runtime_owner": "worker_observation_bridge_v1",
                 "command_resume_policy": "new_task_restart",
                 "rng_state": self._capture_rng_state(),
+                "skipped_nonfinite_updates": self.skipped_nonfinite_updates,
             },
             "lineage": {
                 "s0_checkpoint_sha256": self.s0_checkpoint_sha256,
@@ -1058,7 +1101,10 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         self.actor_critic.vision_encoder.load_state_dict(vision_state, strict=True)
         self.actor_critic.actor.load_state_dict(actor_state, strict=True)
 
-        is_visual_ppo_bundle = checkpoint.get("stage_type") == self.STAGE_TYPE
+        is_visual_ppo_bundle = checkpoint.get("stage_type") in {
+            "standard_visual_ppo",
+            "p15_response_adapter",
+        }
         saved_schedule_mode = (
             checkpoint.get("training_state", {}).get("schedule_mode")
             if isinstance(checkpoint.get("training_state"), dict)
@@ -1087,6 +1133,11 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             and is_visual_ppo_bundle
             and saved_schedule_mode == "visual_anchor_anneal_v2"
         )
+        transition_resume = transition_resume or (
+            self.schedule_mode == "p15_response_adapter_v1"
+            and is_visual_ppo_bundle
+            and saved_schedule_mode == "visual_command_generalization_v1"
+        )
 
         if same_mode or transition_resume:
             # Full resume: restore critic, std, optimizer, anchor clock, RNG.
@@ -1103,9 +1154,15 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             self.optimizer.load_state_dict(optimizer_state)
             state = checkpoint.get("training_state", {})
             self.current_iteration = int(state.get("current_iteration", 0))
-            if self.schedule_mode == "visual_command_generalization_v1":
+            self.skipped_nonfinite_updates = int(
+                state.get("skipped_nonfinite_updates", 0)
+            )
+            if self.schedule_mode == "visual_command_generalization_v1" or (
+                self.schedule_mode == "p15_response_adapter_v1" and transition_resume
+            ):
                 # Preserve the learned PPO state but start a fresh command
-                # session for every independently configured platform task.
+                # session when entering a new command curriculum. Exact P1.5
+                # schema-2 resumes restore their saved wall-clock phase below.
                 self.anchor_session_elapsed_hours = 0.0
             else:
                 clock = state.get("anchor_session_elapsed_hours")
@@ -1171,6 +1228,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             self.baseline_hard_termination_windows = 0
             self.baseline_hard_termination_rate = None
             self.last_anchor_action_mse = 0.0
+            self.skipped_nonfinite_updates = 0
             self.resume_loaded = False
             if other_visual_schedule:
                 # Migration: warn but accept VisionEncoder/Actor as new parent.
@@ -1205,6 +1263,95 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             self.storage.num_envs if self.storage is not None else 1
         )
         return load_mode
+
+    def load_low_level_only_bundle(
+        self,
+        path: str,
+        *,
+        expected_spec: dict[str, int],
+        env_seed: int | None = None,
+        restore_optimizer: bool = False,
+    ) -> str:
+        """Explicitly restore Standard low-level state while ignoring adapters."""
+        checkpoint = torch.load(path, weights_only=False, map_location=self.device)
+        if not is_kaiwu_train_bundle(checkpoint):
+            raise ValueError(f"Expected kaiwu_train_v1 checkpoint: {path}")
+        validate_low_level_spec(checkpoint, expected_spec)
+        modules = checkpoint.get("modules", {})
+        vision_state = modules.get("vision_encoder", {}).get("state_dict")
+        actor_state = modules.get("low_level", {}).get("actor_state_dict")
+        critic_state = modules.get("critic", {}).get("state_dict")
+        if not all(isinstance(value, dict) for value in (vision_state, actor_state, critic_state)):
+            raise KeyError(
+                "low_level_only preload requires vision_encoder, low_level actor, and critic"
+            )
+        state_tensors = [
+            value
+            for state_dict in (vision_state, actor_state, critic_state)
+            for value in state_dict.values()
+            if torch.is_tensor(value)
+        ]
+        if not all(bool(torch.isfinite(value).all()) for value in state_tensors):
+            raise ValueError("low_level_only checkpoint contains nonfinite weights")
+        self.actor_critic.vision_encoder.load_state_dict(vision_state, strict=True)
+        self.actor_critic.actor.load_state_dict(actor_state, strict=True)
+        self.actor_critic.critic.load_state_dict(critic_state, strict=True)
+        std_value = modules.get("action_distribution", {}).get("std")
+        if std_value is not None and hasattr(self.actor_critic, "std"):
+            if not bool(torch.isfinite(std_value).all()):
+                raise ValueError("low_level_only checkpoint contains nonfinite action std")
+            self.actor_critic.std.data.copy_(std_value.to(self.device))
+        anchor = modules.get("s0_anchor", {})
+        self.anchor_encoder.load_state_dict(
+            anchor.get("vision_encoder_state_dict", vision_state), strict=True
+        )
+        self.anchor_actor.load_state_dict(
+            anchor.get("actor_state_dict", actor_state), strict=True
+        )
+
+        state = checkpoint.get("training_state", {})
+        if not isinstance(state, dict):
+            state = {}
+        optimizer_state = checkpoint.get("optimizers", {}).get("visual_ppo")
+        optimizer_restored = restore_optimizer and isinstance(optimizer_state, dict)
+        if optimizer_restored:
+            self.optimizer.load_state_dict(optimizer_state)
+            self.current_iteration = int(state.get("current_iteration", 0))
+            self.skipped_nonfinite_updates = int(
+                state.get("skipped_nonfinite_updates", 0)
+            )
+            self._restore_rng_state(state.get("rng_state"), self.logger)
+        else:
+            self._reseed(env_seed)
+            self.current_iteration = int(state.get("current_iteration", 0))
+            self.skipped_nonfinite_updates = 0
+            if restore_optimizer and self.logger:
+                self.logger.warning(
+                    "[VisualPPO] low_level_only optimizer was requested but is missing; "
+                    "continuing as weights-only warm start"
+                )
+        self.anchor_session_elapsed_hours = 0.0
+        self.elapsed_training_hours = 0.0
+        self.loaded_platform_model_id = checkpoint.get("platform_model_id")
+        self.loaded_schedule_mode = state.get("schedule_mode")
+        self.resume_loaded = optimizer_restored
+        self.current_phase = self._phase_for_elapsed(0.0)
+        self._set_trainable_phase(self.current_phase)
+        self._set_phase_learning_rates(self.current_phase)
+        self.initialize_recurrent_states(
+            self.storage.num_envs if self.storage is not None else 1
+        )
+        if self.logger:
+            self.logger.warning(
+                "[VisualPPO] explicit low_level_only preload completed; "
+                "modules.high_level was intentionally ignored "
+                f"optimizer_restored={optimizer_restored}"
+            )
+        return (
+            "low_level_only_resume"
+            if optimizer_restored
+            else "low_level_only_warm_start"
+        )
 
     def _reseed(self, env_seed: int | None) -> None:
         """Reinitialize process-level RNG from the active TOML seed (§5.4 N1).

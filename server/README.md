@@ -18,19 +18,23 @@
 
 ## 活动基线
 
-- **当前功能分支入口**：`StandardVisualPPOConfig`
-  （`visual_policy_optimization`）的下一任务是 `standard-command-r1` /
-  `visual_command_generalization_v1`。它从 Anchor R2 固定评估选出的视觉学生恢复，
-  CNN 继续冻结，训练 Actor/LSTM/Critic；冻结 S0 只计算固定的
-  action/latent anchor `0.35/0.10`，不参与执行或评估推理。
+- **当前功能分支入口**：`P15ResponseConfig`（`p15_response`），任务名
+  `p15resp8h`。它从 `commandfull-34728` 恢复完整低层 PPO 状态，CNN 继续冻结，
+  前 7 小时联合训练 Actor/LSTM/Critic 与独立 ResponseAdapter，最后 1 小时只校准
+  Adapter；S0 action/latent anchor 固定为 `0.35/0.10`。worker 传输 346 维
+  privileged wire，aisrv 在进入 PPO 前拆成 Critic316 与独立 aux30。
+  Adapter rollout 为 80 帧，future horizon 不跨低层 optimizer update；GRU 使用 8 帧
+  burn-in 和逐环境 episode reset。Terrain 使用静态 0-9 难度覆盖，原生距离 curriculum
+  保持关闭。
 - 本任务的 P0 是评估入口闭环：平台最终的
   `tools/eval/conf/eval_env_conf.toml` 必须显式设置
   `policy_entry = "visual_policy_optimization"`，并由 aisrv 和 learner 同时记录
   VisualPPO stage/loader。P0 smoke 未取得前，任何评估分数都只是入口诊断数据，不能
   用于选择模型或宣称本任务可用。
-- 平台任务页控制实际 4 小时时长，workflow 按墙钟约每 10 分钟请求一次 checkpoint；
+- 平台任务页控制实际 8 小时时长，workflow 首次约 2 分钟、之后按墙钟约每 10 分钟
+  请求一次 checkpoint，并在课程边界额外保存；
   `task_end_hours` 只是训练包元数据，`max_iterations` 只是高安全上限。训练恢复包使用
-  `commandbase`/`commandblend`/`commandfull` 纯字母标签，仍为
+  `responsebase`/`responseexpand`/`responsefull`/`responsecalib` 纯字母标签，仍为
   `kaiwu_train_v1` 且 `deployable=false`。
 - Actor 只使用 `proprio45 + depth180x320x1 + LSTM state`；训练 Critic 可使用
   `height_scan` 等特权状态。Camera 评估只加载视觉 Encoder 与低层 Actor，
@@ -45,8 +49,11 @@
   `capabilities.deployable=false`；当前部署导出器只接受单独审查生成的
   `lbc_loco` 制品。
 - 文件数字 ID 完全由平台注入，不能从 iteration 人工计算。Anchor R2 的
-  `anchor*` 标签只用于父阶段；当前 command 泛化使用
-  `commandbase`/`commandblend`/`commandfull`。
+  `anchor*` 与上一阶段的 `command*` 标签只用于父阶段；P1.5 使用
+  `responsebase`/`responseexpand`/`responsefull`/`responsecalib`。
+- `response_observation32` 的实时速度只使用 SportMode `vx/vy` 与 IMU `wz`；UWB 不进入
+  0.2/0.6/1.0 秒 Adapter 输入。跨任务 resume 只恢复已完成 records，未完成 future
+  history 始终清空。Standard 读取 response 包必须显式启用 `low_level_only_preload`。
 - TrackNav 历史实验不再提供活动 `StageConfig` 或可直接启动的 TOML；需要恢复时
   必须从 Git 历史新建独立实验分支并重新验证。
 - 含 ST7-Opt2B `dynamic_tilt_risk`、ST7-Opt3 `goal_noise`、行为蒸馏/LBC 机制（在 `codex/st7-opt2a` 并入主干）。
@@ -95,6 +102,8 @@ TBPTT 更新后对独立进程组发送 SIGTERM，并将状态、stdout 和原�
 
 当前命令泛化的 P0、四小时日程、保存/恢复和验收见
 [`../shared/分析记录/2026-07-25_Standard命令泛化下半四小时实施计划.md`](../shared/分析记录/2026-07-25_Standard命令泛化下半四小时实施计划.md)。
+P1.5 八小时扩域与响应器实现见
+[`../shared/分析记录/2026-07-28_P1.5连续指令扩域与响应器八小时实施记录.md`](../shared/分析记录/2026-07-28_P1.5连续指令扩域与响应器八小时实施记录.md)。
 Anchor R2 只作为父阶段记录，见
 [`../shared/分析记录/2026-07-25_StandardAnchorR2四小时实施计划.md`](../shared/分析记录/2026-07-25_StandardAnchorR2四小时实施计划.md)。
 

@@ -3,8 +3,9 @@
 """Wall-clock workflow for constrained recurrent visual PPO schedules.
 
 ``visual_anchor_anneal_v2`` uses the Anchor R2 phase labels; command
-generalization uses ``commandbase`` -> ``commandblend`` -> ``commandfull``.
-Both use a session clock, not the cumulative-training-hours record.
+generalization uses ``commandbase`` -> ``commandblend`` -> ``commandfull``;
+P1.5 uses the four ``response*`` labels. All use a session clock, not the
+cumulative-training-hours record.
 """
 
 from __future__ import annotations
@@ -38,10 +39,20 @@ _PHASE_CODES = {
     "commandbase": 0,
     "commandblend": 1,
     "commandfull": 2,
+    "responsebase": 0,
+    "responseexpand": 1,
+    "responsefull": 2,
+    "responsecalib": 3,
 }
 
 
-def _save_final_checkpoint(agent, logger, *, reason: str) -> bool:
+def _save_final_checkpoint(
+    agent,
+    logger,
+    *,
+    reason: str,
+    sleep_fn=time.sleep,
+) -> bool:
     """Best-effort final save for a graceful workflow exit.
 
     This helper intentionally does not catch a failed normal save in the main
@@ -55,31 +66,90 @@ def _save_final_checkpoint(agent, logger, *, reason: str) -> bool:
         or getattr(agent, "_visual_ppo_final_save_done", False)
     ):
         return False
-    try:
-        logger.warning(
-            "[VisualPPO] graceful workflow exit; saving final checkpoint "
-            f"(reason={reason})"
-        )
-        agent.save_model()
-    except Exception as exc:  # Preserve the original shutdown exception.
-        logger.error(
-            "[VisualPPO] final checkpoint save failed during graceful exit: "
-            f"{exc}"
-        )
-        return False
+    p15_schedule = bool(getattr(agent, "is_p15_response", False))
+    attempts = 2 if p15_schedule else 1
+    for attempt in range(attempts):
+        try:
+            logger.warning(
+                "[VisualPPO] graceful workflow exit; saving final checkpoint "
+                f"(reason={reason}, attempt={attempt + 1}/{attempts})"
+            )
+            agent.save_model()
+            break
+        except Exception as exc:  # Preserve the original shutdown exception.
+            if attempt + 1 < attempts:
+                logger.error(
+                    "[P15Response] graceful final checkpoint failed; retrying "
+                    f"once in 5s without replacing the previous valid file: {exc}"
+                )
+                sleep_fn(5.0)
+                continue
+            logger.error(
+                "[VisualPPO] final checkpoint save failed during graceful exit: "
+                f"{exc}"
+            )
+            return False
     agent._visual_ppo_final_save_done = True
     agent._visual_ppo_final_save_reason = reason
     return True
+
+
+def _attempt_scheduled_checkpoint(agent, logger, *, p15_schedule: bool) -> bool:
+    """Save once; P1.5 logs failures for the caller's 60-second retry."""
+    try:
+        agent.save_model()
+    except Exception as exc:
+        if not p15_schedule:
+            raise
+        logger.error(
+            "[P15Response] checkpoint save failed; previous valid file was "
+            f"preserved and retry is scheduled in 60s: {exc}"
+        )
+        return False
+    return True
+
+
+def _save_iteration_cap_checkpoint(
+    agent,
+    logger,
+    *,
+    p15_schedule: bool,
+    sleep_fn=time.sleep,
+) -> bool:
+    """Save the iteration-cap checkpoint, retrying P1.5 once after 60 seconds."""
+    attempts = 2 if p15_schedule else 1
+    for attempt in range(attempts):
+        try:
+            agent.save_model()
+        except Exception as exc:
+            if not p15_schedule:
+                raise
+            if attempt + 1 < attempts:
+                logger.error(
+                    "[P15Response] iteration-cap final save failed; previous "
+                    "valid file was preserved and one retry is scheduled in 60s: "
+                    f"{exc}"
+                )
+                sleep_fn(60.0)
+                continue
+            logger.error(
+                "[P15Response] iteration-cap final save failed after the 60s "
+                f"retry; preserving the original workflow outcome: {exc}"
+            )
+            return False
+        agent._visual_ppo_final_save_done = True
+        agent._visual_ppo_final_save_reason = "iteration_cap"
+        return True
+    return False
 
 
 def _install_sigterm_checkpoint_handler(logger):
     """Convert the default SIGTERM action into the existing graceful path.
 
     The training platform normally stops a completed wall-clock task with a
-    signal rather than an iteration-cap return.  Only replace Python's default
-    SIGTERM action; a framework-installed handler remains authoritative.  The
-    handler raises ``SystemExit`` so ``workflow`` can perform exactly one
-    best-effort final save before restoring the original disposition.
+    signal rather than an iteration-cap return. A callable framework handler
+    is chained first; if it returns, ``SystemExit`` routes control through the
+    workflow's idempotent final-save path.
     """
     if (
         not hasattr(signal, "SIGTERM")
@@ -87,18 +157,22 @@ def _install_sigterm_checkpoint_handler(logger):
     ):
         return None
     previous = signal.getsignal(signal.SIGTERM)
-    if previous is not signal.SIG_DFL:
+    if previous is signal.SIG_IGN:
         logger.info(
-            "[VisualPPO] preserving existing SIGTERM handler; "
-            "final checkpoint depends on its graceful-exit path"
+            "[VisualPPO] SIGTERM is explicitly ignored; preserving disposition"
         )
         return None
 
-    def _handle_sigterm(signum, _frame):
+    def _handle_sigterm(signum, frame):
+        if previous is not signal.SIG_DFL and callable(previous):
+            previous(signum, frame)
         raise SystemExit(f"SIGTERM({signum})")
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
-    logger.info("[VisualPPO] installed default SIGTERM graceful-save handler")
+    logger.info(
+        "[VisualPPO] installed chained SIGTERM graceful-save handler "
+        f"previous={previous!r}"
+    )
     return previous
 
 
@@ -139,31 +213,38 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
     resume_first_save_s = 60.0 * float(
         stage_conf.get("resume_first_save_minutes", save_interval_s / 60.0)
     )
+    fresh_first_save_s = 60.0 * float(
+        stage_conf.get("first_save_minutes", save_interval_s / 60.0)
+    )
     log_interval = max(1, int(stage_conf.get("log_interval", 10)))
     max_iterations = int(stage_conf.get("max_iterations", 50000))
     # Phase milestone saves (minutes -> seconds). Command generalization uses
     # its own boundary key; Anchor R2 keeps the historical anchor key.
-    milestone_key = (
-        "command_checkpoint_minutes"
-        if algorithm.schedule_mode == "visual_command_generalization_v1"
-        else "anchor_checkpoint_minutes"
-    )
+    if algorithm.schedule_mode == "p15_response_adapter_v1":
+        milestone_key = "response_checkpoint_minutes"
+    elif algorithm.schedule_mode == "visual_command_generalization_v1":
+        milestone_key = "command_checkpoint_minutes"
+    else:
+        milestone_key = "anchor_checkpoint_minutes"
     anchor_checkpoint_s = sorted(
         60.0 * float(value)
         for value in stage_conf.get(milestone_key, [])
     )
 
-    command_schedule = (
-        algorithm.schedule_mode == "visual_command_generalization_v1"
+    p15_schedule = algorithm.schedule_mode == "p15_response_adapter_v1"
+    command_schedule = algorithm.schedule_mode == "visual_command_generalization_v1"
+    session_clock_name = (
+        "response_session_h"
+        if p15_schedule
+        else ("command_session_h" if command_schedule else "anchor_h")
     )
-    session_clock_name = "command_session_h" if command_schedule else "anchor_h"
     resume_session_h = float(algorithm.anchor_session_elapsed_hours)
     resume_cumulative_h = float(algorithm.elapsed_training_hours)
     session_start = time.monotonic()
     resume_loaded = bool(getattr(algorithm, "resume_loaded", False))
     # Periodic save deadline. On a fresh start the first save is one full
     # cadence out; on resume it is resume_first_save_s out (§5.8 N3).
-    first_save_delay_s = resume_first_save_s if resume_loaded else save_interval_s
+    first_save_delay_s = resume_first_save_s if resume_loaded else fresh_first_save_s
     next_periodic_save = session_start + first_save_delay_s
     last_save_time = session_start
     last_monitor_time = 0.0
@@ -180,8 +261,13 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
     last_critic_obs = critic_obs.clone()
 
     logger.info(
-        "[VisualPPO] start command generalization schedule: "
-        if command_schedule else "[VisualPPO] start anchor r2 schedule: "
+        "[P15Response] start eight-hour mixed schedule: "
+        if p15_schedule
+        else (
+            "[VisualPPO] start command generalization schedule: "
+            if command_schedule
+            else "[VisualPPO] start anchor r2 schedule: "
+        )
     )
     logger.info(
         f"run={algorithm.run_name}, schedule={algorithm.schedule_mode}, "
@@ -277,6 +363,9 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 f"latent_anchor_w={algorithm.latent_anchor_weight_current:.3f}, "
                 f"anchor_mse={metrics.get('anchor_action_mse', 0.0):.5f}, "
                 f"hard_term={metrics.get('hard_termination_rate', 0.0):.4f}, "
+                f"adapter={metrics.get('adapter_loss', 0.0):.5f}, "
+                f"adapter_mae={metrics.get('adapter_velocity_mae', 0.0):.5f}, "
+                f"low_frozen={metrics.get('low_level_frozen', 0.0):.0f}, "
                 f"frozen={algorithm.anchor_schedule_frozen}, "
                 f"cost_s={now - loop_start:.2f}"
             )
@@ -347,6 +436,8 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
         # never pauses actor updates; this only persists an extra checkpoint for
         # inspection and does not end the task.
         if (
+            not p15_schedule
+            and
             getattr(algorithm, "last_diagnostic_save_requested", False)
             and not diagnostic_checkpoint_saved
         ):
@@ -403,22 +494,29 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         f"milestone_"
                         f"{round(anchor_checkpoint_s[next_anchor_index] / 60.0, 1)}min"
                     )
-                agent.save_model()
-                last_save_time = now
-                # Reschedule next periodic deadline from the actual save time.
-                next_periodic_save = now + save_interval_s
-                if milestone_due:
-                    next_anchor_index += 1
-                logger.info(
-                    f"[VisualPPO] checkpoint saved ({'+'.join(save_reasons)})"
+                saved = _attempt_scheduled_checkpoint(
+                    agent, logger, p15_schedule=p15_schedule
                 )
+                if not saved:
+                    next_periodic_save = now + 60.0
+                else:
+                    last_save_time = now
+                    # Reschedule next periodic deadline from the actual save time.
+                    next_periodic_save = now + save_interval_s
+                    if milestone_due:
+                        next_anchor_index += 1
+                    logger.info(
+                        f"[VisualPPO] checkpoint saved ({'+'.join(save_reasons)})"
+                    )
 
     logger.warning(
         f"[VisualPPO] reached max_iterations={max_iterations}; final save"
     )
-    agent.save_model()
-    agent._visual_ppo_final_save_done = True
-    agent._visual_ppo_final_save_reason = "iteration_cap"
+    _save_iteration_cap_checkpoint(
+        agent,
+        logger,
+        p15_schedule=p15_schedule,
+    )
 
 
 def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):

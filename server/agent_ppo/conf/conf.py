@@ -259,6 +259,22 @@ class StandardVisualPPOConfig(StageConfig):
     model_save_interval = 500  # platform fallback; workflow saves by wall clock
 
 
+class P15ResponseConfig(StandardVisualPPOConfig):
+    """P1.5 Standard visual PPO with an independently trained response adapter."""
+
+    name = "p15_response"
+    task_type = "standard"
+    algorithm = "p15_response"
+    ckpt_name = "model.ckpt-responsefull"
+    # The worker transports 346 privileged values, but aisrv splits them before
+    # PPO. The model and RecurrentRolloutStorage contract therefore remains 316.
+    num_critic_observations = 316
+    # Future labels need 51 contiguous frames. Agent initializes rollout storage
+    # from the StageConfig class, so the matching TOML key is documentation only.
+    num_steps_per_env = 80
+    model_save_interval = 500
+
+
 class NavDaggerConfig(StageConfig):
     """hier-nav 高层导航 DAgger 训练阶段（Track + Camera，冻结低层）。
 
@@ -345,7 +361,13 @@ def _configured_training_stage(logger):
         os.path.join(os.path.dirname(__file__), "..", "..", "conf", "configure_app.toml")
     )
     try:
-        configure = toml.load(configure_path)
+        try:
+            configure = toml.load(configure_path)
+        except AttributeError:
+            # ``tomllib.load`` accepts only a binary file object. Some local
+            # test/runtime images provide it behind the legacy ``toml`` name.
+            with open(configure_path, "rb") as configure_file:
+                configure = toml.load(configure_file)
     except (OSError, TypeError, ValueError) as exc:
         if logger is not None:
             logger.warning(
@@ -366,6 +388,7 @@ def _configured_training_stage(logger):
         "visual_policy_optimization": StandardVisualPPOConfig,
         "standard_visual_ppo": StandardVisualPPOConfig,
         "visual_ppo": StandardVisualPPOConfig,
+        "p15_response": P15ResponseConfig,
         "lbc_loco": LBCLocoConfig,
         "locomotion": LocomotionConfig,
         "nav_dagger": NavDaggerConfig,
@@ -400,13 +423,10 @@ class Config:
         task_name = "Unitree-Go2-Velocity-Camera" + mode=standard -> LBCLocoConfig
     """
 
-    # Keep the literal default aligned with this dedicated Track branch.  The
-    # platform registers its built-in environment dashboard before the later
-    # configure_app bootstrap is guaranteed to run; leaving a Standard stage
-    # here makes the frontend select monitor_default.yaml even though the
-    # environment worker subsequently starts with terrain.mode=track.
-    # configure_app.toml remains authoritative at runtime and is checked below.
-    CURRENT = NavDaggerConfig
+    # Keep the literal default aligned with the branch's active training stage.
+    # configure_app.toml remains authoritative for worker subprocesses and is
+    # checked again below during module bootstrap.
+    CURRENT = P15ResponseConfig
 
     @staticmethod
     def load_conf(logger):
@@ -532,6 +552,7 @@ def _valid_explicit_policy_stage(usr_conf):
         "visual_policy_optimization": StandardVisualPPOConfig,
         "standard_visual_ppo": StandardVisualPPOConfig,
         "visual_ppo": StandardVisualPPOConfig,
+        "p15_response": P15ResponseConfig,
         "lbc_loco": LBCLocoConfig,
         "locomotion": LocomotionConfig,
         # hier-nav：训练与评估入口分离（评估类永不构造训练 Algorithm）。

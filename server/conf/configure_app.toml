@@ -8,7 +8,7 @@ preload_model = true
 # Repository-side stage bootstrap. This is read before the stage-specific
 # training TOML path is constructed; the same TOML cannot select itself.
 # S0a probing must change this together with preload_model_id in one commit.
-policy_entry = "nav_dagger"
+policy_entry = "p15_response"
 replay_buffer_capacity = 4096
 
 # The ratio of the sample pool capacity that triggers training
@@ -50,9 +50,9 @@ reverb_error_buffer = 8
 train_batch_size = 2048
 
 # Model-pool publication frequency in successful BaseAgent.learn() callbacks.
-# Nav DAgger advances this lifecycle once per successful low-level batch frame;
-# its workflow has no periodic custom-save path. With the current 128-env
-# Camera Track throughput, 3600 callbacks is roughly five minutes.
+# P1.5 also performs explicit two-minute/ten-minute platform archive requests.
+# This lifecycle fallback remains deliberately sparse so it cannot dominate the
+# wall-clock checkpoint cadence.
 dump_model_freq = 3600
 
 # The Learner pushes model updates, and the frequency at which Actors fetch the model (in minutes).

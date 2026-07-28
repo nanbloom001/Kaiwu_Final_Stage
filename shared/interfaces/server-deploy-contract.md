@@ -189,6 +189,81 @@ model.ckpt-commandfull-<平台ID>.pkl
 静默回退。训练代码不会由本地未保存文件覆盖评估模型包。`command*` 继续
 `deployable=false`，部署端仍只接受经过独立导出和审查的 `lbc_loco` 制品。
 
+#### `p15_response_adapter_v1`：P1.5 低层扩域与响应器训练包
+
+P1.5 从 `commandfull-34728` 的 schema 1 包迁移，保持 Standard Actor77、depth、
+proprio45 和 action12 外部合同不变。训练包升级到 schema 2，并加入高层内部的
+adapter-only 组件；它仍是不可部署的训练恢复包：
+
+```text
+format = "kaiwu_train_v1"
+schema_version = 2
+stage_type = "p15_response_adapter"
+model_spec = proprio45 / scan256 / depth180x320x1 / latent32 / action12 / goal0
+modules.vision_encoder.state_dict
+modules.low_level.actor_state_dict
+modules.low_level.locomotion_encoder.state_dict
+modules.low_level.actor.state_dict
+modules.low_level.critic.state_dict
+modules.critic.state_dict
+modules.action_distribution.std
+modules.high_level.component_status = "adapter_only"
+modules.high_level.response_adapter.spec / state_dict
+optimizers.visual_ppo
+optimizers.response_adapter
+schedulers.low_level
+schedulers.response_adapter
+training_states.global.compound_schedule_phase / session_elapsed_hours / env_steps
+training_states.low_level.current_iteration / gradient_steps / skipped_nonfinite / rng_state
+training_states.response_adapter.iteration / gradient_steps / skipped_nonfinite / rng_state
+training_states.response_adapter.buffer.resume_policy = "completed_records_only_v2"
+contracts.command / command_digest
+contracts.feedback.profile / implementation.sha256 / feedback_digest
+contracts.critic_transport = wire346 -> critic316 + response_aux30
+lineage.low_level_state_digest
+capabilities.envelope_type = "piecewise_union_v1"
+capabilities.high_level_component = "adapter_only"
+capabilities.deployable = false
+```
+
+运行时维度固定为：
+
+```text
+policy observation = proprio45 | scan256 | depth57600 = 57901
+worker privileged wire = critic316 | response_aux30 = 346
+aisrv Critic/PPO storage = critic316
+response observation = active_target3 | exec3 | measured_velocity3 |
+                       valid1 | age1 | IMU6 | capability15 = 32
+response profile = future_velocity9 | pose_delta3 | stuck1 | log_sigma_xyz_1s3 = 16
+```
+
+`response_aux30` 只用于 Adapter 标签与审计，禁止进入低层 Critic、Actor 或 PPO
+minibatch。`velocity_log_sigma` 的三个值是 1.0 秒速度的 XYZ 不确定度，不得解释成
+三个 horizon 各一个标量。`measured_velocity3` 的短时语义固定为
+`SportMode(vx,vy) | IMU gyro(wz)`；UWB 不进入 response observation、tracking error 或
+0.2/0.6/1.0 秒预测，只允许作为独立的 3-5 秒低频卡滞证据。`capability15` 使用
+`piecewise_union_profile_v1`，显式描述主 `[vx,wz]` 分支、`vy` 专项分支和父域 replay，
+不得解释成三轴任意组合的矩形包络。文件标签固定为：
+
+```text
+model.ckpt-responsebase-<平台ID>.pkl
+model.ckpt-responseexpand-<平台ID>.pkl
+model.ckpt-responsefull-<平台ID>.pkl
+model.ckpt-responsecalib-<平台ID>.pkl
+```
+
+平台 ID 与路径只能由框架注入，不生成同 ID 别名。schema 2 续训恢复 aisrv 的
+低层/Adapter 权重、optimizer、scheduler、RNG、计数和已经形成标签的 records；未完成的
+future history 在低层版本切换或新进程 resume 时必须清空，禁止跨 optimizer update 或新
+任务 reset 拼接。完整状态标记为 `weights_optim_rng_resume_with_history_reset`；缺 scheduler、
+RNG 或必要训练状态时显式降级为 `warm_start` 并告警。worker command clock 不新增 IPC，
+跨任务续训时必须把 checkpoint 的 session hour 显式写入
+`p15_response.command_resume_offset_hours`。该差异只告警，不成为长训单点阻断门禁。
+
+Standard 若要从 `response*` 包继续训练，必须显式设置 `low_level_only_preload=true`；
+loader 只恢复视觉 Encoder、Actor、Critic、动作方差及可选 PPO optimizer，并明确忽略
+`modules.high_level`。默认 Standard candidate 顺序不得静默偏向 `response*`。
+
 文件数字 ID 完全使用开悟框架传入值，不由业务代码从 iteration 或父模型 ID
 计算。R2 每次保存同一 payload 的阶段文件和评估兼容别名：
 

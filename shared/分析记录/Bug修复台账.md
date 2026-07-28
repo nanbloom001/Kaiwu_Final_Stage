@@ -822,6 +822,298 @@
   元数据不一致按当前策略 warning-only；结构不兼容、非有限权重、写盘失败
   仍必须硬停。回滚可撤销 `f7145da` 的诊断指标，不触碰 `base_env.py`。
 
+## BUG-20260728-001：P1.5 预审发现目标 epoch、物理随机化与 NLL 语义漂移
+
+- 状态：本地已验证，开发容器与平台待验证。
+- 影响：`p15_response` future-label 有效性、父步态保持、前两小时控制变量和
+  ResponseAdapter 不确定性训练。
+- 症状：本轮尚未提交的平台前置实现中，smooth target 每 5 Hz 改变时没有同步增加
+  `command_epoch`，future-label buffer 会把变化中的目标误判为 horizon 内恒定；
+  `[domain_rand] enable_domain_rand=true` 又未显式关闭缺省为 true 的 base-mass
+  randomization；摩擦边界只修改 event config，没有证明 startup event 会重新执行；
+  Adapter 还把 `velocity_log_sigma_xyz_1s3` 错当成三个 horizon 的标量 sigma。
+- 根因：command destination、实际 active target 和 label epoch 三者未分开；TOML 只关闭
+  已显式列出的 randomization 项，没有核对平台 `base_env.py` 的缺省值；运行时摩擦切换
+  只改配置对象而未调用 event manager；NLL 广播维度虽然 shape 合法，但与 16 维输出的
+  固定物理语义不一致。
+- 修复：smooth target 每次实际变化都推进 epoch，step/急停只在 target 真变化时推进；
+  transition family 固定为 zero/start/brake，并记录 `vx-only/wz-only/both` 均衡事件。
+  P1.5 TOML 将总开关保持开启以保留原生 `physics_material` event，但启动范围固定为
+  `[1.0,1.0]`，并显式关闭 base mass 与 push；2 小时后由 worker 将摩擦扩为
+  `[0.6,1.2]` 并实际调用 event manager，失败只告警并每 500 步重试。
+  NLL 只作用于 1.0 秒 XYZ 速度头；三个 horizon 单独报告 MAE，并增加 zero/copy-exec
+  baseline。父模型支持域内的 zero、pure-yaw 和 lateral 也恢复 S0 anchor 权重。
+- 其他修正：schema 2 补齐低层 scheduler、gradient/skipped 计数恢复；response buffer
+  返回逐记录 low-level digest/iteration；reset 与 step 两条 workflow 路径都立即拆分
+  wire346，Critic/storage 始终只见 316。monitor builder 按 `policy_entry` 选择 P1.5 或
+  原 Nav 面板，避免新阶段覆盖旧入口。
+- 验证：P1.5 本地测试当前 `26 passed`；完整 agent 回归（排除两个已知失效旧 API
+  测试）为 `146 passed, 3 subtests passed`，VisualPPO 回归为
+  `57 passed, 24 subtests passed`。真实父文件在 CPU 完成 schema1 首载与 schema2
+  save/resume：父内记录 iteration `6327`，低层 digest 与 Adapter 参数恢复一致，输出包
+  13,780,365 bytes。GPU 容器 rollout/update 与平台 smoke 尚未完成，不能提升为平台已验证。
+- 防复发：回归测试覆盖课程边界、独立轴采样、smooth epoch、父域 anchor、346 拆分、
+  bounded buffer、双训练状态、FeedbackEmulator 可复现性、摩擦 event 调用、保存失败重试
+  与 monitor 中文名称。正式任务继续只把结构/写盘不可用作为外部不可恢复故障；训练指标
+  不得变成阶段暂停或提前停止门禁。
+- 血缘：分支 `codex/p15-response-adapter`；父包
+  `commandfull-34728`，SHA256
+  `0ce3b485053faa5da37c2b0ad792ad414ec6f5a482208c728cee65487d019d0f`；关联 commit/PR、
+  平台任务、输出模型 ID 与 SHA256 尚未生成。
+- 遗留风险：平台 EventManager 的公开方法签名和运行中重新应用 physics material 仍需
+  GPU 容器 smoke；当前开发容器旧 IDE `18005` 已返回 `WEBIDE_RECORD_NOT_FOUND`，需用户
+  重新打开 IDE 后才能同步。跨任务 resume 的 worker clock 依赖 TOML offset，不新增 IPC。回滚时
+  删除 P1.5 新入口与 TOML即可，不修改平台拥有的 `isaac_env/base_env.py`。
+- 2026-07-28 更正：课程扩域必须覆盖主联合域中的连续低速端，expanded joint/straight
+  不再保留人为 `vx>=0.05`、`|wz|>=0.03` 的孔洞；急停明确绕过 slew。跨 `num_envs`
+  resume 仅丢弃 shape 不兼容的 bounded warm history，不影响模型、optimizer 或计数恢复。
+  iteration-cap 最终保存失败会等待 60 秒重试一次，第二次失败只保留明确错误，仍不把
+  业务代码变成提前终止门禁。schema2 现在写入实际 TOML feedback profile 与
+  `FeedbackEmulator` 源文件 SHA256，不再只记录静态默认 profile。
+
+## BUG-20260728-002：P1.5 Response 序列跨 episode/低层版本污染及反馈合同漂移
+
+- 状态：本地与开发容器已验证，平台短 smoke 待验证。
+- 影响：`p15_response` 的 0.2/0.6/1.0 秒标签、GRU hidden、跨任务 resume、Standard
+  terrain 难度分布、短时速度反馈、schema2 恢复可信度和八小时任务最终保存。
+- 首次发现：分支 `codex/p15-response-adapter` 的未提交预审实现；父模型
+  `commandfull-34728`，生产配置 Standard + Camera、256 环境、rollout 48 帧、最长 future
+  horizon 50 帧。平台任务、输出模型 ID 与 checkpoint SHA256 尚未生成。
+- 症状：48 帧 rollout 必然让 50 帧标签跨过一次低层 PPO 更新；buffer 只按 done/command
+  epoch mask，没有 low-level version 边界。随机 16 帧窗口从零 hidden 开始且没有 episode
+  reset/burn-in。schema2 resume 还恢复未完成 history，而新任务首次 env reset 会与旧任务尾部
+  拼接。`FeedbackEmulator` 可把低频 UWB 当作即时 `[vx,vy,wz]` 输入；terrain 又重新开启了
+  BUG-20260725-006 已证伪的距离 curriculum。缺 scheduler/RNG 时 loader 仍沿用完整 resume
+  名称。逐腿 swing/air 指标和 command family 统计也存在分母语义混淆。
+- 根因：future-label 生命周期、低层 optimizer 生命周期和 episode 生命周期没有建立同一份
+  版本/reset 合同；反馈 profile 把长时定位证据与短时速度反馈混在一个 source selector；
+  P1.5 配置没有复用命令泛化阶段已验证的静态 difficulty 边界；恢复代码只检查模块/optimizer，
+  没有报告 scheduler、RNG 和 buffer 的实际恢复级别。
+- 排除项：加速 command 课程 `0.5/1.25/2/7h` 是用户最终批准方案，不回退；不修改既有 gait
+  reward 权重、不新增 3-8 秒 command segment、不修改 `isaac_env/base_env.py`。UWB 过去没有
+  直接充当 future true-velocity label，但它会进入当前 response observation/tracking error，
+  因此仍需从短时输入移除。
+- 修复：生产 rollout 改为 80 帧，buffer 在 low-level digest/iteration 变化时清空未完成
+  history，采样窗口只允许单一版本；GRU 增加 8 帧 burn-in 与逐环境 reset mask。checkpoint
+  只恢复已经形成标签的 records，未完成 history 永久采用
+  `completed_records_only_v2`。短时 `measured_velocity3` 固定为 SportMode `vx/vy` + IMU
+  gyro `wz`，source 仅 0/1；UWB 仅保留为独立长时卡滞证据。capability15 改为显式
+  `piecewise_union_profile_v1`。terrain `curriculum=false`，新增
+  terrain family×level×command family 直方图。schema2 完整恢复标记为
+  `weights_optim_rng_resume_with_history_reset`，缺 scheduler/RNG 等状态 warning-only 降级
+  `warm_start`；Standard 读取 response 包必须显式 `low_level_only_preload=true`。
+- 运行时修正：重采样 family 与按帧 active family 分开统计；air/swing 指标使用各腿有效样本
+  分母。摩擦切换增加 event config readback、attempt/failure telemetry，仍在失败后每 500 步
+  重试。P1.5 graceful final save 失败短重试一次；SIGTERM wrapper 链接已有平台 handler 后
+  进入幂等 final save，继续复用 BUG-20260727-009 已平台验证的无参数
+  `agent.save_model()` → `/data/user_ckpt_dir` → ZIP → 网页模型列表链。开发容器首启还发现
+  monitor 标题 `P1.5动态响应训练` 的句点不在平台白名单，已改为 `P15动态响应训练` 并加入
+  源码回归断言；该错误只会跳过自定义面板，不会停止训练。
+- 修改文件：`response_aux_buffer.py`、`response_adapter.py`、`algorithm_p15_response.py`、
+  `algorithm_visual_ppo.py`、`feedback_emulator.py`、`p15_contract.py`、
+  `p15_command_schedule.py`、`p15_worker_bridge.py`、`visual_ppo_workflow.py`、`agent.py`、
+  P1.5 TOML、checkpoint candidate、接口/实施记录和专项测试。
+- 当前验证：修改 Python 文件 `py_compile`、TOML 解析和 `git diff --check` 已通过。
+  开发容器 P1.5 专项测试 `38 passed`；Nav + P1.5 + hard-start 支持回归集
+  `164 passed`。自定义 monitor 已在容器日志确认“User custom monitor config loaded
+  successfully”。首次真实 GPU smoke 还证明 Standard + Camera、wire346 拆分、
+  34728 preload、低层 PPO update 与 schema2 保存链可运行，但暴露 Adapter 空转。
+  80 帧 StageConfig 修正后的二次 GPU smoke 和 schema2 完整进程 resume 已完成，
+  详细证据见本条后续更正。
+  平台短任务、八小时长训、评估和真机均未执行，不能提升为平台已验证。
+- 防复发：测试必须覆盖 episode reset 后 hidden 等价于零状态重放、版本切换不混合窗口、
+  resume 不恢复 unfinished history、80 帧 rollout 能在单一版本内形成 50 帧标签、UWB
+  profile 变化不影响短时输入、curriculum 永久关闭、schema2 warm-start 分类、显式
+  low-level-only、逐腿有效分母、摩擦 readback、SIGTERM handler 链和 final save 重试。
+- 血缘：分支 `codex/p15-response-adapter`；父包 SHA256
+  `0ce3b485053faa5da37c2b0ad792ad414ec6f5a482208c728cee65487d019d0f`；关联 commit/PR、
+  平台任务、输出模型 ID/路径/大小/SHA256 均待生成。
+- 遗留风险：80 帧 rollout 的 GPU 显存和实际吞吐、Isaac EventManager 运行时摩擦应用、
+  terrain metadata API、平台已有 SIGTERM handler 行为都必须由 8-16 环境开发容器 smoke
+  验证。回滚时可以恢复旧 Adapter replay，但不得恢复 48 帧跨版本标签、未完成 history
+  resume、UWB 短时输入或距离 curriculum。再次遇到的最短检查路径：rollout/horizon →
+  low-level version → episode reset mask → buffer resume mode → feedback source → terrain level
+  histogram → save path category。
+- 2026-07-28 更正：开发容器 8 环境真实 GPU smoke 表明之前“rollout 已改为
+  80 帧”的结论只在 TOML 层成立。`Agent` 初始化 storage 时只读
+  `P15ResponseConfig.num_steps_per_env`，运行时实际仍为继承值 48。证据 checkpoint：
+  `low_gradient_steps=460`、`adapter_iteration=23`，但 `adapter_gradient_steps=0`、
+  `buffer.record_steps=0`、`global.env_steps=8840`；日志中 `adapter=0.00000`、
+  `adapter_mae=0.00000`。根因是 48 帧永远达不到 51 帧 future-label 门槛，而
+  低层每轮更新后 digest/iteration 改变会正确清空 unfinished history。修复为
+  `P15ResponseConfig.num_steps_per_env=80`，并新增 buffer append、history 峰值、version
+  reset、record 与 valid-horizon 遥测。
+- 2026-07-28 容器复验：修正 StageConfig 后，8 环境真实 GPU 链在
+  `iter=6330` 已出现 `records=91`、`adapter_gradient_steps=3`、
+  `adapter_loss=0.34020`、`adapter_mae=0.40075`；继续到 `iter=6340` 时为
+  `records=391`、`adapter_gradient_steps=13`、loss `0.28751`、MAE `0.35434`。首个
+  周期包 `/data/user_ckpt_dir/legged_robot_competition_26_ppo/`
+  `model.ckpt-responsebase-34743.pkl`，大小 `14184143` bytes，SHA256
+  `346366fbd548a5bc447a7f8ddb6a6efa46336b31e4293f37e3a85c7c947f70ea`。解析结果为
+  schema 2 / `p15_response_adapter`，含全部低层、Adapter-only、S0 anchor 模块与
+  `visual_ppo`/`response_adapter` 双 optimizer；`low_gradient_steps=300`、
+  `adapter_gradient_steps=15`、`record_steps=451`。将该包作为 preload 后的第二次
+  完整进程 resume 在 `iter=6350` 继续到 `adapter_gradient_steps=23`、loss
+  `0.04697`、MAE `0.24892`，证明低层、Adapter、optimizer 计数和 bounded completed
+  records 均实际恢复。容器专项测试 `38 passed`，Nav + P1.5 + hard-start
+  回归 `164 passed`。测试后已恢复容器 `configure_app.toml` 原 SHA256
+  `99224b5abcd377e69297eeb8d3f8fdf21cc05f10b265267e378722b23662ffb5`，并按用户
+  授权删除上传分片、34728 预加载副本和 resume 临时副本。生成的
+  第二次 smoke 启动会清理上一轮 `/data/user_ckpt_dir`，因此
+  `responsebase-34743` 文件已不在容器；其路径、大小、SHA256 和解析结果已如实记录，
+  不将它表述为仍可下载制品。
+
+## BUG-20260728-003：开发容器 full-smoke 解析 symlink 后丢失项目运行根
+
+- 状态：开发容器已验证。
+- 影响：开发容器中 Nav/P1.5 的非 `KAIWU_TRAIN_TEST` 完整训练链 smoke；正式平台训练不走
+  该工具，不受影响。
+- 症状：后台 smoke 先报 `ModuleNotFoundError: No module named 'kaiwudrl'`；显式补充
+  `PYTHONPATH` 后继续报 `tools/change_sample_server.sh: No such file or directory`。
+- 根因：`nav_full_smoke._start()` 用 `Path(__file__).resolve().parents[2]` 作为子进程 cwd。
+  开发容器的 `agent_ppo` 是指向 `/workspace/code/agent_ppo` 的 symlink，resolve 后 cwd
+  离开 `/data/projects/legged_robot_competition_26`，从而丢失项目内 `kaiwudrl` namespace
+  和平台 `tools` 目录。
+- 排除项：34728 checkpoint SHA、P1.5 observation/optimizer、Isaac GPU 和生产 TOML 均尚未
+  进入失败路径；这不是父包不兼容或 `base_env.py` 问题。
+- 修复：启动器保留操作者调用时的 server 根目录，并在缺少 `train_test.py` 时明确拒绝；
+  回归测试锁定传给 `subprocess.Popen` 的 cwd 等于调用 cwd。
+- 验证：修复前两条原始错误已在 IDE 18005 稳定复现；修复后同一启动器已
+  两次成功起动非 `KAIWU_TRAIN_TEST` 的 8 环境 Standard + Camera GPU 链，完成真实
+  34728 preload、rollout、低层/Adapter update、checkpoint 与 resume。父包容器端
+  SHA256 为 `0ce3b485053faa5da37c2b0ad792ad414ec6f5a482208c728cee65487d019d0f`；
+  测试后已按授权删除预加载副本与临时分片。
+- 防复发：任何后台 smoke 启动器都不得从 symlink-resolved `__file__` 推导平台项目根；最短
+  检查路径为 child cwd → `kaiwudrl.__path__` → `tools/change_sample_server.sh` → preload。
+- 血缘：分支 `codex/p15-response-adapter`；关联 commit/PR、输出模型 ID/SHA256 尚未生成。
+- 遗留风险：调用者必须从 server 根启动；若未来需要任意 cwd，应新增显式 `--project-root`
+  参数，不得再次从 resolved module path 猜测。回滚仅移除 smoke 工具修复，不触碰生产流程。
+- 2026-07-28 补充：实测 `stop` 后父 PID 已死，但框架创建的新进程组仍可短暂存活；
+  旧逻辑只等待 pidfile 中的父 PID，会误报已清理。工具现按 `--runtime-dir` 扫描
+  `/proc/*/cmdline`，对同一 smoke 的所有已证明子进程组发送 TERM/KILL；并新增“父 PID
+  已死、子进程仍活”回归测试。容器随后被平台回收为
+  `WEBIDE_RECORD_NOT_FOUND`，所以该收尾修正当前只能标记本地验证，待下次容器 smoke 复核。
+- 2026-07-28 容器复验：IDE 18005 中专项测试 `10 passed`；随后创建两个携带相同
+  `--runtime-dir=/tmp/p15_proc_cleanup_check`、各自独立 session/process-group 的临时子进程，
+  并把 pidfile 写成不存在的父 PID。`_owned_smoke_pids()` 在停止前识别出两个 PID，
+  `_stop()` 返回 0 并终止两个进程组，停止后再次扫描结果为 `[]`。Nav + P1.5 +
+  hard-start 支持回归集为 `165 passed`。该证据验证的是开发容器 smoke 工具的孤儿进程
+  收尾，不替代当前正式 128 环境平台 smoke 或八小时长训。
+
+## BUG-20260728-004：P1.5 256 环境在 ray-caster 初始化时报 CUDA illegal memory
+
+- 状态：平台已验证（128 环境缓解方案）。
+- 影响：`p15resp8h` 首次正式平台任务；环境 reset 失败，训练尚未进入 rollout、PPO 或
+  ResponseAdapter 更新。
+- 症状：learner 在 `gym.make()` 的 `self.sim.reset()` 阶段失败；CUDA 错误最终出现在
+  `anisotropic_grid_pattern` 向 `ray_directions` 写入方向张量时，aisrv 随后只报告
+  `_initialize_training_state` reset failed。关键原文为
+  `RuntimeError: CUDA error: an illegal memory access was encountered`。
+- 根因判断：当前标记为高概率初始化/rollout 显存压力，平台复验前不写成 scanner 逻辑
+  已确认损坏。P1.5 为容纳 50 帧 future label、8 帧 burn-in 和训练序列，把低层 rollout
+  从父阶段的 48 帧提高到 80 帧；256 环境使批量帧预算从父阶段已验证的
+  `256x48=12288` 增至 `256x80=20480`，同时还增加 response aux、future records 和
+  Adapter 状态。CUDA 异步错误可能在更早的分配/内核发生，只在 ray-caster 的下一次
+  CUDA 调用处被抛出，因此栈顶不能单独证明 pattern 赋值是根因。
+- 排除项：P1.5 TOML 没有覆盖 ray pattern/direction；Camera、Standard terrain grid 与
+  已验证视觉父阶段一致。历史 273-ray 问题是 observation shape 解析失败，不是本次 CUDA
+  illegal-memory。异常发生在 env reset，尚未使用 command scheduler、奖励、Adapter loss
+  或 checkpoint。不得修改平台 `server/isaac_env/base_env.py`。
+- 修复：生产 `num_envs` 从 256 固定为 128，80 帧 rollout 保持不变；批量帧预算降为
+  `128x80=10240`，低于父阶段预算。地形、相机、scanner、摩擦日程、command 课程和八小时
+  墙钟均不改变。配置测试同时锁定 128、80 和 10240，防止未来只恢复环境数却忘记
+  future-label 对 rollout 长度的要求。
+- 验证：本地 TOML 解析和 `128x80=10240` 合同检查通过，`git diff --check` 通过。修复文件
+  已经精确同步到 IDE 18005；容器读取结果为 `num_envs=128`、`num_steps_per_env=80`、
+  `batch_frames=10240`，配置专项测试 `5 passed`，完整 P1.5 回归 `38 passed`。开发容器
+  8 环境完整训练链此前已验证；128 环境平台证据见下方复验记录。
+- 2026-07-28 平台复验：任务 `p15resp8h-r1` / `234864` 使用修复后的 128 环境配置启动，
+  已跨过 reset 并持续训练。05:32:51 日志为 `iter=6340`、`records=391`、
+  `adapter_gradient_steps=13`、Adapter loss `0.20407`、MAE `0.26942`；05:33:08 保存
+  `/data/user_ckpt_dir/.../model.ckpt-responsebase-34743.pkl`，SHA256
+  `bc66279ac430c8d3fdedfa199a1d8ad53e0e1efb1a9d04070d59eb224d07edca`，05:33:30
+  learner 报告平台 ZIP 复制成功。05:34:03 Standard monitor 已累计
+  `completed=113, abnormal=14, timeout=8`。因此 128 环境缓解方案的平台启动、更新和保存链
+  均已验证；“256x80 显存压力是唯一根因”仍保留为高概率解释，不扩写成已证明的 CUDA
+  内核根因。
+- 血缘：分支 `codex/p15-response-adapter`；父包 `commandfull-34728`，SHA256
+  `0ce3b485053faa5da37c2b0ad792ad414ec6f5a482208c728cee65487d019d0f`；失败任务
+  `234863`，成功任务 `234864`，输出模型 ID `34743`，checkpoint SHA256 见平台复验记录。
+- 回滚与最短检查：若 128 仍在 reset 报同类错误，先用同包做 64 环境隔离，并设置
+  `CUDA_LAUNCH_BLOCKING=1` 的开发容器诊断；随后比较 domain-rand startup event 和已验证
+  visual 配置。不得通过改 scanner 几何、关闭 Camera 或降低 rollout 到 50 帧以下掩盖问题。
+
+## BUG-20260728-005：P1.5 课程里程碑破坏十分钟模型保存节奏
+
+- 状态：代码已修复待平台验证。
+- 影响：P1.5 八小时任务的网页模型数量、保存间隔和恢复点可预测性。
+- 症状：任务 `234864` 首个 bundle 于 05:33:08 保存，日志中的
+  `anchor_session_h=0.032` 对应 workflow 启动后约 1.92 分钟；原配置随后每 10 分钟周期
+  保存，但 30/75/120/420/470 分钟里程碑会插入额外模型，使部分相邻保存只有 5-8 分钟。
+- 根因：`first_save_minutes=2`、`save_interval_minutes=10` 和独立
+  `response_checkpoint_minutes` 三套触发同时存在。workflow 每次实际保存后重新以该时刻
+  计算下一周期，因此里程碑不仅增加一个模型，还会整体平移后续周期。
+- 修复：fresh/resume 的首存统一改为 10 分钟，常规周期保持 10 分钟，P1.5 独立里程碑
+  列表清空。课程阶段仍按墙钟正常切换，由切换后的下一个周期包记录；正常结束和 SIGTERM
+  的幂等最终保存继续保留，不计入常规周期。
+- 验证：TOML 与配置测试锁定 `10/10/10` 分钟及空里程碑列表；本地解析、容器测试和平台
+  实际间隔待修改后补录。正在运行的任务 `234864` 已在启动时加载旧配置，不支持热更新，
+  因此本修复只影响后续任务，不要求中断当前成功训练。
+- 回滚：恢复 2 分钟首存和课程里程碑列表；无需修改 workflow、checkpoint schema 或
+  `base_env.py`。
+
+## BUG-20260728-006：P1.5 adapter-only 包被 Camera 评估误判为 hier-nav
+
+- 状态：本地已验证，平台重新评估待验证。
+- 影响：P1.5 `response*` checkpoint 的 Standard/Track Camera 低层评估；训练、checkpoint
+  schema、ResponseAdapter 状态和 low-level-only 续训数据本身未损坏。
+- 首次发现：评估日志 `log-598368-18520933.zip`，请求模型 ID `37953`，命中文件
+  `model.ckpt-responsecalib-37953.pkl`；评估任务 ID 未包含在下载日志中。训练血缘为
+  `p15resp8h-r1`、父模型 `commandfull-34728`。
+- 症状：平台把 Camera 评估入口推导为 `lbc_loco` 后，13:58:49 在真正加载权重前报
+  `[LBC-Loco eval] this bundle contains modules.high_level (a hier-nav combined bundle)`，并错误
+  建议改走 `nav_eval`；随后 `_exploit_lbc_loco` 正确拒绝在未加载 checkpoint 时推理，评估失败。
+- 根因：P1.5 schema2 按模块化组合契约把辅助 ResponseAdapter 保存到
+  `modules.high_level={component_status: adapter_only, response_adapter: ...}`。旧 Camera 防呆只
+  检查 `"high_level" in modules`，没有区分“不会产生动作的 adapter-only 组件”和真正的
+  hier-nav 高层动作策略，因此把合法 P1.5 包误拒绝。
+- 排除项：候选选择已按请求 ID 正确优先命中 `responsecalib-37953`，不是文件名、探活、模型
+  ID、Standard terrain、Camera task 或 `base_env.py` 问题。真实 checkpoint 可反序列化，
+  `vision_encoder` 与 low-level Actor 均能 `strict=True` 加载并完成有限值前向；不应把该包改走
+  `nav_eval`，也不应删除其 Adapter、optimizer 或训练状态来制造低层别名。
+- 修复：`checkpoint_io.py` 新增最小分类函数。没有 `high_level` 时沿用历史低层评估；
+  `component_status=="adapter_only"` 时不加载、不校验该未使用组件，继续严格加载视觉编码器和
+  low-level Actor；其他 high-level 仍按可能的动作策略拒绝静默降级。`agent.py` 在成功日志中
+  输出 `high_level=adapter_only_ignored_for_locomotion_eval`。该变化不修改候选标签、checkpoint
+  schema、训练 loader 或 `low_level_only_parent_candidates()`，因此 Standard/Track 后续续训路径
+  保持不变。
+- 验证：`PY311test`（Python 3.11.13、PyTorch 2.11.0）运行评估/候选专项测试通过；真实
+  `37953` 包分类为 adapter-only，视觉编码器与 Actor `strict=True` 加载后完成一次 CPU 前向，
+  latent/action shape 为 `(1,32)/(1,12)` 且 action 全有限。评估专项为
+  `27 passed, 3 subtests passed`，Nav + P1.5 + hard-start 支持回归为
+  `164 passed, 3 subtests passed`，`git diff --check` 通过。开发容器同步、平台重新评估和视频
+  均未执行，不能标记平台或评估已验证。
+- 防复发：测试固定四条边界：adapter-only 即使不提供可用 Adapter state 也不得阻塞未使用的
+  低层评估；真正 Nav state 必须拒绝；`responsecalib` 同 ID 候选必须可发现；视觉编码器和 Actor
+  必须继续 `strict=True` 加载。日志必须同时给出 selected path、SHA256、bundle/lineage 和
+  high-level disposition。
+- 血缘与制品：分支 `codex/p15-response-adapter`，当前 P1.5 源码仍为未提交工作区，commit/PR
+  待生成；原 checkpoint SHA256
+  `5b3715491bd2a184f157aa37a63a598848b733b67d34b7474120a6e9e5cd6193`。制品级热修复包
+  `p15resp8h-r1_37953-evalfix-v1.zip` SHA256
+  `b251a4eefe56c316cc62463b9c21ad26eefdab80f305a5497812c9d4a28f404e`，checkpoint 字节未改。
+- 回滚与再遇检查：回滚只需恢复旧分类调用，不修改 checkpoint；原始未热修复归档仍保留。
+  再遇时依次检查 requested ID/candidate → selected path → `component_status` →
+  `vision_encoder`/Actor strict load → loaded log；只有真正动作型 Nav 包才切换 `nav_eval`。
+- 2026-07-28 审查更正：仅检查 `component_status="adapter_only"` 仍会让误标或恶意构造的
+  Nav 动作策略绕过 Camera 防线。分类现改为接收完整 bundle，并同时要求
+  `stage_type="p15_response_adapter"`、`modules.high_level` 只包含
+  `component_status/response_adapter`，以及 Adapter spec 的 class/input/hidden/profile
+  分别为 `CommandResponseAdapter/32/64/16`。Camera 路径仍不加载未使用的 Adapter 权重，
+  但会在 `strict=True` 前分别检查 vision encoder 与 low-level Actor 权重有限性；新增伪造
+  adapter-only、错误 stage 和嵌套 NaN 回归测试。该更正当前为本地代码修改，平台重新评估
+  仍待验证，不能提升本条状态。
+
 ## 3. 已知高频误判
 
 以下现象可能伴随真实 Bug，但不能单独作为根因：

@@ -42,6 +42,12 @@ def _resolve_policy_observation_process():
         )
         return _Policy
 
+    if algorithm == "p15_response":
+        from agent_ppo.feature.p15_observation_process import (
+            P15PolicyObservationProcess as _Policy,
+        )
+        return _Policy
+
     if algorithm in {"lbc_loco", "visual_ppo"}:
         from agent_ppo.feature.lbc_observation_process import (
             LBCObservationProcess as _Policy,
@@ -66,6 +72,12 @@ def _resolve_critic_observation_process():
     if algorithm in {"nav_dagger", "nav_eval"}:
         from agent_ppo.feature.nav_observation_process import (
             NavCriticObservationProcess as _Critic,
+        )
+        return _Critic
+
+    if algorithm == "p15_response":
+        from agent_ppo.feature.p15_observation_process import (
+            P15CriticObservationProcess as _Critic,
         )
         return _Critic
 

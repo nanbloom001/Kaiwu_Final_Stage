@@ -22,6 +22,8 @@ import torch
 
 KAIWU_TRAIN_FORMAT = "kaiwu_train_v1"
 KAIWU_TRAIN_SCHEMA_VERSION = 1
+KAIWU_TRAIN_SCHEMA_V2 = 2
+SUPPORTED_KAIWU_TRAIN_SCHEMAS = (KAIWU_TRAIN_SCHEMA_VERSION, KAIWU_TRAIN_SCHEMA_V2)
 
 
 class CheckpointSaveError(RuntimeError):
@@ -70,6 +72,13 @@ VISUAL_COMMAND_PHASE_LABELS = (
     "commandfull",
 )
 
+P15_RESPONSE_PHASE_LABELS = (
+    "responsebase",
+    "responseexpand",
+    "responsefull",
+    "responsecalib",
+)
+
 _PROBE_NAME = re.compile(r"^model\.ckpt-[a-z]*-*[0-9]+\.[^.]+$")
 
 
@@ -77,7 +86,159 @@ def is_kaiwu_train_bundle(value: Any) -> bool:
     return (
         isinstance(value, dict)
         and value.get("format") == KAIWU_TRAIN_FORMAT
-        and int(value.get("schema_version", 0)) == KAIWU_TRAIN_SCHEMA_VERSION
+        and int(value.get("schema_version", 0)) in SUPPORTED_KAIWU_TRAIN_SCHEMAS
+    )
+
+
+def normalize_kaiwu_train_bundle(value: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return a schema-2-compatible view while preserving legacy aliases.
+
+    Schema 1 remains a valid low-level parent. The normalized view does not
+    fabricate missing optimizer or high-level state; it only gives schema-2
+    readers stable module/training-state locations.
+    """
+    if not is_kaiwu_train_bundle(value):
+        raise ValueError(
+            "Expected kaiwu_train_v1 schema 1/2 checkpoint, got "
+            f"format={getattr(value, 'get', lambda *_: None)('format')!r}, "
+            f"schema={getattr(value, 'get', lambda *_: None)('schema_version')!r}"
+        )
+    bundle = dict(value)
+    original_schema = int(bundle.get("schema_version", 0))
+    modules = dict(bundle.get("modules") or {})
+    low_level = dict(modules.get("low_level") or {})
+    vision_state = (modules.get("vision_encoder") or {}).get("state_dict")
+    actor_state = low_level.get("actor_state_dict")
+    critic_state = (modules.get("critic") or {}).get("state_dict")
+    if isinstance(vision_state, dict):
+        low_level.setdefault(
+            "locomotion_encoder",
+            {"class_name": "VisionEncoder", "state_dict": vision_state, "spec": {}},
+        )
+    if isinstance(actor_state, dict):
+        low_level.setdefault(
+            "actor",
+            {"class_name": "Actor77Sequential", "state_dict": actor_state, "spec": {}},
+        )
+    if isinstance(critic_state, dict):
+        low_level.setdefault(
+            "critic",
+            {"class_name": "VisualCritic", "state_dict": critic_state, "spec": {}},
+        )
+    low_level.setdefault("contract_version", "low_level_v2")
+    modules["low_level"] = low_level
+    bundle["modules"] = modules
+
+    legacy_state = bundle.get("training_state")
+    training_states = dict(bundle.get("training_states") or {})
+    if isinstance(legacy_state, dict):
+        training_states.setdefault("low_level", dict(legacy_state))
+    training_states.setdefault(
+        "global",
+        {
+            "last_active_scope": "low_level",
+            "bundle_revision": 0,
+            "compound_schedule_phase": None,
+        },
+    )
+    bundle["training_states"] = training_states
+    report = {
+        "source_format": bundle.get("format"),
+        "source_schema": original_schema,
+        "normalized_schema": KAIWU_TRAIN_SCHEMA_V2,
+        "recognized_modules": sorted(modules.keys()),
+        "optimizer_restore_level": (
+            "exact_resume"
+            if isinstance((bundle.get("optimizers") or {}).get("visual_ppo"), dict)
+            else "weights_only"
+        ),
+    }
+    return bundle, report
+
+
+def p15_response_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
+    model_id = str(model_id)
+    return [
+        os.path.join(path, f"model.ckpt-{label}-{model_id}.pkl")
+        for label in reversed(P15_RESPONSE_PHASE_LABELS)
+    ]
+
+
+def p15_response_parent_candidates(path: str, model_id: str | int) -> list[str]:
+    candidates = [
+        *p15_response_checkpoint_candidates(path, model_id),
+        *visual_command_parent_candidates(path, model_id),
+    ]
+    result: list[str] = []
+    for candidate in candidates:
+        if candidate not in result and os.path.isfile(candidate):
+            result.append(candidate)
+    return result
+
+
+def low_level_only_parent_candidates(path: str, model_id: str | int) -> list[str]:
+    """Explicit opt-in candidates for extracting only Standard low-level state."""
+    result: list[str] = []
+    for candidate in (
+        *p15_response_checkpoint_candidates(path, model_id),
+        *visual_command_checkpoint_candidates(path, model_id),
+        *vision_checkpoint_candidates(path, model_id),
+    ):
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def classify_locomotion_eval_high_level(bundle: dict[str, Any]) -> str:
+    """Classify optional high-level state before low-level Camera evaluation.
+
+    P1.5 stores its auxiliary ResponseAdapter under ``modules.high_level`` even
+    though that component does not produce locomotion actions at evaluation.
+    A real hier-nav policy also uses ``modules.high_level`` and must never be
+    silently discarded. The adapter itself is not validated here because it is
+    not loaded by this evaluation path; Standard/Track low-level reuse must not
+    depend on an unused auxiliary component.
+    """
+    modules = bundle.get("modules")
+    if not isinstance(modules, dict):
+        raise KeyError("modules missing from kaiwu_train_v1 checkpoint")
+    if "high_level" not in modules:
+        return "absent"
+
+    high_level = modules.get("high_level")
+    expected_spec = {
+        "class_name": "CommandResponseAdapter",
+        "input_dim": 32,
+        "hidden_dim": 64,
+        "profile_dim": 16,
+    }
+    if (
+        isinstance(high_level, dict)
+        and high_level.get("component_status") == "adapter_only"
+    ):
+        if bundle.get("stage_type") != "p15_response_adapter":
+            raise ValueError(
+                "adapter-only high_level requires stage_type='p15_response_adapter'"
+            )
+        if set(high_level) != {"component_status", "response_adapter"}:
+            raise ValueError(
+                "adapter-only high_level contains unexpected fields; refusing to "
+                "drop a possible action-producing policy"
+            )
+        adapter = high_level.get("response_adapter")
+        spec = adapter.get("spec") if isinstance(adapter, dict) else None
+        if not isinstance(spec, dict) or any(
+            spec.get(key) != value for key, value in expected_spec.items()
+        ):
+            raise ValueError(
+                "adapter-only high_level has an incompatible ResponseAdapter spec"
+            )
+        return "adapter_only_ignored_for_locomotion_eval"
+
+    raise ValueError(
+        "modules.high_level is not an adapter-only auxiliary component; "
+        "refusing to drop a possible action-producing hier-nav policy. "
+        "Evaluate hier-nav bundles via the nav_eval policy_entry"
     )
 
 
@@ -300,6 +461,7 @@ def _latest_visual_anchor_r2_candidates(path: str) -> list[str]:
 def visual_latest_model_id(path: str) -> int | None:
     """Return the largest numeric ID among all visual checkpoint labels."""
     labels = (
+        *P15_RESPONSE_PHASE_LABELS,
         *VISUAL_COMMAND_PHASE_LABELS,
         *VISUAL_ANCHOR_R2_PHASE_LABELS,
         *VISUAL_RL_PHASE_LABELS,
@@ -389,9 +551,12 @@ def visual_eval_checkpoint_candidates(path: str, model_id: str | int) -> list[st
         model_id = resolved_id
     candidates = [
         candidate
-        for candidate in visual_command_checkpoint_candidates(path, model_id)
+        for candidate in p15_response_checkpoint_candidates(path, model_id)
         if os.path.isfile(candidate)
     ]
+    for candidate in visual_command_checkpoint_candidates(path, model_id):
+        if os.path.isfile(candidate) and candidate not in candidates:
+            candidates.append(candidate)
     for candidate in visual_anchor_r2_eval_candidates(path, model_id):
         if candidate not in candidates:
             candidates.append(candidate)
@@ -408,6 +573,7 @@ def visual_eval_checkpoint_diagnostics(path: str, model_id: str | int) -> dict[s
     """
     requested_id = str(model_id)
     same_id_expected: list[str] = [
+        *p15_response_checkpoint_candidates(path, requested_id),
         *visual_command_checkpoint_candidates(path, requested_id),
         *[
             os.path.join(path, f"model.ckpt-{label}-{requested_id}.pkl")
@@ -426,6 +592,7 @@ def visual_eval_checkpoint_diagnostics(path: str, model_id: str | int) -> dict[s
     labels = tuple(
         dict.fromkeys(
             (
+                *P15_RESPONSE_PHASE_LABELS,
                 *VISUAL_COMMAND_PHASE_LABELS,
                 *VISUAL_ANCHOR_R2_PHASE_LABELS,
                 *VISUAL_RL_PHASE_LABELS,
@@ -800,9 +967,15 @@ def validate_high_level_spec(bundle: dict[str, Any], expected: dict[str, Any]) -
 
 
 def validate_state_dict_finite(state: dict[str, Any], name: str) -> None:
-    for key, value in state.items():
-        if not torch.is_tensor(value):
-            continue
+    def _walk(mapping: dict[str, Any], prefix: str):
+        for key, value in mapping.items():
+            field = f"{prefix}.{key}" if prefix else str(key)
+            if isinstance(value, dict):
+                yield from _walk(value, field)
+            elif torch.is_tensor(value):
+                yield field, value
+
+    for key, value in _walk(state, ""):
         if not bool(torch.isfinite(value.detach()).all()):
             raise FloatingPointError(f"non-finite tensor in {name}: {key}")
 

@@ -163,9 +163,27 @@ class TestValidateNavEvalBundle(unittest.TestCase):
 class TestAgentWiringSource(unittest.TestCase):
     """Agent 类依赖平台运行时，本地不整机构造；按仓库先例做源码防线断言。"""
 
-    def test_lbc_eval_guard_refuses_nav_bundles(self):
-        self.assertIn('if "high_level" in modules:', _AGENT_SRC)
-        self.assertIn("Refusing to silently drop the high", _AGENT_SRC)
+    def test_lbc_eval_classifies_optional_high_level_before_loading(self):
+        self.assertIn("classify_locomotion_eval_high_level(ckpt)", _AGENT_SRC)
+        self.assertIn("high_level={high_level_eval_disposition}", _AGENT_SRC)
+
+    def test_lbc_eval_keeps_required_module_loading_strict(self):
+        self.assertIn(
+            've_state, "modules.vision_encoder.state_dict"',
+            _AGENT_SRC,
+        )
+        self.assertIn(
+            'act_state, "modules.low_level.actor_state_dict"',
+            _AGENT_SRC,
+        )
+        self.assertIn(
+            "self.vision_encoder.load_state_dict(ve_state, strict=True)",
+            _AGENT_SRC,
+        )
+        self.assertIn(
+            "self.teacher_actor.load_state_dict(act_state, strict=True)",
+            _AGENT_SRC,
+        )
 
     def test_nav_dispatch_present(self):
         self.assertIn('self.is_nav_dagger = self.algorithm_name == "nav_dagger"', _AGENT_SRC)
@@ -193,6 +211,79 @@ class TestAgentWiringSource(unittest.TestCase):
     def test_nav_load_records_selected_checkpoint(self):
         self.assertIn("self.cur_model_name = hit", _AGENT_SRC)
         self.assertIn("self.cur_model_name = ckpt_path", _AGENT_SRC)
+
+
+class TestLocomotionEvalHighLevelClassification(unittest.TestCase):
+    def test_absent_high_level_is_accepted(self):
+        self.assertEqual(
+            cio.classify_locomotion_eval_high_level({"modules": {}}), "absent"
+        )
+
+    @staticmethod
+    def _adapter_only_bundle():
+        return {
+            "stage_type": "p15_response_adapter",
+            "modules": {
+                "high_level": {
+                    "component_status": "adapter_only",
+                    "response_adapter": {
+                        "spec": {
+                            "class_name": "CommandResponseAdapter",
+                            "input_dim": 32,
+                            "hidden_dim": 64,
+                            "profile_dim": 16,
+                        },
+                        "state_dict": {},
+                    },
+                }
+            },
+        }
+
+    def test_adapter_only_is_accepted_without_loading_unused_state(self):
+        bundle = self._adapter_only_bundle()
+        self.assertEqual(
+            cio.classify_locomotion_eval_high_level(bundle),
+            "adapter_only_ignored_for_locomotion_eval",
+        )
+
+    def test_action_producing_nav_high_level_is_rejected(self):
+        bundle = {
+            "modules": {
+                "high_level": {"state_dict": {"head.weight": torch.ones(2, 2)}}
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "nav_eval"):
+            cio.classify_locomotion_eval_high_level(bundle)
+
+    def test_nav_policy_cannot_forge_adapter_only_marker(self):
+        bundle = self._adapter_only_bundle()
+        bundle["modules"]["high_level"]["state_dict"] = {
+            "head.weight": torch.ones(2, 2)
+        }
+        with self.assertRaisesRegex(ValueError, "action-producing"):
+            cio.classify_locomotion_eval_high_level(bundle)
+
+    def test_adapter_only_requires_p15_stage_type(self):
+        bundle = self._adapter_only_bundle()
+        bundle["stage_type"] = "nav_dagger"
+        with self.assertRaisesRegex(ValueError, "stage_type"):
+            cio.classify_locomotion_eval_high_level(bundle)
+
+    def test_state_dict_finite_validation_rejects_nested_nan(self):
+        with self.assertRaisesRegex(FloatingPointError, "nested.weight"):
+            cio.validate_state_dict_finite(
+                {"nested": {"weight": torch.tensor([float("nan")])}},
+                "test.state_dict",
+            )
+
+    def test_responsecalib_exact_id_remains_a_camera_eval_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            expected = os.path.join(
+                directory, "model.ckpt-responsecalib-37953.pkl"
+            )
+            torch.save({"format": cio.KAIWU_TRAIN_FORMAT}, expected)
+            candidates = cio.visual_eval_checkpoint_candidates(directory, "37953")
+            self.assertEqual(candidates[0], expected)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,47 @@ from tools.base_env.base_reward import RewardProcessBase
 
 
 class RewardProcess(RewardProcessBase):
+    def _p15_contact_statistics(self, ema_tau_s: float = 1.0):
+        """Return current air time and a once-per-step contact-duty EMA."""
+        sensor_cfg = self._get_foot_sensor_cfg()
+        contact_sensor = self.env.scene.sensors[sensor_cfg.name]
+        if not getattr(contact_sensor.cfg, "track_air_time", False):
+            zeros = torch.zeros(self.env.num_envs, 4, device=self.env.device)
+            return zeros, zeros
+        air_time = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids]
+        contact = (air_time <= 0.0).to(torch.float32)
+        step_key = int(getattr(self.env, "common_step_counter", -1))
+        state = getattr(self.env, "_p15_contact_reward_state", None)
+        if not isinstance(state, dict) or state.get("duty") is None:
+            state = {"step": None, "duty": contact.clone()}
+            self.env._p15_contact_reward_state = state
+        if state["step"] != step_key:
+            dt_s = float(
+                getattr(self.env, "step_dt", getattr(self.env, "physics_dt", 0.02))
+            )
+            alpha = 1.0 - torch.exp(
+                torch.tensor(
+                    -max(0.0, dt_s) / max(1.0e-3, float(ema_tau_s)),
+                    device=contact.device,
+                )
+            )
+            state["duty"].mul_(1.0 - alpha).add_(contact * alpha)
+            reset = torch.zeros(
+                self.env.num_envs, dtype=torch.bool, device=contact.device
+            )
+            lengths = getattr(self.env, "episode_length_buf", None)
+            if torch.is_tensor(lengths) and lengths.numel() == self.env.num_envs:
+                reset |= lengths.to(contact.device).reshape(-1) == 0
+            term_mgr = getattr(self.env, "termination_manager", None)
+            terminated = getattr(term_mgr, "terminated", None)
+            time_outs = getattr(term_mgr, "time_outs", None)
+            for value in (terminated, time_outs):
+                if torch.is_tensor(value) and value.numel() == self.env.num_envs:
+                    reset |= value.to(contact.device).reshape(-1).bool()
+            state["duty"][reset] = contact[reset]
+            state["step"] = step_key
+        return air_time, state["duty"]
+
     @staticmethod
     def _zero_stability_huber(value, scale: float):
         """Per-environment robust normalized penalty for zero-command stability."""
@@ -135,6 +176,40 @@ class RewardProcess(RewardProcessBase):
         return torch.var(torch.clip(last_air_time, max=0.5), dim=1) + torch.var(
             torch.clip(last_contact_time, max=0.5), dim=1
         )
+
+    def _reward_max_continuous_air_time_penalty(
+        self, soft_limit_s: float = 0.55, hard_limit_s: float = 1.20
+    ):
+        air_time, _ = self._p15_contact_statistics()
+        scale = max(1.0e-3, float(hard_limit_s) - float(soft_limit_s))
+        normalized = torch.clamp((air_time - float(soft_limit_s)) / scale, 0.0, 1.0)
+        return normalized.max(dim=1).values
+
+    def _reward_contact_duty_factor_symmetry(
+        self,
+        ema_tau_s: float = 1.0,
+        full_symmetry_wz: float = 0.15,
+        minimum_scale: float = 0.25,
+        maximum_wz: float = 0.80,
+    ):
+        _, duty = self._p15_contact_statistics(ema_tau_s)
+        front = torch.abs(duty[:, 0] - duty[:, 1])
+        rear = torch.abs(duty[:, 2] - duty[:, 3])
+        raw = 0.5 * (front + rear)
+        command = self.env.command_manager.get_command("base_velocity")[:, :3]
+        yaw = torch.abs(command[:, 2])
+        span = max(1.0e-3, float(maximum_wz) - float(full_symmetry_wz))
+        blend = torch.clamp(1.0 - (yaw - float(full_symmetry_wz)) / span, 0.0, 1.0)
+        scale = float(minimum_scale) + (1.0 - float(minimum_scale)) * blend
+        return torch.clamp(raw * scale, 0.0, 1.0)
+
+    def _reward_foot_contact_participation(
+        self, ema_tau_s: float = 1.0, minimum_duty_factor: float = 0.12
+    ):
+        _, duty = self._p15_contact_statistics(ema_tau_s)
+        minimum = max(1.0e-3, float(minimum_duty_factor))
+        deficit = torch.clamp((minimum - duty) / minimum, 0.0, 1.0)
+        return deficit.mean(dim=1)
 
     def _reward_max_foot_air_time(self, threshold: float = 0.5):
         """Penalize any foot that stays in the air too long."""

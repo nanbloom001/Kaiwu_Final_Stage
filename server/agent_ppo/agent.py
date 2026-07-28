@@ -34,11 +34,15 @@ from agent_ppo.checkpoint_io import (
     CheckpointSaveError,
     KAIWU_TRAIN_FORMAT,
     checkpoint_candidates,
+    classify_locomotion_eval_high_level,
     is_kaiwu_train_bundle,
     low_level_policy_state,
+    low_level_only_parent_candidates,
+    validate_state_dict_finite,
     validate_low_level_spec,
     validate_probe_filename,
     validate_visual_eval_bundle_identity,
+    p15_response_parent_candidates,
     visual_command_parent_candidates,
     visual_eval_checkpoint_diagnostics,
     visual_eval_checkpoint_candidates,
@@ -127,7 +131,8 @@ class Agent(BaseAgent):
         self.algorithm_name = getattr(stage, "algorithm", "ppo")
         self.is_lbc = self.algorithm_name == "lbc_loco"
         self.is_behavior_distill = self.algorithm_name == "behavior_distill"
-        self.is_visual_ppo = self.algorithm_name == "visual_ppo"
+        self.is_p15_response = self.algorithm_name == "p15_response"
+        self.is_visual_ppo = self.algorithm_name in {"visual_ppo", "p15_response"}
         self.is_nav_dagger = self.algorithm_name == "nav_dagger"
         self.is_nav_eval = self.algorithm_name == "nav_eval"
 
@@ -145,7 +150,13 @@ class Agent(BaseAgent):
                 stage.depth_height * stage.depth_width * stage.depth_channels
             )
             self.num_obs = num_proprio + num_scan + depth_size
-            self._init_visual_ppo(num_proprio, num_scan, stage, usr_conf)
+            self._init_visual_ppo(
+                num_proprio,
+                num_scan,
+                stage,
+                usr_conf,
+                p15_response=self.is_p15_response,
+            )
         else:
             self._init_flat(num_proprio, num_scan, stage)
             if self.is_behavior_distill:
@@ -548,7 +559,9 @@ class Agent(BaseAgent):
         self.algorithm = None
         self.logger.info("[nav] eval-only assembly (no training Algorithm constructed)")
 
-    def _init_visual_ppo(self, num_proprio, num_scan, stage, usr_conf):
+    def _init_visual_ppo(
+        self, num_proprio, num_scan, stage, usr_conf, *, p15_response=False
+    ):
         """Initialize Stage-5 recurrent visual PPO from a frozen S0 preload."""
         from agent_ppo.algorithm.algorithm_visual_ppo import AlgorithmVisualPPO
         from agent_ppo.model.visual_actor_critic import VisualActorCritic
@@ -606,7 +619,46 @@ class Agent(BaseAgent):
                 },
             ]
         )
-        self.algorithm = AlgorithmVisualPPO(
+        algorithm_class = AlgorithmVisualPPO
+        algorithm_extra = {}
+        if p15_response:
+            from agent_ppo.algorithm.algorithm_p15_response import AlgorithmP15Response
+            from agent_ppo.feature.response_aux_buffer import ResponseAuxBuffer
+            from agent_ppo.model.response_adapter import CommandResponseAdapter
+
+            self.response_adapter = CommandResponseAdapter().to(self.device)
+            response_conf = visual_conf.get("response_adapter", {})
+            if not isinstance(response_conf, dict):
+                response_conf = {}
+            self.response_optimizer = optim.Adam(
+                self.response_adapter.parameters(),
+                lr=float(response_conf.get("learning_rate", 3.0e-4)),
+            )
+            self.response_scheduler = optim.lr_scheduler.LambdaLR(
+                self.response_optimizer, lr_lambda=lambda _step: 1.0
+            )
+            self.low_level_scheduler = optim.lr_scheduler.LambdaLR(
+                self.optimizer, lr_lambda=lambda _step: 1.0
+            )
+            self.response_aux_buffer = ResponseAuxBuffer(
+                self.num_envs,
+                self.device,
+                capacity_steps=int(response_conf.get("capacity_steps", 4096)),
+                sequence_length=int(response_conf.get("sequence_length", 16)),
+                burn_in_steps=int(response_conf.get("burn_in_steps", 8)),
+            )
+            algorithm_class = AlgorithmP15Response
+            algorithm_extra = {
+                "response_adapter": self.response_adapter,
+                "response_optimizer": self.response_optimizer,
+                "response_scheduler": self.response_scheduler,
+                "low_level_scheduler": self.low_level_scheduler,
+                "response_buffer": self.response_aux_buffer,
+                "response_config": response_conf,
+                "p15_config": visual_conf,
+            }
+
+        self.algorithm = algorithm_class(
             model=self.model,
             anchor_encoder=self.anchor_encoder,
             anchor_actor=self.anchor_actor,
@@ -697,6 +749,7 @@ class Agent(BaseAgent):
                 visual_conf.get("num_learning_epochs", stage.num_learning_epochs)
             ),
             desired_kl=None,
+            **algorithm_extra,
         )
         command_conf = visual_conf.get("command_schedule", {})
         if not isinstance(command_conf, dict):
@@ -705,7 +758,7 @@ class Agent(BaseAgent):
         commands = usr_conf.get("commands", {})
         self.worker_command_enabled = bool(
             str(visual_conf.get("schedule_mode", ""))
-            == "visual_command_generalization_v1"
+            in {"visual_command_generalization_v1", "p15_response_adapter_v1"}
             and commands.get("worker_progressive", {}).get("enabled", False)
             and not self.is_eval
         )
@@ -735,6 +788,17 @@ class Agent(BaseAgent):
             f"{depth_conf.get('augmentation', {}).get('enabled')}, "
             "command_runtime_owner=environment_worker"
         )
+
+    def split_p15_transport(self, critic_wire):
+        if not self.is_p15_response:
+            return critic_wire, None
+        from agent_ppo.feature.response_aux_buffer import split_privileged_transport
+
+        return split_privileged_transport(critic_wire)
+
+    def observe_response_aux(self, aux, dones):
+        if self.is_p15_response and aux is not None:
+            self.algorithm.observe_response_aux(aux, dones)
 
     def exploit(self, list_obs_data):
         """
@@ -874,9 +938,14 @@ class Agent(BaseAgent):
         if obs.ndim != 2 or obs.shape[1] < 9:
             raise ValueError("visual policy observation has no command fields at [6:9]")
         command = obs[:, 6:9]
-        from agent_ppo.feature.command_schedule import anchor_weights_from_commands
+        if self.is_p15_response:
+            from agent_ppo.feature.p15_contract import p15_anchor_weights_from_commands
 
-        weights = anchor_weights_from_commands(command)
+            weights = p15_anchor_weights_from_commands(command)
+        else:
+            from agent_ppo.feature.command_schedule import anchor_weights_from_commands
+
+            weights = anchor_weights_from_commands(command)
         metrics = {
             "command_runtime_owner": "worker_observation_bridge_v1",
             "anchor_weight_mean": float(weights.mean().item()),
@@ -1567,7 +1636,16 @@ class Agent(BaseAgent):
                 "use the explicit platform model ID"
             )
         else:
-            if self.algorithm.schedule_mode == "visual_command_generalization_v1":
+            stage_config = self.usr_conf.get(self.stage.name, {})
+            low_level_only_preload = bool(
+                isinstance(stage_config, dict)
+                and stage_config.get("low_level_only_preload", False)
+            )
+            if low_level_only_preload:
+                candidates = low_level_only_parent_candidates(path, id)
+            elif self.algorithm.schedule_mode == "p15_response_adapter_v1":
+                candidates = p15_response_parent_candidates(path, id)
+            elif self.algorithm.schedule_mode == "visual_command_generalization_v1":
                 candidates = visual_command_parent_candidates(path, id)
             else:
                 configured_parent_id = self.usr_conf.get(
@@ -1614,14 +1692,43 @@ class Agent(BaseAgent):
             load_mode = "visual_eval"
         else:
             eval_info = None
-            load_mode = self.algorithm.load_training_bundle(
-                selected,
-                expected_spec=expected_spec,
-                env_seed=env_seed,
+            stage_config = self.usr_conf.get(self.stage.name, {})
+            low_level_only_preload = bool(
+                isinstance(stage_config, dict)
+                and stage_config.get("low_level_only_preload", False)
             )
+            if low_level_only_preload:
+                load_mode = self.algorithm.load_low_level_only_bundle(
+                    selected,
+                    expected_spec=expected_spec,
+                    env_seed=env_seed,
+                    restore_optimizer=bool(
+                        stage_config.get("low_level_only_restore_optimizer", False)
+                    ),
+                )
+            else:
+                load_mode = self.algorithm.load_training_bundle(
+                    selected,
+                    expected_spec=expected_spec,
+                    env_seed=env_seed,
+                )
         # Agent mirrors the algorithm's anchor session clock; elapsed_training_h
         # is only a cumulative-training record, not a phase driver (§4.3).
         self.training_elapsed_h = self.algorithm.anchor_session_elapsed_hours
+        if self.is_p15_response and self.algorithm.resume_loaded:
+            configured_offset = float(
+                self.usr_conf.get(self.stage.name, {}).get(
+                    "command_resume_offset_hours", 0.0
+                )
+            )
+            if abs(configured_offset - self.training_elapsed_h) > 0.05:
+                self.logger.warning(
+                    "[P15Response] aisrv training clock resumed but the worker "
+                    "command clock uses the TOML offset; set "
+                    "p15_response.command_resume_offset_hours before an exact "
+                    f"resume (saved={self.training_elapsed_h:.3f}, "
+                    f"configured={configured_offset:.3f}). Training continues."
+                )
         self.cur_model_name = selected
         bundle_id = self.algorithm.loaded_platform_model_id or "unknown"
         lineage_for_log = "unknown"
@@ -2037,15 +2144,9 @@ class Agent(BaseAgent):
         modules = ckpt.get("modules", {})
         if not isinstance(modules, dict):
             raise KeyError(f"[LBC-Loco eval] modules missing in {vision_path}")
-        # hier-nav 防呆：nav 组合包（含 modules.high_level）绝不允许被 lbc_loco
-        # 路径静默降级为 loco-only 评估（Camera 自动回退历史事故的堵点）。
-        if "high_level" in modules:
-            raise ValueError(
-                "[LBC-Loco eval] this bundle contains modules.high_level (a "
-                "hier-nav combined bundle). Refusing to silently drop the high "
-                "level and score loco-only; evaluate it via the nav_eval "
-                f"policy_entry instead. path={vision_path}"
-            )
+        # P1.5's ResponseAdapter is auxiliary and ignored by this deploy-shaped
+        # Camera path. A real action-producing nav policy remains a hard stop.
+        high_level_eval_disposition = classify_locomotion_eval_high_level(ckpt)
         vision_section = modules.get("vision_encoder", {})
         ve_state = (
             vision_section.get("state_dict")
@@ -2071,6 +2172,12 @@ class Agent(BaseAgent):
 
         # Camera evaluation must remain deploy-shaped: do not load the
         # privileged teacher encoder, critic, optimizer, or training state.
+        validate_state_dict_finite(
+            ve_state, "modules.vision_encoder.state_dict"
+        )
+        validate_state_dict_finite(
+            act_state, "modules.low_level.actor_state_dict"
+        )
         self.vision_encoder.load_state_dict(ve_state, strict=True)
         self.vision_encoder.eval()
         self.vision_encoder.reset_hidden_state(
@@ -2086,6 +2193,7 @@ class Agent(BaseAgent):
             f"bundle_id={identity['bundle_id']!r}, "
             f"lineage_id={identity['lineage_id']!r}, "
             f"lineage={identity['lineage']}, "
+            f"high_level={high_level_eval_disposition}, "
             "modules=vision_encoder+low_level_actor, "
             "teacher_encoder_not_loaded=true, uses_height_scan_at_inference=false"
         )

@@ -18,6 +18,19 @@ import torch
 from collections import deque, defaultdict
 
 
+def _split_and_record_p15_transport(agent, critic_wire, dones=None):
+    """Keep the 346-D worker wire out of Critic/PPO storage on every path."""
+    if not getattr(agent, "is_p15_response", False):
+        return critic_wire
+    critic_obs, response_aux = agent.split_p15_transport(critic_wire)
+    if dones is None:
+        dones = torch.zeros(
+            critic_obs.shape[0], dtype=torch.bool, device=critic_obs.device
+        )
+    agent.observe_response_aux(response_aux, dones)
+    return critic_obs
+
+
 def _initialize_training_state(env, agent, logger):
     """
     Initialize training state including storage, buffers, and observations.
@@ -69,6 +82,7 @@ def _initialize_training_state(env, agent, logger):
         critic_obs = obs
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
+    critic_obs = _split_and_record_p15_transport(agent, critic_obs)
     logger.info(f"obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
 
     # Load reward keys from monitor config
@@ -513,6 +527,7 @@ def run_episodes_(
             # Move tensors to device
             # 将张量移动到设备
             obs, critic_obs, rewards, dones = _move_tensors_to_device(obs, critic_obs, rewards, dones, agent.device)
+            critic_obs = _split_and_record_p15_transport(agent, critic_obs, dones)
             if getattr(agent, "is_visual_ppo", False):
                 reset_mask = dones.reshape(-1).bool()
                 agent._rollout_reset_mask = reset_mask.detach().clone()
