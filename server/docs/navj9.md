@@ -4,7 +4,7 @@
 
 - Parent model: Stage3J-1 30min Best.
 - Stage name: `navj9`.
-- Config: `agent_ppo/conf/train_env_conf_track_navj9.toml`.
+- Historical config: `train_env_conf_track_navj9.toml` (removed from the active tree; recover from Git history).
 - Goal: determine whether a truly fixed PPO learning rate reduces L9 policy drift.
 
 ## Only Training Change

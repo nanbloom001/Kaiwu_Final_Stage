@@ -16,6 +16,7 @@ import toml
 # Valid task types (Isaac Lab native config format)
 # 有效任务类型（Isaac Lab 原生配置格式）
 _VALID_TASKS = {"standard", "track"}
+_EXPLICIT_POLICY_ENTRY_MISSING = object()
 
 
 class StageConfig:
@@ -222,6 +223,190 @@ class LBCLocoConfig(StageConfig):
     teacher_actor_activation = "elu"
 
 
+class StandardVisualPPOConfig(StageConfig):
+    """Stage 5 recurrent visual PPO and command generalization."""
+
+    name = "visual_policy_optimization"
+    task_type = "standard"
+    algorithm = "visual_ppo"
+    model_class = "VisualActorCritic"
+    # Actual saves use the current pure-letter phase label.
+    ckpt_name = "model.ckpt-commandfull"
+
+    proprio_dim = 45
+    scan_dim = 256
+    depth_height = 180
+    depth_width = 320
+    depth_channels = 1
+    cnn_output_dim = 32
+    lstm_hidden_size = 64
+    lstm_num_layers = 2
+    latent_dim = 32
+
+    num_steps_per_env = 48
+    tbptt_sequence_length = 16
+    num_learning_epochs = 5
+    num_mini_batches = 4
+    # Class fallback learning rates (§4.2/§5.2). The active TOML is authoritative;
+    # these apply only when the TOML key is absent. critic_warmup_learning_rate is
+    # read solely from the TOML; missing it falls back to critic_lr (1e-4) with a
+    # warning, never silently to 3e-4.
+    actor_lr = 1e-5
+    lstm_lr = 5e-6
+    critic_lr = 1e-4
+    lr = actor_lr
+    max_grad_norm = 1.0
+    model_save_interval = 500  # platform fallback; workflow saves by wall clock
+
+
+class P15ResponseConfig(StandardVisualPPOConfig):
+    """P1.5 Standard visual PPO with an independently trained response adapter."""
+
+    name = "p15_response"
+    task_type = "standard"
+    algorithm = "p15_response"
+    ckpt_name = "model.ckpt-responsefull"
+    # The worker transports 346 privileged values, but aisrv splits them before
+    # PPO. The model and RecurrentRolloutStorage contract therefore remains 316.
+    num_critic_observations = 316
+    # Future labels need 51 contiguous frames. Agent initializes rollout storage
+    # from the StageConfig class, so the matching TOML key is documentation only.
+    num_steps_per_env = 80
+    model_save_interval = 500
+
+
+class NavDaggerConfig(StageConfig):
+    """hier-nav 高层导航 DAgger 训练阶段（Track + Camera，冻结低层）。
+
+    冻结低层 = command-34728 的 VisionEncoder + Actor77（optimizer 只含
+    HighLevelPolicy 参数）。obs 布局与全部接口常量的权威来源是
+    ``feature/nav_contract.py``；本类维度字段必须与其一致。
+
+    本阶段必须经显式 policy_entry 选择（TOML env_conf.policy_entry =
+    "nav_dagger"）；禁止进入 task-name 回退——那会把 Camera 任务打给
+    lbc_loco 并静默丢弃高层。
+    """
+
+    name = "nav_dagger"
+    task_type = "track"
+    algorithm = "nav_dagger"
+    model_class = "HighLevelPolicy"
+    # Actual saves use the current pure-letter phase label (navbc/navdagger/navfull).
+    ckpt_name = "model.ckpt-navdagger"
+
+    # 观测布局（与 nav_contract 一致；agent 侧显式设 num_obs=57905 /
+    # num_critic_obs=323，不走基类通用公式——policy goal4 与 critic
+    # goal3 + nav privilege 不对称）
+    num_goal_obs = 4
+    num_actor_observations = 57905   # proprio45 | scan256 | goal4 | depth57600
+    num_critic_observations = 323    # critic60 | scan256 | goal3 | nav privilege4
+
+    # 冻结低层结构维度（load 校验与模型构造共用；与 StandardVisualPPOConfig 一致）
+    proprio_dim = 45
+    scan_dim = 256
+    depth_height = 180
+    depth_width = 320
+    depth_channels = 1
+    cnn_output_dim = 32
+    lstm_hidden_size = 64
+    lstm_num_layers = 2
+    latent_dim = 32
+
+    # 低层 Actor77 结构（Sequential 手工搭建时使用，与低层 checkpoint key 对齐）
+    teacher_actor_hidden_dims = [512, 256, 128]
+    teacher_actor_activation = "elu"
+
+    # 高层结构（HighLevelPolicy）
+    nav_input_dim = 48
+    nav_vocab_size = 10
+    nav_lstm_hidden_size = 64
+    nav_lstm_num_layers = 2
+
+    # 训练超参（TOML [nav_dagger] 优先，此处为类兜底）
+    lr = 3e-4
+    lr_min = 1e-5
+    max_iterations = 20000
+    max_grad_norm = 1.0
+    log_interval = 10
+    num_steps_per_env = 160          # 160 低层帧 = 16 nav tick = 一个 TBPTT 段
+    tbptt_sequence_length = 16
+    platform_archive_interval_minutes = 5.0
+    lr_scheduler_iterations = 14000
+    ramp_start_h = 0.50
+    ramp_end_h = 4.00
+
+
+class NavEvalConfig(NavDaggerConfig):
+    """hier-nav 评估专用阶段：只组装推理模块，永不构造训练 Algorithm。
+
+    与训练类分离的原因（历史事故）：显式 policy_entry 命中训练类曾导致
+    eval 构造训练 Algorithm 并因缺训练 schedule 崩溃。本类 algorithm 值
+    不同（"nav_eval"），agent 按它走纯推理装配 + 硬停止自检链。
+    """
+
+    name = "nav_eval"
+    algorithm = "nav_eval"
+
+
+def _configured_training_stage(logger):
+    """Resolve the training stage before its stage-specific TOML is chosen.
+
+    A stage-specific TOML cannot select itself: its path contains the stage
+    name, so ``policy_entry`` inside that file is only a consistency check.
+    ``conf/configure_app.toml`` is loaded by the platform before training and
+    therefore provides the one reliable, operator-visible bootstrap selector.
+    Older branches without this key retain ``Config.CURRENT`` behavior.
+    """
+
+    configure_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "conf", "configure_app.toml")
+    )
+    try:
+        try:
+            configure = toml.load(configure_path)
+        except AttributeError:
+            # ``tomllib.load`` accepts only a binary file object. Some local
+            # test/runtime images provide it behind the legacy ``toml`` name.
+            with open(configure_path, "rb") as configure_file:
+                configure = toml.load(configure_file)
+    except (OSError, TypeError, ValueError) as exc:
+        if logger is not None:
+            logger.warning(
+                f"[train] unable to read stage bootstrap {configure_path}: {exc}; "
+                "falling back to Config.CURRENT"
+            )
+        return None
+    app_conf = configure.get("app", {})
+    entry = app_conf.get("policy_entry") if isinstance(app_conf, dict) else None
+    if entry is None:
+        return None
+    if not isinstance(entry, str) or not entry.strip():
+        raise ValueError(
+            "conf/configure_app.toml [app].policy_entry must be a non-empty string"
+        )
+    normalized = entry.strip().lower()
+    selected = {
+        "visual_policy_optimization": StandardVisualPPOConfig,
+        "standard_visual_ppo": StandardVisualPPOConfig,
+        "visual_ppo": StandardVisualPPOConfig,
+        "p15_response": P15ResponseConfig,
+        "lbc_loco": LBCLocoConfig,
+        "locomotion": LocomotionConfig,
+        "nav_dagger": NavDaggerConfig,
+    }.get(normalized)
+    if selected is None:
+        raise ValueError(
+            "unsupported training policy_entry in conf/configure_app.toml: "
+            f"{entry!r}"
+        )
+    if logger is not None:
+        logger.info(
+            f"[train] stage bootstrap selected: {normalized} -> {selected.name} "
+            f"from {configure_path}"
+        )
+    return selected
+
+
 class Config:
     """
     Unified config entry point.
@@ -233,18 +418,16 @@ class Config:
     设置 ``Config.CURRENT`` 为某个 StageConfig 子类，然后通过
     ``Config.CURRENT.lr``、``Config.CURRENT.num_mini_batches`` 等读取超参数。
 
-    Auto stage inference (based on TOML env_conf.task_name):
+    Evaluation-stage selection uses an explicit policy entry when present.
+    The legacy task-name fallback remains for old model packages:
         task_name = "Unitree-Go2-Velocity"        + mode=standard -> LocomotionConfig
         task_name = "Unitree-Go2-Velocity-Camera" + mode=standard -> LBCLocoConfig
     """
 
-    # Default stage; can be overridden by TOML env_conf.task_name during eval.
-    # 阶段 4（深度视觉蒸馏）：训练入口固定为 lbc_loco。
-    # 阶段 2 的 standard_ref_distill 已完成（daggerfull-16288），R2 分支的默认值
-    # 会让训练继续进入特权桥接，读取错误的 TOML。视觉阶段必须默认 lbc_loco，
-    # 才会加载 train_env_conf_standard_lbc_loco.toml 并走 lbc_workflow。
-    # eval 时仍由 _infer_stage_from_task_name 按 task_name 覆盖。
-    CURRENT = LBCLocoConfig
+    # Keep the literal default aligned with the branch's active training stage.
+    # configure_app.toml remains authoritative for worker subprocesses and is
+    # checked again below during module bootstrap.
+    CURRENT = P15ResponseConfig
 
     @staticmethod
     def load_conf(logger):
@@ -261,14 +444,6 @@ class Config:
         from common_python.config.config_control import CONFIG
         from kaiwudrl.common.utils.kaiwudrl_define import KaiwuDRLDefine
 
-        stage = Config.CURRENT
-        task_type = stage.task_type
-
-        if task_type not in _VALID_TASKS:
-            raise ValueError(
-                f"Invalid task_type '{task_type}' in stage '{stage.name}'. " f"Only {_VALID_TASKS} are supported."
-            )
-
         # Determine if it's evaluation mode
         # 判断是否为评估模式
         is_eval = False
@@ -277,6 +452,20 @@ class Config:
                 KaiwuDRLDefine.RUN_MODE_EVAL,
                 KaiwuDRLDefine.RUN_MODE_EXAM,
             ]
+
+        stage = Config.CURRENT
+        if not is_eval:
+            configured_stage = _configured_training_stage(logger)
+            if configured_stage is not None:
+                Config.CURRENT = configured_stage
+                stage = configured_stage
+        task_type = stage.task_type
+
+        if task_type not in _VALID_TASKS:
+            raise ValueError(
+                f"Invalid task_type '{task_type}' in stage '{stage.name}'. "
+                f"Only {_VALID_TASKS} are supported."
+            )
 
         if is_eval:
             usr_conf_file = f"tools/eval/conf/eval_env_conf.toml"
@@ -290,21 +479,32 @@ class Config:
             logger.error(error_msg)
             raise Exception(error_msg)
 
-        # train_test 显存不足，将 num_envs 降为 1
-        # reduce num_envs to 1 for train_test due to GPU memory
-        if os.environ.get("KAIWU_TRAIN_TEST"):
-            usr_conf["env"]["num_envs"] = 1
-            logger.info("KAIWU_TRAIN_TEST detected, set num_envs to 1")
+        if not is_eval:
+            declared_entry = _get_explicit_policy_entry(usr_conf)
+            if declared_entry is not _EXPLICIT_POLICY_ENTRY_MISSING:
+                declared_stage = _valid_explicit_policy_stage(usr_conf)
+                if declared_stage is None or declared_stage is not stage:
+                    raise ValueError(
+                        "training stage bootstrap/TOML mismatch: "
+                        f"bootstrap={stage.name}, TOML policy_entry={declared_entry!r}"
+                    )
 
-        # Eval-time stage override: infer stage from task_name and terrain mode.
-        # 评估时按 task_name + terrain mode 推断 stage，覆盖 conf.py 顶部的 CURRENT，
-        # 从而同一份代码可在平台上自动识别 loco / lbc_loco 两条评估路径。
+        _apply_runtime_env_overrides(usr_conf, logger)
+
+        # Eval-time selection: explicit policy entry first, then the legacy
+        # task-name fallback when no explicit entry is available.
         if is_eval:
             inferred = _infer_stage_from_task_name(usr_conf, logger)
             if inferred is not None and inferred is not stage:
+                explicit_stage = _valid_explicit_policy_stage(usr_conf)
+                selection_reason = (
+                    "explicit policy entry"
+                    if inferred is explicit_stage
+                    else "inferred from TOML task_name"
+                )
                 logger.info(
                     f"[eval] Override Config.CURRENT: {stage.name} -> {inferred.name} "
-                    f"(inferred from TOML task_name)"
+                    f"({selection_reason})"
                 )
                 Config.CURRENT = inferred
                 stage = inferred
@@ -315,25 +515,164 @@ class Config:
         return usr_conf, usr_conf_file, is_eval, stage
 
 
+def _get_explicit_policy_entry(usr_conf):
+    """Return the highest-precedence operator entry, including invalid values.
+
+    The caller must distinguish an absent key from a present-but-invalid value:
+    falling through from an empty/non-string ``env_conf.policy_entry`` to a
+    lower-precedence table would silently select a different policy than the
+    operator configured.
+    """
+    if not isinstance(usr_conf, dict):
+        return _EXPLICIT_POLICY_ENTRY_MISSING
+    env_conf = usr_conf.get("env_conf", {})
+    if not isinstance(env_conf, dict):
+        env_conf = {}
+    eval_conf = usr_conf.get("eval", {})
+    if not isinstance(eval_conf, dict):
+        eval_conf = {}
+    for table, key in (
+        (env_conf, "policy_entry"),
+        (env_conf, "eval_policy"),
+        (eval_conf, "policy_entry"),
+        (eval_conf, "eval_policy"),
+        (usr_conf, "policy_entry"),
+        (usr_conf, "eval_policy"),
+    ):
+        if key in table:
+            return table[key]
+    return _EXPLICIT_POLICY_ENTRY_MISSING
+
+
+def _valid_explicit_policy_stage(usr_conf):
+    """Return a stage only when the highest-priority explicit value is usable."""
+    entry = _get_explicit_policy_entry(usr_conf)
+    if not isinstance(entry, str):
+        return None
+    return {
+        "visual_policy_optimization": StandardVisualPPOConfig,
+        "standard_visual_ppo": StandardVisualPPOConfig,
+        "visual_ppo": StandardVisualPPOConfig,
+        "p15_response": P15ResponseConfig,
+        "lbc_loco": LBCLocoConfig,
+        "locomotion": LocomotionConfig,
+        # hier-nav：训练与评估入口分离（评估类永不构造训练 Algorithm）。
+        # 刻意不加入 task-name 回退（_infer_stage_from_task_name 第 6 步）：
+        # nav 只能显式选择，绝不允许静默路径。
+        "nav_dagger": NavDaggerConfig,
+        "nav_eval": NavEvalConfig,
+    }.get(entry.strip().lower())
+
+
+def _apply_runtime_env_overrides(usr_conf, logger) -> None:
+    """Apply explicit test-only overrides to the in-memory config."""
+
+    # Official train_test retains its historical one-environment behavior.
+    if os.environ.get("KAIWU_TRAIN_TEST"):
+        usr_conf["env"]["num_envs"] = 1
+        logger.info("KAIWU_TRAIN_TEST detected, set num_envs to 1")
+        return
+    if os.environ.get("NAV_FULL_SMOKE") != "1":
+        return
+    raw_num_envs = os.environ.get("NAV_FULL_SMOKE_NUM_ENVS", "8")
+    try:
+        smoke_num_envs = int(raw_num_envs)
+    except ValueError as exc:
+        raise ValueError("NAV_FULL_SMOKE_NUM_ENVS must be an integer") from exc
+    if not 1 <= smoke_num_envs <= 256:
+        raise ValueError("NAV_FULL_SMOKE_NUM_ENVS must be in [1, 256]")
+    configured_num_envs = int(usr_conf["env"]["num_envs"])
+    usr_conf["env"]["num_envs"] = smoke_num_envs
+    logger.warning(
+        "[NavSmoke] temporary in-memory num_envs override: "
+        f"configured={configured_num_envs}, smoke={smoke_num_envs}; "
+        "production TOML is unchanged"
+    )
+
+
 def _infer_stage_from_task_name(usr_conf, logger):
     """Infer StageConfig subclass from TOML env_conf.task_name + terrain.mode.
 
-    Rules:
+    An explicit ``env_conf.policy_entry`` (or ``eval_policy`` alias) has
+    precedence over task-name inference. Camera task names are shared by the
+    deployment-shaped LBC loader and the recurrent VisualPPO loader, so the
+    evaluator must be able to select the checkpoint contract explicitly.
+
+    Evaluation rules when no valid explicit entry is present:
         task_name = "Unitree-Go2-Velocity"        + mode=standard -> LocomotionConfig
         task_name = "Unitree-Go2-Velocity-Camera" + mode=standard -> LBCLocoConfig
+
+    A Camera task name alone is not enough to select the recurrent visual PPO
+    loader. ``policy_entry = "visual_policy_optimization"`` must select
+    ``StandardVisualPPOConfig`` before this task-name fallback runs.
 
     Returns None if task_name is missing or unrecognized (fallback to Config.CURRENT).
     """
     if not isinstance(usr_conf, dict):
         return None
     env_conf = usr_conf.get("env_conf", {})
+    if not isinstance(env_conf, dict):
+        logger.warning(
+            "[eval] env_conf is not a table; ignoring explicit policy entry"
+        )
+        env_conf = {}
+
+    # Keep the operator-facing override explicit and deterministic.  The
+    # platform has used all three layouts over time, so accept them in a fixed
+    # precedence order without allowing a missing [eval] table to erase the
+    # value from [env_conf].
+    explicit_entry = _get_explicit_policy_entry(usr_conf)
+    if explicit_entry is not _EXPLICIT_POLICY_ENTRY_MISSING:
+        if not isinstance(explicit_entry, str):
+            logger.warning(
+                "[eval] Explicit policy entry must be a non-empty string; "
+                f"got {type(explicit_entry).__name__}, falling back to task_name inference"
+            )
+            explicit_entry = None
+        else:
+            explicit_entry = explicit_entry.strip().lower()
+            if not explicit_entry:
+                logger.warning(
+                    "[eval] Explicit policy entry is empty; falling back to task_name inference"
+                )
+                explicit_entry = None
+        if explicit_entry:
+            selected = _valid_explicit_policy_stage(usr_conf)
+            if selected is not None:
+                if selected is NavDaggerConfig:
+                    selected = NavEvalConfig
+                logger.info(
+                    "[eval] Explicit policy entry selected: "
+                    f"{explicit_entry} -> {selected.name}"
+                )
+                return selected
+            logger.warning(
+                "[eval] Unknown explicit policy entry "
+                f"{explicit_entry!r}; falling back to task_name inference"
+            )
     task_name = env_conf.get("task_name")
     if not task_name:
         logger.info("[eval] task_name not set in TOML, fallback to Config.CURRENT")
         return None
+    if not isinstance(task_name, str):
+        logger.warning(
+            "[eval] task_name is not a string; fallback to Config.CURRENT"
+        )
+        return None
 
     terrain_conf = usr_conf.get("terrain", {})
+    if not isinstance(terrain_conf, dict):
+        logger.warning(
+            "[eval] terrain is not a table; fallback to Config.CURRENT"
+        )
+        return None
     mode = str(terrain_conf.get("mode", "standard")).lower()
+    if mode == "track" and "Camera" in task_name:
+        logger.info(
+            "[eval] Track+Camera task selected nav_eval without an explicit "
+            "policy entry; this keeps platform Camera routing deploy-shaped"
+        )
+        return NavEvalConfig
     if mode != "standard":
         logger.warning(
             f"[eval] Only terrain.mode='standard' is supported; "
@@ -343,6 +682,27 @@ def _infer_stage_from_task_name(usr_conf, logger):
 
     has_camera = "Camera" in task_name
     return LBCLocoConfig if has_camera else LocomotionConfig
+
+
+def _infer_stage_for_eval(usr_conf, logger):
+    """Compatibility entry used by the platform-owned environment worker.
+
+    The operator-supplied ``base_env.py`` resolves this historical symbol in a
+    spawned subprocess. Keep the implementation in the agent package so the
+    platform file can remain byte-for-byte unchanged.
+    """
+
+    return _infer_stage_from_task_name(usr_conf, logger)
+
+
+# Training workers are separate processes and do not inherit the aisrv-side
+# ``Config.load_conf`` mutation. Bootstrap at module import from the same
+# operator-owned file so lazy observation-process resolution is identical in
+# aisrv and worker. Evaluation resets still override this from eval TOML via
+# ``_infer_stage_for_eval``.
+_BOOTSTRAP_STAGE = _configured_training_stage(logger=None)
+if _BOOTSTRAP_STAGE is not None:
+    Config.CURRENT = _BOOTSTRAP_STAGE
 
 
 def _deep_merge(base, override):

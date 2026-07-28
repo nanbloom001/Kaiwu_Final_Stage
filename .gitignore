@@ -1,5 +1,8 @@
 .DS_Store
 .nfs*
+.env
+/.worktrees/
+/.zcode/
 __pycache__/
 *.py[cod]
 kaiwu_ide_crack/
@@ -9,3 +12,10 @@ kaiwu_ide_crack/
 /unitree_isaaclab_deploy/
 /代码存档/
 /分析记录/
+
+# Local historical snapshots and downloaded model packages are not active source.
+# Curated analysis and provenance records remain versioned under shared/分析记录/.
+/archive/代码存档/
+
+# Local evaluation recordings are evidence artifacts, not source files.
+/shared/视频存档/

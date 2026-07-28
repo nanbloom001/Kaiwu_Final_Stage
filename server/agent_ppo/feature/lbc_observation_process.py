@@ -17,7 +17,11 @@ obs layout:
 
 from tools.base_env.observation_process import ObservationProcess
 
-from agent_ppo.feature import nav_observation_utils
+from agent_ppo.feature import nav_observation_utils, nav_probe
+from agent_ppo.feature.worker_command_bridge import (
+    apply_worker_command,
+    record_worker_command_observation,
+)
 
 
 class LBCObservationProcess(ObservationProcess):
@@ -26,7 +30,11 @@ class LBCObservationProcess(ObservationProcess):
     target_group = "policy"
 
     def process(self):
+        apply_worker_command(self.env)
+        # S0a 只读探针：默认关闭，由激活阶段 TOML 的 [nav_probe] enabled 门控
+        nav_probe.probe_once(self.env)
         # default_observation() = [proprio | height_scan] by Isaac Lab ObsCfg
         obs = self.default_observation()
+        record_worker_command_observation(self.env, "policy", obs)
         depth = nav_observation_utils.depth_camera_image(self.env)   # (N, 57600)
         return self.concatenate_terms(obs, depth)

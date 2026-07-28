@@ -13,8 +13,9 @@ TrackNavOpt5DebugConfig
 name = navopt5debug
 ```
 
-The environment file is
-`agent_ppo/conf/train_env_conf_track_navopt5debug.toml`.
+The historical environment file was
+`train_env_conf_track_navopt5debug.toml`; it has been removed from the active
+tree and remains available in Git history.
 
 ## Audit Findings
 

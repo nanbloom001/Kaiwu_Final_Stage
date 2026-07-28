@@ -1354,7 +1354,6 @@ class Robot:
         self._task_type = "track"  # 默认 track，reset 时从 usr_conf["terrain"]["task"] 更新
 
         self.is_eval = False
-        self._continuous_training = False
         self.eval_write_json_file = False
         self.env_nums = 4096
 
@@ -1551,17 +1550,6 @@ class Robot:
         #   - 训练时: 在非 maze 段中随机生成
         #   - 评估时: 固定在赛道起点生成
         self._gym_env.unwrapped._is_eval = bool(self.is_eval)
-        self._gym_env.unwrapped._is_training = not bool(self.is_eval)
-        depth_camera_conf = (
-            self.usr_conf.get("camera", {}).get("depth_camera", {})
-            if isinstance(self.usr_conf, dict)
-            else {}
-        )
-        self._gym_env.unwrapped._depth_preprocess_conf = (
-            dict(depth_camera_conf)
-            if isinstance(depth_camera_conf, dict)
-            else {}
-        )
 
         # 设置地形块边界终止开关（仅评估模式 + 配置启用时生效）
         # 训练时默认关闭，避免正常速度跟踪被频繁截断
@@ -2244,16 +2232,6 @@ class Robot:
             env_section = usr_conf.get("env", {})
             terrain_section = usr_conf.get("terrain", {})
             task_name = env_conf.get("task_name", "Unitree-Go2-Velocity")
-            custom_parameters = usr_conf.get("custom_parameters", {})
-            self._continuous_training = (
-                bool(custom_parameters.get("continuous_training", False))
-                and not self.is_eval
-            )
-            self.logger.info(
-                "[episode lifecycle] "
-                f"continuous_training={self._continuous_training}, "
-                f"is_eval={bool(self.is_eval)}, task_name={task_name}"
-            )
 
             entry_point_key = "play_env_cfg_entry_point" if self.is_eval else "env_cfg_entry_point"
 
@@ -2640,13 +2618,7 @@ class Robot:
             terminated_flat = terminated.flatten()
             all_terminated = bool(terminated_flat.all())
             terminated_count = int(terminated_flat.sum())
-            # frame_no 是自本次 env.reset() 起的全局 workflow 计数，不是每个
-            # Isaac Lab 子环境的 episode_length_buf。长时间流式蒸馏依靠底层
-            # per-env auto-reset，不能在 1250 帧后永久把 infos["all_done"] 置真。
-            reached_max_length = (
-                not getattr(self, "_continuous_training", False)
-                and self.frame_no > self.max_episode_length
-            )
+            reached_max_length = self.frame_no > self.max_episode_length
 
             # 评估模式：所有 env 都完成过一次 episode 即触发 all_done
             eval_all_envs_done = (

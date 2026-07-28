@@ -14,6 +14,7 @@ Exports:
     - VisionEncoder:       depth 图像 CNN + LSTM 编码器（LBC 蒸馏学生）
     - DmEncoder:           height_scan MLP 编码器（LBC 蒸馏教师）
     - CNNRNN:              VisionEncoder 的兼容外壳
+    - VisualActorCritic:   recurrent depth actor + privileged critic
     - create_cnn_encoder:  SimpleCNN 构造函数
 """
 
@@ -21,6 +22,7 @@ from agent_ppo.model.actor_critic import ActorCritic, resolve_nn_activation
 from agent_ppo.model.actor_critic_encoder import ActorCriticEncoder, L2Norm
 from agent_ppo.model.simple_cnn import create_cnn_encoder
 from agent_ppo.model.vision_encoder import VisionEncoder, DmEncoder, CNNRNN
+from agent_ppo.model.visual_actor_critic import VisualActorCritic
 
 __all__ = [
     "ActorCritic",
@@ -31,4 +33,5 @@ __all__ = [
     "VisionEncoder",
     "DmEncoder",
     "CNNRNN",
+    "VisualActorCritic",
 ]

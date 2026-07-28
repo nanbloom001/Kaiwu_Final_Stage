@@ -43,6 +43,10 @@ class RolloutStorage:
             self.action_mean = None
             self.action_sigma = None
             self.hidden_states = None
+            self.anchor_actions = None
+            self.anchor_latents = None
+            self.anchor_weights = None
+            self.hard_terminations = None
 
         def clear(self):
             self.__init__()
@@ -282,3 +286,150 @@ class RolloutStorage:
             # 掩码占位符
             None,
         )
+
+
+class RecurrentRolloutStorage(RolloutStorage):
+    """Sequence-preserving PPO storage for the Standard visual policy.
+
+    The ordinary PPO generator intentionally flattens ``[time, env]``. This
+    variant keeps contiguous TBPTT chunks, the actor LSTM state at each chunk
+    boundary, prior-step continuation masks, and frozen-S0 anchor targets.
+    """
+
+    def __init__(self, *args, anchor_latent_dim: int, **kwargs):
+        super().__init__(*args, **kwargs)
+        shape = (self.num_transitions_per_env, self.num_envs)
+        self.anchor_actions = torch.zeros(
+            *shape, *self.actions_shape, device=self.device
+        )
+        self.anchor_latents = torch.zeros(
+            *shape, int(anchor_latent_dim), device=self.device
+        )
+        self.anchor_weights = torch.ones(*shape, 1, device=self.device)
+        self.hard_terminations = torch.zeros(*shape, 1, device=self.device).byte()
+        self.recurrent_hidden_h = None
+        self.recurrent_hidden_c = None
+
+    def _save_hidden_states(self, hidden_states):
+        if hidden_states is None:
+            raise ValueError("Recurrent visual PPO transition is missing hidden state")
+        hidden_h, hidden_c = hidden_states
+        if not isinstance(hidden_h, torch.Tensor) or not isinstance(hidden_c, torch.Tensor):
+            raise TypeError("Expected actor LSTM hidden state tuple (h, c)")
+        if self.recurrent_hidden_h is None:
+            time_steps = self.num_transitions_per_env
+            self.recurrent_hidden_h = torch.zeros(
+                time_steps, *hidden_h.shape, device=self.device, dtype=hidden_h.dtype
+            )
+            self.recurrent_hidden_c = torch.zeros(
+                time_steps, *hidden_c.shape, device=self.device, dtype=hidden_c.dtype
+            )
+        self.recurrent_hidden_h[self.step].copy_(hidden_h)
+        self.recurrent_hidden_c[self.step].copy_(hidden_c)
+
+    def add_transitions(self, transition):
+        if transition.anchor_actions is None or transition.anchor_latents is None:
+            raise ValueError("Recurrent visual PPO transition is missing S0 anchors")
+        if transition.hard_terminations is None:
+            raise ValueError("Recurrent visual PPO transition is missing hard terminations")
+        if transition.anchor_weights is None:
+            raise ValueError("Recurrent visual PPO transition is missing anchor weights")
+        self.anchor_actions[self.step].copy_(transition.anchor_actions)
+        self.anchor_latents[self.step].copy_(transition.anchor_latents)
+        self.hard_terminations[self.step].copy_(
+            transition.hard_terminations.view(-1, 1)
+        )
+        self.anchor_weights[self.step].copy_(
+            transition.anchor_weights.view(-1, 1)
+        )
+        super().add_transitions(transition)
+
+    def recurrent_mini_batch_generator(
+        self,
+        num_mini_batches: int,
+        num_epochs: int,
+        sequence_length: int,
+    ):
+        """Yield contiguous ``[T, B, ...]`` chunks with exact start states."""
+        sequence_length = int(sequence_length)
+        if sequence_length <= 0:
+            raise ValueError("sequence_length must be positive")
+        if self.num_transitions_per_env % sequence_length != 0:
+            raise ValueError(
+                "num_transitions_per_env must be divisible by sequence_length: "
+                f"{self.num_transitions_per_env} vs {sequence_length}"
+            )
+        if self.recurrent_hidden_h is None or self.recurrent_hidden_c is None:
+            raise RuntimeError("No recurrent hidden states were collected")
+
+        chunks_per_env = self.num_transitions_per_env // sequence_length
+        sequence_refs = [
+            (start, env_id)
+            for env_id in range(self.num_envs)
+            for start in range(0, self.num_transitions_per_env, sequence_length)
+        ]
+        total_sequences = self.num_envs * chunks_per_env
+        if total_sequences % int(num_mini_batches) != 0:
+            raise ValueError(
+                f"{total_sequences} recurrent sequences are not divisible by "
+                f"num_mini_batches={num_mini_batches}"
+            )
+        mini_batch_sequences = total_sequences // int(num_mini_batches)
+
+        for _epoch in range(int(num_epochs)):
+            order = torch.randperm(total_sequences, device=self.device).tolist()
+            for batch_index in range(int(num_mini_batches)):
+                selected = order[
+                    batch_index * mini_batch_sequences:
+                    (batch_index + 1) * mini_batch_sequences
+                ]
+                refs = [sequence_refs[index] for index in selected]
+
+                def stack_chunks(buffer):
+                    return torch.stack(
+                        [
+                            buffer[start:start + sequence_length, env_id]
+                            for start, env_id in refs
+                        ],
+                        dim=1,
+                    )
+
+                hidden_h = torch.stack(
+                    [
+                        self.recurrent_hidden_h[start, :, env_id, :]
+                        for start, env_id in refs
+                    ],
+                    dim=1,
+                )
+                hidden_c = torch.stack(
+                    [
+                        self.recurrent_hidden_c[start, :, env_id, :]
+                        for start, env_id in refs
+                    ],
+                    dim=1,
+                )
+                # done[t] terminates the transition after obs[t]. The visual
+                # model consumes masks[t-1] before obs[t], so passing the full
+                # continuation tensor preserves that convention.
+                continuation_masks = ~stack_chunks(self.dones).bool()
+
+                yield (
+                    stack_chunks(self.observations),
+                    stack_chunks(
+                        self.privileged_observations
+                        if self.privileged_observations is not None
+                        else self.observations
+                    ),
+                    stack_chunks(self.actions),
+                    stack_chunks(self.values),
+                    stack_chunks(self.advantages),
+                    stack_chunks(self.returns),
+                    stack_chunks(self.actions_log_prob),
+                    stack_chunks(self.mu),
+                    stack_chunks(self.sigma),
+                    (hidden_h, hidden_c),
+                    continuation_masks,
+                    stack_chunks(self.anchor_actions),
+                    stack_chunks(self.anchor_latents),
+                    stack_chunks(self.anchor_weights),
+                )

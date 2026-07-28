@@ -1,0 +1,246 @@
+# Standard Stage 5: four-hour visual command generalization.
+# Parent checkpoint: the operator-selected best Anchor R2 bundle.
+# 任务：standard-command-r1；详见 Standard命令泛化下半四小时实施计划.md。
+
+[env]
+num_envs = 256
+episode_length_s = 25
+task = "standard"
+
+[env_conf]
+task_name = "Unitree-Go2-Velocity-Camera"
+policy_entry = "visual_policy_optimization"
+seed = 0
+
+[custom_parameters]
+continuous_training = true
+
+[terrain]
+mode = "standard"
+num_rows = 10
+num_cols = 20
+difficulty_range = [0.0, 1.0]
+curriculum = true
+max_init_terrain_level = 9
+
+[terrain.standard_wall]
+enabled = true
+min_difficulty = 0.60
+full_difficulty = 0.90
+max_probability = 0.15
+height_range = [0.25, 0.45]
+thickness_range = [0.10, 0.15]
+margin_range = [0.05, 0.10]
+eligible_keywords = ["slope", "stairs"]
+exclude_keywords = ["maze", "corridor"]
+
+[terrain.standard.pyramid_slope]
+proportion = 0.20
+
+[terrain.standard.pyramid_slope_inv]
+proportion = 0.20
+
+[terrain.standard.pyramid_stairs]
+proportion = 0.20
+
+[terrain.standard.pyramid_stairs_inv]
+proportion = 0.40
+
+[terrain.standard.maze]
+proportion = 0.0
+platform_width = 3.0
+
+[domain_rand]
+enable_domain_rand = false
+randomize_friction = false
+friction_range = [0.3, 1.5]
+push_robots = false
+push_interval_s = 15
+max_push_vel_xy = 0.5
+
+[noise]
+add_noise = false
+
+[init_state]
+pos = [0.0, 0.0, 0.35]
+
+# The platform-native sampler is a source-domain fallback. The environment
+# worker performs the actual 1.5--10 second resampling; 300 seconds prevents
+# the native sampler from overwriting a held worker command.
+[commands]
+resampling_time = [300.0, 300.0]
+
+[commands.ranges]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_yaw = [-0.3, 0.3]
+
+# commands.limit.ang_vel_z and commands.ranges.ang_vel_yaw are the platform's
+# two legacy key names for the same Z-axis yaw command; keep both as-is.
+[commands.limit]
+lin_vel_x = [0.0, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_z = [-0.3, 0.3]
+
+[commands.buckets]
+enabled = false
+
+[commands.worker_progressive]
+enabled = true
+log_interval_steps = 500
+
+[visual_policy_optimization]
+run_name = "standard-command-r1"
+schedule_mode = "visual_command_generalization_v1"
+transition_parent_model_id = 28401
+
+max_iterations = 50000
+num_steps_per_env = 48
+tbptt_sequence_length = 16
+num_learning_epochs = 5
+num_mini_batches = 4
+# Per-group learning rates (§4.2). class fallback in conf.py is
+# actor 1e-5 / lstm 5e-6 / critic 1e-4; these TOML values are authoritative.
+actor_learning_rate = 1.0e-5
+lstm_learning_rate = 5.0e-6
+critic_learning_rate = 1.0e-4
+# Critic warmup LR used only during anchorcritic (0-45 min). Missing key falls
+# back to critic_learning_rate (1e-4) with a warning, never silently 3e-4.
+critic_warmup_learning_rate = 3.0e-4
+max_grad_norm = 1.0
+init_noise_std = 0.15
+
+# Anchor R2's final weights stay fixed throughout command generalization.
+command_anchor_action = 0.35
+command_anchor_latent = 0.10
+
+# task_end_hours is recorded for backward compatibility only; the platform
+# task page controls the actual four-hour deadline.
+task_end_hours = 4.0
+save_interval_minutes = 10.0
+resume_first_save_minutes = 2.0
+# Command milestone saves: first three are phase boundaries, 230 min is a
+# pre-reclamation safety save (platform may reclaim near 240 min).
+command_checkpoint_minutes = [30.0, 120.0, 180.0, 230.0]
+
+# Safety thresholds (§5.3): Anchor R2 is warning-only. Violations emit a
+# warning and request a diagnostic checkpoint; they never pause actor updates
+# or freeze the schedule.
+warning_only_safety = true
+max_anchor_action_mse = 0.05
+max_hard_termination_delta = 0.02
+max_action_amplitude = 6.0
+log_interval = 10
+
+[visual_policy_optimization.command_schedule]
+step_dt_s = 0.02
+source_hold_s = [6.0, 10.0]
+target_hold_s = [3.0, 6.0]
+zero_hold_s = [1.5, 3.0]
+source_vx = [0.3, 1.3]
+source_vy = [-0.2, 0.2]
+source_wz = [-0.3, 0.3]
+target_bucket_weights = [0.15, 0.20, 0.30, 0.15, 0.10, 0.10]
+
+[camera.depth_camera]
+offset_pos = [0.339871, 0.034697, 0.075010]
+offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
+max_depth = 5.0
+
+[camera.depth_camera.augmentation]
+enabled = false
+pixel_dropout_prob = 0.10
+gaussian_noise_scale = 0.02
+roll_range_deg = 10.0
+pitch_shift_pix = 10
+
+# Anchor R2 reward surface plus the bounded zero-command stability term.
+[rewards.track_lin_vel_xy]
+weight = 3.0
+[rewards.track_lin_vel_xy.params]
+std = 0.25
+command_name = "base_velocity"
+
+[rewards.track_ang_vel_z]
+weight = 1.0
+[rewards.track_ang_vel_z.params]
+std = 0.25
+command_name = "base_velocity"
+
+[rewards.forward_velocity]
+weight = 0.0
+
+[rewards.air_time_variance_penalty]
+weight = -3.0
+
+[rewards.max_foot_air_time]
+weight = -3.0
+[rewards.max_foot_air_time.params]
+threshold = 0.8
+
+[rewards.foot_symmetry]
+weight = -2.0
+[rewards.foot_symmetry.params]
+max_diff = 0.2
+
+[rewards.trot_gait]
+weight = -1.0
+
+[rewards.zero_command_stability]
+weight = -0.05
+[rewards.zero_command_stability.params]
+command_threshold = 0.05
+grace_period_s = 0.4
+
+[rewards.hip_to_default]
+weight = -0.1
+
+[rewards.dof_pos_limits]
+weight = -0.3
+
+[rewards.joint_acc]
+weight = -1.0e-6
+
+[rewards.joint_position_penalty]
+weight = -0.1
+[rewards.joint_position_penalty.params]
+stand_still_scale = 2.0
+velocity_threshold = 0.1
+
+[rewards.feet_air_time]
+weight = 0.5
+[rewards.feet_air_time.params]
+command_name = "base_velocity"
+threshold = 0.1
+
+[rewards.feet_regulation]
+weight = -0.05
+[rewards.feet_regulation.params]
+base_height_target = 0.38
+
+[rewards.feet_contact_forces]
+weight = -0.01
+[rewards.feet_contact_forces.params]
+max_force = 147.0
+
+[rewards.feet_slide]
+weight = -0.05
+
+[rewards.feet_stumble]
+weight = -0.1
+
+[rewards.legs_distance]
+weight = -0.1
+[rewards.legs_distance.params]
+min_distance = 0.1
+
+[rewards.x_command_hip_regular]
+weight = -0.1
+
+[rewards.approach_goal]
+weight = 2.0
+
+[rewards.reach_goal]
+weight = 10.0
+[rewards.reach_goal.params]
+threshold = 0.6

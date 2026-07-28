@@ -4,6 +4,7 @@
 
 .DS_Store
 .nfs*
+.env
 __pycache__/
 *.py[cod]
 *.log

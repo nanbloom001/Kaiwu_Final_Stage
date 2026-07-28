@@ -1,6 +1,13 @@
 # LBC Loco training configuration.
 # LBC Loco 训练配置。
 #
+# ⚠⚠⚠ S0a 临时探测状态（本 commit 为独立提交，S0a 结束后整体回退）⚠⚠⚠
+# 当前文件被临时切换为 Track+Camera+256+120s 短链探测配置（hier-nav 计划步骤 1）：
+# 用现役 lbc_loco 入口验证 track 地形 + 相机 + 256 环境的显存/耗时，并经
+# [nav_probe] 盘点 goal_positions / goal_yaw / nav_scanner 规格。
+# 探测配置的永久留档见 train_env_conf_track_nav_dagger.toml。
+# ⚠⚠⚠ 探测结束后回退本 commit，恢复 lbc_loco 原始训练配置 ⚠⚠⚠
+#
 # The teacher (a frozen locomotion ckpt) runs normal eval in sim and drives the env;
 # the student (VisionEncoder, CNN+LSTM) learns to approximate the teacher latent
 # from depth_image with an MSE loss.
@@ -28,7 +35,8 @@
 num_envs = 256
 # Max episode duration (seconds).
 # 最大 episode 时长（秒）
-episode_length_s = 25
+# S0a 临时：25 → 120.0（探测用户决定的正式 episode 时长）
+episode_length_s = 120.0
 # Legacy field, not consumed by base_env (terrain mode is read from [terrain].mode).
 # 遗留字段，base_env 不读取（地形模式由 [terrain].mode 决定）
 task = "standard"
@@ -53,22 +61,28 @@ continuous_training = true
 [terrain]
 # Terrain mode, valid values: "standard" | "track".
 # 地形模式，合法值："standard" | "track"
-mode = "standard"
-# Number of difficulty tiers (curriculum levels along X), valid range [1, 10].
-# 难度级别数（沿 X 轴的课程档位），合法范围 [1, 10]
-num_rows = 10
+# S0a 临时：standard → track（短链探测）
+mode = "track"
 # Parallel plots within the same difficulty tier along Y, valid range [1, 40].
 # 同一难度下的并行地块数（沿 Y 轴），合法范围 [1, 40]
-num_cols = 20
+# S0a 临时：20 → 10（对齐历史 track_nav 配置）
+num_cols = 10
 # Difficulty range [min, max], valid range: [0.0, 1.0].
 # 难度范围 [min, max]，合法范围：[0.0, 1.0]
 difficulty_range = [0.0, 1.0]
 # Whether to enable terrain curriculum (promote/demote difficulty by performance).
 # 是否启用地形课程学习（按表现晋级/降级难度）
-curriculum = true
-# Max init difficulty tier for robot placement, valid range: [0, 9].
-# 阶段 4 控制变量：与父模型 standard_ref_distill.toml 一致（9），不限制初始难度档。
-max_init_terrain_level = 9
+# S0a 临时：true → false（track 探测不使用课程）
+curriculum = false
+# Track starts at the first segment; difficulty is carried by native parallel
+# track columns and verified from the runtime terrain_types histogram.
+max_init_terrain_level = 0
+
+# S0a 临时新增：短链（maze 必须最后）
+[terrain.track]
+track_length = 2
+sub_terrains = ["pyramid_slope", "open_entry_maze"]
+num_parallel_tracks = 10
 
 # Pre-expose side walls on high-difficulty standard terrain (consistent with Stage 1 locomotion).
 # 高难度 standard 地形侧墙预暴露（与 Stage 1 locomotion 保持一致）
@@ -159,7 +173,12 @@ pos = [0.0, 0.0, 0.35]
 # （train_env_conf_standard_standard_ref_distill.toml:50-60），
 # 不扩展速度/转向范围。只验证 height_scan → depth 的感知迁移。
 [commands]
-resampling_time = [6.0, 10.0]
+# S0a 临时：[6.0, 10.0] → [300, 300]（压制原生重采样，探测期一条指令走全程）
+resampling_time = [300.0, 300.0]
+
+# S0a 临时新增：关闭 worker 侧渐进指令桥
+[commands.worker_progressive]
+enabled = false
 
 [commands.ranges]
 # 命令始终在此区间均匀采样，与父模型教师域一致。
@@ -183,7 +202,8 @@ ang_vel_z = [-0.3, 0.3]
 [lbc_loco]
 # 蒸馏阶段保守 lr；lr_min 可选，未给则用 conf.py 默认 1e-5。
 learning_rate = 2e-4
-max_iterations = 20000
+# S0a 临时：20000 → 50（小值冒烟，只测环境不做正式蒸馏）
+max_iterations = 50
 max_grad_norm = 1.0
 log_interval = 100
 save_interval = 225
@@ -232,12 +252,8 @@ safety_p95_multiplier = 2.0
 # 相机在机器人 base 系下的安装位置 (x前, y左, z上)，单位 m，逐台校准。
 #
 # 21.22° pitch 标定值（约 pitch 21.22° / roll -1.31° / yaw -2.60°）。
-# 这是仓库统一采纳的真机安装外参，与下列出处完全一致：
-#   - 9 处 config（standard_distill_1/2/3、visual_ppo_1/2、hjcnew10288_lbc_loco、
-#     track_lbc_loco / _d2 / p22_lbc_loco）
-#   - server/CHANGELOG.md standard-distill-1 条目
-#   - server/docs/standard-distill-1.md / standard-distill-3-action.md
-#     （后者明确写 "calibrated 21.22-degree camera extrinsics"）
+# 这是仓库统一采纳的真机安装外参；历史实验配置已从活动目录移除，来源与
+# 迁移记录保留在 server/CHANGELOG.md、server/docs 和 Git 历史中。
 # 此前 lbc_loco.toml 用的是另一套 ~11.16° 值（offset_pos=[0.486886,...] /
 # offset_rot=[0.995199,...]），由 commit 05734d7「恢复 HJC 最小训练路径」带入，
 # 与仓库其余视觉阶段不一致；本次视觉蒸馏对齐到 21.22° 标准值。
@@ -255,6 +271,10 @@ pixel_dropout_prob = 0.10
 gaussian_noise_scale = 0.02
 roll_range_deg = 10.0
 pitch_shift_pix = 10
+
+# S0a 临时新增：只读环境探针（log-once 盘点 goal/nav_scanner/num_envs/显存）
+[nav_probe]
+enabled = true
 
 # No [rewards] section.
 # 不配置 [rewards]

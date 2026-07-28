@@ -1,0 +1,3712 @@
+{
+ "contract": {
+  "input_layout_version": 2,
+  "vocab": [
+   [
+    0.0,
+    0.0,
+    0.0
+   ],
+   [
+    0.2,
+    0.0,
+    0.0
+   ],
+   [
+    0.45,
+    0.0,
+    0.0
+   ],
+   [
+    0.7,
+    0.0,
+    0.0
+   ],
+   [
+    0.35,
+    0.0,
+    0.25
+   ],
+   [
+    0.35,
+    0.0,
+    -0.25
+   ],
+   [
+    0.2,
+    0.0,
+    0.25
+   ],
+   [
+    0.2,
+    0.0,
+    -0.25
+   ],
+   [
+    0.0,
+    0.0,
+    0.25
+   ],
+   [
+    0.0,
+    0.0,
+    -0.25
+   ]
+  ],
+  "nav_period_frames": 10,
+  "min_dwell_ticks": 10,
+  "slew_rate_up": [
+   0.4,
+   0.4,
+   0.5
+  ],
+  "slew_rate_down": [
+   1.2,
+   1.2,
+   1.2
+  ],
+  "zero_token_bypasses_slew": true,
+  "cmd_clamp_min": [
+   0.0,
+   -0.2,
+   -0.3
+  ],
+  "cmd_clamp_max": [
+   0.7,
+   0.2,
+   0.3
+  ]
+ },
+ "token_script": [
+  [
+   0,
+   3
+  ],
+  [
+   4,
+   8
+  ],
+  [
+   10,
+   4
+  ],
+  [
+   20,
+   0
+  ],
+  [
+   22,
+   2
+  ],
+  [
+   30,
+   2
+  ],
+  [
+   36,
+   9
+  ]
+ ],
+ "frames": [
+  {
+   "frame": 0,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 1,
+   "exec_cmd": [
+    0.008,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 2,
+   "exec_cmd": [
+    0.016,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 3,
+   "exec_cmd": [
+    0.024,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 4,
+   "exec_cmd": [
+    0.032,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 5,
+   "exec_cmd": [
+    0.04,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 6,
+   "exec_cmd": [
+    0.048,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 7,
+   "exec_cmd": [
+    0.056,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 8,
+   "exec_cmd": [
+    0.064,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 9,
+   "exec_cmd": [
+    0.072,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 10,
+   "exec_cmd": [
+    0.08,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 11,
+   "exec_cmd": [
+    0.088,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 12,
+   "exec_cmd": [
+    0.096,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 13,
+   "exec_cmd": [
+    0.104,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 14,
+   "exec_cmd": [
+    0.112,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 15,
+   "exec_cmd": [
+    0.12,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 16,
+   "exec_cmd": [
+    0.128,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 17,
+   "exec_cmd": [
+    0.136,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 18,
+   "exec_cmd": [
+    0.144,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 19,
+   "exec_cmd": [
+    0.152,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 20,
+   "exec_cmd": [
+    0.16,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 21,
+   "exec_cmd": [
+    0.168,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 22,
+   "exec_cmd": [
+    0.176,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 23,
+   "exec_cmd": [
+    0.184,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 24,
+   "exec_cmd": [
+    0.192,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 25,
+   "exec_cmd": [
+    0.2,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 26,
+   "exec_cmd": [
+    0.208,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 27,
+   "exec_cmd": [
+    0.216,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 28,
+   "exec_cmd": [
+    0.224,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 29,
+   "exec_cmd": [
+    0.232,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 30,
+   "exec_cmd": [
+    0.24,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 31,
+   "exec_cmd": [
+    0.248,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 32,
+   "exec_cmd": [
+    0.256,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 33,
+   "exec_cmd": [
+    0.264,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 34,
+   "exec_cmd": [
+    0.272,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 35,
+   "exec_cmd": [
+    0.28,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 36,
+   "exec_cmd": [
+    0.288,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 37,
+   "exec_cmd": [
+    0.296,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 38,
+   "exec_cmd": [
+    0.304,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 39,
+   "exec_cmd": [
+    0.312,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 40,
+   "exec_cmd": [
+    0.32,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 41,
+   "exec_cmd": [
+    0.328,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 42,
+   "exec_cmd": [
+    0.336,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 43,
+   "exec_cmd": [
+    0.344,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 44,
+   "exec_cmd": [
+    0.352,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 45,
+   "exec_cmd": [
+    0.36,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 46,
+   "exec_cmd": [
+    0.368,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 47,
+   "exec_cmd": [
+    0.376,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 48,
+   "exec_cmd": [
+    0.384,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 49,
+   "exec_cmd": [
+    0.392,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 50,
+   "exec_cmd": [
+    0.4,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 51,
+   "exec_cmd": [
+    0.408,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 52,
+   "exec_cmd": [
+    0.416,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 53,
+   "exec_cmd": [
+    0.424,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 54,
+   "exec_cmd": [
+    0.432,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 55,
+   "exec_cmd": [
+    0.44,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 56,
+   "exec_cmd": [
+    0.448,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 57,
+   "exec_cmd": [
+    0.456,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 58,
+   "exec_cmd": [
+    0.464,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 59,
+   "exec_cmd": [
+    0.472,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 60,
+   "exec_cmd": [
+    0.48,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 61,
+   "exec_cmd": [
+    0.488,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 62,
+   "exec_cmd": [
+    0.496,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 63,
+   "exec_cmd": [
+    0.504,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 64,
+   "exec_cmd": [
+    0.512,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 65,
+   "exec_cmd": [
+    0.52,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 66,
+   "exec_cmd": [
+    0.528,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 67,
+   "exec_cmd": [
+    0.536,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 68,
+   "exec_cmd": [
+    0.544,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 69,
+   "exec_cmd": [
+    0.552,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 70,
+   "exec_cmd": [
+    0.56,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 71,
+   "exec_cmd": [
+    0.568,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 72,
+   "exec_cmd": [
+    0.576,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 73,
+   "exec_cmd": [
+    0.584,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 74,
+   "exec_cmd": [
+    0.592,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 75,
+   "exec_cmd": [
+    0.6,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 76,
+   "exec_cmd": [
+    0.608,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 77,
+   "exec_cmd": [
+    0.616,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 78,
+   "exec_cmd": [
+    0.624,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 79,
+   "exec_cmd": [
+    0.632,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 80,
+   "exec_cmd": [
+    0.64,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 81,
+   "exec_cmd": [
+    0.648,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 82,
+   "exec_cmd": [
+    0.656,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 83,
+   "exec_cmd": [
+    0.664,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 84,
+   "exec_cmd": [
+    0.672,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 85,
+   "exec_cmd": [
+    0.68,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 86,
+   "exec_cmd": [
+    0.688,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 87,
+   "exec_cmd": [
+    0.696,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 88,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 89,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 90,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 91,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 92,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 93,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 94,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 95,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 96,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 97,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 98,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 99,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 100,
+   "exec_cmd": [
+    0.7,
+    0.0,
+    0.0
+   ],
+   "held_token": 3
+  },
+  {
+   "frame": 101,
+   "exec_cmd": [
+    0.676,
+    0.0,
+    0.01
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 102,
+   "exec_cmd": [
+    0.652,
+    0.0,
+    0.02
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 103,
+   "exec_cmd": [
+    0.628,
+    0.0,
+    0.03
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 104,
+   "exec_cmd": [
+    0.604,
+    0.0,
+    0.04
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 105,
+   "exec_cmd": [
+    0.58,
+    0.0,
+    0.05
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 106,
+   "exec_cmd": [
+    0.556,
+    0.0,
+    0.06
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 107,
+   "exec_cmd": [
+    0.532,
+    0.0,
+    0.07
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 108,
+   "exec_cmd": [
+    0.508,
+    0.0,
+    0.08
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 109,
+   "exec_cmd": [
+    0.484,
+    0.0,
+    0.09
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 110,
+   "exec_cmd": [
+    0.46,
+    0.0,
+    0.1
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 111,
+   "exec_cmd": [
+    0.436,
+    0.0,
+    0.11
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 112,
+   "exec_cmd": [
+    0.412,
+    0.0,
+    0.12
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 113,
+   "exec_cmd": [
+    0.388,
+    0.0,
+    0.13
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 114,
+   "exec_cmd": [
+    0.364,
+    0.0,
+    0.14
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 115,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.15
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 116,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.16
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 117,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.17
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 118,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.18
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 119,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.19
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 120,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.2
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 121,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.21
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 122,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.22
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 123,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.23
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 124,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.24
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 125,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 126,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 127,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 128,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 129,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 130,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 131,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 132,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 133,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 134,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 135,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 136,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 137,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 138,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 139,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 140,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 141,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 142,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 143,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 144,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 145,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 146,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 147,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 148,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 149,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 150,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 151,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 152,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 153,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 154,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 155,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 156,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 157,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 158,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 159,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 160,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 161,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 162,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 163,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 164,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 165,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 166,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 167,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 168,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 169,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 170,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 171,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 172,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 173,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 174,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 175,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 176,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 177,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 178,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 179,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 180,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 181,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 182,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 183,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 184,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 185,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 186,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 187,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 188,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 189,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 190,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 191,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 192,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 193,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 194,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 195,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 196,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 197,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 198,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 199,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 200,
+   "exec_cmd": [
+    0.35,
+    0.0,
+    0.25
+   ],
+   "held_token": 4
+  },
+  {
+   "frame": 201,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 202,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 203,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 204,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 205,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 206,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 207,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 208,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 209,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 210,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 211,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 212,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 213,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 214,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 215,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 216,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 217,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 218,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 219,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 220,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 221,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 222,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 223,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 224,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 225,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 226,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 227,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 228,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 229,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 230,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 231,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 232,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 233,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 234,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 235,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 236,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 237,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 238,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 239,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 240,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 241,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 242,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 243,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 244,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 245,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 246,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 247,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 248,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 249,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 250,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 251,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 252,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 253,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 254,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 255,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 256,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 257,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 258,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 259,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 260,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 261,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 262,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 263,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 264,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 265,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 266,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 267,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 268,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 269,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 270,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 271,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 272,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 273,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 274,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 275,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 276,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 277,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 278,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 279,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 280,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 281,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 282,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 283,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 284,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 285,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 286,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 287,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 288,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 289,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 290,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 291,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 292,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 293,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 294,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 295,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 296,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 297,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 298,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 299,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 300,
+   "exec_cmd": [
+    0.0,
+    0.0,
+    0.0
+   ],
+   "held_token": 0
+  },
+  {
+   "frame": 301,
+   "exec_cmd": [
+    0.008,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 302,
+   "exec_cmd": [
+    0.016,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 303,
+   "exec_cmd": [
+    0.024,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 304,
+   "exec_cmd": [
+    0.032,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 305,
+   "exec_cmd": [
+    0.04,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 306,
+   "exec_cmd": [
+    0.048,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 307,
+   "exec_cmd": [
+    0.056,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 308,
+   "exec_cmd": [
+    0.064,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 309,
+   "exec_cmd": [
+    0.072,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 310,
+   "exec_cmd": [
+    0.08,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 311,
+   "exec_cmd": [
+    0.088,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 312,
+   "exec_cmd": [
+    0.096,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 313,
+   "exec_cmd": [
+    0.104,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 314,
+   "exec_cmd": [
+    0.112,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 315,
+   "exec_cmd": [
+    0.12,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 316,
+   "exec_cmd": [
+    0.128,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 317,
+   "exec_cmd": [
+    0.136,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 318,
+   "exec_cmd": [
+    0.144,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 319,
+   "exec_cmd": [
+    0.152,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 320,
+   "exec_cmd": [
+    0.16,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 321,
+   "exec_cmd": [
+    0.168,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 322,
+   "exec_cmd": [
+    0.176,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 323,
+   "exec_cmd": [
+    0.184,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 324,
+   "exec_cmd": [
+    0.192,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 325,
+   "exec_cmd": [
+    0.2,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 326,
+   "exec_cmd": [
+    0.208,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 327,
+   "exec_cmd": [
+    0.216,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 328,
+   "exec_cmd": [
+    0.224,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 329,
+   "exec_cmd": [
+    0.232,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 330,
+   "exec_cmd": [
+    0.24,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 331,
+   "exec_cmd": [
+    0.248,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 332,
+   "exec_cmd": [
+    0.256,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 333,
+   "exec_cmd": [
+    0.264,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 334,
+   "exec_cmd": [
+    0.272,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 335,
+   "exec_cmd": [
+    0.28,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 336,
+   "exec_cmd": [
+    0.288,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 337,
+   "exec_cmd": [
+    0.296,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 338,
+   "exec_cmd": [
+    0.304,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 339,
+   "exec_cmd": [
+    0.312,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 340,
+   "exec_cmd": [
+    0.32,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 341,
+   "exec_cmd": [
+    0.328,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 342,
+   "exec_cmd": [
+    0.336,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 343,
+   "exec_cmd": [
+    0.344,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 344,
+   "exec_cmd": [
+    0.352,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 345,
+   "exec_cmd": [
+    0.36,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 346,
+   "exec_cmd": [
+    0.368,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 347,
+   "exec_cmd": [
+    0.376,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 348,
+   "exec_cmd": [
+    0.384,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 349,
+   "exec_cmd": [
+    0.392,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 350,
+   "exec_cmd": [
+    0.4,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 351,
+   "exec_cmd": [
+    0.408,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 352,
+   "exec_cmd": [
+    0.416,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 353,
+   "exec_cmd": [
+    0.424,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 354,
+   "exec_cmd": [
+    0.432,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 355,
+   "exec_cmd": [
+    0.44,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 356,
+   "exec_cmd": [
+    0.448,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 357,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 358,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 359,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 360,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 361,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 362,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 363,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 364,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 365,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 366,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 367,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 368,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 369,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 370,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 371,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 372,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 373,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 374,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 375,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 376,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 377,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 378,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 379,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 380,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 381,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 382,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 383,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 384,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 385,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 386,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 387,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 388,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 389,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 390,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 391,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 392,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 393,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 394,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 395,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 396,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 397,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 398,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  },
+  {
+   "frame": 399,
+   "exec_cmd": [
+    0.45,
+    0.0,
+    0.0
+   ],
+   "held_token": 2
+  }
+ ]
+}

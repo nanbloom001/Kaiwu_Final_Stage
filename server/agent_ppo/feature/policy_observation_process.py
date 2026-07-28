@@ -38,12 +38,19 @@ Extending to track terrain (optional):
 
 from tools.base_env.observation_process import ObservationProcess
 
+from agent_ppo.feature.worker_command_bridge import (
+    apply_worker_command,
+    record_worker_command_observation,
+)
+
 
 class PolicyObservationProcess(ObservationProcess):
     target_group = "policy"
 
     def process(self):
+        apply_worker_command(self.env)
         obs = self.default_observation()
+        record_worker_command_observation(self.env, "policy", obs)
         # TODO (track terrain): you can construct features from env.goal_positions /
         # env.goal_yaw or env.scene.sensors["nav_scanner"] and concatenate them to obs.
         # TODO (track 地形)：可按需从 env.goal_positions / env.goal_yaw

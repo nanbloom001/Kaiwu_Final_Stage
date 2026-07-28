@@ -12,8 +12,8 @@ TrackNavOpt5BConfig
 name = navopt5b
 ```
 
-The environment file is
-`agent_ppo/conf/train_env_conf_track_navopt5b.toml`.
+The historical environment file was `train_env_conf_track_navopt5b.toml`; it
+has been removed from the active tree and remains available in Git history.
 
 ## Experimental Variable
 

@@ -28,8 +28,8 @@ diagnostics and fixed-evaluation evidence.
 
 ## Runtime Contract
 
-- Stage: `StandardDistill1Config`
-- TOML: `agent_ppo/conf/train_env_conf_standard_standard_distill_1.toml`
+- Historical stage: `StandardDistill1Config` (removed from the active loader)
+- Historical TOML: `train_env_conf_standard_standard_distill_1.toml` (recover from Git history)
 - Algorithm: `lbc_loco`
 - Environment: `Unitree-Go2-Velocity-Camera`
 - Frozen teacher: validated encoder-based Standard bridge artifact

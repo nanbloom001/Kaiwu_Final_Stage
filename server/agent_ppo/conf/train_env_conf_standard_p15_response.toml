@@ -1,0 +1,317 @@
+# P1.5: eight-hour Standard low-level expansion plus response-adapter training.
+# Parent checkpoint: commandfull-34728.
+
+[env]
+# P1.5 keeps 80 rollout frames so the 50-frame future label plus burn-in fit
+# inside one low-level version. 128 envs keeps the aggregate rollout at 10240
+# frames, below the parent's proven 256 x 48 = 12288 startup/storage budget.
+num_envs = 128
+episode_length_s = 25
+task = "standard"
+
+[env_conf]
+task_name = "Unitree-Go2-Velocity-Camera"
+policy_entry = "p15_response"
+seed = 0
+
+[custom_parameters]
+continuous_training = true
+
+[terrain]
+mode = "standard"
+num_rows = 10
+num_cols = 20
+difficulty_range = [0.0, 1.0]
+curriculum = false
+max_init_terrain_level = 9
+
+[terrain.standard_wall]
+enabled = true
+min_difficulty = 0.60
+full_difficulty = 0.90
+max_probability = 0.15
+height_range = [0.25, 0.45]
+thickness_range = [0.10, 0.15]
+margin_range = [0.05, 0.10]
+eligible_keywords = ["slope", "stairs"]
+exclude_keywords = ["maze", "corridor"]
+
+[terrain.standard.pyramid_slope]
+proportion = 0.20
+
+[terrain.standard.pyramid_slope_inv]
+proportion = 0.20
+
+[terrain.standard.pyramid_stairs]
+proportion = 0.20
+
+[terrain.standard.pyramid_stairs_inv]
+proportion = 0.40
+
+[terrain.standard.maze]
+proportion = 0.0
+platform_width = 3.0
+
+[domain_rand]
+enable_domain_rand = true
+# Keep the native physics-material event registered, but deterministic, for the
+# first two hours. P15WorkerBridge widens future reset samples to [0.6,1.2]
+# after the boundary. Every other physical randomizer remains disabled below.
+randomize_friction = true
+friction_range = [1.0, 1.0]
+randomize_base_mass = false
+push_robots = false
+push_interval_s = 15
+max_push_vel_xy = 0.5
+
+[noise]
+add_noise = false
+
+[init_state]
+pos = [0.0, 0.0, 0.35]
+
+# The platform-native sampler is a source-domain fallback. The environment
+# worker performs the actual 1.5--10 second resampling; 300 seconds prevents
+# the native sampler from overwriting a held worker command.
+[commands]
+resampling_time = [300.0, 300.0]
+
+[commands.ranges]
+lin_vel_x = [0.3, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_yaw = [-0.3, 0.3]
+
+# commands.limit.ang_vel_z and commands.ranges.ang_vel_yaw are the platform's
+# two legacy key names for the same Z-axis yaw command; keep both as-is.
+[commands.limit]
+lin_vel_x = [0.0, 1.3]
+lin_vel_y = [-0.2, 0.2]
+ang_vel_z = [-0.3, 0.3]
+
+[commands.buckets]
+enabled = false
+
+[commands.worker_progressive]
+enabled = true
+log_interval_steps = 500
+
+[p15_response]
+run_name = "p15resp8h"
+schedule_mode = "p15_response_adapter_v1"
+transition_parent_model_id = 34728
+command_resume_offset_hours = 0.0
+
+max_iterations = 200000
+num_steps_per_env = 80
+tbptt_sequence_length = 16
+num_learning_epochs = 5
+num_mini_batches = 4
+# Per-group learning rates (§4.2). class fallback in conf.py is
+# actor 1e-5 / lstm 5e-6 / critic 1e-4; these TOML values are authoritative.
+actor_learning_rate = 1.0e-5
+lstm_learning_rate = 5.0e-6
+critic_learning_rate = 1.0e-4
+# Critic warmup LR used only during anchorcritic (0-45 min). Missing key falls
+# back to critic_learning_rate (1e-4) with a warning, never silently 3e-4.
+critic_warmup_learning_rate = 3.0e-4
+max_grad_norm = 1.0
+init_noise_std = 0.15
+
+# Anchor R2's final weights stay fixed throughout command generalization.
+command_anchor_action = 0.35
+command_anchor_latent = 0.10
+
+# task_end_hours is recorded for checkpoint metadata; the platform task page
+# controls the actual eight-hour deadline and business code never stops early.
+task_end_hours = 8.0
+save_interval_minutes = 10.0
+# Use one wall-clock cadence for fresh and resumed sessions. Phase boundaries
+# are captured by the next periodic package instead of creating extra models.
+first_save_minutes = 10.0
+resume_first_save_minutes = 10.0
+response_checkpoint_minutes = []
+
+# Safety thresholds (§5.3): Anchor R2 is warning-only. Violations emit a
+# warning and request a diagnostic checkpoint; they never pause actor updates
+# or freeze the schedule.
+warning_only_safety = true
+max_anchor_action_mse = 0.05
+max_hard_termination_delta = 0.02
+max_action_amplitude = 6.0
+log_interval = 10
+
+[p15_response.command_schedule]
+step_dt_s = 0.02
+target_period_frames = 10
+slew_rate = [0.30, 0.30, 1.00]
+
+[p15_response.response_adapter]
+learning_rate = 3.0e-4
+max_grad_norm = 1.0
+capacity_steps = 4096
+sequence_length = 16
+burn_in_steps = 8
+batch_envs = 64
+updates_per_iteration = 1
+velocity_loss_weight = 1.0
+pose_loss_weight = 0.5
+stuck_loss_weight = 0.25
+nll_loss_weight = 0.1
+velocity_horizon_weights = [1.0, 0.75, 0.5]
+stuck_positive_ema_start = 0.1
+stuck_ema_decay = 0.99
+seed = 1501
+
+[p15_response.feedback_profile]
+version = "p15_feedback_v2"
+age_clip_s = 0.8
+complete_failure_probability = 0.015
+complete_failure_duration_s = [0.10, 0.60]
+short_horizon_velocity_sources = ["sport_mode_xy", "imu_gyro_z"]
+uwb_role = "long_horizon_only_not_in_response_observation"
+
+[p15_response.feedback_profile.sport]
+rate_hz = [35.0, 50.0]
+delay_s = [0.0, 0.06]
+noise_std = [0.025, 0.025, 0.035]
+bias_std = [0.015, 0.015, 0.020]
+dropout_probability = [0.0, 0.08]
+freshness_timeout_s = [0.10, 0.22]
+
+[p15_response.feedback_profile.uwb]
+# Reserved for a separate 3-5 second stuck detector. These values never feed
+# response_observation32 or the 0.2/0.6/1.0-second Adapter targets.
+rate_hz = [4.0, 6.0]
+delay_s = [0.08, 0.30]
+noise_std = [0.06, 0.06, 0.05]
+bias_std = [0.03, 0.03, 0.02]
+low_pass_tau_s = [0.18, 0.45]
+dropout_probability = [0.0, 0.18]
+freshness_timeout_s = [0.30, 0.70]
+
+[p15_response.feedback_profile.imu]
+gyro_noise_std = [0.006, 0.006, 0.009]
+gyro_bias_std = [0.004, 0.004, 0.006]
+gravity_noise_std = 0.004
+
+[camera.depth_camera]
+offset_pos = [0.339871, 0.034697, 0.075010]
+offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
+max_depth = 5.0
+
+[camera.depth_camera.augmentation]
+enabled = false
+pixel_dropout_prob = 0.10
+gaussian_noise_scale = 0.02
+roll_range_deg = 10.0
+pitch_shift_pix = 10
+
+# Anchor R2 reward surface plus the bounded zero-command stability term.
+[rewards.track_lin_vel_xy]
+weight = 3.0
+[rewards.track_lin_vel_xy.params]
+std = 0.25
+command_name = "base_velocity"
+
+[rewards.track_ang_vel_z]
+weight = 1.0
+[rewards.track_ang_vel_z.params]
+std = 0.25
+command_name = "base_velocity"
+
+[rewards.forward_velocity]
+weight = 0.0
+
+[rewards.air_time_variance_penalty]
+weight = -3.0
+
+[rewards.max_continuous_air_time_penalty]
+weight = -0.05
+[rewards.max_continuous_air_time_penalty.params]
+soft_limit_s = 0.55
+hard_limit_s = 1.20
+
+[rewards.contact_duty_factor_symmetry]
+weight = -0.05
+[rewards.contact_duty_factor_symmetry.params]
+ema_tau_s = 1.0
+full_symmetry_wz = 0.15
+minimum_scale = 0.25
+
+[rewards.foot_contact_participation]
+weight = -0.05
+[rewards.foot_contact_participation.params]
+ema_tau_s = 1.0
+minimum_duty_factor = 0.12
+
+[rewards.max_foot_air_time]
+weight = -3.0
+[rewards.max_foot_air_time.params]
+threshold = 0.8
+
+[rewards.foot_symmetry]
+weight = -2.0
+[rewards.foot_symmetry.params]
+max_diff = 0.2
+
+[rewards.trot_gait]
+weight = -1.0
+
+[rewards.zero_command_stability]
+weight = -0.05
+[rewards.zero_command_stability.params]
+command_threshold = 0.05
+grace_period_s = 0.4
+
+[rewards.hip_to_default]
+weight = -0.1
+
+[rewards.dof_pos_limits]
+weight = -0.3
+
+[rewards.joint_acc]
+weight = -1.0e-6
+
+[rewards.joint_position_penalty]
+weight = -0.1
+[rewards.joint_position_penalty.params]
+stand_still_scale = 2.0
+velocity_threshold = 0.1
+
+[rewards.feet_air_time]
+weight = 0.5
+[rewards.feet_air_time.params]
+command_name = "base_velocity"
+threshold = 0.1
+
+[rewards.feet_regulation]
+weight = -0.05
+[rewards.feet_regulation.params]
+base_height_target = 0.38
+
+[rewards.feet_contact_forces]
+weight = -0.01
+[rewards.feet_contact_forces.params]
+max_force = 147.0
+
+[rewards.feet_slide]
+weight = -0.05
+
+[rewards.feet_stumble]
+weight = -0.1
+
+[rewards.legs_distance]
+weight = -0.1
+[rewards.legs_distance.params]
+min_distance = 0.1
+
+[rewards.x_command_hip_regular]
+weight = -0.1
+
+[rewards.approach_goal]
+weight = 0.0
+
+[rewards.reach_goal]
+weight = 0.0
+[rewards.reach_goal.params]
+threshold = 0.6

@@ -18,6 +18,19 @@ import torch
 from collections import deque, defaultdict
 
 
+def _split_and_record_p15_transport(agent, critic_wire, dones=None):
+    """Keep the 346-D worker wire out of Critic/PPO storage on every path."""
+    if not getattr(agent, "is_p15_response", False):
+        return critic_wire
+    critic_obs, response_aux = agent.split_p15_transport(critic_wire)
+    if dones is None:
+        dones = torch.zeros(
+            critic_obs.shape[0], dtype=torch.bool, device=critic_obs.device
+        )
+    agent.observe_response_aux(response_aux, dones)
+    return critic_obs
+
+
 def _initialize_training_state(env, agent, logger):
     """
     Initialize training state including storage, buffers, and observations.
@@ -69,6 +82,7 @@ def _initialize_training_state(env, agent, logger):
         critic_obs = obs
     obs = torch.clone(obs)
     critic_obs = torch.clone(critic_obs)
+    critic_obs = _split_and_record_p15_transport(agent, critic_obs)
     logger.info(f"obs.shape:{obs.shape}, critic_obs.shape:{critic_obs.shape}")
 
     # Load reward keys from monitor config
@@ -97,6 +111,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     """
     agent = agents[0]
     env = envs[0]
+    logger.info(
+        "[LifecycleProbe] train_workflow enter "
+        f"pid={os.getpid()} stage={getattr(agent.stage, 'name', 'unknown')} "
+        f"algorithm={getattr(agent, 'algorithm_name', 'unknown')} "
+        f"flags=lbc:{getattr(agent, 'is_lbc', False)},"
+        f"nav:{getattr(agent, 'is_nav_dagger', False)},"
+        f"visual:{getattr(agent, 'is_visual_ppo', False)},"
+        f"distill:{getattr(agent, 'is_behavior_distill', False)}"
+    )
 
     # LBC 阶段：转发到 lbc_workflow（纯监督蒸馏，不走 PPO）
     # LBC stage: forward to lbc_workflow (pure supervised distillation)
@@ -105,12 +128,31 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
         return lbc_workflow(envs, agents, logger=logger, monitor=monitor, *args, **kwargs)
 
+    # hier-nav 高层 DAgger：转发到 nav_dagger_workflow（TBPTT 序列 BC，不走 PPO）
+    # hier-nav high-level DAgger: forward to nav_dagger_workflow (TBPTT BC, no PPO)
+    if getattr(agent, "is_nav_dagger", False):
+        logger.info("[LifecycleProbe] train_workflow nav_import begin")
+        from agent_ppo.workflow.nav_dagger_workflow import workflow as nav_dagger_workflow
+
+        logger.info("[LifecycleProbe] train_workflow nav_import complete")
+        logger.info("[LifecycleProbe] train_workflow dispatch=nav_dagger")
+        return nav_dagger_workflow(envs, agents, logger=logger, monitor=monitor, *args, **kwargs)
+
     # Reference behavior distillation: flat standard teacher -> ActorCriticEncoder student
     # 参考模型行为蒸馏：扁平 standard teacher -> ActorCriticEncoder student
     if getattr(agent, "is_behavior_distill", False):
         from agent_ppo.workflow.behavior_distill_workflow import workflow as behavior_distill_workflow
 
         return behavior_distill_workflow(envs, agents, logger=logger, monitor=monitor, *args, **kwargs)
+
+    if getattr(agent, "is_visual_ppo", False):
+        from agent_ppo.workflow.visual_ppo_workflow import (
+            workflow as visual_ppo_workflow,
+        )
+
+        return visual_ppo_workflow(
+            envs, agents, logger=logger, monitor=monitor, *args, **kwargs
+        )
 
     # Initialize training state
     # 初始化训练状态
@@ -264,6 +306,9 @@ def _process_env_step_result(data, episode, logger):
         raise Exception(f"episode {episode}, obs is None after processing!")
 
     dones = torch.logical_or(terminated, truncated)
+    if not isinstance(infos, dict):
+        infos = {}
+    infos["hard_terminated"] = terminated
     return frame_no, obs, critic_obs, rewards, dones, infos
 
 
@@ -307,6 +352,11 @@ def _update_transition_data(
     transition.critic_observations = critic_obs
     transition.rewards = rewards.clone()
     transition.dones = dones
+    transition.hard_terminations = infos.get("hard_terminated", dones)
+    if getattr(agent, "is_visual_ppo", False):
+        transition.hidden_states = agent._last_rollout_hidden
+        transition.anchor_actions = agent._last_anchor_action
+        transition.anchor_latents = agent._last_anchor_latent
 
     # Bootstrapping on time outs
     # 处理 timeouts
@@ -385,6 +435,45 @@ def run_episodes_(
     """
     transition = RolloutStorage.Transition()
     obs, critic_obs = last_obs, last_critic_obs
+    reset_mask = getattr(
+        agent,
+        "_rollout_reset_mask",
+        torch.ones(obs.shape[0], dtype=torch.bool, device=agent.device),
+    )
+    zero_telemetry = None
+    zero_step_dt_s = 0.02
+    if getattr(agent, "is_visual_ppo", False):
+        from agent_ppo.feature.zero_command_telemetry import ZeroCommandTelemetry
+
+        usr_conf = getattr(agent, "usr_conf", {})
+        if not isinstance(usr_conf, dict):
+            usr_conf = {}
+        stage_conf = usr_conf.get(getattr(agent.stage, "name", ""), {})
+        if not isinstance(stage_conf, dict):
+            stage_conf = {}
+        reward_conf = stage_conf.get("rewards", {}).get(
+            "zero_command_stability", {}
+        )
+        reward_params = reward_conf.get("params", {}) if isinstance(reward_conf, dict) else {}
+        if not isinstance(reward_params, dict):
+            reward_params = {}
+        zero_step_dt_s = float(
+            getattr(agent, "command_step_dt_s", 0.02)
+        )
+        existing = getattr(agent, "_zero_command_telemetry", None)
+        if (
+            existing is None
+            or existing.num_envs != int(obs.shape[0])
+            or existing.device != torch.device(agent.device)
+        ):
+            existing = ZeroCommandTelemetry(
+                int(obs.shape[0]),
+                agent.device,
+                command_threshold=float(reward_params.get("command_threshold", 0.05)),
+                grace_period_s=float(reward_params.get("grace_period_s", 0.4)),
+            )
+            agent._zero_command_telemetry = existing
+        zero_telemetry = existing
 
     # TODO: for hierarchical training, handle the mismatch between env action and
     # PPO storage action on your own.
@@ -394,6 +483,13 @@ def run_episodes_(
     # 策略执行循环
     with torch.inference_mode():
         for i in range(agent.num_steps_per_env):
+            if getattr(agent, "is_visual_ppo", False):
+                obs, critic_obs, anchor_weights, command_metrics = (
+                    agent.prepare_rollout_step(
+                        env, obs, critic_obs, reset_mask=reset_mask
+                    )
+                )
+                agent._last_command_metrics = command_metrics
             # Predict actions
             # 预测动作
             predict_data = (obs, critic_obs)
@@ -415,6 +511,13 @@ def run_episodes_(
             command_actions = torch.clip(joint_actions, -6.0, 6.0).to(agent.device)
             if i == 0:
                 logger.info(f"clipped_action:{command_actions}")
+            if zero_telemetry is not None:
+                zero_telemetry.observe(
+                    obs[:, 6:9],
+                    command_actions,
+                    reset_mask=reset_mask,
+                    dt_s=zero_step_dt_s,
+                )
 
             # Environment interaction
             # 环境交互
@@ -424,6 +527,10 @@ def run_episodes_(
             # Move tensors to device
             # 将张量移动到设备
             obs, critic_obs, rewards, dones = _move_tensors_to_device(obs, critic_obs, rewards, dones, agent.device)
+            critic_obs = _split_and_record_p15_transport(agent, critic_obs, dones)
+            if getattr(agent, "is_visual_ppo", False):
+                reset_mask = dones.reshape(-1).bool()
+                agent._rollout_reset_mask = reset_mask.detach().clone()
 
             # Update episode statistics (always, regardless of decimation)
             # 更新 episode 统计（始终执行，不受降频影响）
@@ -454,12 +561,18 @@ def run_episodes_(
                 infos,
                 agent,
             )
+            if getattr(agent, "is_visual_ppo", False):
+                transition.anchor_weights = anchor_weights
             storage.add_transitions(transition)
+            if getattr(agent, "is_visual_ppo", False):
+                agent.algorithm.reset_recurrent_states(dones)
             transition.clear()
 
         # Compute advantages and returns
         # 计算优势函数和回报
         storage_stats = _compute_advantages_and_returns(storage, agent, critic_obs, logger)
+        if zero_telemetry is not None:
+            agent._last_zero_command_telemetry = zero_telemetry.metrics()
         last_obs = torch.clone(obs)
 
     # Note: batch generation now handled by AlgorithmPPO.learn()
