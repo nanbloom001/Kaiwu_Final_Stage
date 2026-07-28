@@ -1174,6 +1174,9 @@ class Agent(BaseAgent):
             self._nav_last_save_wall_time = saved_at
             self._nav_last_save_lifecycle_callbacks = lifecycle_callbacks
             path_category = self._nav_checkpoint_path_category(path)
+            self._nav_last_save_path = nav_file_path
+            self._nav_last_save_path_category = path_category
+            self._nav_last_save_platform_id = str(id)
             self.logger.info(
                 f"[nav_dagger] save nav bundle={nav_file_path} "
                 f"(ramp_p={float(getattr(self.algorithm, 'ramp_probability', 0.0)):.3f}, "

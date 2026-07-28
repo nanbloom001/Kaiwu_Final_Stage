@@ -601,6 +601,95 @@ class PlatformOwnedSyncPathTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "path escapes root"):
                 workspace.resolve("outside_link/payload.py")
 
+    def test_workspace_allows_platform_mapped_sync_directories(self):
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            tempfile.TemporaryDirectory() as platform_dir,
+        ):
+            root = Path(temp_dir)
+            platform_code = Path(platform_dir) / "workspace" / "code"
+            for name in TONGBU.PLATFORM_MAPPED_SYNC_DIRS:
+                mapped_dir = platform_code / name
+                mapped_dir.mkdir(parents=True)
+                (root / name).symlink_to(mapped_dir, target_is_directory=True)
+            source = platform_code / "agent_diy" / "source.py"
+            source.write_text("source\n", encoding="utf-8")
+            workspace = TONGBU.Workspace(
+                root,
+                "test-token",
+                platform_code_root=platform_code,
+            )
+            dispatcher = self._ReplyCapture()
+
+            resolved = workspace.resolve("agent_diy/source.py")
+            self.assertEqual(
+                resolved, workspace.base_dir / "agent_diy" / "source.py"
+            )
+            TONGBU._read(
+                dispatcher,
+                workspace,
+                {"path": ["agent_diy/source.py"]},
+                None,
+            )
+            payload, status = dispatcher.payloads[-1]
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["path"], "agent_diy/source.py")
+            self.assertEqual(
+                base64.b64decode(payload["content_base64"]), b"source\n"
+            )
+
+            encoded = base64.b64encode(b"updated\n").decode("ascii")
+            TONGBU._write(
+                dispatcher,
+                workspace,
+                {},
+                {"path": "agent_ppo/model.py", "content_base64": encoded},
+            )
+            self.assertEqual(
+                (platform_code / "agent_ppo" / "model.py").read_bytes(),
+                b"updated\n",
+            )
+
+            TONGBU._manifest(
+                dispatcher,
+                workspace,
+                {"scope": ["agent_diy,agent_ppo,conf"]},
+                None,
+            )
+            manifest, status = dispatcher.payloads[-1]
+            self.assertEqual(status, 200)
+            self.assertIn("agent_diy/source.py", manifest["files"])
+            self.assertIn("agent_ppo/model.py", manifest["files"])
+
+            (root / "mapped_alias").symlink_to(
+                platform_code / "agent_diy", target_is_directory=True
+            )
+            with self.assertRaisesRegex(ValueError, "path escapes root"):
+                workspace.resolve("mapped_alias/source.py")
+
+    def test_workspace_rejects_escape_inside_platform_mapped_directory(self):
+        with (
+            tempfile.TemporaryDirectory() as temp_dir,
+            tempfile.TemporaryDirectory() as platform_dir,
+            tempfile.TemporaryDirectory() as outside_dir,
+        ):
+            root = Path(temp_dir)
+            platform_code = Path(platform_dir) / "workspace" / "code"
+            mapped_dir = platform_code / "agent_diy"
+            mapped_dir.mkdir(parents=True)
+            (root / "agent_diy").symlink_to(mapped_dir, target_is_directory=True)
+            (mapped_dir / "escape").symlink_to(
+                Path(outside_dir), target_is_directory=True
+            )
+            workspace = TONGBU.Workspace(
+                root,
+                "test-token",
+                platform_code_root=platform_code,
+            )
+
+            with self.assertRaisesRegex(ValueError, "path escapes root"):
+                workspace.resolve("agent_diy/escape/payload.py")
+
     def test_protected_path_rejects_symlink_alias(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

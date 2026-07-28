@@ -122,6 +122,9 @@ class TestNavStageSelection(unittest.TestCase):
         self.assertNotIn("level_mix", config["terrain"])
         self.assertEqual(config["terrain"]["track"]["num_parallel_tracks"], 10)
         self.assertEqual(config["env"]["num_envs"], 128)
+        self.assertEqual(
+            config["nav_dagger"]["platform_archive_interval_minutes"], 5.0
+        )
         for removed_key in (
             "save_interval",
             "initial_save_after_iterations",
@@ -187,6 +190,29 @@ class TestNavStageSelection(unittest.TestCase):
         self.assertNotIn("hard_termination_rate", monitor_source)
         self.assertNotIn('name_en="value_loss"', monitor_source)
 
+    def test_monitor_panel_names_use_platform_supported_characters(self):
+        monitor_path = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "conf"
+            / "monitor_builder.py"
+        )
+        module = ast.parse(monitor_path.read_text(encoding="utf-8"))
+        assignments = {
+            node.targets[0].id: ast.literal_eval(node.value)
+            for node in module.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id in {"TRACK_PANEL_SPECS", "NAV_PANEL_SPECS"}
+        }
+        for specs in assignments.values():
+            for name, *_ in specs:
+                self.assertLessEqual(len(name), 20, name)
+                self.assertTrue(
+                    name and all(char.isalnum() or char in "*-_ " for char in name),
+                    name,
+                )
+
 
 class TestNavPlatformDumpCadence(unittest.TestCase):
     def test_callbacks_until_next_dump_boundaries(self):
@@ -195,6 +221,8 @@ class TestNavPlatformDumpCadence(unittest.TestCase):
         self.assertEqual(_callbacks_until_next_dump(3600, 3600), 0)
         self.assertEqual(_callbacks_until_next_dump(3601, 3600), 3599)
         self.assertEqual(_callbacks_until_next_dump(7200, 3600), 0)
+        self.assertEqual(_callbacks_until_next_dump(0, 3600, 34728), 1272)
+        self.assertEqual(_callbacks_until_next_dump(1272, 3600, 34728), 0)
 
     def test_invalid_callback_counters_are_rejected(self):
         with self.assertRaises(ValueError):

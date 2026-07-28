@@ -57,16 +57,23 @@ def _platform_dump_model_freq() -> int:
     return value
 
 
-def _callbacks_until_next_dump(completed_callbacks: int, dump_frequency: int) -> int:
-    """Return 0 on a dump boundary, otherwise successful callbacks remaining."""
+def _callbacks_until_next_dump(
+    completed_callbacks: int,
+    dump_frequency: int,
+    base_platform_model_id: int = 0,
+) -> int:
+    """Return callbacks remaining to the next absolute platform dump boundary."""
 
     if completed_callbacks < 0:
         raise ValueError("completed_callbacks must be non-negative")
     if dump_frequency <= 0:
         raise ValueError("dump_frequency must be positive")
-    if completed_callbacks == 0:
+    if base_platform_model_id < 0:
+        raise ValueError("base_platform_model_id must be non-negative")
+    absolute_callbacks = base_platform_model_id + completed_callbacks
+    remainder = absolute_callbacks % dump_frequency
+    if completed_callbacks == 0 and remainder == 0:
         return dump_frequency
-    remainder = completed_callbacks % dump_frequency
     return 0 if remainder == 0 else dump_frequency - remainder
 
 
@@ -199,6 +206,67 @@ def _ramp_elapsed_from_probability(p: float, ramp_start_h: float, ramp_end_h: fl
     if p >= 1.0:
         return ramp_end_h
     return ramp_start_h + p * (ramp_end_h - ramp_start_h)
+
+
+def _periodic_archive_due(now_s: float, last_archive_s: float, interval_s: float) -> bool:
+    if interval_s <= 0.0:
+        raise ValueError("platform archive interval must be positive")
+    return now_s - last_archive_s >= interval_s
+
+
+def _save_periodic_platform_archive(agent, logger, *, completed_iteration: int) -> None:
+    """Request a user-visible platform archive without supplying path or model ID."""
+
+    logger.warning(
+        "[NavDAgger] periodic platform archive request begin "
+        f"iteration={completed_iteration}; platform must inject path and model ID"
+    )
+    try:
+        agent.save_model()
+    except CheckpointSaveError:
+        logger.error(
+            "[NavDAgger] periodic platform archive checkpoint write failed; "
+            "stopping training"
+        )
+        raise
+    except Exception as exc:
+        logger.error(
+            "[NavDAgger] periodic platform archive request failed; stopping training: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        raise CheckpointSaveError(
+            "periodic platform archive request failed at "
+            f"iteration={completed_iteration}"
+        ) from exc
+    agent._nav_periodic_archive_requests = int(
+        getattr(agent, "_nav_periodic_archive_requests", 0)
+    ) + 1
+    path_category = str(
+        getattr(agent, "_nav_last_save_path_category", "unknown_unreported")
+    )
+    platform_model_id = str(
+        getattr(agent, "_nav_last_save_platform_id", "unknown")
+    )
+    saved_path = str(getattr(agent, "_nav_last_save_path", "unknown"))
+    logger.info(
+        "[NavDAgger] periodic platform archive request complete "
+        f"iteration={completed_iteration} requests={agent._nav_periodic_archive_requests}; "
+        f"platform_id={platform_model_id} path_category={path_category} path={saved_path}"
+    )
+    if path_category != "final_platform_archive_candidate":
+        logger.error(
+            "[NavDAgger] periodic save did not receive the user archive path; "
+            "frontend model publication is not proven: "
+            f"path_category={path_category} path={saved_path}"
+        )
+    emit_nav_event(
+        "periodic_platform_archive_requested",
+        iteration=completed_iteration,
+        requests=agent._nav_periodic_archive_requests,
+        platform_model_id=platform_model_id,
+        path_category=path_category,
+        path=saved_path,
+    )
 
 
 def _save_final_checkpoint(agent, logger, *, reason: str) -> bool:
@@ -334,6 +402,18 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
         nav_conf.get("lr_scheduler_iterations", stage.lr_scheduler_iterations)
     )
     dump_model_freq = _platform_dump_model_freq()
+    platform_archive_interval_minutes = float(
+        nav_conf.get(
+            "platform_archive_interval_minutes",
+            getattr(stage, "platform_archive_interval_minutes", 5.0),
+        )
+    )
+    if platform_archive_interval_minutes <= 0.0:
+        raise ValueError(
+            "platform_archive_interval_minutes must be positive, got "
+            f"{platform_archive_interval_minutes}"
+        )
+    platform_archive_interval_s = platform_archive_interval_minutes * 60.0
 
     # ---- 契约一致性启动断言（TOML 镜像 == nav_contract 权威值）----
     # 镜像键必填：缺键会让 get(默认=契约值) 自比自、断言必过——静默绕过
@@ -401,6 +481,7 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
         f"[NavDAgger] start: conf={usr_conf_file} max_iter={max_iterations} "
         f"steps/iter={num_steps_per_env} T={tbptt_T} "
         f"platform_dump_model_freq={dump_model_freq} "
+        f"platform_archive_interval_min={platform_archive_interval_minutes:.2f} "
         f"ramp=[{ramp_start_h},{ramp_end_h}]h resume={algorithm.resume_loaded} "
         f"ramp_p={algorithm.ramp_probability:.3f} "
         f"low_level_digest={algorithm.low_level_state_digest}"
@@ -442,10 +523,20 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
     total_low_level_steps = 0
     session_total_env_frames = 0
     first_lifecycle_success_logged = False
+    try:
+        base_platform_model_id = int(algorithm.loaded_platform_model_id or 0)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[NavDAgger] loaded platform model ID is not numeric; "
+            "running-checkpoint boundary telemetry starts at zero"
+        )
+        base_platform_model_id = 0
+    last_platform_archive_at = time.monotonic()
     agent._nav_platform_dump_model_freq = dump_model_freq
     agent._nav_lifecycle_success_callbacks = 0
     agent._nav_lifecycle_failure_callbacks = 0
     agent._nav_lifecycle_attempt_callbacks = 0
+    agent._nav_periodic_archive_requests = 0
 
     try:
         for iteration_index in range(start_iteration, max_iterations):
@@ -631,12 +722,15 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                             "[LifecycleProbe] nav_first_lifecycle_callback complete"
                         )
                     callbacks_until_next_dump = _callbacks_until_next_dump(
-                        platform_lifecycle_callbacks, dump_model_freq
+                        platform_lifecycle_callbacks,
+                        dump_model_freq,
+                        base_platform_model_id,
                     )
                     if callbacks_until_next_dump == 0:
                         logger.info(
                             "[NavDAgger] platform lifecycle dump boundary reached "
                             f"callbacks={platform_lifecycle_callbacks} "
+                            f"base_platform_model_id={base_platform_model_id} "
                             f"dump_model_freq={dump_model_freq}"
                         )
                         emit_nav_event(
@@ -678,7 +772,9 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     "total_low_level_steps": total_low_level_steps,
                     "total_env_frames": session_total_env_frames,
                     "callbacks_until_next_dump": _callbacks_until_next_dump(
-                        platform_lifecycle_callbacks, dump_model_freq
+                        platform_lifecycle_callbacks,
+                        dump_model_freq,
+                        base_platform_model_id,
                     ),
                 }
             )
@@ -810,6 +906,19 @@ def _workflow_impl(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     )
                 except Exception as exc:
                     logger.warning(f"[NavDAgger] monitor.put_data failed: {exc}")
+
+            archive_check_at = time.monotonic()
+            if _periodic_archive_due(
+                archive_check_at,
+                last_platform_archive_at,
+                platform_archive_interval_s,
+            ):
+                _save_periodic_platform_archive(
+                    agent,
+                    logger,
+                    completed_iteration=completed_iteration,
+                )
+                last_platform_archive_at = time.monotonic()
 
         algorithm.training_status = (
             "completed_with_warnings" if algorithm.soft_stay_frozen else "completed"

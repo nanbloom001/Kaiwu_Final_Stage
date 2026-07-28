@@ -154,11 +154,14 @@ lr_min = 1e-5
 max_iterations = 20000
 max_grad_norm = 1.0
 log_interval = 10
-# Routine model-pool publication is controlled only by configure_app.toml
-# dump_model_freq and the per-frame BaseAgent.learn lifecycle callback. The
-# workflow performs one best-effort final save only when training exits.
-# 常规模型池发布只由 configure_app.toml 的 dump_model_freq 和逐帧
-# BaseAgent.learn 生命周期回调控制；workflow 仅在训练退出时执行一次最终保存。
+# User-visible platform archives are requested without custom path/ID every five
+# minutes. configure_app.toml dump_model_freq separately controls internal
+# /data/ckpt running checkpoints; normal/SIGTERM exit still requests one final
+# archive. The platform wrapper is the only authority for archive path and ID.
+# 每五分钟无参数请求一次用户可见的平台归档；configure_app.toml 的
+# dump_model_freq 另行控制 /data/ckpt 运行中 checkpoint。正常结束/SIGTERM
+# 仍请求一次最终归档，归档路径和数字 ID 只允许平台 wrapper 注入。
+platform_archive_interval_minutes = 5.0
 # One outer iteration = 160 low-level frames = 16 nav ticks = exactly one TBPTT
 # segment (T=16, nav_period_frames=10). Keep the three numbers consistent.
 # 一个 outer iteration = 160 低层帧 = 16 个 nav tick = 恰好一个 TBPTT 段

@@ -60,6 +60,10 @@ IGNORED_FOLDERS = {
 # Platform bootstrap owns this file and may replace it on startup.  Do not let
 # a sync client write or delete it; other isaac_env files remain synchronizable.
 PROTECTED_SYNC_PATHS = frozenset({"isaac_env/base_env.py"})
+PLATFORM_MAPPED_SYNC_DIRS = frozenset({"agent_diy", "agent_ppo", "conf"})
+DEFAULT_PLATFORM_CODE_ROOT = Path(
+    os.environ.get("IDE_SYNC_PLATFORM_CODE_ROOT", "/workspace/code")
+)
 
 
 def pack_json(payload: Any, code: int = 200) -> Tuple[int, bytes]:
@@ -81,20 +85,53 @@ def digest_file(fp: Path) -> str:
 class Workspace:
     base_dir: Path
     api_key: str
+    platform_code_root: Optional[Path] = None
 
     def __post_init__(self) -> None:
-        # Canonicalize the configured project root once. Child paths are also
-        # canonicalized below so a symlink cannot escape the workspace or
-        # alias a protected platform-owned file.
         self.base_dir = self.base_dir.expanduser().resolve()
+        configured_code_root = self.platform_code_root or DEFAULT_PLATFORM_CODE_ROOT
+        self.platform_code_root = configured_code_root.expanduser().resolve(strict=False)
+
+    @staticmethod
+    def _relative_to(path: Path, root: Path) -> Optional[Path]:
+        try:
+            return path.relative_to(root)
+        except ValueError:
+            return None
+
+    def relative_path(self, target: Path) -> str:
+        """Return the stable logical path after validating its canonical target."""
+        canonical = target.resolve(strict=False)
+        relative = self._relative_to(canonical, self.base_dir)
+        if relative is None:
+            lexical_relative = self._relative_to(
+                Path(os.path.abspath(target)), self.base_dir
+            )
+            assert self.platform_code_root is not None
+            for name in PLATFORM_MAPPED_SYNC_DIRS:
+                mapped_root = (self.platform_code_root / name).resolve(strict=False)
+                mapped_relative = self._relative_to(canonical, mapped_root)
+                if (
+                    mapped_relative is not None
+                    and lexical_relative is not None
+                    and lexical_relative.parts
+                    and lexical_relative.parts[0] == name
+                ):
+                    relative = Path(name) / mapped_relative
+                    break
+        if relative is None:
+            raise ValueError(f"path escapes root: {target}")
+        return os.path.normpath(relative.as_posix()).replace("\\", "/")
 
     def resolve(self, raw: Optional[str]) -> Path:
         cleaned = unquote(raw or "").replace("\\", "/").lstrip("/")
-        destination = (self.base_dir / cleaned).resolve(strict=False)
-        try:
-            destination.relative_to(self.base_dir)
-        except ValueError as exc:
+        destination = Path(os.path.abspath(self.base_dir / cleaned))
+        if self._relative_to(destination, self.base_dir) is None:
             raise ValueError(f"path escapes root: {raw}")
+        try:
+            self.relative_path(destination)
+        except ValueError as exc:
+            raise ValueError(f"path escapes root: {raw}") from exc
         return destination
 
 
@@ -193,7 +230,7 @@ def _staging_path(fp: Path) -> Path:
 
 
 def _relative_path(ws: Workspace, target: Path) -> str:
-    return os.path.normpath(target.relative_to(ws.base_dir).as_posix()).replace("\\", "/")
+    return ws.relative_path(target)
 
 
 def _assert_writable_sync_path(ws: Workspace, target: Path) -> None:
@@ -232,7 +269,7 @@ def _manifest(dispatcher: RequestDispatcher, ws: Workspace, qs: Dict[str, List[s
         for item in scan_root.rglob("*"):
             if not item.is_file():
                 continue
-            rel = item.relative_to(ws.base_dir).as_posix()
+            rel = _relative_path(ws, item)
             if any(part in IGNORED_FOLDERS for part in Path(rel).parts):
                 continue
             info = item.stat()
@@ -255,7 +292,7 @@ def _read(dispatcher: RequestDispatcher, ws: Workspace, qs: Dict[str, List[str]]
     payload = target.read_bytes()
     dispatcher._reply(
         {
-            "path": target.relative_to(ws.base_dir).as_posix(),
+            "path": _relative_path(ws, target),
             "content_base64": base64.b64encode(payload).decode("ascii"),
             "sha256": hashlib.sha256(payload).hexdigest(),
         }
@@ -340,7 +377,7 @@ def _exec_b64(
             "returncode": returncode,
             "timed_out": timed_out,
             "elapsed_s": time.monotonic() - started,
-            "cwd": cwd.relative_to(ws.base_dir).as_posix() or ".",
+            "cwd": _relative_path(ws, cwd) or ".",
             "stdout_base64": base64.b64encode(stdout).decode("ascii"),
             "stderr_base64": base64.b64encode(stderr).decode("ascii"),
             "stdout_truncated": stdout_truncated,
@@ -370,7 +407,7 @@ def _write(dispatcher: RequestDispatcher, ws: Workspace, qs: Dict[str, List[str]
     dispatcher._reply(
         {
             "ok": True,
-            "path": target.relative_to(ws.base_dir).as_posix(),
+            "path": _relative_path(ws, target),
             "bytes": len(raw),
             "sha256": hashlib.sha256(raw).hexdigest(),
         }
@@ -385,7 +422,7 @@ def _write_begin(dispatcher: RequestDispatcher, ws: Workspace, qs: Dict[str, Lis
     _assert_writable_sync_path(ws, target)
     target.parent.mkdir(parents=True, exist_ok=True)
     _staging_path(target).write_bytes(b"")
-    dispatcher._reply({"ok": True, "path": target.relative_to(ws.base_dir).as_posix()})
+    dispatcher._reply({"ok": True, "path": _relative_path(ws, target)})
 
 
 def _write_chunk(dispatcher: RequestDispatcher, ws: Workspace, qs: Dict[str, List[str]], body: Optional[Dict[str, Any]]) -> None:
@@ -417,7 +454,7 @@ def _write_finish(dispatcher: RequestDispatcher, ws: Workspace, qs: Dict[str, Li
     dispatcher._reply(
         {
             "ok": True,
-            "path": target.relative_to(ws.base_dir).as_posix(),
+            "path": _relative_path(ws, target),
             "bytes": len(payload),
             "sha256": hashlib.sha256(payload).hexdigest(),
         }
@@ -433,7 +470,7 @@ def _delete(dispatcher: RequestDispatcher, ws: Workspace, qs: Dict[str, List[str
         _assert_writable_sync_path(ws, target)
         if target.exists() and target.is_file():
             target.unlink()
-            deleted.append(target.relative_to(ws.base_dir).as_posix())
+            deleted.append(_relative_path(ws, target))
     dispatcher._reply({"ok": True, "deleted": deleted})
 
 
@@ -572,7 +609,7 @@ def _bundle_finish(
             staging.write_bytes(data)
             os.replace(staging, target)
             os.utime(target, (mtime, mtime))
-            written[target.relative_to(ws.base_dir).as_posix()] = {
+            written[_relative_path(ws, target)] = {
                 "sha256": hashlib.sha256(data).hexdigest()
             }
         dispatcher._reply({"ok": True, "files": written})

@@ -704,6 +704,11 @@
   平台归档候选，并打印平台 ID、文件大小、SHA256、距离上次保存的墙钟时间和 lifecycle
   数。不得用运行中 `/data/ckpt` 文件存在替代平台模型列表登记证据；单机任务运行中前端
   不实时展示模型时，最终以正常停止后的 `/data/user_ckpt_dir` 和模型列表为准。
+- 2026-07-27 平台证据再更正：任务 `234786` 运行中连续写出
+  `navbc-36000/39600/...`，任务结束后才生成可下载的 `navbc-52313` ZIP。最终包包含规范
+  `ckpt/id_list`、`ckpt/kaiwu.json` 与同一三模块 checkpoint，证明 `dump_model_freq`
+  的 `/data/ckpt` 写盘和前端用户归档是两条生命周期。当前方案因此恢复无参数、无自定义
+  ID/path 的五分钟 `agent.save_model()` 平台归档请求；`dump_model_freq` 只保留为运行恢复。
 - 校验策略更正：`platform_model_id`、lineage、父模型 ID、low-level digest 和历史身份
   元数据不一致为 warning-only；结构兼容的操作者指定包可以继续训练/续训/保存。硬停止
   仅保留给文件写入/反序列化失败、必需模块缺失、state-dict key/shape 不兼容、非有限
@@ -761,7 +766,7 @@
 
 ## BUG-20260727-006：IDE 同步路径可经符号链接越界或绕过保护文件
 
-- 状态：本地已验证。
+- 状态：平台已验证（开发容器同步链）。
 - 影响：开发容器同步/RPC 的路径边界，以及平台拥有的 `isaac_env/base_env.py`。
 - 症状：`Workspace.resolve()` 只用文本 `abspath` 折叠 `..`，工作区内指向外部的
   symlink 仍可通过 `relative_to()`；指向 `isaac_env` 的别名也会让保护检查看到
@@ -785,6 +790,19 @@
   应将这类挂载设为 `--root` 本身，不应放宽任意子路径。回滚只能回到另一个真实路径
   实现，不得回到 lexical-only 检查。再遇最短路径：原始 path → canonical path →
   根目录边界 → 保护相对路径。
+- 2026-07-27 更正：实际开悟容器不是单一真实根。同步根为
+  `/data/projects/legged_robot_competition_26`，但 `agent_diy`、`agent_ppo`、`conf`
+  是指向 `/workspace/code/<同名目录>` 的平台固定符号链接，`isaac_env` 则仍在原根内。
+  因此“把特殊挂载设为唯一 `--root`”不适用于该平台；上述 canonical-only
+  修复会在 manifest 阶段误报 `path escapes root: agent_diy`。现实现保留根内逻辑路径，
+  另行核验 canonical target：只允许三个固定顶层目录映射到
+  `/workspace/code/<同名目录>`，映射目录内的任意二次越界仍拒绝，canonical alias
+  命中 `isaac_env/base_env.py` 时仍禁止写入。新增 mapped read/write/manifest 正例和
+  mapped 内部越界负例。同步回归 `27 passed`，相关 Python 编译和
+  `git diff --check` 通过。容器内新服务 SHA256 为
+  `f0ee115b4b526e011b41c7f5707ee1902007877e91568908e4a01d83747796ea`，按原根目录重启后真实
+  `local_sync_client.py --dry-run` 成功读取四个目录，清单为 103 个本地文件、7 个
+  待更新文件、0 个删除候选，不再出现 `path escapes root`。该 dry-run 未上传业务文件。
 
 ## BUG-20260727-007：Nav 高低层控制链缺少可区分的统计口径
 
@@ -821,6 +839,86 @@
 - 遗留风险：所有新指标仍需平台 monitor 实际上报验证。身份与 digest
   元数据不一致按当前策略 warning-only；结构不兼容、非有限权重、写盘失败
   仍必须硬停。回滚可撤销 `f7145da` 的诊断指标，不触碰 `base_env.py`。
+
+## BUG-20260727-008：Nav 控制链面板名称含斜杠导致监控配置整体跳过
+
+- 状态：本地已验证，平台待验证。
+- 影响：hier-nav Track/Nav 自定义监控面板加载；不影响训练计算、模型或 checkpoint。
+- 首次发现：2026-07-27，任务名、平台任务 ID 和模型 ID 未记录。
+- 症状：learner 启动时报 `Error occurred while loading user monitor config`，并列出
+  `requested/effective 不一致`、`worker/exec 指令误差`、`worker/exec 指令匹配率`
+  三个中文名称非法，随后 `will skip loading`。
+- 根因：`agent_ppo/conf/monitor_builder.py` 的三个中文显示名包含平台白名单不接受的 `/`；
+  builder 校验按整份配置失败处理，因此其他合法 Track/Nav 面板也被一并跳过。
+- 排除项：英文面板 ID、metric key、指标上报逻辑、Track stage、`base_env.py` 和 checkpoint
+  均与本错误无关。
+- 修复：仅将三个显示名改为 `请求生效不一致`、`执行指令误差`、`执行指令匹配率`；
+  英文 ID 和 metric key 不变。新增测试遍历 Track/Nav 面板规格，约束名称长度不超过 20，
+  且只含中英文、数字、`*`、`-`、`_` 和空格。
+- 验证：目标单元测试和 Python 编译通过；容器同步、平台 smoke、评估和真机未执行。
+- 防复发：新增面板时必须通过统一字符与长度测试，不再只检查已知三个字符串。
+- 血缘：分支 `codex/hier-nav-dagger`；不涉及父模型、checkpoint 或 SHA256；commit/PR 待生成。
+- 回滚：恢复三个旧显示名即可，但会重新触发平台拒绝，因此仅用于定位差异。
+- 再遇检查：先看 learner 的 monitor config 校验原文，再核对显示名字符与长度，最后确认
+  容器已同步并重启；不要先排查训练 workflow 或模型加载。
+
+## BUG-20260727-009：Nav 运行 checkpoint 正常但前端模型列表只在任务结束后更新
+
+- 状态：平台已验证。
+- 影响：hier-nav 训练中模型可见性、下载、阶段中途评估和长训恢复。
+- 首次发现：平台任务 `234786`，父模型 `34728`，最终模型 `navbc-52313`。
+- 症状：运行中日志连续记录 `/data/ckpt/model.ckpt-navbc-36000.pkl`、`39600.pkl`、
+  `46800.pkl` 等非空文件，SHA256 正常且 lifecycle failure 为 0，但前端模型列表为空；
+  任务正常结束后模型 `52313` 立即出现并可下载。
+- 根因：运行中的 `dump_model_freq` 只触发 `/data/ckpt` checkpoint；用户可见归档还需要
+  平台 wrapper 生成 `ckpt/id_list`、`ckpt/kaiwu.json` 并打包 ZIP。此前为避免业务侧重复
+  保存而删除五分钟无参数 `agent.save_model()`，误把运行 checkpoint 当成前端归档发布。
+- 排除项：下载包已证明 `navbc` 纯字母标签合法、4.49 MB 文件大小可接受、
+  `kaiwu_train_v1/nav_dagger_v1` 可反序列化，且 `vision_encoder`、`low_level`、
+  `high_level`、optimizer、父 ID 和 digest 均存在；因此不是文件名、模块缺失、schema、
+  `base_env.py` 或 monitor builder 导致。
+- 修复：`nav_dagger_workflow.py` 在完整 TBPTT outer iteration 边界按墙钟每五分钟调用一次
+  无参数 `agent.save_model()`；不传 path/id、不创建别名，正常结束/SIGTERM final save 保持
+  独立幂等。周期归档异常转换为 `CheckpointSaveError` 并停止，避免无可下载模型的长训。
+  `dump_model_freq=3600` 保留为 `/data/ckpt` 运行 checkpoint。自动 dump 倒计时改为计入
+  `algorithm.loaded_platform_model_id`，父 `34728` 的首边界正确为 1272 callback 后的 36000。
+- 验证：最终包
+  `legged_robot_competition_26-234786-ppo-52313-2026_07_27_20_20_30-27.0.21.zip`
+  已由平台生成；本地 SHA256 为
+  `36f5cff83884fd1f4adfe9fbc1d0b00c1ba21986aa0c3d737ec8b5dea0a6d97d`，包内 checkpoint
+  `platform_model_id=52313` 且三模块齐全。本地完整 Nav 回归为
+  `123 passed, 3 subtests passed`，相关 Python 编译、TOML 解析和 `git diff --check` 通过；
+  容器同步和新平台 smoke 未执行，当前不得宣称运行中前端归档已验证。
+- 2026-07-27 平台周期归档验证：任务 `234805`、父模型 `34728`在
+  iteration 30 执行第 1 次无参数周期归档。平台注入模型 ID `39528` 和路径
+  `/data/user_ckpt_dir/legged_robot_competition_26_ppo/model.ckpt-navbc-39528.pkl`；
+  日志确认 `path_category=final_platform_archive_candidate`、文件大小 `4492589`
+  字节、checkpoint SHA256
+  `ca8ab4d42d510fa6aff8fdc20f4662cde611bfdd332b321f25ef6918fba93bea`。
+  24 秒后平台打包
+  `legged_robot_competition_26-234805-ppo-39528-2026_07_27_21_15_16-27.0.21.zip`
+  并记录 `copy to /workspace/train/backup_model/ success`；用户已在网页模型列表确认
+  `39528` 可见。这证明“运行中无参数 `agent.save_model()` →
+  `/data/user_ckpt_dir` → ZIP → 前端模型列表”全链路有效。
+- 同一时间窗的反例特征：周期归档后 4 秒，`dump_model_freq=3600` 又以
+  ID `39600` 写入
+  `/data/ckpt/legged_robot_competition_26_ppo/model.ckpt-navbc-39600.pkl`，分类为
+  `running_checkpoint`，SHA256 为
+  `671258ae5de0d87cbb9b381e3852ce96a3bee02236014e3dc1166f573bc36fb5`。该文件与前端归档
+  `39528` 不是同一次保存；不得用 `/data/ckpt` 成功日志代替前端发布证据。
+- 防复发：测试覆盖 300 秒边界、周期保存与 final 幂等隔离、周期保存异常硬停止、父模型
+  ID 偏移下的自动 dump 边界，以及平台仍注入 `/data/ckpt` 时的醒目错误。日志必须同时
+  打印平台注入的 path category、绝对路径和数字 ID。
+- 血缘：分支 `codex/hier-nav-dagger`；父模型 `34728`；最终 checkpoint `navbc-52313`；
+  commit/PR 待生成。
+- 遗留风险：此前“周期归档待 smoke”已由任务 `234805` 关闭。平台打包到前端
+  列表可见仍可能有数十秒异步延迟，应先查 `final_platform_archive_candidate`和
+  `backup_model success` 再判定失败。最终 ZIP 还可能包含 `conf/.env` 和缓存文件；
+  这不影响 checkpoint 有效性，但发布前必须另行清理远端敏感配置并轮换同步凭据。
+- 回滚：删除 `platform_archive_interval_minutes` 与周期归档调用即可恢复“仅任务结束可见”；
+  不得修改 checkpoint 标签、父模型或 `base_env.py`。
+- 再遇检查：save path category → `id_list`/`kaiwu.json` → ZIP 是否生成 → 前端模型列表；
+  不要先调 `dump_model_freq`、文件名或网络结构。
 
 ## 3. 已知高频误判
 
