@@ -164,7 +164,7 @@ class TestAgentWiringSource(unittest.TestCase):
     """Agent 类依赖平台运行时，本地不整机构造；按仓库先例做源码防线断言。"""
 
     def test_lbc_eval_classifies_optional_high_level_before_loading(self):
-        self.assertIn("classify_locomotion_eval_high_level(ckpt)", _AGENT_SRC)
+        self.assertIn("classify_locomotion_eval_high_level(\n            ckpt,", _AGENT_SRC)
         self.assertIn("high_level={high_level_eval_disposition}", _AGENT_SRC)
 
     def test_lbc_eval_keeps_required_module_loading_strict(self):
@@ -254,6 +254,20 @@ class TestLocomotionEvalHighLevelClassification(unittest.TestCase):
         }
         with self.assertRaisesRegex(ValueError, "nav_eval"):
             cio.classify_locomotion_eval_high_level(bundle)
+
+    def test_complete_p2_high_level_requires_explicit_low_level_only_eval(self):
+        bundle = {
+            "stage_type": "p2_nav_ppo",
+            "modules": {"high_level": {"component_status": "complete"}},
+        }
+        with self.assertRaisesRegex(ValueError, "nav_eval"):
+            cio.classify_locomotion_eval_high_level(bundle)
+        self.assertEqual(
+            cio.classify_locomotion_eval_high_level(
+                bundle, allow_complete_hier_nav_low_level_only=True
+            ),
+            "complete_hier_nav_ignored_by_explicit_low_level_only_eval",
+        )
 
     def test_nav_policy_cannot_forge_adapter_only_marker(self):
         bundle = self._adapter_only_bundle()

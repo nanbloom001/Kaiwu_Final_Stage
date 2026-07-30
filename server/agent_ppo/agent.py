@@ -43,6 +43,8 @@ from agent_ppo.checkpoint_io import (
     validate_probe_filename,
     validate_visual_eval_bundle_identity,
     p15_response_parent_candidates,
+    p2_nav_evaluation_candidates,
+    p2_nav_training_candidates,
     visual_command_parent_candidates,
     visual_eval_checkpoint_diagnostics,
     visual_eval_checkpoint_candidates,
@@ -72,6 +74,8 @@ class Agent(BaseAgent):
         # checkpoint has completed the strict load below.
         self._eval_checkpoint_path = None
         self._eval_requested_model_id = None
+        self._p2_eval_checkpoint_path = None
+        self._p2_eval_requested_model_id = None
         self._lifecycle_probe_exploit_logged = False
         self._lifecycle_probe_predict_logged = False
         self._lifecycle_probe_learn_logged = False
@@ -132,11 +136,15 @@ class Agent(BaseAgent):
         self.is_lbc = self.algorithm_name == "lbc_loco"
         self.is_behavior_distill = self.algorithm_name == "behavior_distill"
         self.is_p15_response = self.algorithm_name == "p15_response"
+        self.is_p2_nav = self.algorithm_name in {"p2_nav_ppo", "p2_nav_eval"}
+        self.is_p2_nav_eval = self.algorithm_name == "p2_nav_eval"
         self.is_visual_ppo = self.algorithm_name in {"visual_ppo", "p15_response"}
         self.is_nav_dagger = self.algorithm_name == "nav_dagger"
         self.is_nav_eval = self.algorithm_name == "nav_eval"
 
-        if self.is_lbc:
+        if self.is_p2_nav:
+            self._init_p2_nav(stage, usr_conf)
+        elif self.is_lbc:
             # LBC 阶段：创建学生 + 教师；不初始化 PPO storage
             self._init_lbc_loco(num_proprio, num_scan, env_conf, stage, usr_conf)
         elif self.is_nav_dagger:
@@ -172,6 +180,7 @@ class Agent(BaseAgent):
             or self.is_behavior_distill
             or self.is_nav_dagger
             or self.is_nav_eval
+            or self.is_p2_nav
         ):
             # Initialize storage
             # 初始化存储
@@ -386,6 +395,146 @@ class Agent(BaseAgent):
     # ------------------------------------------------------------------
     # hier-nav（nav_dagger 训练 / nav_eval 推理）
     # ------------------------------------------------------------------
+
+    def _init_p2_nav(self, stage, usr_conf):
+        """Build P2 modules without creating any low-level PPO state."""
+        if self.is_p2_nav_eval:
+            self._init_p2_nav_eval(stage, usr_conf)
+            return
+        import torch.nn as _nn
+
+        from agent_ppo.algorithm.algorithm_p2_nav_ppo import AlgorithmP2NavPPO
+        from agent_ppo.feature.p2_response_buffer import P2ResponseAuxBuffer
+        from agent_ppo.model.p2_high_level import (
+            NavigationEncoder,
+            NavigationSafetyHead,
+            P2NavigationActor,
+            P2NavigationCritic,
+        )
+        from agent_ppo.model.response_adapter import CommandResponseAdapter
+        from agent_ppo.model.vision_encoder import VisionEncoder
+
+        self.num_obs = stage.num_actor_observations
+        self.num_critic_obs = stage.num_critic_observations
+        self.low_level_encoder = VisionEncoder(
+            image_shape=(stage.depth_height, stage.depth_width, stage.depth_channels),
+            proprio_dim=stage.proprio_dim,
+            cnn_output_dim=stage.cnn_output_dim,
+            rnn_hidden_dim=stage.lstm_hidden_size,
+            rnn_num_layers=stage.lstm_num_layers,
+            rnn_output_dim=stage.latent_dim,
+            use_lstm=True,
+        ).to(self.device)
+        self.low_level_actor = self._build_nav_low_level_actor(stage)
+        self.navigation_encoder = NavigationEncoder().to(self.device)
+        self.navigation_safety_head = NavigationSafetyHead().to(self.device)
+        self.p2_actor = P2NavigationActor().to(self.device)
+        self.p2_critic = P2NavigationCritic().to(self.device)
+        self.response_adapter = CommandResponseAdapter().to(self.device)
+        p2_conf = usr_conf.get("p2_nav_ppo", {})
+        if not isinstance(p2_conf, dict):
+            p2_conf = {}
+        response_conf = p2_conf.get("response_adapter", {})
+        if not isinstance(response_conf, dict):
+            response_conf = {}
+        self.response_aux_buffer = P2ResponseAuxBuffer(
+            self.num_envs,
+            "cpu",
+            capacity_steps=int(response_conf.get("capacity_steps", 4096)),
+            sequence_length=int(response_conf.get("sequence_length", 16)),
+            burn_in_steps=int(response_conf.get("burn_in_steps", 8)),
+        )
+        self.model = _nn.ModuleDict(
+            {
+                "navigation_encoder": self.navigation_encoder,
+                "navigation_safety_head": self.navigation_safety_head,
+                "actor": self.p2_actor,
+                "critic": self.p2_critic,
+                "response_adapter": self.response_adapter,
+            }
+        )
+        self.algorithm = AlgorithmP2NavPPO(
+            low_level_encoder=self.low_level_encoder,
+            low_level_actor=self.low_level_actor,
+            navigation_encoder=self.navigation_encoder,
+            safety_head=self.navigation_safety_head,
+            actor=self.p2_actor,
+            critic=self.p2_critic,
+            response_adapter=self.response_adapter,
+            response_buffer=self.response_aux_buffer,
+            num_envs=self.num_envs,
+            device=self.device,
+            config=p2_conf,
+            logger=self.logger,
+            monitor=self.monitor,
+        )
+        self.training_elapsed_h = 0.0
+        self._p2_parent_model_id = str(p2_conf.get("parent_model_id", 291713))
+        self.logger.info(
+            "[P2NavPPO] dedicated high-level algorithm initialized; "
+            f"parent={self._p2_parent_model_id} num_envs={self.num_envs} "
+            "low_level=inference_only adapter=online_auxiliary"
+        )
+
+    def _init_p2_nav_eval(self, stage, usr_conf):
+        """Build only the modules required by evaluate_full inference."""
+        import torch.nn as _nn
+
+        from agent_ppo.algorithm.algorithm_p2_nav_ppo import AlgorithmP2NavPPO
+        from agent_ppo.model.p2_high_level import NavigationEncoder, P2NavigationActor
+        from agent_ppo.model.response_adapter import CommandResponseAdapter
+        from agent_ppo.model.vision_encoder import VisionEncoder
+
+        self.num_obs = stage.num_actor_observations
+        self.num_critic_obs = stage.num_critic_observations
+        self.low_level_encoder = VisionEncoder(
+            image_shape=(stage.depth_height, stage.depth_width, stage.depth_channels),
+            proprio_dim=stage.proprio_dim,
+            cnn_output_dim=stage.cnn_output_dim,
+            rnn_hidden_dim=stage.lstm_hidden_size,
+            rnn_num_layers=stage.lstm_num_layers,
+            rnn_output_dim=stage.latent_dim,
+            use_lstm=True,
+        ).to(self.device)
+        self.low_level_actor = self._build_nav_low_level_actor(stage)
+        self.navigation_encoder = NavigationEncoder().to(self.device)
+        self.p2_actor = P2NavigationActor().to(self.device)
+        self.p2_critic = None
+        self.response_adapter = CommandResponseAdapter().to(self.device)
+        self.response_aux_buffer = None
+        self.model = _nn.ModuleDict(
+            {
+                "navigation_encoder": self.navigation_encoder,
+                "actor": self.p2_actor,
+                "response_adapter": self.response_adapter,
+            }
+        )
+        p2_conf = usr_conf.get("p2_nav_ppo", {})
+        if not isinstance(p2_conf, dict):
+            p2_conf = {}
+        self.algorithm = AlgorithmP2NavPPO(
+            low_level_encoder=self.low_level_encoder,
+            low_level_actor=self.low_level_actor,
+            navigation_encoder=self.navigation_encoder,
+            safety_head=None,
+            actor=self.p2_actor,
+            critic=None,
+            response_adapter=self.response_adapter,
+            response_buffer=None,
+            num_envs=self.num_envs,
+            device=self.device,
+            config=p2_conf,
+            logger=self.logger,
+            monitor=self.monitor,
+            training=False,
+        )
+        self.training_elapsed_h = 0.0
+        self._p2_parent_model_id = str(p2_conf.get("parent_model_id", 291713))
+        self.logger.info(
+            "[P2NavPPO] eval-only assembly initialized; modules="
+            "low_level/navigation_encoder/actor/response_adapter "
+            "critic=absent optimizers=absent response_buffer=absent"
+        )
 
     def _build_nav_low_level_actor(self, stage):
         """复刻低层 Actor77 结构（与 :287-301 教师 Actor 同形，key 对齐低层包）。"""
@@ -805,7 +954,7 @@ class Agent(BaseAgent):
         Exploit learned policy for action selection in evaluation mode.
         在评估模式下利用已学习的策略进行动作选择。
         """
-        (obs) = list_obs_data
+        obs = list_obs_data
         if not self._lifecycle_probe_exploit_logged:
             self._lifecycle_probe_exploit_logged = True
             self.logger.info(
@@ -814,6 +963,14 @@ class Agent(BaseAgent):
                 f"obs_shape={getattr(obs, 'shape', None)}"
             )
         with torch.no_grad():
+            if self.is_p2_nav:
+                self._ensure_p2_eval_checkpoint_loaded()
+                obs, critic_wire = self._p2_eval_inputs(list_obs_data)
+                result, _, _ = self.algorithm.frame_begin(
+                    obs, critic_wire, deterministic=True
+                )
+                self.algorithm.eval_frame_advance()
+                return [ActData(action=result["actions"])]
             if self.is_lbc:
                 return self._exploit_lbc_loco(obs)
             if self.is_nav_dagger or self.is_nav_eval:
@@ -822,6 +979,64 @@ class Agent(BaseAgent):
             if self.is_visual_ppo:
                 self._log_visual_eval_runtime_diagnostics(obs, actions)
             return [ActData(action=actions)]
+
+    def _p2_eval_inputs(self, eval_input):
+        """Normalize platform single-stream or local dual-stream P2 eval input."""
+        from agent_ppo.feature import nav_contract, p2_contract
+
+        if isinstance(eval_input, (tuple, list)) and len(eval_input) == 2:
+            obs, critic_wire = eval_input
+            obs = torch.as_tensor(obs, device=self.device)
+            critic_wire = torch.as_tensor(critic_wire, device=self.device)
+            return obs, critic_wire
+
+        if isinstance(eval_input, (tuple, list)) and len(eval_input) == 1:
+            eval_input = eval_input[0]
+        obs = torch.as_tensor(eval_input, device=self.device)
+        if obs.ndim != 2 or obs.shape[1] != nav_contract.POLICY_OBS_DIM:
+            raise ValueError(
+                f"P2 eval policy obs must be [N,{nav_contract.POLICY_OBS_DIM}], "
+                f"got {tuple(obs.shape)}"
+            )
+        aux = p2_contract.unpack_eval_response_aux(obs)
+        critic_wire = torch.zeros(
+            obs.shape[0],
+            p2_contract.PRIVILEGED_WIRE_DIM,
+            device=obs.device,
+            dtype=obs.dtype,
+        )
+        critic_wire[
+            :,
+            p2_contract.CRITIC_OBS_DIM :
+            p2_contract.CRITIC_OBS_DIM + p2_contract.RESPONSE_AUX_DIM,
+        ] = aux
+        return obs, critic_wire
+
+    def _ensure_p2_eval_checkpoint_loaded(self) -> None:
+        if not self.is_p2_nav_eval or self._p2_eval_checkpoint_path is not None:
+            return
+        from common_python.config.config_control import CONFIG
+
+        model_dir = getattr(CONFIG, "eval_model_dir", None)
+        model_id = getattr(CONFIG, "eval_model_id", None)
+        if not model_dir or model_id in (None, ""):
+            import toml
+
+            configure_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "conf", "configure_app.toml")
+            )
+            app_conf = toml.load(configure_path).get("app", {})
+            model_dir = model_dir or app_conf.get("eval_model_dir")
+            model_id = model_id if model_id not in (None, "") else app_conf.get("eval_model_id")
+        if not model_dir or model_id in (None, ""):
+            raise RuntimeError(
+                "P2 eval checkpoint location is unavailable; refusing random inference"
+            )
+        self._load_p2_nav(str(model_dir), str(model_id))
+        if self._p2_eval_checkpoint_path is None:
+            raise RuntimeError(
+                "P2 eval checkpoint was not loaded; refusing random inference"
+            )
 
     def _log_visual_eval_runtime_diagnostics(self, obs, actions) -> None:
         """Print bounded input/output evidence for VisualPPO evaluation.
@@ -924,6 +1139,8 @@ class Agent(BaseAgent):
             return None
         if self.is_behavior_distill:
             return None
+        if self.is_p2_nav:
+            return None
         if self.is_nav_dagger or self.is_nav_eval:
             # nav 训练在 nav_dagger_workflow 内直接调 algorithm；此处 no-op
             # 仅用于推进平台 lifecycle（每个成功低层批量帧恰调用一次）。
@@ -980,6 +1197,11 @@ class Agent(BaseAgent):
             raise RuntimeError(
                 "agent.predict() is not used in behavior_distill stage; "
                 "behavior_distill_workflow calls algorithm.act_teacher/update directly."
+            )
+        if self.is_p2_nav:
+            raise RuntimeError(
+                "agent.predict() is not used in P2; p2_nav_ppo_workflow owns "
+                "semi-MDP collection and recurrent PPO updates."
             )
         if self.is_nav_dagger or self.is_nav_eval:
             raise RuntimeError(
@@ -1157,7 +1379,29 @@ class Agent(BaseAgent):
         else:
             model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
 
-        if self.is_visual_ppo:
+        if self.is_p2_nav:
+            if self.is_p2_nav_eval:
+                self.logger.info("[p2_nav_eval] save_model is a no-op")
+                return
+            if str(id) == "0" and self.algorithm.low_level_state_digest is None:
+                self.logger.warning(
+                    "[P2NavPPO] skip framework bootstrap save id=0 before parent preload"
+                )
+                return
+            phase_label = self.algorithm.current_phase
+            p2_path = f"{path}/model.ckpt-{phase_label}-{str(id)}.pkl"
+            if not validate_probe_filename(p2_path):
+                raise ValueError(f"P2 checkpoint filename not probe-compatible: {p2_path}")
+            checksum = self.algorithm.save_training_bundle(
+                p2_path, platform_model_id=id
+            )
+            file_size = os.path.getsize(p2_path)
+            self.logger.info(
+                f"[P2NavPPO] save bundle={p2_path} phase={phase_label} "
+                f"platform_id={id} size_bytes={file_size} sha256={checksum} "
+                "deployable=false"
+            )
+        elif self.is_visual_ppo:
             phase_label = self.algorithm.current_phase
             visual_rl_path = f"{path}/model.ckpt-{phase_label}-{str(id)}.pkl"
             if not validate_probe_filename(visual_rl_path):
@@ -1335,6 +1579,7 @@ class Agent(BaseAgent):
             or self.is_visual_ppo
             or self.is_nav_dagger
             or self.is_nav_eval
+            or self.is_p2_nav
         ):
             self._save_side_locomotion(path, id)
 
@@ -1435,7 +1680,9 @@ class Agent(BaseAgent):
                 "[LifecycleProbe] nav_load_model inventory "
                 f"pid={os.getpid()} requested_id={id} same_id_files={same_id_files}"
             )
-        if self.is_visual_ppo:
+        if self.is_p2_nav:
+            self._load_p2_nav(path, id)
+        elif self.is_visual_ppo:
             self._load_visual_ppo(path, id)
         elif self.is_nav_dagger or self.is_nav_eval:
             self._load_nav(path, id)
@@ -1457,6 +1704,56 @@ class Agent(BaseAgent):
                 requested_id=str(id),
                 selected=self.cur_model_name,
             )
+
+    def _load_p2_nav(self, path=None, id="1"):
+        if not path:
+            raise FileNotFoundError("[P2NavPPO] preload path is empty")
+        requested = str(id)
+        if self.is_p2_nav_eval:
+            candidates = p2_nav_evaluation_candidates(path, requested)
+        else:
+            candidates = p2_nav_training_candidates(
+                path,
+                requested,
+                parent_model_id=self._p2_parent_model_id,
+            )
+        # Model ID/lineage differences are warning-only, but a selected file's
+        # serialization and module contract are not. Candidate fallback applies
+        # only when a higher-priority file is absent; never hide a corrupt exact
+        # resume by silently loading another model.
+        selected = next(
+            (candidate for candidate in candidates if os.path.isfile(candidate)), None
+        )
+        if selected is None:
+            raise FileNotFoundError(
+                f"[P2NavPPO] no P2 resume or configured P1.5 parent checkpoint "
+                f"for requested_id={requested}; "
+                f"tried={candidates}"
+            )
+        selected_id = os.path.basename(selected).rsplit("-", 1)[-1].split(".", 1)[0]
+        if requested != "latest" and selected_id != requested and self.logger:
+            self.logger.warning(
+                "[P2NavPPO] requested model ID did not match the selected file; "
+                "continuing with structural validation instead of blocking. "
+                f"requested={requested} selected_id={selected_id} selected={selected}"
+            )
+        if self.is_p2_nav_eval:
+            load_mode = self.algorithm.load_evaluation_bundle(
+                selected, platform_model_id=requested
+            )
+        else:
+            load_mode = self.algorithm.load_bundle(
+                selected, platform_model_id=requested
+            )
+        self.training_elapsed_h = self.algorithm.effective_training_seconds / 3600.0
+        self.cur_model_name = selected
+        if self.is_p2_nav_eval:
+            self._p2_eval_checkpoint_path = selected
+            self._p2_eval_requested_model_id = requested
+        self.logger.info(
+            f"[P2NavPPO] load complete mode={load_mode} requested_id={requested} "
+            f"selected={selected} effective_h={self.training_elapsed_h:.3f}"
+        )
 
     def _load_nav(self, path=None, id="1"):
         """nav 加载分派：eval 走硬停止链；训练走首载低层父 / nav resume。
@@ -1995,6 +2292,33 @@ class Agent(BaseAgent):
             # Track+Camera eval TOML, so both sides retain the 57905-D contract.
             from agent_ppo.checkpoint_io import nav_eval_checkpoint_candidates
 
+            lbc_eval_conf = self.usr_conf.get("lbc_loco", {})
+            p2_eval_conf = self.usr_conf.get("p2_nav_ppo", {})
+            terrain_mode = str(self.usr_conf.get("terrain", {}).get("mode", ""))
+            low_level_only_eval = bool(
+                isinstance(lbc_eval_conf, dict)
+                and lbc_eval_conf.get("low_level_only_eval", False)
+            ) or bool(
+                terrain_mode == "standard"
+                and isinstance(p2_eval_conf, dict)
+                and p2_eval_conf.get("standard_low_level_only_eval", False)
+            )
+            p2_candidates = [
+                candidate
+                for candidate in p2_nav_evaluation_candidates(path, id)
+                if candidate and os.path.isfile(candidate)
+            ]
+            if low_level_only_eval and p2_candidates:
+                self._eval_requested_model_id = str(id)
+                self._eval_checkpoint_path = None
+                eval_path = p2_candidates[0]
+                self._load_lbc_loco_for_eval(
+                    eval_path,
+                    allow_complete_hier_nav_low_level_only=True,
+                )
+                self.cur_model_name = eval_path
+                return
+
             if nav_eval_checkpoint_candidates(path, id):
                 self._promote_forced_lbc_eval_to_nav(path, id)
                 return
@@ -2114,7 +2438,9 @@ class Agent(BaseAgent):
         identity["path"] = os.path.abspath(vision_path)
         return identity
 
-    def _load_lbc_loco_for_eval(self, vision_path):
+    def _load_lbc_loco_for_eval(
+        self, vision_path, *, allow_complete_hier_nav_low_level_only=False
+    ):
         """Eval 模式：模拟真机视角，只加载 vision_encoder + teacher_actor。
 
         真机部署时 teacher_encoder（吃 height_scan）不存在，故 eval 也不加载它。
@@ -2149,27 +2475,39 @@ class Agent(BaseAgent):
             raise KeyError(f"[LBC-Loco eval] modules missing in {vision_path}")
         # P1.5's ResponseAdapter is auxiliary and ignored by this deploy-shaped
         # Camera path. A real action-producing nav policy remains a hard stop.
-        high_level_eval_disposition = classify_locomotion_eval_high_level(ckpt)
+        high_level_eval_disposition = classify_locomotion_eval_high_level(
+            ckpt,
+            allow_complete_hier_nav_low_level_only=(
+                allow_complete_hier_nav_low_level_only
+            ),
+        )
         vision_section = modules.get("vision_encoder", {})
         ve_state = (
             vision_section.get("state_dict")
             if isinstance(vision_section, dict)
             else None
         )
-        if not isinstance(ve_state, dict):
-            raise KeyError(
-                "[LBC-Loco eval] modules.vision_encoder.state_dict missing in "
-                f"{vision_path}"
-            )
         low_level = modules.get("low_level", {})
         act_state = (
             low_level.get("actor_state_dict")
             if isinstance(low_level, dict)
             else None
         )
+        if allow_complete_hier_nav_low_level_only and isinstance(low_level, dict):
+            canonical_encoder = low_level.get("locomotion_encoder")
+            canonical_actor = low_level.get("actor")
+            if isinstance(canonical_encoder, dict):
+                ve_state = canonical_encoder.get("state_dict")
+            if isinstance(canonical_actor, dict):
+                act_state = canonical_actor.get("state_dict")
+        if not isinstance(ve_state, dict):
+            raise KeyError(
+                "[LBC-Loco eval] low-level VisionEncoder state missing in "
+                f"{vision_path}"
+            )
         if not isinstance(act_state, dict):
             raise KeyError(
-                "[LBC-Loco eval] modules.low_level.actor_state_dict missing in "
+                "[LBC-Loco eval] low-level actor state missing in "
                 f"{vision_path}"
             )
 

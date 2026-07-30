@@ -1211,6 +1211,1065 @@
 - 再遇检查：save path category → `id_list`/`kaiwu.json` → ZIP 是否生成 → 前端模型列表；
   不要先调 `dump_model_freq`、文件名或网络结构。
 
+## BUG-20260728-007：P2 高层专用 storage 与训练边界初版存在解冻后崩溃和序列污染风险
+
+- 状态：本地已验证。
+- 影响：`p2nav2h` 两小时 Track 连续高层 PPO；涉及十分钟 CNN 解冻、ResponseAdapter
+  future label、recurrent reset、variable-duration GAE、checkpoint exact resume、显存降级与
+  平台周期归档。P1.5/Standard/Nav 既有训练入口不应受影响；平台拥有的
+  `server/isaac_env/base_env.py` 未修改。
+- 复现背景：分支 `codex/p2-track-nav-ppo`，基线 commit
+  `b1ace13918f47776245bde13fa7fe9c972d5a9e3`，父包 `responsecalib-37953`；本地归档
+  `p15resp8h-r1_37953.zip` SHA256
+  `134b8388220309131d676b83f672887ded26ed2d71f942b6a0bb6a61d7feb206`。生产配置为
+  Track/Camera、128 环境、32 high-level ticks、TBPTT16、固定 slope→open-maze，TOML
+  SHA256 `24dd4905a41734b65d10e953b18d73c9effe8ea263d0c2936517616b93025d00`。
+  当前没有平台任务 ID、P2 模型 ID 或 checkpoint SHA256。
+- 预审症状与根因：初版解冻后把 Camera depth `[N,180,320,1]` 直接 `copy_` 到
+  `[N,57600]` CPU FP16 storage，形状不可广播，会在十分钟边界后的首个 depth rollout
+  必现失败。ResponseAdapter 初版还混用了 P2 Actor capability 与 P1.5 Adapter capability，
+  done slice 和 episode-start reset 各有一帧偏移，可能让终止前 hidden 或未来标签污染新
+  episode。PPO 初版按 rollout 全局归一化 advantage，并在 4-sequence CNN microbatch 层面
+  混用 Actor/Critic 数据，不能满足完整 64-sequence minibatch 口径。exact resume 若缺
+  scheduler/RNG/buffer 或含非有限状态也不能静默降级。
+- 排除项：历史平台任务已证明无参数 `agent.save_model()` 会由 wrapper 注入
+  `/data/user_ckpt_dir` 路径与数字 ID，因此 P2 的周期/最终无参数保存不是
+  `path=None/id=1` Bug，不得改成 iteration ID 或业务侧自造路径。P1.5 的 128 环境
+  CUDA illegal-memory 发生在 256 环境 ray-caster 初始化，不能据此预判 P2 128 环境必败；
+  本轮仍必须以真实 rollout/backward 峰值决定是否重启为 96/80 环境。
+- 核心修复：新增独立二维 squashed-Gaussian high-level Actor/Critic、CPU-backed P2 storage、
+  `critic323|aux30` worker transport、5 Hz target/50 Hz slew、P1.5 shared FeedbackEmulator、
+  terrain curriculum probe 与高层 tick reward。depth 入库前现在严格校验元素数并显式展平；
+  frozen/unfrozen rollout 分别保存 nav feature 或 pinned FP16 depth。Adapter Track/parent
+  records 分别使用 P2 response capability 和 P1.5 capability，future done 边界覆盖当前
+  transition，episode reset mask 移到 termination 后的 observation，resume 只恢复 completed
+  records并清空 unfinished history。PPO advantage 在完整 minibatch 统计，microbatch loss
+  按有效 timestep 比例缩放，Actor/Critic 独立传输与 backward。timeout 只在 delta bootstrap
+  一次且 continuation 为零。exact resume 严格要求高层模块、三套 optimizer/scheduler/RNG、
+  计数和兼容 buffer，并对模块/optimizer tensor 做有限值检查。同 ID loader 先尝试
+  `navfull/navadapt/navwarm` exact resume，仅在不存在 P2 包且 ID 为 37953 时回退
+  `responsecalib` 父包；保存端在原子替换前检查六个活动模块与三套 optimizer 的有限值。
+  CNN 解冻同时更新 optimizer group LR、`initial_lr`、LambdaLR `base_lrs/_last_lr`，防止
+  scheduler 在首个解冻 update 后把分层学习率重新归零。
+  128→96→80 的显存降级允许对 completed records 的环境维做向下切片，模型、optimizer、
+  RNG 与有效训练秒数仍精确恢复；反向扩容仍拒绝伪造 exact resume。Adapter update 单独捕获
+  OOM，跳过当次辅助 step并把 batch_envs 减半，不回滚或污染已完成的高层 PPO update。
+  后续静态审查还发现 tracking penalty 原先在新动作刚采样、尚未执行时取样，会把上一指令
+  的响应误归到新 transition；现已移至 `finish_tick()`，使用 10 个低层帧结束时的
+  `exec_cmd/measured_velocity`，command-rate 仍在动作切换时计算。高层命令方向、反馈有效率、
+  confidence、三项 tick penalty、Adapter 三 horizon MAE/NLL/有效率、课程累计值与完整性能
+  时序现均进入 monitor metrics，所有项目只观测、不形成训练门禁。另修复 lifecycle
+  自动 dump 抛 `CheckpointSaveError` 时被特殊向外重抛、违背跑满两小时策略的问题；现在
+  与其他 lifecycle 异常一致只累计告警，并安排 60 秒后的无参数平台归档重试。最后将
+  `Config.CURRENT` 的字面默认从 P1.5 同步为 P2，使配置 bootstrap、训练 TOML 和首次加载前
+  的 stage 读取保持一致。
+- 保存与运行策略：首存约五分钟、之后十分钟及 CNN 解冻边界使用无参数平台归档；
+  normal end/SIGTERM 共用一次幂等 final save。训练指标、curriculum、Adapter 质量和低层 digest
+  漂移只告警；非有限 minibatch 跳过 optimizer step。显存首先把 CNN microbatch 从
+  64 frame 降到 32 frame并开 activation checkpointing；环境数调整只能新建 96/80 环境任务，
+  不在已创建 Isaac/CUDA 进程中热改。
+- 当前验证：新增 action/log-prob、GAE、row/column probe、capability 分离、future done/reset、
+  CPU buffer resume、128/96/80 sequence 数、depth flatten、timeout mask、累计 CNN 解冻和
+  final-save 幂等测试，并补充 transition 末端 tracking penalty 与 curriculum monitor
+  flatten 回归。Python `py_compile`、两份 TOML 解析、P2 面板名称字符检查、`git diff --check`
+  及同步客户端 `27 tests` 已通过。腾讯 IDE dry-run 仍返回
+  `ApiUserErrors.WEBIDE_RECORD_NOT_FOUND`；宿主机无 PyTorch，因此 pytest、真实 37953 strict load、GPU
+  rollout/update/save/resume、128 环境峰值、平台 smoke、模型列表与评估均未验证；状态不得
+  提升为本地/平台/评估已验证。
+- 防复发：CNN 解冻路径必须使用真实 Camera shape 完成至少一轮 storage add 与 PPO backward；
+  same-ID parent/resume 需检查 stage/component/spec/finite；P2 Actor capability 与 Adapter
+  piecewise-union capability 必须分别锁定；future history、live recurrent hidden、未完成
+  rollout 和 per-env terrain state 不进入 checkpoint。运行时必须同时报告 allocated/reserved
+  当前值与峰值、pinned depth bytes、H2D/rollout/update 时间。
+- 遗留风险与回滚：平台 eval 是否同时向 `agent.exploit()` 提供 policy observation 与
+  critic/response wire 仍需 smoke；timeout terminal observation 能否由 wrapper 精确提供也需
+  容器确认。若 128 环境 OOM，按 96→80 新任务回退并从已有 P2 checkpoint 累计有效训练秒数；
+  若无有效 P2 包则从 37953 重新跑满两小时。整体回滚为切回 P1.5 `responsecalib-37953`，
+  不删除父包、不修改 base env、不将 P2 标记为 deployable。
+- 关联：commit/PR、平台任务名 `p2nav2h` 对应的任务 ID、最终模型 ID、checkpoint SHA256
+  均待完成后补录。
+
+- 2026-07-28 复审更正（状态仍为“代码已修复待验证”）：此前本条写成“timeout 只在 delta
+  bootstrap 一次”，该结论隐含平台能提供 terminal critic observation，现已确认不成立。
+  `server/isaac_env/base_env.py` 在 trajectory recorder 关闭时会把 `truncated` 覆盖为全零，
+  返回 infos 也不保留原始 `time_outs`；同时 auto-reset 后公开 observation 已属于新 episode。
+  修复改为 worker 在现有 `response_aux30` 的 aux24 写 reset boundary、aux25 写
+  `0 none/1 success/2 failure/3 timeout`，aisrv 从下一帧 wire 恢复 done/timeout。当前无 terminal
+  observation 时 timeout 使用 `bootstrap_mask=0`、`continuation_mask=0`，明确禁止拿 reset
+  后状态为旧 transition bootstrap；未来只有平台提供显式 terminal observation/value 后才可
+  恢复单次 timeout bootstrap。
+- 同轮复审还确认并修复：高层 `mean/log_std/pre_tanh/log_prob/target/value` 非有限时原实现
+  只替换 target，仍会把非有限 transition 写入 storage；现在相关 env 执行 zero、所有存储字段
+  清洗、recurrent hidden 清零并标记整轮 PPO 跳过，Adapter update 和两小时任务继续。Actor
+  采样新增 device-local action RNG，与 sequence shuffle、neutral dropout、Adapter RNG 分开保存
+  和 exact resume。P2 schema2 新包补齐 `bundle_kind`、实际 `train_scope` 以及每个可学习 leaf 的
+  `class_name/spec/state_dict`；训练 resume 继续严格恢复三套 optimizer/scheduler/buffer，
+  `p2_nav_eval` 则使用模块-only 装配，不再创建或恢复 Critic、optimizer、scheduler、PPO storage
+  和 ResponseBuffer。
+- 课程诊断原实现尝试从 aisrv 代理穿透读取 worker 的 env-owned probe，平台进程边界下会永久
+  得到空快照。现由 aisrv 使用 aux24/25/28/29 独立累计 row/column movement、outcome、start 和
+  histogram，并将累计值写入 checkpoint；per-env previous row/column 不保存，resume 首帧只建立
+  新边界，避免跨任务伪造一次 reset 迁移。请求 ID 与 payload 内历史 `platform_model_id` 不一致
+  仍遵循仓库既有身份策略只告警，实际候选继续由平台请求 ID/同 ID 文件名选择，没有升级为新的
+  单点硬门禁。
+- 真实 `responsecalib-37953` 结构核验进一步发现：父包的动作方差位于
+  `modules.action_distribution`，S0 anchor 位于 `modules.s0_anchor`，初版 P2 payload 只重建
+  `modules.low_level/high_level`，会在首存时丢弃这两组冻结状态。现将其迁移为
+  `modules.low_level.action_distribution` 与 `modules.low_level.s0_anchor` 的规范 leaf；真实
+  37953 已完成 CPU bootstrap、P2 schema2 保存和 exact resume，迁移后 low-level 键包含
+  `action_distribution/actor/critic/locomotion_encoder/s0_anchor`，父 completed records 为 32。
+- 本次新增回归覆盖 timeout aux 恢复、post-reset no-bootstrap、课程累计/恢复、终止原因优先级、
+  非有限 transition 清洗、action RNG exact resume、leaf 契约 round-trip 和 eval 无训练状态；
+  宿主 `PY311test` 的 P2 专项为 `33 passed`；排除仓库已知失效的旧
+  `test_j9_fixed_lr.py` 与 `test_st9_opt3_d2.py` 后，训练端回归为
+  `207 passed, 3 subtests passed`。真实 37953 已完成 CPU bootstrap、schema2 保存和 exact
+  resume；GPU rollout/update/save/resume、128 环境显存、平台 smoke、模型列表与评估仍未执行，
+  因此不得升级为“本地已验证”或更高状态。
+
+- 2026-07-28 开发容器 full-stack preflight 补充（状态仍为“代码已修复待验证”）：使用真实
+  `responsecalib-37953`、生产 P2 配置和 128 环境启动时，aisrv 在 Isaac reset 前明确拒绝配置：
+  `Configuration validation failed ... [terrain.track] sub_terrains_random is not supported and must not be configured`。
+  根因是生产 TOML 沿用了设计稿中的 `sub_terrains_random=false`，但当前平台配置白名单禁止该键
+  存在；布尔值为 false 也不会绕过校验。现从活动 TOML 删除该字段，固定
+  `pyramid_slope -> open_entry_maze` 顺序继续由 `sub_terrains` 列表表达，并增加配置回归断言
+  禁止重新写入该键。首次失败未创建环境、未执行 rollout，也不是 CUDA/OOM；后续 broken-pipe
+  与子进程 `signal_killed` 均为 aisrv 首错后的派生噪声。需重新同步并取得真实 reset、首轮 update、
+  显存峰值和 checkpoint 证据后，才能提升验证状态。
+
+- 2026-07-28 第二轮开发容器 full-stack preflight 补充（状态仍为“代码已修复待验证”）：删除非法
+  `sub_terrains_random` 后，128 环境已完成真实 Track/Camera 创建，环境创建阶段显存约
+  `3693 MiB / 5000 MiB`，但首次 reset 在平台 curriculum manager 中失败：
+  `ValueError: Reward term 'track_lin_vel_xy' not found`。根因不是 OOM，也不是 P2 goal reward
+  实现，而是当前平台把 `[terrain] curriculum=true` 同时解释为启用
+  `terrain_levels`、`lin_vel_cmd_levels` 和 `ang_vel_cmd_levels`；后两项固定查询
+  `track_lin_vel_xy` / `track_ang_vel_z`，P2 的全量 reward override 未注册它们。平台源码同时
+  证明 Track 的 `terrain_levels_vel` 会升降 `terrain_types`（难度列），不是升降赛道 row。
+  为保留用户批准的通用 terrain curriculum 且不修改平台 `base_env.py`，P2 TOML 现注册两个
+  `weight=0.0` 的 compatibility-only tracking term。Isaac RewardManager 不删除零权重 term；
+  原生 command curriculum 读取到的 episode sum 与 `0.8 * weight` 阈值均为零，严格比较
+  `0 > 0` 为假，因此不扩张平台 fallback command，两项也对 P2 reward 数值贡献严格为零。
+  新增配置回归断言锁定 term 名、零权重和参数。后续 broken pipe、`env.reset returned None` 与
+  `signal_killed` 均为首次 reset 异常后的派生错误。仍需重新同步并取得 reset、32 tick rollout、
+  PPO/Adapter update、CUDA 峰值、checkpoint save 与 exact resume 证据后升级状态。
+
+- 2026-07-28 正式训练前开发容器验证补充（状态升级为“本地已验证”）：父包使用容器原生
+  `/data/pre_model/ckpt/model.ckpt-responsecalib-37953.pkl`，SHA256
+  `5b3715491bd2a184f157aa37a63a598848b733b67d34b7474120a6e9e5cd6193`。生产 128 环境
+  Track/Camera 已完成真实 reset、32 个高层 tick、冻结低层 inference、Actor/Critic/Adapter
+  update，lifecycle callback `320` 次且失败为 `0`；首轮 `max_memory_allocated=535753216`、
+  `max_memory_reserved=645922816`，未出现 CUDA/OOM。运行 checkpoint
+  `/data/ckpt/.../model.ckpt-navwarm-38400.pkl` 大小 `21033482`、SHA256
+  `0943d595803e1d8d6f11e641ed00c7141f9eaf9073e09d1ff9e6d520c6e08455`；SIGTERM final
+  candidate `/data/user_ckpt_dir/.../model.ckpt-navwarm-38723.pkl` 大小 `21033482`、SHA256
+  `0349f936fa651822abd9e85904cc170dbfd74aecd65ff986f870f10abefb7309`。后者已用 CUDA、
+  128 环境完成 `exact_resume_history_reset`，恢复 `iteration=2`、`nav_ticks=9984`、三套
+  gradient step `32/32/2`、有效训练秒 `59.8843`，unfinished history 为零、completed records
+  为 `32`。
+- CNN 解冻规格通过独立 128 环境 probe：pinned depth `471859200` bytes（450 MiB），
+  64-frame microbatch 完成 Actor/Critic/Adapter backward，`h2d_time_s=0.38294`、
+  `max_memory_allocated=477448704`、`max_memory_reserved=530579456`，无需降级 microbatch 或
+  activation checkpointing。最后修正 worker curriculum 探针的初始化时序：旧实现会在首次
+  Track reset 前把 Isaac 的临时均匀列分配写成 initial histogram，并且只读取
+  `manager.active_terms`；新实现等待显式列初始化标记，当前平台无该标记时退化为等待首个非零
+  episode length，同时回退读取 `_term_names`。该问题只影响课程诊断日志，不影响实际训练；
+  checkpoint 已证明实际初始分布为 row0/col0 全 `128`。宿主和容器 P2 专项均为
+  `35 passed`；按当前分支实际存在的测试文件执行 Nav/P1.5/P2 邻近回归为 `209 passed`，同步后
+  二次 dry-run 为零差异。容器中另外残留 6 个本地分支已不存在的旧 Standard 测试文件，它们在
+  pytest 收集期引用已归档符号而失败；未将其计入当前分支回归，也未越权删除。平台正式任务、
+  模型列表和评估尚未执行，状态不得提升为“平台已验证”或“评估已验证”。
+
+## BUG-20260728-008：P2 面板碎片化且课程 reset 日志逐环境刷屏
+
+- 状态：本地已验证。
+- 影响：`p2nav2h` 的前端监控可读性和 aisrv 日志量；不改变 PPO、奖励、课程状态、模型权重、
+  checkpoint schema 或平台 `base_env.py`。当前已运行的平台任务不会热加载本修复，需下一次任务
+  启动时生效。
+- 用户可见症状：P2 页面包含大量旧的、没有数据的 Track 计分面板，同时 2026-07-28
+  `21:25:58` 至 `21:26:08` 连续出现多条单环境
+  `p2_curriculum_reset_batch_aisrv`。样本均为 `old_row/new_row=0`、`old_col/new_col=0`、
+  `termination_reason_code=2`；同窗口 `EnvMonitor` 报告 `completed=0, abnormal=5, timeout=0`。
+- 含义与根因：reason code `1/2/3` 分别为成功/失败/超时，因此日志确实表示 row0/col0 的环境
+  失败后 reset，课程没有晋级或换列，并非训练循环重新启动。噪声来自 aisrv 每个低层帧解析
+  aux24/25 后立即 INFO；128 环境的 reset 分散到不同帧时，所谓 batch 经常只有一个 env。
+  面板侧则把 53 个 P2 指标各建一个图，并继续注册 `completed_count_track_l0..9` 等 70 条旧 Track
+  计分序列；仓库 P2 workflow 没有这些旧 key 的生产者，所以页面出现空图。
+- 核心修复：`monitor_builder.py` 将 P2 重组为训练收敛、导航控制、响应预测、课程诊断和性能资源
+  五组共 30 个多曲线面板，移除 P2 下的旧 Track 计分组，Nav/P1.5 独立入口保持不变。新增
+  rollout reward/return/value/advantage、动作探索标准差、Actor/Critic/Adapter 学习率、累计非有限
+  跳过和目标进度等只读 telemetry，使面板可以直接判断收敛、探索、导航进展和资源余量。
+  `P2CurriculumAccumulator` 改为每 60 秒输出一条 `p2_curriculum_reset_summary_aisrv`，聚合
+  success/failure/timeout、row/column move 和 reset 总数，只保留最多 12 个样本用于定位；累计
+  histogram、monitor metrics 和 checkpoint 内容不变。
+- 排除项：日志中的 code 2 不是 timeout，也不是 curriculum 自己触发的重启；旧 Track 空面板与
+  奖励计算、父包 `37953`、GPU 显存和 checkpoint 保存链无关。当前失败占比是否过高仍需结合
+  新面板的目标距离/进度、终止累计和指令响应判断，不能因减少日志就认定训练效果已改善。
+- 验证：宿主 Python 编译、`git diff --check` 和 P2/Nav/P1.5 相关测试 `66 passed`；开发容器同组
+  测试 `66 passed, 1 warning`。容器原生 `MonitorConfigBuilder.build()` 成功生成五组 30 个面板，
+  中文名称和 metric expression 均通过平台 builder；同步后待执行零差异复核。正式平台新任务、
+  前端面板显示和日志降频尚未验证，因此状态不能提升为“平台已验证”。
+- 防复发：P2 新面板必须引用 workflow/algorithm 直接上报的 metric key；禁止重新引入仅由旧
+  Standard/Nav 假定存在的 `*_track_l*` 序列。高频 per-env 事件必须先在进程内聚合，INFO 日志
+  只输出窗口摘要，精细计数进入 monitor/checkpoint。
+- 血缘：分支 `codex/p2-track-nav-ppo`，父包 `responsecalib-37953`；当前平台任务 ID、模型 ID、
+  commit/PR 均未记录。回滚可恢复旧 `_build_p2_monitor()` 和逐事件日志，但会重新产生空面板与
+  日志洪泛。
+- 再遇检查：确认 `policy_entry=p2_nav_ppo` → 查看 monitor builder 加载错误 → 核对新任务是否
+  包含五个 P2 group → 检查 `rollout_reward_mean/goal_progress/curriculum_failures` 是否上报 →
+  确认 reset 日志为每分钟 summary，而不是逐环境 batch。
+
+## BUG-20260728-009：P2 Track checkpoint 被旧 Nav 评估入口拒绝
+
+- 状态：本地已验证，平台评估待验证。
+- 影响：P2 `navwarm/navadapt/navfull` 模型的 Track+Camera 评估入口，以及 P2 训练效果监控；
+  不修改 PPO、奖励权重、checkpoint schema、网络输入、平台 `base_env.py` 或部署端。
+- 任务与证据：分支 `codex/p2-track-nav-ppo`，父包 `responsecalib-37953`，请求模型 ID
+  `43393`，失败日志 `/Users/nanbloom001/Downloads/log-598611-18525725.zip`。评估任务 ID
+  `598611`，关联运行号 `18525725`；训练任务名 `p2nav2h`，平台训练 task ID 未在日志包中记录。
+- 用户可见症状：2026-07-28 21:33:38，aisrv 先打印
+  `Override Config.CURRENT: p2_nav_ppo -> nav_eval`、`Stage: nav_eval`，随后旧 loader 报
+  `[nav-eval] no same-ID nav checkpoint for id=43393`，候选仅包含
+  `navfull/navdagger/navbc`。21:34:04 因 checkpoint 未加载拒绝推理，之后
+  `NoneType object is not subscriptable` 与 `process_stop error_code 1` 均为派生错误。Track
+  环境稍后成功创建为 `pyramid_slope -> open_entry_maze`，因此地形、CUDA、reward 和模型行为
+  不是本次首错。
+- 根因：`conf.py::_infer_stage_from_task_name()` 在平台 eval TOML 没有转发 `policy_entry` 时，
+  对所有 Track+Camera 无条件返回历史 `NavEvalConfig`，覆盖仓库已由 `configure_app.toml`
+  建立的 P2 lineage。旧 `nav_eval` 只识别 DAgger/Nav 命名空间和离散高层契约；P2 首存约五分钟
+  时通常为 `navwarm-<id>.pkl`，应由 `p2_nav_eval` 的模块化连续高层装配加载。日志中的
+  `existing_nav_files=[]` 只过滤旧 Nav 文件，不能证明同目录没有 P2 文件。
+- 排除项：不是 checkpoint 完整性门禁“过严”。旧 Nav loader 在错误装配下拒绝未知模型是正确
+  防线；直接让它接受 `navwarm` 会把连续 P2 Actor、85 维输入和 ResponseAdapter 误装进离散
+  DAgger 高层，风险高于硬失败。也不允许在加载失败后用随机参数继续评分。
+- 核心修复：显式 eval `policy_entry=p2_nav_ppo` 自动转换为 `P2NavEvalConfig`；无显式入口的
+  Track+Camera 根据 `Config.CURRENT` bootstrap lineage 选择 `p2_nav_eval`，旧 Nav/Dagger lineage
+  仍选择 `nav_eval`。P2 路径继续只搜索同 ID `navwarm/navadapt/navfull`，使用已有 eval-only
+  assembly，仅创建低层、NavigationEncoder、连续 Actor 和 ResponseAdapter；Critic、optimizer、
+  scheduler、PPO storage 和 ResponseBuffer 不创建。schema、module spec、shape、有限值和同 ID
+  选择仍严格校验。
+- 监控补强：此前五组 30 面板仍缺少十项实际奖励贡献和多个效果判据。P2 现扩展为八组 45
+  面板、110 个去重 metric key，新增 `reward_approach_goal`、速度投影、航向、距离、成功、时间、
+  终止、姿态、能耗、body contact，高层三项 penalty，以及 success/failure/timeout、推进速度、
+  target/exec/measured/true 速度、有效反馈误差、source/age、域外探索、机身倾斜、横向漂移和动作
+  饱和。新增 telemetry 只读取 rollout/aux/action，不参与 loss、reward 或阶段推进。
+- 修改文件：`server/agent_ppo/conf/conf.py`、`server/agent_ppo/workflow/p2_nav_ppo_workflow.py`、
+  `server/agent_ppo/conf/monitor_builder.py`、两组相关测试、`server/README.md`、
+  `server/CHANGELOG.md` 与本台账。
+- 验证：宿主 `PY311test` 下 P2/Nav 定向回归 `64 passed`，Python 编译和 `git diff --check`
+  通过；AST 校验得到 P2 monitor `8 groups / 45 panels / 110 unique metrics`。宿主缺少平台
+  `kaiwudrl.common.monitor.MonitorConfigBuilder`，因此本轮尚未取得平台原生 builder、容器同步、
+  真实 `43393` 加载或 Track 评估证据，状态不得提升为“平台已验证”或“评估已验证”。
+- 2026-07-28 回迁核验：将同一评估路由修复最小回迁到模型 `61633` 的代码快照
+  `archive/代码存档/legged_robot_competition_26-ppo-61633`，仅更新 `agent_ppo/conf/conf.py`
+  和对应路由回归测试；归档自带的 `eval_model_id=61633` 保持不变。真实 checkpoint
+  `model.ckpt-navadapt-61633.pkl` 已直接核验为 `kaiwu_train_v1/schema2`、
+  `stage_type=p2_nav_ppo`、`bundle_kind=hierarchical_control_v3`、完整 high-level 组件，SHA256
+  为 `26aabe5f7eb5b590349fc3b46823a1934e9dc686862c506764d5ee45cbd409ed`。模块-only 加载返回
+  `evaluate_full_modules_only`，CPU 确定性前向得到有限 `action[1,12]` 和有限
+  `target_cmd3`；活动回归 `64 passed`、快照路由回归 `25 passed`、ZIP 完整性检查通过。
+  修复包为 `legged_robot_competition_26-ppo-61633-evalfix-v1.zip`，SHA256
+  `1a5ba2ff98991c837b57c7c0ed28ebd27c5e37dcdc6e0614f00169bb674373dc`；包内 checkpoint
+  字节未改变，且未包含 `.env`、`__pycache__` 或 `.pyc`。容器同步和平台 Track 评估尚未执行，
+  因此状态仍为“本地已验证”。
+- 2026-07-28 二次更正（评估任务 `598619` / 运行号 `18526070`）：v1 路由回迁实际已生效，
+  日志依次出现 `selected p2_nav_eval`、`Stage: p2_nav_eval` 和 eval-only assembly；新的首错是
+  22:20:44 `P2 evaluation requires both policy observation and the worker response/critic transport`。
+  平台标准 eval workflow 只转发 policy observation，worker 生成的 `critic323|response_aux30`
+  critic group 没有进入 aisrv；同一日志也没有任何 `load_model`、`navadapt-61633` 或
+  `evaluate_full_modules_only` 证据，因此修 transport 后还存在随机权重评分风险。修复保持
+  policy 维度 57905：仅在 eval worker 把 aux30 和 marker 写入 P2 不消费的 scan 前缀，aisrv
+  拆出后构造零 critic323 前缀供 `frame_begin()` 运输；训练路径不变。首次 exploit 同时从 runtime
+  `eval_model_dir/eval_model_id`（必要时回退包内配置）严格加载同 ID checkpoint，未加载仍拒绝评分。
+  这两项是评估链的必要一致性检查，不新增表现门禁、重复 schema 检查或自动停止策略。
+  活动 P2/Nav 回归 `68 passed`，61633 快照回归 `64 passed`；真实
+  `model.ckpt-navadapt-61633.pkl` 已通过修复后的 `Agent.exploit()` 自动定位并返回
+  `evaluate_full_modules_only`，确定性 action `(1,12)` 与 target 均有限。v2 修复包
+  `legged_robot_competition_26-ppo-61633-evalfix-v2.zip` SHA256 为
+  `e5c809f747a17c9d1e2d9936ed5a660fb5d6f928ee2ac603afb339ae24367d5f`，包内 checkpoint SHA256
+  仍为 `26aabe5f7eb5b590349fc3b46823a1934e9dc686862c506764d5ee45cbd409ed`。平台复评尚未执行，
+  状态仍为“本地已验证”。
+- 2026-07-28 `99393` 回迁核验：原始包
+  `legged_robot_competition_26-ppo-99393.zip` SHA256 为
+  `6c9e704edfa295cee8efedd7624636caf8fdd709202265c6afe79c97566773c1`。其六个评估相关文件与
+  修复前 `61633` 快照逐字节一致，因此原样回迁 v2 的 P2 eval 路由、单流 aux30
+  运输、首次 `exploit()` 同 ID 加载和对应回归测试，保留 `eval_model_id=99393`。
+  快照定向回归 `64 passed`；真实 `Agent.exploit()` 输出
+  `evaluate_full_modules_only`，选中 `model.ckpt-navadapt-99393.pkl`，确定性 action shape
+  为 `(1,12)`，action 和 `target_cmd3` 均为有限值。修复包
+  `legged_robot_competition_26-ppo-99393-evalfix-v2.zip` SHA256 为
+  `fb5156916b1406ab9298ad6b67a6e5dd4e852d56911ea9605b195df87f57f305`；包内 checkpoint
+  SHA256 仍为 `eb682662c113fb0aa8d015aa4ea4b8756661b81026273e54e7fae7ee465b4556`，
+  且未包含 `.env`、`__pycache__`、`.pyc` 或 `.pytest_cache`。容器同步和平台 Track
+  评估尚未执行，状态仍为“本地已验证”。
+- 防复发：评估测试同时覆盖“P2 无显式入口保留 lineage”“显式训练入口提升为 eval-only”和
+  “旧 Nav 无显式入口保持 nav_eval”。模型列表可见不等于 loader 已选对；每次评估必须依次确认
+  stage、候选 namespace、selected path、load mode 和有限前向。
+- 血缘与制品：commit/PR、模型 ZIP 和 SHA256 未记录；模型 ID `43393` 的实际内部标签需通过模型
+  ZIP 或下一次加载日志确认，当前按训练时间高置信推断为 `navwarm`，不写成已直接核验事实。
+- 回滚与最短检查：回滚本条只需恢复旧 eval 映射和新增面板/telemetry，不修改 checkpoint 字节。
+  再遇时先查最早的 `Stage:` → 查看是否为 `p2_nav_eval` → 核对同 ID P2 candidate → 确认
+  `evaluate_full_modules_only` → 再看环境、动作和视频；禁止从末尾 `NoneType` 反推模型损坏。
+
+## BUG-20260729-001：P2 两小时奖励与双段统计合同不适合八小时三段长训
+
+- 状态：本地已验证，开发容器与平台待验证。
+- 影响：分支 `codex/p2-track-nav-ppo` 的 P2 高层 PPO、ResponseAdapter、课程统计、监控和
+  checkpoint exact resume；默认 warm-start 父包为 P2 `99393`。不修改或上传平台拥有的
+  `server/isaac_env/base_env.py`，不改变默认部署 runtime，训练包继续 `deployable=false`。
+- 用户可见症状与证据：此前 `p2nav2h` 训练中课程列提升、失败数下降但完成数长期为零，末段
+  姿态/能耗改善同时 `navigation_time` 更接近完整超时。旧 50 Hz 奖励允许静止持续领取绝对
+  距离/航向正回报，progress 又被环境 `dt` 二次缩小；旧 scorer 还可能在 auto-reset 后用新
+  `terrain_types` 给刚结束 episode 归档。新任务要求逆缓坡、下台阶、迷宫三段连续训练 8 小时，
+  原 `2x10` 探针、aux30-only wire、两小时调度和旧 reward contract 均不再匹配。
+- 根因：导航任务目标和低层安全 shaping 混在 50 Hz RewardManager 中，导致高层的任务进展
+  信号相对弱且存在保守策略漏洞；terminal 前 column/row/goal-distance 没有稳定跨 worker wire
+  传给 aisrv；CNN 解冻状态曾可在非 rollout 边界先切换；worker 成功 term 只读取
+  `active_terms`，平台仅暴露 `_term_names` 时会误分类。监控只覆盖旧 reward 和少量全局均值，
+  无法按命令联合域、三段 Track、逐腿 gait 或 Adapter 域别定位退化。
+- 核心修复：任务改为 `p2nav8h`、28800 秒与固定
+  `pyramid_slope_inv -> pyramid_stairs_inv -> open_entry_maze`。5 Hz reward-v2 使用非对称进度、
+  new-best、一次性 success/failure/timeout、时间、crawl、command-rate、仿真真值 tracking 和
+  封顶 `-0.04` 的 1.5 秒 gait 非劣化约束；删除绝对距离/朝向/障碍/地形门控，stall 仅监控，
+  Adapter 与 UWB 不进入 PPO reward。50 Hz 只保留轻量姿态、能耗、body contact 和两个零权重
+  curriculum compatibility term。
+- 统计与反馈修复：worker wire 从 353 扩为
+  `critic323 | response_aux30 | diagnostic_aux28 = 381`，前 30 槽保持 P1.5 Adapter 合同，追加
+  四足窗口指标及 pre-step column/row/goal-distance。terminal outcome 使用 pre-step 快照，
+  reset 后 row/column 只计下一 episode，首次 128 个 episode 也计入 starts；成功 term 同时兼容
+  `active_terms/_term_names`。课程探针扩为 `3x10`，逐环境 reset INFO 继续按分钟聚合。
+- 终止奖励边界修复：`frame_end()` 在存在待结算高层 transition 时保留旧 episode 的
+  `best_goal_distance`，由 `finish_tick()` 使用 terminal-safe end distance 完成 `new_best` 结算后
+  再清空，避免 terminal tick 重复发新纪录奖励。合法 worker reason `1/2/3` 统一决定
+  success/failure/timeout，只有缺失或非法 reason 才回退 wrapper timeout，因此 hard 与 timeout
+  mask、奖励和面板结果严格互斥。
+- 训练与恢复修复：八小时 schedule 固定 0/10/20 分钟、2/6/8 小时的 CNN/Actor/Critic/
+  Adapter LR 与 entropy；CNN 只在空 rollout 边界切换，旧 optimizer group 缺 `base_lr` 时按组名
+  恢复。旧 P2 reward-v1 采用 `reward_v2_warm_start`，保留低层/NavigationEncoder/Actor/Adapter
+  权重并重建 Critic、return statistics 和高层优化状态；reward-v2 exact resume 强制校验训练
+  contract、阶段、CNN 状态、LR/entropy、return statistics、gait baseline、completed records
+  和独立 RNG。首存 5 分钟，resume 后回到下一个全局 10 分钟保存边界。
+- 监控修复：新增 reward 分解守恒、20 个 `vx x |wz|` 桶的 count/share、目标/执行/真值、
+  tracking MAE、progress、outcome 与 gait penalty；增加三段起点条件统计、逐腿 duty/swing/air/
+  frequency/slip，以及 Adapter 的 horizon/axis/baseline/coverage、分 row 和核心域/外沿域 MAE。
+  当前仓库无法从公开 observation 确定机器人实时所在的物理赛道段，因此不伪造
+  slope-to-stairs/maze 边界穿越率；现有 row 面板明确是 episode 起点条件统计。
+- 修改文件：`server/agent_ppo/feature/p2_contract.py`、`p2_gait.py`、`p2_worker_bridge.py`、
+  `p2_curriculum_probe.py`、`p2_response_buffer.py`、`p2_observation_process.py`，
+  `server/agent_ppo/algorithm/algorithm_p2_nav_ppo.py`、P2 workflow/TOML/monitor/tests、
+  `server/README.md`、`server/CHANGELOG.md` 和接口契约。
+- 验证：宿主 `PY311test` 下 `agent_ppo/tests/test_p2_core.py` 为 `57 passed`，覆盖三段/八小时
+  配置、reward 排序、非对称负进度、new-best 不可重复、gait 正常零罚与异常封顶、五个时间
+  边界、rollout 边界解冻、pre-reset 归因、成功 term fallback、旧 P2 warm start、reward-v2
+  exact resume、action RNG、全 rollout advantage 归一化及 Adapter 分组监控。P2/Nav/P1.5
+  终止 new-best 和 success/timeout 互斥。除两个无关旧模块外的训练端扩展回归为
+  `235 passed, 3 subtests passed`；Python 编译、TOML 解析和 `git diff --check` 通过。完整
+  `agent_ppo/tests` 仍有旧 `test_st9_opt3_d2.py` 导入已删除 `_student_drive_probability` 的收集
+  问题，以及 `test_j9_fixed_lr.py` 对当前 `AlgorithmPPO` 已删除 `_validate_fixed_lr` 的 4 个旧断言
+  失败，均与本轮 P2 变更无关。真实 `99393`、小环境
+  PPO/Adapter/save-resume、128 环境完整 backward、平台 monitor
+  builder 和正式任务均尚未验证，不能标记为平台已修复。
+- 防复发：奖励分解和必须等于 PPO storage reward；PPO reward 输入测试必须拒绝 Adapter/UWB/
+  障碍/地形/朝向依赖；所有 terminal scorer 使用 reset 前快照；训练合同或 aux 维度变化必须
+  同步 checkpoint/interface/test。禁止用 column 晋级、全局 reward 或平台旧
+  `completed_count_track_l*` 单独证明迷宫能力。
+- 血缘与回滚：当前无 commit/PR、平台 task ID、八小时模型 ID 或 checkpoint SHA256；工作区原有
+  多项未提交 P2 修改，未清理或覆盖。回滚应整体恢复 reward-v1、353 wire、双段 TOML 和旧
+  training contract，不能只回滚一端造成 observation/checkpoint 不兼容。最短检查路径：确认
+  `run_name/track_length/wire_dim` → 查看 reward 守恒 → 核对 pre-step outcome → 检查 schedule/
+  exact resume → 再看联合命令桶、三段进度、gait 与 Adapter 分组误差。
+- 2026-07-29 更正：本条记录的“默认 warm-start 父包为 P2 `99393`”已被用户明确撤销；当前
+  指定父包为 `p15resp8h-r1_37953-F` / `responsecalib-37953`。历史描述保留用于说明当时实现，
+  新的选择和身份策略见 `BUG-20260729-002`，不得再据本条把 99393 当成默认父包。
+
+## BUG-20260729-002：P2 模型 ID 单点门禁与在线步态基线污染
+
+- 状态：本地已验证，开发容器、平台 smoke 与八小时训练待验证。
+- 影响：分支 `codex/p2-track-nav-ppo` 的 P2 preload/eval 候选、checkpoint lineage、八小时
+  gait 非劣化奖励和监控。指定父包为本地归档
+  `archive/代码存档/p15resp8h-r1_37953-F.zip`，其中模型文件为
+  `model.ckpt-responsecalib-37953.pkl`；归档 `kaiwu.json` 记录 train_step/model ID `37953`。
+- 用户可见症状与风险：活动配置仍把 `99393` 写成默认 P2 warm start；P2 candidate 只有在平台
+  请求 ID 等于配置父 ID 时才允许回退 `responsecalib`，`latest` 还会直接报错，因此平台重写、
+  沿用或未正确注入 ID 时，兼容的 37953 父包也会被单点拒绝。步态保护则在 P2 前十分钟用
+  正在变化的高层策略在线收集阈值，校准期间 penalty 为零，不能称为父模型基线；计算虽已上报
+  逐腿 step frequency，却没有把持续快慢脚纳入 penalty。
+- 根因：候选层把模型 ID 从“选择/追溯元数据”错误提升为兼容性条件；gait v1 把 CNN 冻结窗口
+  等同于父基线采样窗口，没有独立的父模型离线 envelope，且 `_metrics()` 只返回 duty、swing 和
+  prolonged-air 三项。
+- 核心修复：`configure_app.toml` 与 P2 TOML 默认改为 `37953`。P2 loader 现在按“请求 ID P2
+  优先 → 配置父包 → 同类发现候选”选择，训练和评估都允许 ID 不一致或 `latest`，并输出
+  requested/selected/payload 身份告警；实际 lineage 采用 bundle 身份。ID、label、lineage、SHA
+  只用于诊断，不能单点阻断；文件不存在、反序列化失败、stage/module/spec/shape 不兼容或非有限
+  state 仍硬失败，避免在未加载有效策略时继续训练/评分。
+- 步态修复：baseline 升级为 `p2_gait_parent_baseline_v2`，训练开始前即以版本化的
+  `p15resp8h-r1_37953-F` 保守 envelope 生效，`observe()` 不再允许 Track on-policy 数据改写
+  阈值；checkpoint 保存 parent label/ID/SHA、固定阈值和“非经验 P99”来源说明。新增
+  `step_frequency_imbalance_hz=1.5`，与 duty/swing/prolonged-air 一起计算超限，整体仍封顶
+  `-0.04/tick`；面板新增 `reward_gait_frequency_excess`。Adapter row/core/outer 样本占比也改为
+  只按有效 horizon mask 统计，避免无标签 future slot 扭曲覆盖率判断。
+- 审查项处理边界：P2 worker/probe 已使用 terminal 前 row/column/goal-distance，P2 自有结果为
+  权威口径；平台拥有且同步脚本排除的 `server/isaac_env/base_env.py` 通用 EnvMonitor 仍只传 row
+  快照，本轮不伪装成已修复，也不重新注册旧 `completed_count_track_l*` 面板。outer command 已有
+  `command_core_overflow_rate`、hard-boundary rate 和 20 个联合桶，按计划只监控、不增加配额或
+  表现门禁。平台默认 maze 也继续只作实验变量，不声称 L0 是简单迷宫。
+- 修改文件：`server/agent_ppo/checkpoint_io.py`、`agent.py`、
+  `algorithm/algorithm_p2_nav_ppo.py`、`feature/p2_contract.py`、`feature/p2_gait.py`、P2 TOML、
+  `configure_app.toml`、monitor、tests、`server/README.md`、`server/CHANGELOG.md` 和接口契约。
+- 本地验证：`test_p2_core.py + test_nav_stage_and_metrics.py` 为 `87 passed`；排除两个已知无关旧
+  模块后的训练端回归为 `238 passed, 3 subtests passed`。Python 编译、全部 TOML 解析和
+  `git diff --check` 通过。直接解包真实 `p15resp8h-r1_37953-F`，故意以请求 ID `88888`
+  调用 P2 bootstrap，结果为 `bootstrap_high`，实际 `source_parent_model_id` 与
+  `loaded_platform_model_id` 均为 `37953`，证明 ID 不一致未阻断且真实 schema/module 校验通过。
+- 防复发：单测锁定配置父 ID 37953、跨 ID/`latest` 候选、payload 实际身份、固定 baseline 不受
+  live observe 影响和纯步频失衡产生 penalty。今后新增任何 loader 时，身份检查只能改变候选
+  优先级或产生告警；不得替代 stage/module/spec/shape/finite 兼容性校验，也不得成为唯一失败点。
+- 血缘与回滚：当前无 commit/PR、平台 task/model ID 或新 checkpoint SHA；父归档文件 SHA 仍以
+  原归档记录为准，本轮未修改模型。回滚代码可恢复旧候选和 gait v1，但会重新引入 ID 单点阻断
+  与在线基线污染，不建议单独回滚。再次遇到 preload 失败时最短路径：列出 candidates/selected
+  → 看结构校验首个异常 → 核对 bundle stage/spec/finite → 最后才看 requested/payload ID 告警。
+
+## BUG-20260729-003：开发容器历史文件与测试缓存导致训练任务创建失败
+
+- 状态：平台已验证；清理后训练任务可正常创建，无缓存容器回归已通过。
+- 影响：腾讯开悟开发容器 `/data/projects/legged_robot_competition_26` 向平台创建
+  `p2nav8h-r1` 训练任务时的代码快照/打包路径。不影响本地源码、父模型字节或 P2
+  checkpoint loader 语义。
+- 用户可见症状与原始证据：前端只提示“训练任务创建失败”。通过 Chrome Network
+  直接捕获 `POST /api/v5/Competition/CreateTrainTask`，请求为 `p2nav8h-r1`、PPO、单机、
+  `28800s`、父模型 ID `334205`，平台返回 HTTP `500`、`code=1102`、
+  `TrainErrors.TRAIN_TASK_CREATE_FAIL`。`CheckTrainTask` 与 `GetResourceBalance` 均返回
+  `code=0`；团队余额为 CPU 6 核、GPU 1 卡、并发任务 1。模型 `334205` 名为
+  `p15resp8h-r1_37953-F`、状态 `success`，且已成功用于先前 `p2nav2h-r1`。
+- 排除的错误方向：不是 P2 模型 ID 门禁。`CreateTrainTask` 在 learner/aisrv 容器创建、
+  Python import 和 checkpoint 加载之前已失败，业务 loader 尚未执行。也不是同名任务、
+  资源余额、并发限制、父模型不可用或训练时长越界。
+- 根因：容器同步默认不删除远端历史文件，容器共有 188 个 sync-scope 文件，而当前
+  本地合法清单为 132 个。多出 56 个历史 TOML、旧 Standard 测试、废弃模块和容器专用
+  文件；同时容器测试改写了被工作区 Git 跟踪的 `__pycache__/*.pyc`，并生成
+  `.pytest_cache`。平台代码快照/打包在这一污染状态下返回通用 500；清理后立即恢复任务
+  创建。现有证据证明“清理整体”与恢复有因果关系，但平台未返回具体失败文件，
+  因此不把某一个单独缓存文件写成已被独立证明的唯一根因。
+- 修复：对远端 manifest 与本地 `local_sync_client.collect_local_files()` 同等边界做差集，
+  删除 53 个确定已过期的历史配置、旧测试和废弃模块；保留容器/平台必需的
+  `agent_ppo/conf/deploy.yaml`、`conf/start_tongbu.sh` 和 `isaac_env/base_env.py`。删除全部
+  `.pyc/.pyo/__pycache__/.pytest_cache/.mypy_cache/.ruff_cache/*.sync-tmp`。清理后 manifest 为
+  135 个文件，其中 132 个与本地合法清单一致，另外 3 个是上述容器必需文件。
+  `conf/.env`、同步 Token、Cookie、模型、checkpoint 和训练日志均未删除。
+- 平台验证：用户在清理后确认同一创建流程已可成功创建训练任务。这一证据将
+  状态提升为“平台已验证”，但不等价于 P2 八小时训练、平台 smoke 或最终模型能力已验证。
+- 容器回归：所有 pytest 均设置 `PYTHONDONTWRITEBYTECODE=1 -p no:cacheprovider`。P2/Nav 定向
+  回归 `87 passed`，P1.5/checkpoint 邻近回归 `108 passed`；测试后复查
+  `pyc=0`、`__pycache__=0`、`.pytest_cache=0`，证明新测试方式没有重新污染平台快照。
+- 防复发：容器测试统一使用 `PYTHONDONTWRITEBYTECODE=1` 与 pytest `-p no:cacheprovider`，
+  不再在平台快照工作区运行会生成缓存的 `compileall`。每次正式创建任务前比对本地/远端
+  manifest，只允许 3 个已知容器专用差异，并确认 cache count 为零。
+- 血缘与回滚：分支 `codex/p2-track-nav-ppo`；父模型 `p15resp8h-r1_37953-F`，平台
+  模型 ID `334205`。本次是容器运维清理与文档记录，不修改模型或 checkpoint；commit/PR 未建立。
+  若需回滚仅能从历史版本重新同步某个已删文件，不应恢复任意缓存。再次遇到时的最短检查
+  路径：`CreateTrainTask` 响应 → `CheckTrainTask/GetResourceBalance` → 父模型状态 →
+  local/remote manifest 差集 → cache count → 容器 IDE record。
+- 2026-07-29 复发补充：创建 `p2nav10hvyavoid` 前再次出现“训练任务创建失败”。容器根磁盘
+  仅使用 19%，但真实代码挂载 `/workspace/code` 为 118 MB / 1344 files。其中
+  `agent_ppo/tests/data` 遗留一个 25 MB `291713` smoke checkpoint 和 9 个约 25 MB 的上传分片，
+  另有 8 组 `__pycache__`；活动代码仅在 `tmp_path` 单测中使用同名文件，不依赖这些残留。
+  按用户授权删除临时 checkpoint、分片和字节码缓存，保留 `.env`、Token、平台配置、源码、
+  golden data 和 `/tmp/vgpu` 平台缓存。随后对 Git 执行标准 `gc --prune=now`：1091 个、
+  51.65 MiB 松散对象压缩为 1 个 45.05 MiB pack，所有可达历史和未提交工作区修改保留。
+  最终 `/workspace/code` 为 65 MB / 149 files，松散对象、`__pycache__`、pytest/ruff/mypy cache、
+  `.ide-sync-*` 和 `*.sync-tmp` 均为 0。当前尚未取得用户重新创建任务成功的证据，因此这次
+  复发只记录为“容器已清理待平台重试”，不能把旧平台已验证结论自动套到新任务上。
+
+## BUG-20260729-004：P2 指令联合域 line 面板超过平台 20 指标上限
+
+- 状态：开发容器已验证，新训练任务启动日志待确认。
+- 影响：`p2nav8h` learner 加载 `agent_ppo/conf/monitor_builder.py` 时的整套自定义监控。
+  训练数值路径不受影响，但配置校验失败后平台会跳过所有 P2 面板，导致长训不可观测。
+- 用户可见症状与原始日志：`learner_init Error occurred while loading user monitor config`，
+  随后报“配置校验失败，共发现 5 个错误”，5 条均为“line 类型面板最多支持 20 个指标，
+  当前 24 个”，最后 `will skip loading`。
+- 根因：“指令联合域”中 5 个 `vx分桶N命令链` 同时放入四个 `|wz|` 桶的
+  `target/exec/true vx` 与 `target/exec/true |wz|`，即 `4 x 6 = 24` 条曲线。仓库原测试只校验
+  group/panel 名称字符合法性，没有锁定平台的单面板指标数上限。
+- 修复：每个 `vx` 分桶拆成两个 line 面板：`前进链` 保留四个 `|wz|` 桶的
+  target/exec/true vx，`转向链` 保留 target/exec/true `|wz|`，各 12 项。不删除、改名
+  或重新聚合任何底层 metric key。`test_p2_core.py` 新增对每个 P2 panel `<=20` 的断言。
+- 本地验证：`PYTHONDONTWRITEBYTECODE=1` 且禁用 pytest cache 运行
+  `test_p2_core.py + test_nav_stage_and_metrics.py`，结果 `87 passed`。容器原生 builder 加载、
+  配置校验和训练启动日志待验证，本条暂不标记为平台已验证。
+- 容器验证：修复文件同步后，直接导入容器安装的
+  `kaiwudrl.common.monitor.monitor_config_builder.MonitorConfigBuilder` 并执行完整
+  `build_monitor()`，返回 `monitor_builder_ok dict`，未再出现单面板 24 指标校验错误。
+  同一容器的 P2/Nav 定向回归为 `87 passed`，P1.5/checkpoint 邻近回归为
+  `108 passed`。为避免重现 `BUG-20260729-003`，全部测试均禁止 bytecode 和 pytest cache，
+  测试后 cache count 仍为零。
+- 防复发：新增 P2 面板时必须通过单面板 `<=20` 测试；“监控指标全部存在”不等于
+  “平台 builder 可接受”，正式训练前还必须在开发容器调用平台原生
+  `MonitorConfigBuilder` 完整构建一次。
+- 血缘与回滚：分支 `codex/p2-track-nav-ppo`，父模型 `p15resp8h-r1_37953-F` / ID
+  `334205`；本轮不修改 checkpoint、奖励、观测或训练算法。回滚只需恢复五个旧面板定义，
+  但会重新导致整份监控配置被平台跳过，不建议回滚。
+
+## BUG-20260729-005：P2 自定义监控依赖空 PID 注册表且静默丢弃
+
+- 日期：2026-07-29；状态：容器已验证，待新平台任务验证。
+- 影响：任务 `p2nav8h-r1` / task `235036` 的 P2 自定义监控。训练、梯度、checkpoint 和
+  EnvMonitor 原生 reward 不受影响，但损失、reward-v2 分解、命令链、Adapter、课程诊断和
+  性能资源面板没有时序数据。
+- 用户可见症状：监控页中只有“运动Reward”有数据，其余大量 P2 面板显示“暂无数据”；训练日志
+  同时正常出现 `[P2NavPPO] iter=...`，且 EnvMonitor 每分钟报告已上报 321 个环境指标。
+- 根因：P2 `_monitor_put()` 使用
+  `monitor.put_data({pid: metrics for pid in monitor.get_pids()})`。该注册 PID 列表在当前 aisrv
+  workflow 中为空或接口不可用时，不会提交当前进程产生的 P2 metrics；异常又被裸
+  `except Exception: pass` 静默吞掉。通用 workflow 的已验证写法是
+  `monitor.put_data({os.getpid(): monitor_data})`。运动 Reward 由独立的 learner EnvMonitor
+  上报，因此形成“只有运动 Reward 有数据”的特征。
+- 修复：P2 上报改用当前进程 `os.getpid()`，不再读取 monitor 注册 PID；函数返回成功状态。
+  上报失败仍不阻断八小时训练，但在原有约一分钟调用周期输出异常类型与原因，禁止静默失败。
+- 回归防线：新增测试验证 `get_pids()` 即使抛错也不会被调用，payload 使用当前 PID；另验证
+  `put_data()` 异常会产生 warning 且返回失败，不向训练路径传播。
+- 验证：宿主 `PY311test` 定向回归 `62 passed`；同步 bundle 校验成功，二次 dry-run 为
+  `files to overwrite: 0`；开发容器 `env_isaaclab` 定向回归 `62 passed`。现有 task `235036`
+  已丢失的历史 P2 时序无法补写，且运行中 Python 不会热加载同步后的 workflow；平台验证必须
+  在重启新任务后确认至少 `actor_loss`、`reward_positive_progress`、`target_vx` 和
+  `adapter_loss` 出现数据。
+- 血缘：分支 `codex/p2-track-nav-ppo`；父模型 `p15resp8h-r1_37953-F` / ID `334205`；
+  checkpoint、reward、observation 和部署契约均未修改。回滚为恢复旧 `_monitor_put()`，会重新
+  造成 P2 自定义面板无数据，不建议回滚。
+
+## BUG-20260729-006：完整赛道前缀进度掩盖迷宫卡墙且缺少可学习脱困信用
+
+- 日期：2026-07-29；状态：代码已修复待容器与平台验证。
+- 影响：`p2nav8h` reward、worker transport、checkpoint exact-resume contract 和 P2 自定义
+  面板；不修改低层、Actor action 维度、Adapter 输入前 30 槽或部署 runtime。
+- 用户可见症状：机器人反复通过逆坡和下台阶取得较高 positive-progress/new-best，进入迷宫后
+  卡墙并持续低分，episode reset 后曲线再次跃升。抓取 `20260729-043111` 中 success 全程为零，
+  progress/new-best 已占真实 reward 绝对量约 64%，说明继续放大进度只会强化容易的赛道前缀，
+  不能给“碰墙前转向”和“卡墙后成功绕出”提供清晰信用。
+- 根因：reward-v2 对负进度已做非对称降权，但 50 Hz body contact 混在 frame safety 中且无法在
+  高层 tick 单独归因；stall 仅监控。高层能够知道卡住最终较差，却没有 collision onset、持续
+  frontier 停滞或真正突破历史最远位置的独立反馈。速度突降同时会由台阶、坡面、Slew 和主动
+  减速触发，不能作为可靠撞墙标签。
+- 修复：reward contract 升级为 `p2_track_reward_v3`。worker 从 contact sensor 排除四足后，
+  运输最近 10 个低层帧的最大非足端接触力；5 Hz collision 首次按严重度处罚 `-0.08~-0.20`，
+  持续贴墙为 `-0.03`，terminal/failure 不重复罚。stagnation 使用 15 tick 前的单调
+  best-distance frontier，3 秒没有至少 `0.03m` 新进展才从 `-0.015` 递增，封顶 `-0.06`，
+  不按命令、地形、墙体方向或 Adapter 门控。recovery 只在已确认停滞后单 tick 将 frontier
+  推进至少 `0.08m` 时发 `+0.15`，5 秒冷却、每 episode 最多两次；reset/terminal 禁止发放。
+- 双罚与刷分防线：TOML 中 50 Hz `undesired_contacts` 改为零权重，仅保留平台监控；碰撞每个
+  高层 tick 只结算一次。frontier 单调不允许后退再前进重复刷新，低命令不能逃逸 stagnation；
+  同位移测试锁定“连续推进回报高于故意等待后 recovery”。速度改变量只允许作为诊断。
+- 接口与恢复：diagnostic aux 从 28 增至 29，wire 从 381 增至 382；新增 aux58 为 0.2 秒非足端
+  最大接触力，response aux30、gait30:55 和 pre-step55:58 保持原语义。reward/training contract
+  升级至 v3，因此旧 reward-v1/v2 P2 包必须走已有显式 warm-start，不能伪装 exact resume；
+  P1.5 父包 `p15resp8h-r1_37953-F` 不受 checkpoint ID 硬门禁。
+- 监控：P2 自定义“奖励贡献”新增“避障与脱困”，报告 collision/stagnation/recovery 三项真实
+  加权贡献；“卡滞与终止”同步展示三项。前端空的“导航Reward(5)”经代码检索确认不属于用户
+  `agent_ppo/conf/monitor_builder.py`，而是平台 Track 基础组；本轮不修改平台拥有的
+  `server/isaac_env/base_env.py`，容器 builder/平台页面验证后再确认是否可由用户配置隐藏。
+- 修改文件：`p2_contract.py`、`p2_gait.py`、`p2_worker_bridge.py`、
+  `algorithm_p2_nav_ppo.py`、P2 TOML、monitor、tests、README、CHANGELOG 和 server-deploy contract。
+- 验证：宿主与开发容器 `env_isaaclab` 的 P2 核心/监控定向回归均为
+  `93 passed`；同步后二次 manifest 为 `files to overwrite: 0`。容器原生 builder 实际
+  构建 10 个 P2 自定义组，line panel 最多 12 个指标，且
+  `legacy_nav_reward_present=False`；容器真实 contact sensor 运行时实测、平台
+  reward 守恒和面板待验证。验收必须确认三个新项长期合计绝对贡献约 `3%-8%`，且连续推进
+  高于停顿刷 recovery、collision 不统计足端、terminal 不双罚。
+- 血缘与回滚：分支 `codex/p2-track-nav-ppo`，父模型 `p15resp8h-r1_37953-F` / ID `334205`。
+  当前无 commit/PR/新 checkpoint SHA。回滚必须原子恢复 reward/training contract、wire dim、
+  worker aux、TOML 和 checkpoint 恢复边界，禁止只回滚单项造成 381/382 transport 错配。
+
+## BUG-20260729-007：P2 评估内部成功 reset 未回传到 Track scorer
+
+- 日期：2026-07-29；状态：本地已验证，待平台重新评估。
+- 影响：`p2nav8h-r2_291713` 的 Track/Camera 评估完成数、single-life mask、结束时机和最终
+  分数。模型前向、训练 reward、checkpoint 模块和模型 ID 选择均不受影响。
+- 用户可见症状：模型多次到达终点后被 Isaac Lab auto-reset 直接传送回起点，但评估没有把该
+  环境标记完成；异常日志 `/Users/nanbloom001/Downloads/log-598805-18532703.zip` 最终
+  `completed=0`、`completion_coeff=0`、`total_score=0`。P2 worker curriculum 汇总同期累计
+  21 次 success、3 次 failure，而 BaseEnv 正式 term-debug 只收到 3 次
+  `bad_orientation` 和 4 次 `time_out`，single-life 仅到 `7/16`。
+- 动态基准：已知正常包 `archive/代码存档/复赛_track` 的评估日志
+  `/Users/nanbloom001/Downloads/log-598816-18533115.zip` 中，16 个环境均通过公开
+  `term='goal_reached'` 进入 single-life，frame 2374 达到 `16/16`，最终
+  `episode_count=16`、`completion_coeff=1.0`、`total_score=73.87`、`completed=16`。
+  两份日志证明 scorer 后段没有丢分；异常发生在 success reset 到公开 done 的回传边界。
+- 静态对比：正常基准、活动树和模型包内 BaseEnv 的
+  `dones -> newly_done -> EnvMonitor.on_step -> all_done` 主逻辑一致。模型目录
+  `archive/代码存档/p2nav8h-r2_291713` 中 `p2_worker_bridge.py`、
+  `p2_observation_process.py` 和 `isaac_env/base_env.py` 与修复前活动代码逐文件一致。
+  P2 独有 worker aux24/25 已保留 reset 及 success/failure/timeout，但只被 P2
+  rollout/recurrent 路径消费，未合并回 Gymnasium step 返回值，BaseScorer 因而完全看不到
+  这些 success。
+- 排除方向：不是 0.6m 阈值过严——worker 在真实 auto-reset 帧已读取
+  `goal_reached=True`；周期性 `[goal_term] reached=0/16` 只是非终止时刻采样。不是模型 ID
+  门禁或 checkpoint 未加载，评估已进入 `p2_nav_eval` 并完成确定性前向。也不是
+  `make_json_and_done_file` 后处理漏分，因为异常 JSON 在生成时已是
+  `episode_count=7/completion_coeff=0`。
+- 根因：当前平台 wrapper 在部分 P2 success auto-reset 行没有向外保留 done；正常 Track
+  scorer 只消费 wrapper dones。我们虽然已为 P2 训练在 aux24/25 建立权威终止恢复，却没有在
+  评估环境返回边界把该信号送回平台既有 scorer，形成“两套终止语义”。
+- 修复：`P2PolicyObservationProcess` 和 `P2CriticObservationProcess` 初始化时，对当前 P2
+  内层环境安装一次幂等 terminal-return adapter。原始 Gymnasium step 完成、worker aux 已更新
+  后，将 `reset && reason in {success,failure}` OR 到 `terminated`，将
+  `reset && reason==timeout` OR 到 `truncated`。原生 flags 只增不减；reason=0 的首次 reset、
+  缺失/短 aux 和非 P2 环境保持原行为。随后继续走正常复赛 Track 已验证的
+  RSL wrapper、BaseEnv single-life 和 BaseScorer，不修改受同步保护的
+  `server/isaac_env/base_env.py`，不创建第二套 scorer，也没有任何模型 ID 硬门禁。
+- 修改文件：`server/agent_ppo/feature/p2_worker_bridge.py`、
+  `server/agent_ppo/feature/p2_observation_process.py`、
+  `server/agent_ppo/tools/p2_terminal_smoke.py`、
+  `server/agent_ppo/tests/test_p2_core.py`、`server/CHANGELOG.md` 与本台账。
+- 回归防线：覆盖 success/failure/timeout 三种恢复、原生 done 保留、初始 reset 忽略、安装
+  幂等及无模型 ID 依赖。宿主 `PY311test` 执行 P2 定向测试 `71 passed`，Python 编译与
+  `git diff --check` 通过。容器 Isaac 原生 step-return、term-debug 出现
+  `goal_reached`、single-life 达到 `16/16` 和平台非零 completion 仍待验证，不能提前升级为
+  平台已验证。
+- 血缘：分支 `codex/p2-track-nav-ppo`；异常模型
+  `p2nav8h-r2_291713` / `model.ckpt-navfull-291713.pkl`；正常动态基准为
+  `archive/代码存档/复赛_track`。原 checkpoint SHA256 为
+  `79cf02e890bdf032dcec6fdc259426e047b8e5ca7bb41521c1b7ad692da71a2a`。已将相同补丁写入冻结
+  目录并生成 `archive/代码存档/p2nav8h-r2_291713-evalfix.zip`，ZIP SHA256 为
+  `ee80b6bd9728d827f17e22720efe1dd9803b49270d7585d19d6da1ab606caf3b`；重新解包后 P2 定向测试
+  `71 passed`，且包内 checkpoint SHA 与原权重完全一致。ZIP 已排除 `.env`、同步脚本、缓存、
+  bytecode 和 `.nfs*`。当前无新 commit/PR。Arena 评估使用模型包中冻结的代码，因此旧
+  `291713` 不会因活动树修改自动变化，应上传该修复 ZIP 重新评估。回滚为移除 P2
+  terminal-return adapter；这会恢复 worker success 可见但 scorer `completed=0` 的缺陷，
+  不建议回滚。
+- 2026-07-29 更正：修复包平台评估 `/Users/nanbloom001/Downloads/log-598827-18533594.zip`
+  仍为 `completed=0`、`completion_coeff=0`、`total_score=0`。worker 在 600 秒累计
+  `25 success / 7 failure`，BaseEnv 正式 single-life 只收到 7 个 `bad_orientation` 和
+  2 个 `time_out`，没有任何 `goal_reached`；因此首版修复的“本地已验证”仅证明纯函数和
+  手工绑定 FakeEnv，不证明平台生命周期，状态退回“代码修复中”。容器源码确认
+  `register_observation_processes()` 无参数构造 process，而 `ObservationBridge.wrapper(env)`
+  只在运行期调用 `process()` 前绑定真实 env；首版在 `__init__` 调用安装时 `env=None`，
+  `install_p2_terminal_return_bridge()` 静默返回 False，随后不再重试。第二版将幂等安装移到
+  policy/critic `process()` 第一行，使 RSL wrapper 初始化 reset 的 observation 计算期间即
+  包装真实 ManagerBasedRLEnv、早于首次正式 step；增加一次安装日志与最多八次 worker/native/
+  merged 计数日志。模型 ID 仍只作告警，不参与安装或终止判断。第二版宿主、真实容器和平台
+  证据应在下方继续追加，未得到 scorer 非零完成前不得升级为平台已验证。
+- 2026-07-29 容器验证：同步后容器文件 SHA256 与本地一致，`env_isaaclab` 执行
+  `agent_ppo/tests/test_p2_core.py` 为 `72 passed`。新增的轻量真实 Isaac smoke 只将测试时
+  Track 缩为 `1 env × 1 column`，仍使用生产三段顺序、真实
+  `Unitree-Go2-Velocity-Camera`、真实 `ManagerBasedRLEnv`、RSL wrapper、平台 BaseEnv
+  single-life 与 BaseScorer；它不加载或检查任何模型 ID，也不修改生产 TOML。强制把 env0
+  放到平台生成的 Track goal 后，日志得到
+  `worker_success=1/native_hard=0/merged_hard=1`，随后正式
+  `term='goal_reached'`、`public_terminated=True`、`public_truncated=False`、
+  `single_life_done=True`、`completed=1`，BaseScorer 生成
+  `episode_count=1/total_score=99.99`，工具最终打印 `[P2TerminalSmoke] PASS`。这证明第二版
+  adapter 在真实平台生命周期中的安装时机与 success 回传闭环均正确；尚未使用修复后的完整
+  `p2nav8h-r2_291713` 模型重新提交 Arena 评估，因此状态只能是“本地已验证”，不能写成
+  “平台已验证”或“评估已验证”。测试结束后已仅清理 smoke 残留 Isaac 进程，RPC 同步服务与
+  凭据未改动。
+- 2026-07-29 冻结包同步：将上述第二版 `process()` 安装时机修复及 `72 passed` 回归同步到
+  `archive/代码存档/p2nav8h-r2_291713`，新建
+  `archive/代码存档/p2nav8h-r2_291713-evalfix-v2.zip`，ZIP SHA256 为
+  `ff436b2364042f97119e4be926b9672343b690bdfc5a4557ffca4170fc70656b`。ZIP 完整性检查通过，
+  包内 checkpoint SHA256 仍为
+  `79cf02e890bdf032dcec6fdc259426e047b8e5ca7bb41521c1b7ad692da71a2a`，与原权重逐字节一致；
+  `.env`、`tongbu.py`、`start_tongbu.sh`、缓存、bytecode 和 `.nfs*` 均未打包。旧
+  `p2nav8h-r2_291713-evalfix.zip` 是已被 `598827` 证伪的首版，不得再上传评估。
+
+## BUG-20260729-009：P2 非有限奖励污染 rollout 且 reset 步态窗口分母错位
+
+- 日期：2026-07-29；状态：开发容器已验证，平台训练短跑待验证。
+- 影响：分支 `codex/p2-track-nav-ppo` 的 5 Hz P2 reward/GAE/return statistics，以及
+  auto-reset 后约 1.5 秒四足 gait 面板和非劣化 reward。低层、Actor85、ResponseAdapter 输入、
+  Track 赛段契约和父包 `p15resp8h-r1_37953-F` 不变。
+- 发现方式与症状：未提交变更审查发现 `finish_tick()` 只清洗 bootstrap value 与 tracking，
+  `start/end_goal_distance`、frame safety、gait/collision aux、duration、terminal reason 和
+  command penalty 可未经有限值检查进入 reward stack。一个 NaN/Inf 会写入 rollout，并可能把
+  `best_goal_distance`、GAE 和 return statistics 变为 NaN。另发现 `P2GaitWindowProbe.step()`
+  先清空 reset 环境，再把 reset 边界样本写入 ring，最后将 `env_counts` 设为零；下一帧 ring
+  已含两帧而分母只有一帧，duty factor 可超过 1。尚无平台日志证明这两项已在长训触发，因此
+  平台影响仍标记为待验证。
+- 根因：reward settlement 缺少统一的逐环境 finite boundary；已有 `rollout_invalid` 只覆盖
+  Actor/critic 部分输出，而且 `update()` 在跳过无效 rollout 前仍会计算 returns。步态窗口则把
+  “reset 帧输出应为零”和“reset 帧是否计入历史”混成两套不一致处理。
+- 核心修复：逐环境验证 bootstrap、goal、duration、terminal reason、frame safety、command 和
+  实际参与 reward 的 gait/collision 输入；异常行的所有 reward component 统一归零，duration
+  收敛到合法 `1..10`，保持旧 best distance，清空该环境 frontier/collision 状态，同时置
+  `rollout_invalid` 并按环境只累计一次 `invalid_transition_count`。写入 storage 的 transition
+  保持有限，因此即使整轮随后跳过，也不会先污染 GAE/return statistics。gait reset 行现在清空
+  当前 ring slot、保持 `env_counts=0`，只有非 reset 行才递增分母。
+- checkpoint 审查结论更正：审查一度建议“首个存在但结构不兼容时继续尝试后续候选”，这与既有
+  安全边界冲突，未实施。模型 ID、payload ID 和 lineage 不一致继续只 warning；候选回退仅处理
+  高优先级文件不存在。一旦选中文件，反序列化失败、必需模块缺失、state-dict key/shape 或输入
+  契约不兼容仍 hard stop，禁止把损坏的 exact resume 静默替换成其他父包。相关 docstring 和
+  loader 注释已明确，该边界不构成模型 ID 单点门禁。
+- 修改文件：`algorithm_p2_nav_ppo.py`、`p2_gait.py`、`checkpoint_io.py`、`agent.py`、
+  `test_p2_core.py`、`server/CHANGELOG.md` 和本台账。
+- 本地验证：`PY311test` 下 `agent_ppo/tests/test_p2_core.py` 为 `79 passed`，新增多重非有限
+  reward 输入只计一个 invalid row、storage reward/duration 有限、best distance 不污染，以及
+  reset ring 与 denominator 对齐测试。模型 ID 非单点门禁测试继续覆盖“平台请求 88888 时仍包含
+  配置父包 37953”；P2/Nav/P1.5 邻近回归共 `152 passed`，相关 Python 编译、12 份 TOML 解析和
+  `git diff --check` 均通过。
+- 容器/平台/评估：2026-07-29 已同步开发容器；`env_isaaclab` 中 P2 核心测试为
+  `79 passed`。以 `p2nav8h-r2_291713-evalfix-v2.zip` 内
+  `model.ckpt-navfull-291713.pkl`（checkpoint SHA256
+  `79cf02e890bdf032dcec6fdc259426e047b8e5ca7bb41521c1b7ad692da71a2a`）执行真实
+  reward-v2 warm start 续训 smoke：NavigationEncoder/Actor/Adapter 权重保持，Critic 与 return
+  statistics 重建，完成 8 次 Actor、8 次 Critic gradient step 和 1 次 Adapter update，保存后
+  exact resume 返回 `exact_resume_history_reset`。真实 1-env Track+Camera smoke 同时通过
+  `goal_reached -> terminated -> completed=1 -> score=99.99`。尚未运行 128-env 完整
+  rollout/backward 或平台训练任务，因此不得升级为“平台已验证”。
+- 防复发、回滚和最短检查路径：reward 测试必须同时注入 goal NaN、safety Inf、gait NaN、
+  collision Inf 和非法 duration，并断言 storage 全有限、invalid count 按行而非按字段计数。
+  gait 测试必须断言 reset 后 ring sum/count 均为零、下一帧 duty 不超过 1。回滚时可独立恢复
+  本条两个运行时修复及测试；不得移除结构兼容 hard stop。再次遇到训练无更新时先查
+  `ppo_rollout_skipped_nonfinite/invalid_transition_count`，再检查 reward 分解与 gait duty 范围。
+- 血缘：本次未生成 checkpoint/model ID/SHA256、commit 或 PR；工作区保留用户已有未提交 P2
+  修改。
+
+## BUG-20260729-008：P2 混用 ContactSensor 局部索引且把出生 row 当实时赛段
+
+- 日期：2026-07-29；状态：开发容器已验证，平台训练短跑待验证。
+- 影响：分支 `codex/p2-track-nav-ppo` 的四足 gait 面板、gait 非劣化 reward、5 Hz
+  body-collision reward、三段 Track 面板及 Adapter 分赛段 MAE。ResponseAdapter 前 30 槽、
+  Actor85、低层模型和评估 terminal bridge 不变；不修改平台拥有且同步排除的
+  `server/isaac_env/base_env.py`，不引入模型 ID 或 checkpoint label 硬门禁。
+- 用户可见症状与证据：八小时抓取 `shared/arena_frontend_monitor/runtime/manual_metric_recorder/
+  sessions/p2nav8h` 中 FL duty 约 `0.69`，FR/RL/RR 约 `0.0012` 且后三条逐点相同；后三足
+  prolonged-air 约 `98%-99%`、最长 air time 达数十秒，但同期 `true_vx` 约 `0.36m/s`。
+  `reward_body_collision` 几乎恒定为 `-0.0302`，恰好接近 persistent-contact 档位，而平台
+  `reward_undesired_contacts` 为零。三段面板同时长期显示
+  `slope_inv_sample_share=1/stairs=0/maze=0`，与 P2 自有累计 `2788` 次 success 和整赛道评估
+  能力矛盾。旧抓取没有逐帧 world X，无法事后恢复真实分段访问次数，必须修复后重新采集。
+- 根因：`P2GaitWindowProbe._resolve()` 从 `robot.find_bodies(".*_foot")` 取得 Articulation
+  全局 body ID，却直接索引 ContactSensor 的 `current_air_time/last_air_time` 局部 body 列；
+  并无条件选取首个带 air-time 的 sensor。`_body_collision_force()` 又复用同一错误 ID 排除
+  `net_forces_w` 足端列。平台镜像确认 ContactSensor 张量第二维按 sensor 自身
+  `body_names` 排列，Go2 的目标 sensor 名为 `contact_forces`。另一方面 workflow 把
+  `terrain_levels` 当 live row；Track 中它只是 episode 出生段，机器人沿 X 进入楼梯/迷宫时
+  不更新。Adapter record 和分组也沿用了该错误字段。
+- 对历史记录的更正：`BUG-20260729-006` 曾写成“worker 从 contact sensor 排除四足”，当时只
+  验证了碰撞公式和 ID 恰好一致的 fake tensor，没有验证真实 sensor-local 映射；该结论被本轮
+  数据与平台 API 证伪。`BUG-20260729-001` 的“公开 observation 无法确定实时物理段”也不再作为
+  阻碍：本地平台镜像提供了 `TerrainExitManager.get_track_segment_index()` 的明确边界公式，
+  可由 `root_pos_w.x`、`track_length` 和 terrain `size_x` 等价计算。
+- 核心修复：固定选择 `scene.sensors["contact_forces"]`，按 FL/FR/RL/RR 精确名称分别建立
+  `robot_foot_ids` 与 `sensor_foot_ids`；foot velocity 只用前者，air/contact/force 只用后者。
+  启动打印 sensor 名称、四足名称、两套 ID、body 数量和 tensor shape。名称不唯一、足端不齐、
+  tensor shape 漂移或 full-body sensor 缺失时，gait/body-collision 映射有效位置零、两项 reward
+  立即归零并 warning，训练继续。碰撞失效时同步清空 0.2 秒 force history，避免残留九帧继续扣分。
+- 实时赛段修复：worker 按平台 Track 居中边界
+  `offset_x=-size_x*track_length/2` 和 `root_pos_w.x` 计算 `current_segment=0/1/2`，非 Track、
+  配置缺失或非有限位置使用 `-1`；auto-reset 行用前一帧 segment 形成 terminal-safe 快照。
+  `terrain_levels` 继续只作 `spawn_row`，`terrain_types` 继续只作 `difficulty_column`。workflow
+  的 slope/stairs/maze progress、速度、结果和 gait 改按 current segment 聚合；Adapter completed
+  Track records 保存 current segment，P1.5 父 records 和旧 records 统一标为 `-1`，不再混入三段
+  MAE 分母。
+- 接口与恢复：worker transport 从
+  `critic323 | response_aux30 | diagnostic_aux29 = 382` 升至
+  `critic323 | response_aux30 | diagnostic_aux32 = 385`；新增 aux59 current segment、aux60
+  gait mapping valid、aux61 collision mapping valid，前 59 槽语义保持。reward/training contract
+  升为 v4，旧 P2 包继续走已有显式 warm-start，不能伪装 exact resume；父包
+  `p15resp8h-r1_37953-F` 的选择仍为 warning-only 身份策略。
+- 修改文件：`p2_gait.py`、`p2_worker_bridge.py`、`p2_contract.py`、
+  `p2_response_buffer.py`、`response_aux_buffer.py`、`algorithm_p2_nav_ppo.py`、
+  `p2_nav_ppo_workflow.py`、`p2_curriculum_probe.py`、`p2_observation_process.py`、monitor、
+  P2 tests、`server/README.md`、`server/CHANGELOG.md` 和 server-deploy contract。
+- 本地验证：`PY311test` 下 `agent_ppo/tests/test_p2_core.py` 为 `77 passed`，覆盖非连续
+  Articulation ID、乱序 sensor-local 足端列、缺足 fail-safe、collision history 立即清空、
+  Track X 边界、terminal 后新 episode 位置隔离和 Adapter current-segment 分组；P2/Nav/P1.5
+  邻近回归共 `150 passed`，Python 编译、全部 TOML 解析和 `git diff --check` 通过。真实
+  `contact_forces` shape、开发容器 Track 短跑和平台面板仍待执行，因此不能标记平台已修复。
+- 开发容器验证（2026-07-29）：真实 1-env Track+Camera 启动打印
+  `sensor=contact_forces`、`robot_foot_ids=[27,28,29,30]`、
+  `sensor_foot_ids=[4,11,20,27]`、`current_air_time_shape=(1,31)`，
+  `gait_valid=True/collision_valid=True`，证明两套索引没有再次混用。worker 以 wire385 启动并
+  打印 `track_length=3,size_x=8.0,boundaries=[-12,-4,4,12]` 与有效 initial segment histogram。
+  同一 smoke 的终点闭环得到 `completed=1/score=99.99`。该单步 smoke 尚未覆盖机器人依次穿越
+  三段后的面板曲线，也未覆盖 128-env 长窗口 gait 分布，因此平台训练短跑和重新抓取仍是必要
+  验收项。
+- 防复发与验收：fake sensor 测试必须让 robot IDs 与 sensor columns 明确不相等；启动日志必须
+  显示四足名称唯一且两套 ID/shape 自洽。短跑验收要求四腿曲线不再出现三腿逐点相同或数十秒
+  air time，collision 应以稀疏事件出现而非固定 `-0.03`；三段 sample share 总和接近 1 且机器人
+  前进时依次出现 0/1/2，Adapter 父 records 不进入分段分母。旧
+  `completed_count_track_l*` 和通用 EnvMonitor 分档仍非 P2 权威口径。
+- 血缘、遗留风险与回滚：本次未生成 checkpoint/model ID/SHA、commit 或 PR，工作区保留用户原有
+  未提交 P2 修改。平台 `base_env.py` 仍未传 `pre_step_terrain_types`，只影响旧通用分档面板，
+  不覆盖 P2 自有 pre-reset column 统计。回滚必须原子恢复 reward/training contract、worker wire、
+  observation shape、buffer metadata 和 monitor，禁止只回滚一端。再次遇到相同症状时最短路径：
+  查 `[P2GaitProbe] contact_mapping` → 核对 aux60/61 → 查看 collision 稀疏性 → 核对
+  current_segment validity/share → 最后再调 gait/collision 权重。
+
+## BUG-20260729-010：P2 二维父策略扩展三轴时的动作墙钟与跨设备 RNG 单点阻断
+
+- 日期：2026-07-29；状态：本地已验证，开发容器与平台 smoke 待验证。
+- 影响：分支 `codex/p2-track-nav-ppo` 的追加十小时 P2 高层 PPO。父 checkpoint 为
+  `archive/代码存档/p2nav8h-r2_291713/ckpt/model.ckpt-navfull-291713.pkl`，SHA256 沿用既有
+  `79cf02e890bdf032dcec6fdc259426e047b8e5ca7bb41521c1b7ad692da71a2a`；冻结低层仍保留
+  37953/F2 lineage，`p15resp8h-r1_37953-F` 仅作为 gait baseline 来源。
+- 症状与计划更正：初版 command-v2 实现按 20 分钟、90 分钟和 2 小时逐级开放 `vy`，并把
+  `vy_expansion_elapsed_seconds` 写入 exact-resume 合同。用户明确取消该动作范围墙钟，要求从
+  首轮直接允许横移探索。真实 `291713` 本地加载还发现其 CUDA `action_rng_state` 为 16-byte
+  generator state；CPU smoke 的 generator 需要 5056-byte state，直接 `set_state()` 会抛出
+  `Expected a CPUGeneratorImplState ...` 并阻断本来结构兼容的 warm start。
+- 根因：动作能力边界与 optimizer 学习率课程被错误绑定为同一时钟；RNG 恢复又把设备实现格式
+  当成模型结构契约。另审查发现 exact resume 未保存驱动 5Hz cadence 的 `frame_count`，恢复后会
+  从 frame 0 重新对齐，不能称为精确续训。
+- 核心修复：删除独立 vy action curriculum/clock，command-v2 从首个 rollout 固定使用可信核心
+  `|vy|<=0.20`、探索硬边界 `|vy|<=0.40`；20/90 分钟阶段只控制新增 head 与共享网络 LR/entropy，
+  不裁剪动作域。保留独立 main/vy sampling RNG；warm start 在 generator state 同设备兼容时恢复，
+  不兼容时保留配置种子并在 `optimizer_migration_report.rng` 记录 `fresh_seed` 原因，不能因模型 ID
+  或 RNG 设备格式单点拒绝。exact resume 仍严格恢复同版本 RNG，并新增 `frame_count` 保存/校验。
+  旧二维 Actor 的 mean/log-std、LSTM 与 CNN 按 shape 校验迁移；新增 vy mean 为零、log-std=-0.7；
+  Critic、return/value statistics 重建。
+- Reward/控制/监控：crawl、command-rate 和仿真真值 tracking 使用三轴尺度
+  `[1.25,0.40,1.0]`；vy/wz 减速与反向使用快速 release-to-zero，禁止越零 overshoot。面板新增
+  vy 使用率、三轴链路、联合桶、Adapter vy specialty/joint outer 与碰撞事件窗口；每个 line 面板
+  继续不超过 20 指标。碰撞力同时报告 rollout mean/max，recovery bonus 已删除，避免奖励撞墙后
+  恢复这一可刷取过程。
+- 本地验证：`PY311test` P2 核心回归在取消动作墙钟后为 `83 passed`；排除仓库已知失效的
+  J9/ST9 两个旧测试后，训练端完整回归为 `261 passed, 3 subtests passed`。真实 `291713` 包的
+  command-v2 smoke 继承 lifetime `28761.0402s`，起始 limits 为 `(0.20,0.40)`，迁移 11 个旧
+  Actor tensor 与 19 份 Adam state，完成 8 次 Actor、8 次 Critic gradient step 和 1 次 Adapter
+  update，重新保存后 exact resume 成功。CPU smoke 对源 CUDA main/neutral RNG 明确记录
+  fresh-seed 降级，Adapter/shuffle RNG 正常恢复；未伪造为 exact RNG 保持。Python 编译、12 份
+  TOML、monitor AST 与 `git diff --check` 均通过。
+- 修改文件：`p2_contract.py`、`p2_high_level.py`、`p2_command_controller.py`、
+  `algorithm_p2_nav_ppo.py`、`p2_nav_ppo_workflow.py`、P2 TOML、monitor、checkpoint candidate、
+  `test_p2_core.py`、`server/README.md`、server-deploy contract、部署制品边界、CHANGELOG 和本台账。
+- 容器/平台/评估：尚未同步本轮三轴代码，尚未完成真实 Isaac 128-env rollout/backward、平台
+  15-30 分钟 smoke 或新 checkpoint 评估；本地 RPC dry-run 返回
+  `ApiUserErrors.WEBIDE_RECORD_NOT_FOUND`，确认 IDE 18005 记录已失效，因此不得标记开发容器/
+  平台/评估已验证。
+- 防复发与回滚：测试必须验证首轮 `vy` hard limit 已为 0.40、二维输出迁移前后逐字相同、新 head
+  零初始化、主/vy RNG 相互独立、跨设备 RNG 只降级不阻断、frame_count exact resume 和反向 slew
+  不越零。回滚必须原子恢复 action/spec/checkpoint/reward/monitor，不得只把 evaluator 改回二维或
+  静默插入 `vy=0`。再次遇到 warm-start 失败时先看 module/spec/shape，再看 migration report，禁止
+  首先增加 checkpoint/model ID 白名单。
+
+## BUG-20260729-011：P2 只有接触后碰撞信用，缺少部署可得的提前避障信号
+
+- 日期：2026-07-29；状态：本地已验证，开发容器与平台 smoke 待验证。
+- 影响：`p2nav10hvy` 的 5Hz 高层 reward、reward contract/checkpoint digest 和监控。低层、
+  Actor/Adapter 输入维度、三轴动作边界、Track 生成和 worker wire 不变。
+- 症状与目标：现有 body collision 只能在接触后处罚，frontier stagnation 还要等待约 3 秒无新
+  纪录，因此视觉策略缺少“尚未撞墙但当前速度已来不及制动”的稠密信用。目标是让模型更早改变
+  路径，同时避免原始距离墙奖励诱导居中慢走、拒绝窄通道或停车刷分。
+- 奖励全量审查：P2 活跃 50Hz 项只有 `flat_orientation=-0.05` 与 `energy=-5e-6`，tracking/contact
+  是零权重课程兼容项；5Hz 不含绝对 goal distance、heading、速度幅值或 recovery 正奖励。
+  未发现 50Hz/5Hz 重复结算、terminal/reset 双算、跨 episode best-distance 污染或撞墙恢复刷分。
+  保留的观察风险是：零命令前三秒只承担 time cost，终点 impulse 相对 dense shaping 较大，以及
+  `wz/vy` 的变化/跟踪成本可能让早期策略偏保守；这些均无正收益漏洞，先通过面板观察，不继续
+  叠加奖励或门控。
+- 核心修复：新增 `predictive_collision_risk`，每个 5Hz tick 从同一份部署可得归一化深度的
+  ROI `[y30:105,x96:224]` 取 10% 稳健低分位净空。深度零值按 D435i 无效/超量程处理为 5m；
+  只用正向 `vx` 计算制动距离 `0.35 + vx^2/(2*0.60)`，仅当其超过净空时按 0.45m risk band
+  的平方风险处罚，单 tick 下限 `-0.04`。全量审查时发现若把 `vy/wz` 也计入中央前向 ROI 的
+  制动速度，会错误处罚墙前横移和原地转向，因此最终实现明确让纯 `vy/wz` 风险为零。零命令
+  风险严格为零，不奖励 clearance 增大，不使用 Adapter/UWB、terrain、heading 或接触状态，
+  因此不能靠停车、摆动或深度空洞领取正奖励。
+- 权重判断：该项最大 `-0.04/tick`，低于首次 body collision 最大约 `-0.20`、frontier cap
+  `-0.06` 和正进度单 tick 最大 `+2.0`，用于提前引导而不取代任务进度。终点/失败/timeout
+  impulse 保持 `+50/-25/-15`，未因本次避障项调整。
+- 监控：新增全局 clearance/stopping-distance/risk/reward 面板，并按 slope_inv/stairs_inv/maze
+  分段记录净空、风险和 penalty，专门检查下楼梯或坡面是否因相机俯视产生误触发。reward
+  decomposition 继续要求与 PPO storage reward 守恒。
+- 修改文件：`p2_contract.py`、`algorithm_p2_nav_ppo.py`、`p2_nav_ppo_workflow.py`、
+  `monitor_builder.py`、`test_p2_core.py`、`server/README.md`、server-deploy contract、CHANGELOG
+  和本台账。
+- 本地验证：P2 定向测试 `86 passed`；排除已知失效旧 J9/ST9 用例后的邻近完整回归为
+  `264 passed, 3 subtests passed`；Python 编译、全部训练 TOML 解析和 `git diff --check` 通过。
+  定向测试覆盖远距离零处罚、中央近障碍封顶、零命令零处罚、纯横移/原地转向零处罚、图像
+  外侧障碍不触发、全零深度按 5m 处理和 penalty 永不为正。使用真实
+  `p2nav8h-r2_291713` checkpoint 完成 command-v2
+  warm start、PPO update、Adapter update、保存和 exact resume smoke；本地 smoke 通过不等于真实相机
+  分布已验证。当前尚无证据证明 ROI 在 slope/stairs/maze 上均无误触发，平台短跑前不得标记平台
+  已验证。
+- 2026-07-29 开发容器补充：同步后使用容器实际测试环境复跑 P2 定向测试 `86 passed`，邻近回归
+  `264 passed`；该层只验证算法、奖励、monitor 和 checkpoint 契约的 CPU/stub 路径。容器镜像
+  当前没有可导入的 PyTorch，因此未运行真实相机/GPU rollout，状态仍保持“平台 smoke 待验证”。
+- 防复发、回滚与最短检查路径：禁止把零 depth 当 0m 障碍，禁止增加 clearance 正奖励或按
+  terrain/heading 关闭风险；测试必须保持 cap、零命令和外侧噪点语义。若短跑出现楼梯前停车，
+  先看三个 segment 的 clearance/risk/penalty，再调整 ROI/quantile/risk band，不能先提高 success
+  或删除 collision。回滚应原子恢复 reward/training version、算法 component、面板和测试。
+
+## BUG-20260729-012：大 checkpoint 单 bundle 上传易丢片且无法断点续传
+
+- 日期：2026-07-29；状态：开发容器已验证；真实 PPO smoke 因容器无 PyTorch 未执行。
+- 影响：开发容器中的模型上传与真实 checkpoint 继续训练 smoke；正式训练运行时和模型格式不变。
+- 症状：25 MB `model.ckpt-navfull-291713.pkl` 使用单个 GET bundle 上传时，最终返回
+  `bundle is missing chunks`；降低到 2 worker 后又在长传输过程中遇到
+  `WEBIDE_RECORD_NOT_FOUND`。失败 bundle 没有生成目标模型，但每次只能从头重传，延长页面
+  空闲时间并增加容器回收概率。
+- 根因：源码同步 bundle 针对少量小文件设计，网关仍按 4 KiB GET 请求转发。单个 20 MB 以上
+  bundle 会形成数千请求，任一响应丢失都会让整包失败；现有客户端没有暴露 bundle 内缺失 offset，
+  无法只重传缺片。Chrome 页面交互只能维持前端活动，不能保证后端 IDE 记录不被平台回收。
+- 修复：新增 `server/model_chunk_uploader.py`。本地先把模型拆成默认 4 MiB 的独立 bundle，使用
+  `part_workers × chunk_workers` 可控并发，每片单独重试和 SHA256 校验；远端 manifest 中哈希一致
+  的片段直接跳过。全部片段齐全后，容器按固定顺序写入 `.uploading`，整文件大小和 SHA256 一致
+  才 `os.replace()` 原子发布，成功后默认清理片段。目标路径硬限制在
+  `agent_ppo/test_artifacts/`，不允许覆盖源码、平台配置、凭据或任意绝对路径。
+- 排除项：本轮 11 个 P2 源码文件的普通增量 bundle 已在 0.8 秒内完成并经二次 dry-run 证明
+  overwrite 为 0；P2 容器测试 `86 passed` 和邻近回归 `264 passed`。因此大模型失败不是源码
+  同步、reward-v6、checkpoint 反序列化或模型 ID 门禁问题。
+- 修改文件：`server/model_chunk_uploader.py`、`server/tests/test_model_chunk_uploader.py`、
+  `server/README.md`、`server/CHANGELOG.md` 和本台账。
+- 验证：工具离线测试 `4 passed, 4 subtests passed`；既有同步测试排除沙箱禁止绑定回环端口的
+  HTTP 往返用例后 `26 passed, 1 deselected`，Python 编译与 `git diff --check` 通过。容器先将
+  `291713` 的 7 个 4 MiB 级片段重组，整文件 SHA256
+  `79cf02e890bdf032dcec6fdc259426e047b8e5ca7bb41521c1b7ad692da71a2a` 与本地一致；新工具随后
+  正确识别完整远端文件并零上传。另以 `model_chunk_uploader.py` 自身完成真实分片上传、容器原子
+  重组、最终 manifest SHA 校验和自动片段清理。容器 P2 专项 `86 passed`、邻近回归
+  `264 passed`。尝试运行真实 `291713` command-v2 smoke 时，容器
+  `/opt/conda/envs/env_isaaclab` 报 `ModuleNotFoundError: No module named 'torch'`，且 `/opt`、
+  `/workspace` 未发现 torch 安装；因此本轮不能把真实 PPO/Adapter backward 标记为容器已验证。
+  本地同一 checkpoint 的 warm start/PPO/Adapter/save/exact-resume smoke 已通过。验证后按授权删除
+  容器中的 25 MB 临时模型、7 个手工片段和 round-trip 文件，未删除凭据或源码。
+- 防复发、回滚与最短检查路径：大于源码同步上限的模型不得加入 `local_sync_client` 常规 scope；
+  遇到失败先看远端 part manifest 和每片 SHA，再看最终 merge SHA，不能仅凭 HTTP 200 判断成功。
+  回滚只需删除本地工具和容器 `agent_ppo/test_artifacts/` 临时文件，不触碰训练代码与已发布模型。
+  关联 commit/PR、平台任务 ID和新 checkpoint：尚未生成。
+
+## BUG-20260730-013：中央深度风险误罚坡面且 terminal 诊断混入 reset 后数据
+
+- 日期：2026-07-30；状态：本地已验证，开发容器与平台 smoke 待验证。
+- 影响：`codex/p2-track-nav-ppo` 的十小时三轴 P2 训练奖励、命令/速度分桶、碰撞与步态面板；
+  父包固定为 `p2nav8h-r2_291713-F2`，模型 ID 仅用于候选选择和 lineage，不形成单点门禁。
+- 症状：旧预测碰撞只读取中央前向 ROI 的 10% 低分位并仅按 `vx` 处罚，无法区分垂直墙、缓坡和
+  仅下部接近的台阶，也不能为 `vy`/纯转向选择对应方向。高层 10 帧窗口中途 done 后，workflow
+  继续推进 reset 后的新 episode；tick 末的 target/exec/measured/true、gait/collision 与命令桶会
+  读取新 episode 数据，`collision_onset_count` 还被错误展示为全程累计。
+- 根因：手工风险缺少垂直结构与方向投影；workflow 只冻结 terminal goal/segment，没有冻结首次
+  done 前的命令与 worker aux。gait excess 仍通过 `reward_*` 名称展示，容易被误解为高层职责。
+- 修复：reward contract 升级为 `p2_track_reward_v7_directional_wall`。深度按三个方向和三个高度带
+  取 q20，用 upper/lower 一致性、upper/middle near 与 stopping gap 组合 wallness/risk，再按
+  `atan2(vy,max(vx,0.05))+0.5*wz*0.8` 的方向权重平滑汇总；零/无效/远景有限且零命令严格零处罚，
+  单 tick 下限 `-0.02`，旧中央风险仅 shadow。上一轮 100 分钟数据中，旧 `-0.04` 风险平均
+  `-0.00875/tick`、约占总负奖励 6.5%，但 body contact 从 1.8% 升至末段约 41%，证明不能只靠
+  放大旧 ROI。新权重取旧上限一半，约为正常 `0.3m/s` 推进 tick 收益的 3.3%，用于加强提前
+  转向提示，同时仍显著弱于真实 collision onset。gait PPO 权重设零，excess 改为无 `reward_` 前缀的
+  诊断。每个低层 step 前保存 target/exec/aux，首次 done 冻结；tick 末 terminal 行选冻结值，
+  live 行选末帧值，terminal tracking 从有效统计剔除。`vy_log_std=-1.1`，动作范围仍为 `±0.40`。
+- 修改文件：`p2_contract.py`、`p2_high_level.py`、`algorithm_p2_nav_ppo.py`、
+  `p2_nav_ppo_workflow.py`、P2 TOML、`monitor_builder.py`、`test_p2_core.py`、接口合同、CHANGELOG
+  和本台账。未修改平台托管 `server/isaac_env/base_env.py`。
+- 验证：P2 定向测试与邻近 monitor 测试 `114 passed`；覆盖垂直墙高风险、线性坡低风险、仅下部
+  台阶低风险、左右横移和纯转向方向选择、零命令/无效深度/远景有限零处罚、gait 权重零但 excess
+  更新、terminal-safe tensor、F2 二维头逐值迁移及 `vy_log_std=-1.1`。Python 编译、TOML 解析和
+  `git diff --check` 结果见本任务最终记录；尚未进行真实 F2 容器 rollout 或五分钟平台 smoke，
+  不得标记平台已验证。
+- 防复发、回滚与最短检查路径：测试必须同时保留 wall/slope/stairs/directional/zero-depth 六类
+  样本；terminal 行不得用 reset 后 telemetry 补值。若平台短跑仍误罚坡面，先比较 legacy/v2、
+  三方向 wallness/risk 和真实视频，再调 flatness/near 尺度，禁止添加 terrain/heading 门控或
+  clearance 正奖励。回滚须原子恢复 reward contract、算法 component、workflow 快照和面板。
+- 关联 commit/PR、新任务/checkpoint：尚未提交；任务名 `p2nav10hvyavoid2`；新 checkpoint 未生成。
+
+## BUG-20260730-014：局部进度长期补贴未完成 episode，策略转向迷宫超时
+
+- 日期：2026-07-30；状态：本地已验证，开发容器和平台 smoke 待验证。
+- 影响：`p2nav10hvyavoid2` 的 5 Hz 高层 PPO reward settlement；网络输入、动作 shape、低层与
+  Adapter 合同不变。父包仍为 `p2nav8h-r2_291713-F2`，身份元数据不形成单点硬门禁。
+- 数据证据：`20260730-004400` 的 100 分钟抓取中，末段 `positive_progress+new_best≈0.574/tick`，
+  success 仅约 `0.076/tick`；前后有效窗口 success 增量 `65→62`，failure `45→42`，timeout
+  `18→46`。maze progress `0.176→0.111m/s`，spin `12.4%→28.4%`，stuck `17.4%→51.5%`。
+- 根因：旧局部 progress/new-best 在坡和楼梯持续发放，即使最后迷宫失败也不会撤销；timeout
+  `-15` 又显著轻于 hard failure `-25`，稳定卡墙直至超时可能优于继续探索终点。
+- 修复：reward contract 升级为 `p2_track_reward_v8_terminal_potential`。删除进入 PPO storage 的
+  positive/negative progress 与 new-best，使用 episode-relative monotonic frontier potential：
+  `phi=2*(episode_start-best)`，tick reward 为
+  `gamma_frame^duration*phi_after-phi_before`；success/failure/timeout 的 `phi_after=0`，通过同一
+  terminal-safe duration 和 outcome 结算。timeout 改为 `-22.5`，success `+50`、failure `-25`、
+  time/stagnation/collision 保持不变。面板新增每 rollout terminal 数量、episode success fraction
+  和 timeout fraction，避免继续误读平台窗口 completed count。live episode start/best 不写
+  checkpoint，resume 后 reset。
+- 修改文件：`p2_contract.py`、`algorithm_p2_nav_ppo.py`、`monitor_builder.py`、`test_p2_core.py`、
+  server-deploy contract、CHANGELOG 和本台账。
+- 验证：定向测试覆盖新 frontier 产生稠密信号、相同 frontier 不可刷正分、terminal clawback、
+  timeout 单次 bootstrap、terminal reset 后 episode 状态清空及 reward decomposition；最终测试数和
+  静态检查见本任务结论。真实 F2 rollout 和平台 5 分钟 smoke 尚未执行。
+- 防复发：完成能力必须看 success/(success+failure+timeout) 和 outcome 增量，禁止用窗口
+  completed_count 或局部 progress 代替。任何新的稠密进度项必须证明 failure/timeout 不保留可刷取
+  正回报。回滚需原子恢复 reward version、algorithm component、monitor 与测试。
+- 关联 commit/PR/checkpoint：尚未提交；新 checkpoint 尚未生成。
+
+## BUG-20260730-015：特权 scanner 坏帧被当开阔空间且 20 列训练仍按 10 列归因
+
+- 日期：2026-07-30；状态：本地已验证，开发容器、平台 smoke 和行为评估待验证。
+- 影响：`codex/p2-track-nav-ppo` 的提前避障教师、P2 reward、两小时续训 checkpoint、
+  Track 难度统计与训练吞吐；任务名 `p2nav2hsafedir`。父包为最新验证通过的
+  `p2nav10hvyavoid2` 完整包，模型 ID/标签只用于选择和 lineage，不形成单点硬门禁。
+- 症状：旧 `nav_scanner_privileged_features()` 将 NaN、负无穷、混合 finite/inf triplet 全部
+  `nan_to_num(0)`，与合法 no-hit 一样解释成开阔空间，无法可靠生成安全方向标签。同时
+  `P2CurriculumAccumulator`/`P2TrackCurriculumProbe` 将 outcome、start 和 histogram 固定为
+  `3×10`；切换 20 条 Track 后 L10–L19 会被 clamp 到 L9 或越界，面板不能证明静态均匀覆盖。
+  高层 tick 的 depth 只保存 GPU view，若平台复用 observation buffer，10 个低层帧后才写入
+  rollout 时可能已经变成后续帧。
+- 根因：scanner 特征最初服务严格 DAgger Oracle，没有定义逐 ray 完整性；P2 复用后又缺少
+  “允许缺帧但 mask 标签”的模式。课程探针继承两小时/八小时 10 列常量。workflow 与 algorithm
+  对 observation 所有权没有显式区分只读 view、立即快照和延迟 storage 写入。
+- 修复：scanner 仅接受 XYZ 全有限的 hit 或 XYZ 全 `+Inf` 的合法 no-hit；NaN、负无穷和混合
+  triplet 判坏。`well_formed_ratio>=0.95` 且 `finite_hit_ratio>=0.80` 才令 P2 `available=1`；
+  no-hit 按无墙，坏 ray 不参与均值。P2 通过显式非严格上下文跳过无效样本，DAgger 默认仍硬失败。
+  新增 goal-independent 安全教师：三方向 scanner risk 与 `height_scan256` 的 q90 前向高度跳变
+  共同生成 safe3；SafetyHead 只读 nav_feat32，并与 PPO 共用 NavigationEncoder forward、Actor
+  optimizer 和一次 backward，不连接 Actor LSTM。错过安全方向奖励只在有明显安全替代、命令非零、
+  scanner 有效时产生负值，不奖励开阔空间。Track 改为 20 列、`curriculum=false`，probe 与
+  checkpoint 统计升级为 3×20，并抑制“课程未生效”的错误告警。高层 depth 在 tick 起点立即复制为
+  独立 CPU FP16；terminal 只复制首次 done 行，完整 next observation 不再逐帧 clone；命令/赛段桶
+  使用 `scatter_add_`。
+- Warm start/checkpoint：新增 `p2_safe_direction_continue_warm_start`，保留 Actor、Critic、Adapter、
+  return statistics、RNG 和旧参数组 Adam moments；SafetyHead 使用新参数和空 Adam state。新包保存
+  `navigation_safety_head` 的 `class_name/spec/state_dict` 并标记 `training_only=true`。exact resume
+  要求恢复该 leaf；即使配置仍写 warm-start 模式，同 reward/training contract 且含 Head 的本轮包
+  也优先走 exact resume，不能重置两小时 session。Track/Standard eval 不实例化或调用它。
+- 排除项：没有把 goal alignment 或 heading 塞入教师；没有增加 open-space 正奖励、corridor
+  centering、转向幅值奖励或 recovery bonus；没有降低 PPO epoch、控制频率、相机分辨率或环境数。
+  平台镜像确认 scanner 为 273 ray、ordering=xy，对应 21 个 lateral-y row × 13 个 forward-x col；
+  该镜像证据仍需当前开发容器启动日志复核。
+- 本地验证：P2、Nav observation、monitor 与 P1.5 邻近定向测试 `135 passed`。覆盖 21×13 pattern、
+  合法 no-hit/坏 ray、左右中墙、坡面/普通台阶连续性、安全替代/等价方向、SafetyHead 梯度隔离、
+  20 列统计、environment buffer 复用时 depth 所有权、四阶段字段、warm start 保留 Critic/return/
+  optimizer moments、checkpoint exact resume 与 eval 忽略 training-only leaf。Python 编译、TOML、
+  diff check 的最终结果见本任务结论。真实 128 环境 rollout/backward/save/resume 与五分钟平台 smoke
+  尚未执行，不能标记平台已验证。
+- 防复发、回滚与最短检查路径：scanner fixture 必须保留 open/left/front/right/no-hit/NaN/shape；
+  20 列配置必须与 probe tensor shape、histogram 和 monitor 面板原子更新；视觉 rollout 不能延迟持有
+  平台 observation view。若 smoke 中 `scanner_available_share` 很低，先看两分钟 scanner ratio 日志和
+  真实 ray shape/order，不得通过把 `available` 固定为 1 绕过。回滚需同时恢复 reward/training
+  contract、SafetyHead leaf、optimizer group、3×20 probe、TOML 和监控。
+- 关联 commit/PR、新 checkpoint：尚未提交；新 checkpoint 尚未生成。
+
+### 2026-07-30 更正：左右坐标、safe 标签发现和条件统计
+
+- 更正原因：后续独立审查发现，上一版“左右中墙 fixture 已覆盖”的结论错误。测试使用人为 row
+  编号命名左右，没有依据平台实际 ray 起点坐标，因此把错误约定固化为通过测试。平台镜像
+  `sensor_patterns.py` 明确显示 `ordering=xy` 时 lateral `y` 从负到正排列；Go2 机体系 `+y` 为左，
+  所以低 row 是右侧、高 row 才是左侧。
+- 用户可见风险：左墙可能被写成右侧风险，SafetyHead 和 `missed_safe_direction` 会把策略推向障碍；
+  新保存的 `safewarm/safefull/safestable` 又不在 P2 候选表内，同 ID 续训/评估可能找不到新包并
+  回退旧 `navfull`。此外 NaN height scan 仍会形成“三向全危险”的有效标签，选向率分母包含方向
+  等价样本。
+- 修复：scanner 和 height 教师统一改为 low-row=right、high-row=left，对外仍输出
+  `[left,center,right]`；fixture 按真实 `y<0/y>0` 构造。height 每个方向要求有限值比例和有效相邻
+  diff 数，任一方向无效则整条教师标签 mask。P2 标签发现顺序补齐
+  `safestable > safefull > safewarm >` 旧标签。选向验收分母改为 scanner/height 有效、运动中、
+  best-safe 足够、`safe_gap>0` 且最佳方向非并列；分子为其中实际选择唯一最佳方向的样本。
+- Standard 契约：新 P2 包补顶层低层 `model_spec`；仅在显式 `low_level_only_eval`，或 Standard
+  terrain 下的 `standard_low_level_only_eval` 时，Camera loader 才读取规范 low-level
+  `locomotion_encoder/actor`。默认路径仍拒绝静默丢弃完整高层，Track 仍加载完整 P2。
+- 验证：修复后定向测试 `168 passed, 3 subtests passed`；覆盖物理坐标左右墙、NaN height mask、
+  `safe*` 同 ID 优先发现、默认拒绝与显式低层评估分类。Python/TOML/diff 静态检查及更广测试见
+  本任务最终结论。开发容器、真实 checkpoint round-trip、128 环境和平台 smoke 仍待验证。
+- 状态：本地已验证；平台行为未验证。旧“135 passed 已覆盖左右 fixture”的文字保留作为历史，
+  以上述更正为准。
+- 训练时长调整：用户随后将本轮从 4 小时缩短为 2 小时；新合同为
+  `p2_track_training_2h_safe_direction_v2`，阶段边界为 30 分钟和 90 分钟，session 目标 7200 秒，
+  安全方向权重仍从 0 渐进到最终 `0.03`。该调整不改变网络、reward 上限、20 列地形或 PPO 规格。
+- 2026-07-30 开发容器复核：最新 bundle 同步后二次 dry-run 为
+  `files to overwrite: 0`；最终 P2/checkpoint 定向回归 `169 passed`，关键 Python 编译和
+  8 份 TOML 解析通过。使用真实 `291713-F2` 包做 command-v2 smoke 时依次发现三个
+  验证链回归：工具用 `INITIAL_LOG_STD=-0.7` 而非 `INITIAL_VY_LOG_STD=-1.1`
+  校验新 `vy` head；人工 rollout 未补 `safety_target/safety_valid` 和 depth；CPU 路径在
+  禁用 AMP 后仍将 FP16 depth 直接传入 FP32 CNN。前两项修复 smoke，第三项在非 CUDA
+  CNN forward 前转 FP32，GPU 训练仍保持 FP16 storage + AMP。复跑通过：保留 CNN/LSTM/
+  旧 `vx/wz`/Adapter，新 `vy` 为零均值且 `log_std=-1.1`，执行 8 次 PPO 更新、1 次
+  Adapter 更新、保存和 `exact_resume_history_reset`。真实 Isaac Track+Camera terminal smoke 进入 headless Kit 后场景
+  初始化超过 4 分钟未返回首次 reset，已只终止本轮 smoke 进程；不得因此标记
+  真实 Isaac、128 环境或平台行为已验证。
+
 ## 3. 已知高频误判
 
 以下现象可能伴随真实 Bug，但不能单独作为根因：
@@ -1225,8 +2284,8 @@
   评估 loader 会选中它。
 - 同步显示 `bundle verified`：证明容器磁盘文件一致，不证明运行中的 Python 已重新 import。
 - 总分接近教师：不能替代分地形指标、固定 seed 和视频；无 checkpoint 加载证据的分数一律无效。
-- warning-only 身份提示：候选文件仍按平台请求 ID 精确选择；包内 ID/lineage/digest
-  属追溯元数据，缺失或不一致只告警。文件不存在、反序列化失败、必需模块缺失、
+- warning-only 身份提示：P2 候选按平台请求 ID 优先，但允许配置父包和同类文件发现兜底；
+  包内 ID/lineage/digest 属追溯元数据，缺失或不一致只告警。文件不存在、反序列化失败、必需模块缺失、
   state-dict key/shape 或网络/输入契约不兼容、非有限张量仍必须 hard stop；未成功
   加载模块时评估不得继续评分。
 

@@ -4,6 +4,223 @@
 
 ## [未发布]
 
+- **[P2 容器 smoke 合同校正]** `p2_continue_smoke.py` 改为使用专用
+  `INITIAL_VY_LOG_STD=-1.1` 校验新增 `vy` head，避免把正确的二维到三维迁移
+  误报为旧 `vx/wz` 初始值 `-0.7`。同步补齐 rollout 新增的
+  `safety_target/safety_valid` 和当前 CNN 训练阶段必需的 CPU FP16 depth，并确认
+  SafetyHead BCE 在真实 checkpoint smoke 中有限。非 CUDA 更新路径在 CNN forward 前
+  将 FP16 depth 转为 FP32；GPU 正式训练仍保持 FP16 storage 和 AMP。
+
+- **[P2 两小时提前安全选向与吞吐优化]** 新任务 `p2nav2hsafedir` 从最新验证通过的
+  `p2nav10hvyavoid2` 完整包继续训练 2 小时。保留三轴 Actor、Critic、NavigationEncoder、
+  Adapter、return statistics 和兼容 Adam moments，只新增 training-only SafetyHead。
+  `nav_scanner` 现在区分 finite hit、全 `+Inf` 合法 no-hit 与坏 ray；P2 在有效率不足时跳过
+  教师损失/奖励，DAgger Oracle 继续严格失败。纯安全教师只使用三方向墙体风险和
+  `height_scan256` 地形连续性，不混入 goal/heading；错过明显更安全方向的负奖励在两小时内
+  从 0 渐进到 `-0.03` 上限，保留部署可得深度风险与真实碰撞项。Track 改为 20 列、关闭课程，
+  统计合同升级为 3×20。PPO epoch 改为读取配置并记录逐 epoch KL/clip/entropy；高层 depth 在
+  tick 起点立即取得 CPU FP16 所有权，低层帧不再复制完整 observation/aux，命令桶和赛段桶改为
+  GPU `scatter_add_` 聚合。后续审查修正 `ordering=xy` 的物理左右语义：低 row 是 body `-y`
+  右侧，高 row 是 body `+y` 左侧；异常 height scan 也会使教师标签失效。checkpoint 发现顺序
+  补齐 `safestable > safefull > safewarm`，并提供显式 `low_level_only_eval`，让 Standard 从完整
+  P2 包只抽取冻结低层，默认路径仍拒绝静默丢弃高层。安全选向率改为只在非并列、确有明显
+  安全替代的条件样本上统计。评估与 Standard 导出忽略 SafetyHead。
+
+- **[P2 reward-v8 terminal-consistent frontier potential]** 根据上一轮 100 分钟训练中
+  success 吞吐基本持平、timeout 增量 `18→46`、迷宫 stuck `17%→52%` 的趋势，删除直接进入 PPO
+  的 `positive_progress/negative_progress/new_best`。改用
+  `gamma_frame^duration * phi_after - phi_before`，其中 `phi=2*(episode_start_distance-best_distance)`，
+  failure/timeout/success 的 terminal potential 固定为零，使坡和楼梯的局部进展无法补贴迷宫失败，
+  同时历史最佳距离允许必要绕行。timeout 从 `-15` 调整为 `-22.5`，缩小与 hard failure `-25`
+  的套利空间；success 保持 `+50`。新增 potential before/after 和 terminal clawback 面板。
+
+- **[开发容器模型分片上传]** 新增 `model_chunk_uploader.py`：大 checkpoint 使用可配置的
+  分片并发和 bundle 内 GET 并发上传，每片独立重试与 SHA256 校验，支持按远端 manifest
+  断点续传；容器端按固定顺序写入 `.uploading` 临时文件，整文件大小/SHA256 正确后才原子
+  替换目标，成功后默认清理分片。远端路径强制限制在 `agent_ppo/test_artifacts/`，模型、Cookie
+  和 Token 均不进入常规源码同步清单。
+
+- **[P2 reward-v7 定向墙体风险与 terminal 统计]** 任务改为 `p2nav10hvyavoid2`。
+  预测碰撞从中央 ROI 升级为 left/center/right 三方向与 upper/middle/lower 三高度带的 20%
+  稳健低分位，按三轴目标运动方向平滑选区，并用上下带平整度降低缓坡及仅下部台阶误报；
+  单 tick 封顶 `-0.02`，旧风险只作 shadow diagnostic。该值根据上一轮 100 分钟数据校准：旧
+  `-0.04` 中央 ROI 项虽占总负奖励约 6.5%，但末段真实接触率仍升高，因此本轮优先修正方向和
+  坡面误报，只保留旧上限的一半。`vy` 初始 `log_std` 收紧为 `-1.1`，
+  但动作范围仍从首轮完整开放到 `±0.40m/s`。gait PPO 权重归零，四足 excess 继续监控。
+  首次 terminal 前的 target/exec/measured/true/gait/collision 会冻结到旧 transition，reset 后的新
+  episode 不再污染命令桶、赛段、碰撞 trace 或 tracking；terminal tracking 明确无效。碰撞 onset
+  改为 rollout 窗口数量和发生率，面板增加三方向 wallness/risk 与 legacy-v2 对比。
+
+- **[P2 command-v2 三轴追加十小时训练]** 新任务 `p2nav10hvy` 从完整二维 P2
+  `p2nav8h-r2_291713` 显式 warm start，保留原 NavigationEncoder、LSTM、`[vx,wz]` head、
+  ResponseAdapter 与兼容 Adam moments，新增零均值 `vy` head 并重建 Critic/return statistics。
+  动作分布、tanh Jacobian、rollout、slew、reward、Adapter 分组和监控统一升级为
+  `[vx,vy,wz]`；`vy` 从首个 rollout 即开放可信核心 `±0.20m/s` 与探索硬边界 `±0.40m/s`，
+  不再使用动作范围墙钟课程。新增 head 仍使用独立 LR 与 RNG，旧 CUDA RNG 无法注入不同设备
+  generator 时只记录 fresh-seed 降级，不形成模型 ID/载荷单点门禁。checkpoint 区分本轮
+  session 与继承 lifetime，新增 `frame_count` 保持 exact resume 的 50Hz/5Hz 相位；评估严格要求
+  command-v2 三轴合同，旧二维 evaluator/exporter 不得静默补零。
+
+- **[P2 非有限奖励与 reset 步态窗口修复]** 5 Hz reward settlement 现在逐环境校验
+  goal distance、duration、terminal reason、frame safety、命令及 gait/collision 输入；异常行
+  写入有限零奖励、保持旧 best distance、清空有状态脱困/碰撞历史并标记整轮跳过，避免 NaN
+  进入 GAE 和 return statistics。四足窗口不再把 auto-reset 边界帧写入 ring 后又将分母清零，
+  消除下一帧 duty factor 可能大于 1 的错配。checkpoint 约束同时澄清为：模型 ID/lineage
+  仅告警，候选文件缺失时允许回退；一旦选中文件，反序列化或模块结构错误仍必须停止，禁止
+  静默替换 exact resume 或配置父包。新增 `tools/p2_continue_smoke.py`，用旧 P2 navfull 包
+  覆盖 warm start、独立 Critic 重建、PPO/Adapter 更新、保存和 exact resume 的完整续训闭环；
+  开发容器已用 `model.ckpt-navfull-291713.pkl` 跑通。
+
+- **[P2 ContactSensor 映射与实时赛段归类修复]** 四足窗口不再把 Articulation
+  全局 body ID 当作 ContactSensor 局部列，也不再选择任意首个带 air-time 的 sensor；运行时固定
+  选择 `contact_forces`，按 FL/FR/RL/RR 精确名称分别建立 robot/sensor 两套索引，并校验名称唯一性
+  和 `current_air_time/net_forces_w` shape。映射异常时 gait 与 body-collision reward 立即归零并
+  warning，训练继续。三段面板不再把出生 `terrain_levels` 当作当前位置，而按 Track 世界 X
+  边界生成 terminal-safe `current_segment`；出生 row、难度 column 和当前段分别保留。Adapter
+  分段 MAE 改用 current segment，父/旧 records 以 `-1` 排除。worker transport 扩为
+  `critic323 | response_aux30 | diagnostic_aux32 = 385`，reward/training contract 升至 v4。
+  通用平台 EnvMonitor 的旧 `completed_count_track_l*` 仍不作为 P2 权威口径，且未修改受保护的
+  `isaac_env/base_env.py`。
+
+- **[P2 Track 评估成功终止回传修复]** 正常复赛 Track 评估依赖 Gymnasium
+  `terminated/truncated -> RslRlVecEnvWrapper dones -> BaseEnv single-life -> BaseScorer`
+  的既有链路；`p2nav8h-r2_291713` 的 worker 已在 auto-reset 帧识别
+  `goal_reached`，但当前平台 wrapper 会在部分 P2 success 行丢失公开 done，导致机器人传送回
+  起点、worker 统计成功而正式 `completed=0`。P2 observation 初始化现在为当前环境安装幂等
+  terminal-return adapter，将 aux24 reset 与 aux25 success/failure/timeout 只做 OR 合并回
+  原生 `terminated/truncated`，从而继续复用已验证 scorer，不修改平台 `base_env.py`、不新增
+  scorer，也不检查模型 ID。平台复测 `598827` 证明首版把 adapter 安装在 observation process
+  无 env 构造期，实际没有包装真实 ManagerBasedRLEnv；现改为在 ObservationBridge 已绑定真实
+  env 的首次 `process()` 开头幂等安装，早于 RSL wrapper 的第一次正式 step，并增加一次安装和
+  最多八次 terminal merge 的有限诊断。原生 done 永不被清除或重分类；初始 reset 的 reason=0
+  不会被计为 episode。真实容器 1-env Track+Camera 闭环已验证
+  `native_hard=0 -> merged_hard=1 -> goal_reached -> completed=1 -> score=99.99`；
+  完整模型的平台重新评估仍待执行，证据分层见 Bug 台账。
+
+- **[P2 reward-v3 避障与脱困]** 在保持 progress/new-best/success 主体不变的前提下，新增三个
+  5 Hz 高层项：非足端接触力 collision（首次按严重度 `-0.08~-0.20`、持续贴墙 `-0.03`）、
+  基于单调 best-distance frontier 的 3 秒停滞惩罚（`-0.015` 递增并封顶 `-0.06`），以及
+  frontier 单 tick 真正推进至少 `0.08m` 后的一次性 `+0.15` recovery。Recovery 具有 5 秒冷却、
+  每 episode 最多两次，reset/terminal 不发放；来回摆动、低命令和后退重进不能刷取。worker
+  transport 扩为 `critic323 | response_aux30 | diagnostic_aux29 = 382`，新增最近 0.2 秒非足端
+  最大接触力，前 58 槽语义不变。50 Hz `undesired_contacts` 改为零权重监控，避免双罚；速度
+  突降不进入 reward。P2 自定义面板新增“避障与脱困”三项贡献。
+
+- **[P2 自定义指标上报修复]** `p2_nav_ppo_workflow` 不再依赖平台 monitor 的
+  `get_pids()` 注册列表，而与通用 workflow 一致使用当前进程 PID 调用 `put_data()`。
+  修复注册列表为空或接口不可用时 P2 损失、奖励分解、命令链、Adapter、课程和性能面板全部
+  无数据、仅 EnvMonitor 原生运动 Reward 可见的问题。上报异常不终止八小时训练，但改为每次
+  既有一分钟上报周期输出明确 warning，不再静默吞掉。
+
+- **[P2 监控 line 面板上限修复]** 平台每个 line 面板最多接受 20 个指标，原五个
+  `vx分桶N命令链` 各含 24 个指标，导致整份用户监控配置被 learner 跳过。现按语义拆为
+  `前进链` 和 `转向链`，每个 12 项，保留全部 target/exec/true 指标。P2 回归测试新增
+  每面板 `<=20` 的静态断言，定向回归 `87 passed`。开发容器使用平台原生
+  `MonitorConfigBuilder` 完整构建成功；邻近 P1.5/checkpoint 回归 `108 passed`。
+
+- **[P2 父包身份与步态基线修复]** `p2nav8h` 默认父包改为
+  `p15resp8h-r1_37953-F` / `responsecalib-37953`。P2 checkpoint 选择改为请求 ID 优先、配置
+  父包与同类文件发现兜底；请求 ID、文件名 ID、payload/lineage 不一致只输出告警，不再形成
+  单点阻断，模块/spec/shape/finite 等兼容性校验仍保持硬失败。gait baseline 升级为训练开始前
+  即生效的版本化 37953 固定 envelope，禁止用正在训练的 P2 策略在线改写，并把逐腿步频差
+  纳入封顶 `-0.04` 的非劣化约束和监控；Adapter 域/赛段样本占比仅统计有效 future horizon。
+  宿主 P2 核心为 `60 passed`，扩展回归为 `238 passed, 3 subtests passed`；真实 37953 父包在
+  故意传入请求 ID `88888` 时仍完成 `bootstrap_high`，实际 lineage 记录为 `37953`。
+
+- **[P2 三段逆向 Track 八小时 reward-v2 长训]** 将活动任务升级为 `p2nav8h`，固定
+  `pyramid_slope_inv -> pyramid_stairs_inv -> open_entry_maze`、128 环境和 28800 秒累计
+  有效训练。默认从 P1.5 `responsecalib-37953` 建立高层；已有 reward-v2 P2 包继续按完整训练
+  合同 exact resume，旧 P2 reward-v1 仍可显式 warm start 并重建 Critic、return statistics、
+  高层 optimizer/scheduler 和 rollout。
+  导航奖励移到 5 Hz，删除持续可领取的绝对距离/航向类正奖励和复杂条件门控，改为非对称
+  进度、新纪录、一次性 success/failure/timeout、恒定时间成本、crawl 死区、小 command-rate、
+  仿真真值 tracking 与封顶 `-0.04` 的 1.5 秒 gait 非劣化约束。50 Hz 仅保留轻量姿态、能耗、
+  body contact 和两个零权重 curriculum compatibility term；Adapter、UWB、障碍评分和地形
+  类型均不参与 PPO reward。
+  worker transport 扩为 `critic323 | response_aux30 | diagnostic_aux28 = 381`，保持前 30 槽
+  Adapter 合同不变，追加四足 duty/swing/air/frequency/slip 和 reset 前 column/row/goal-distance。
+  P2 curriculum outcome 现在按 terminal 前快照归因，首次 episode 起点也计入累计；成功 term
+  同时兼容 `active_terms` 与 `_term_names`，避免平台 manager 版本差异把完成误记为失败；合法
+  worker reason 现在统一决定 hard/timeout 分类，二者严格互斥。terminal tick 结算前不再提前
+  清空 episode 历史最佳距离，避免失败/超时帧把普通 tick 进度重复计作 `new_best`。
+  八小时 LR/entropy 课程覆盖 0/10/20 分钟、2/6/8 小时，CNN 只在 rollout 边界解冻；checkpoint
+  新增八小时训练合同、return statistics、gait baseline、aux 维度和 encoder digest，并保持
+  三套模块/optimizer/scheduler、独立 RNG 与 completed Adapter records。
+  P2 面板新增 reward-v2 守恒分解、20 个 `vx x |wz|` 桶的 count/share/推进/跟踪/命令链/结果/
+  gait 数据、三段起点条件统计、逐腿 gait 和 Adapter 分 row/核心域/外沿域误差。逐环境 reset
+  日志仍按分钟聚合。宿主 P2 核心回归当前 `60 passed`；除两个无关旧模块外的训练端扩展回归
+  为 `238 passed, 3 subtests passed`。容器真实父包 smoke、128 环境完整
+  rollout/backward、平台 builder 和正式八小时任务尚未执行。
+
+- **[P2 Track 连续高层 PPO 两小时训练]** 新增 `p2nav2h` / `p2_nav_ppo`：从
+  `responsecalib-37953` 启动，冻结低层视觉 Encoder/Actor，训练独立
+  NavigationEncoder、二维 tanh-squashed Gaussian recurrent Actor、recurrent Critic，
+  并以独立梯度路径低学习率更新 ResponseAdapter。高层动作只建模 `[vx,wz]`，mapper
+  插入 `vy=0`；探索硬边界为 `vx=[0,1.25]、|wz|<=1.0`，可信核心域只用于 Adapter
+  confidence 衰减，不裁剪策略探索。前 10 分钟 CNN optimizer 组保持零学习率，之后按
+  conv1/conv2/conv3+fc 分层解冻。
+  `configure_app.toml`、训练 TOML 和 `Config.CURRENT` 三处入口统一指向 P2，避免首次
+  `load_conf()` 前的 worker/工具误读 P1.5 默认维度。
+  新增 32-tick、TBPTT16 的高层专用 recurrent PPO storage 和 variable-duration GAE；
+  worker 通过 aux24/25 传输 reset 与 success/failure/timeout，修复 wrapper 丢失
+  `truncated/time_outs` 后旧新 episode 被拼接的问题。当前平台不提供 terminal critic
+  observation，因此 timeout 明确使用 no-bootstrap fallback，且 GAE 不跨 episode。
+  解冻前只保存 85 维高层特征，
+  解冻后深度以 CPU pinned FP16 存放并按 CNN microbatch 搬运，低层 PPO storage、
+  S0 anchor 和第二套 Camera 均不创建。实现 128 环境优先、64->32 frame microbatch
+  降级与显存 allocated/reserved 峰值遥测。
+  Track 固定为 `pyramid_slope -> open_entry_maze`，开启平台通用 curriculum，并新增
+  row/column/reset/outcome 的批量结构化探针；20 分钟语义异常只告警。奖励只迁移目标
+  接近、方向/速度投影、距离、成功、时间、终止、姿态、能耗和 body contact，三项高层
+  command/tracking/stuck penalty 每个 5 Hz tick 只计一次；tracking penalty 使用该
+  transition 结束时的 exec/feedback，避免把上一条指令的响应错误归因给新动作。P2 面板
+  同时报告目标/执行命令、左右转向、反馈有效率、Adapter confidence/MAE/NLL/标签有效率、
+  curriculum 累计值，以及 H2D、各 optimizer update、env-step、吞吐和显存指标。
+  checkpoint 使用 schema 2 的 `navwarm`/`navadapt`/`navfull` 标签，完整保存冻结低层、
+  动作型高层、在线 Adapter、三套 optimizer/scheduler、独立 action/shuffle/neutral/Adapter
+  RNG、有效训练秒数、completed
+  records 和课程诊断，并在 CPU 透明字段保留父低层 optimizer/scheduler/训练状态，保持
+  `deployable=false`。包补齐 `bundle_kind`、实际 train scope 和所有可学习 leaf 的
+  `class_name/spec/state_dict`；P2 eval 改为模块-only 装配，不创建 Critic、optimizer、
+  scheduler 或 ResponseBuffer。非有限 policy/value transition 会执行零指令、清洗存储、
+  清零 recurrent hidden 并跳过当轮 PPO，但 Adapter 和长训继续。
+  P1.5 父包的动作方差与 S0 anchor 同时迁移进规范 low-level leaf，避免 P2 首存后无法再
+  独立恢复低层训练状态。首存约五分钟，之后每十分钟及 CNN 解冻边界请求无参数平台归档；
+  正常结束/SIGTERM final save 幂等。静态预审额外修复了
+  解冻后 `[N,180,320,1]` depth 无法直接写入 `[N,57600]` storage 的必现 shape 错误；
+  lifecycle 自动 dump 写失败现在只告警并安排 60 秒归档重试，不再提前终止两小时任务。
+  开发容器 full-stack preflight 进一步确认平台配置校验器禁止在 `[terrain.track]` 中出现
+  `sub_terrains_random`，即使其值为 `false`；生产 TOML 已删除该字段，固定赛道顺序继续由
+  `sub_terrains=["pyramid_slope","open_entry_maze"]` 表达。第二轮 preflight 又确认平台在
+  `terrain.curriculum=true` 时会同时启用依赖 `track_lin_vel_xy` / `track_ang_vel_z` 的原生
+  command curriculum；P2 现注册两个 `weight=0.0` 的 compatibility-only term，使平台可以
+  解析配置但不产生奖励、也不扩张原生 fallback command，Track 难度列课程继续生效。两项修复
+  均不修改平台 `base_env.py`。
+  课程探针不再在 Isaac 首次 Track reset 前锁定 zero-filled `terrain_types`；显式列初始化
+  标记可用时等待全部环境完成，旧平台则等待首个非零 episode length，并兼容 manager 仅暴露
+  `_term_names` 的版本。当前已完成宿主与开发容器 P2 专项 `35 passed`、按当前分支实际测试
+  清单执行的 Nav/P1.5/P2 邻近回归 `209 passed`、Python 编译、TOML 解析与 diff 检查。
+  真实 37953 已在开发容器完成 128 环境 Track/Camera reset、32 个高层 tick、低层冻结
+  inference、Actor/Critic/Adapter update、运行 checkpoint、SIGTERM final candidate 和 CUDA
+  exact resume；十分钟 CNN 解冻规格另以 128 环境、450 MiB pinned depth、64-frame microbatch
+  完成完整 backward，无 OOM。平台正式训练任务、模型列表发布和评估仍待验证。
+  P2 自定义监控从 53 个单指标图和 7 个无仓库侧生产者的旧 Track 计分图，重组为训练收敛、
+  奖励贡献、导航成效、控制反馈、运动安全、响应预测、课程诊断和性能资源八组共 45 个多曲线
+  面板。除 rollout 回报/价值/优势、动作探索标准差和三套学习率外，现直接展示十项平台
+  `reward_*` 贡献，并新增成功/失败/超时率、目标推进效率、target/exec/measured/true 速度链、
+  feedback source/age、可信核心域外探索、倾斜/横向漂移和低层动作饱和只读遥测；旧
+  `completed_count_track_l*` 等 P2 空面板不再注册。aisrv curriculum reset 明细从逐帧逐环境
+  INFO 改为每分钟聚合成功/失败/超时、行列变化和最多 12 个样本，累计指标与 checkpoint 语义
+  不变。宿主相关 P2/Nav 回归 `64 passed`；当前 8 组 45 面板包含 110 个去重 metric key，平台
+  原生 builder 与前端显示仍需在下一次任务复核。
+  Track 评估兼容路由同时修复：显式 `p2_nav_ppo` 在 eval 模式自动转换为 `p2_nav_eval`；平台
+  未转发 `policy_entry` 时，Track+Camera 根据当前 P2 bootstrap lineage 选择 P2 纯推理装配，
+  不再无条件进入旧 `nav_eval` 并只搜索 `navbc/navdagger/navfull`。旧 Nav lineage 保持原入口；
+  checkpoint schema、模块 spec、有限值和“未加载不得评分”门禁均未放宽。平台 eval 只转发
+  policy observation 的限制通过 eval-only scan 槽位携带 `response_aux30 + marker` 兼容，
+  维度仍为 57905；首次推理优先使用 runtime 评估目录中的同 ID P2 包，ID 不一致只告警，
+  选中的文件仍须通过完整 P2 模块契约后才能进入确定性前向。
+
 - **[P1.5 连续指令扩域与响应器联合训练]** 新增 `p15resp8h` / `p15_response`：
   从 `commandfull-34728` 在 Standard + Camera、128 环境继续训练，CNN 冻结，前 7 小时
   联合更新低层 Actor/LSTM/Critic 与独立 `ResponseAdapter`，最后 1 小时只校准

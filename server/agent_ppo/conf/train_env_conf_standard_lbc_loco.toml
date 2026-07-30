@@ -200,6 +200,10 @@ ang_vel_z = [-0.3, 0.3]
 # LBC-specific parameters (matching LBCLocoConfig; priority on read is TOML > class default).
 # 阶段 4：线性 ramp DAgger + 三路损失（0.5*SmoothL1(latent) + 0.1*(1-cos) + 1.0*SmoothL1(action)）
 [lbc_loco]
+# When Standard evaluation is explicitly run against a complete P2 bundle,
+# extract only its frozen low-level VisionEncoder and Actor. Track evaluation
+# continues to promote the same bundle to the complete P2 evaluator.
+low_level_only_eval = true
 # 蒸馏阶段保守 lr；lr_min 可选，未给则用 conf.py 默认 1e-5。
 learning_rate = 2e-4
 # S0a 临时：20000 → 50（小值冒烟，只测环境不做正式蒸馏）

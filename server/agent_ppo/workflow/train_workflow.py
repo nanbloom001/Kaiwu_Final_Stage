@@ -128,6 +128,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
         return lbc_workflow(envs, agents, logger=logger, monitor=monitor, *args, **kwargs)
 
+    if getattr(agent, "is_p2_nav", False):
+        from agent_ppo.workflow.p2_nav_ppo_workflow import (
+            workflow as p2_nav_ppo_workflow,
+        )
+
+        return p2_nav_ppo_workflow(
+            envs, agents, logger=logger, monitor=monitor, *args, **kwargs
+        )
+
     # hier-nav 高层 DAgger：转发到 nav_dagger_workflow（TBPTT 序列 BC，不走 PPO）
     # hier-nav high-level DAgger: forward to nav_dagger_workflow (TBPTT BC, no PPO)
     if getattr(agent, "is_nav_dagger", False):

@@ -3,12 +3,13 @@
 # Replay buffer configurations
 # 样本池容量
 preload_model_dir = "/data/pre_model/ckpt"
-preload_model_id = 34728
+preload_model_id = 37953
 preload_model = true
 # Repository-side stage bootstrap. This is read before the stage-specific
 # training TOML path is constructed; the same TOML cannot select itself.
-# S0a probing must change this together with preload_model_id in one commit.
-policy_entry = "p15_response"
+# P2 bootstrap should keep this aligned with the preferred parent when possible;
+# a platform-side ID rewrite is warning-only and does not block structural load.
+policy_entry = "p2_nav_ppo"
 replay_buffer_capacity = 4096
 
 # The ratio of the sample pool capacity that triggers training

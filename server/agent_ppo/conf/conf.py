@@ -275,6 +275,41 @@ class P15ResponseConfig(StandardVisualPPOConfig):
     model_save_interval = 500
 
 
+class P2NavPPOConfig(StageConfig):
+    """P2 Track continuous recurrent high-level PPO over a frozen low level."""
+
+    name = "p2_nav_ppo"
+    task_type = "track"
+    algorithm = "p2_nav_ppo"
+    model_class = "P2NavigationActor"
+    ckpt_name = "model.ckpt-navadapt"
+    num_goal_obs = 4
+    num_actor_observations = 57905
+    num_critic_observations = 323
+    proprio_dim = 45
+    scan_dim = 256
+    depth_height = 180
+    depth_width = 320
+    depth_channels = 1
+    cnn_output_dim = 32
+    lstm_hidden_size = 64
+    lstm_num_layers = 2
+    latent_dim = 32
+    teacher_actor_hidden_dims = [512, 256, 128]
+    teacher_actor_activation = "elu"
+    num_steps_per_env = 320
+    tbptt_sequence_length = 16
+    num_learning_epochs = 4
+    num_mini_batches = 4
+    max_grad_norm = 1.0
+    model_save_interval = 500
+
+
+class P2NavEvalConfig(P2NavPPOConfig):
+    name = "p2_nav_eval"
+    algorithm = "p2_nav_eval"
+
+
 class NavDaggerConfig(StageConfig):
     """hier-nav 高层导航 DAgger 训练阶段（Track + Camera，冻结低层）。
 
@@ -390,6 +425,7 @@ def _configured_training_stage(logger):
         "standard_visual_ppo": StandardVisualPPOConfig,
         "visual_ppo": StandardVisualPPOConfig,
         "p15_response": P15ResponseConfig,
+        "p2_nav_ppo": P2NavPPOConfig,
         "lbc_loco": LBCLocoConfig,
         "locomotion": LocomotionConfig,
         "nav_dagger": NavDaggerConfig,
@@ -427,7 +463,7 @@ class Config:
     # Keep the literal default aligned with the branch's active training stage.
     # configure_app.toml remains authoritative for worker subprocesses and is
     # checked again below during module bootstrap.
-    CURRENT = P15ResponseConfig
+    CURRENT = P2NavPPOConfig
 
     @staticmethod
     def load_conf(logger):
@@ -554,6 +590,8 @@ def _valid_explicit_policy_stage(usr_conf):
         "standard_visual_ppo": StandardVisualPPOConfig,
         "visual_ppo": StandardVisualPPOConfig,
         "p15_response": P15ResponseConfig,
+        "p2_nav_ppo": P2NavPPOConfig,
+        "p2_nav_eval": P2NavEvalConfig,
         "lbc_loco": LBCLocoConfig,
         "locomotion": LocomotionConfig,
         # hier-nav：训练与评估入口分离（评估类永不构造训练 Algorithm）。
@@ -641,6 +679,8 @@ def _infer_stage_from_task_name(usr_conf, logger):
             if selected is not None:
                 if selected is NavDaggerConfig:
                     selected = NavEvalConfig
+                elif selected is P2NavPPOConfig:
+                    selected = P2NavEvalConfig
                 logger.info(
                     "[eval] Explicit policy entry selected: "
                     f"{explicit_entry} -> {selected.name}"
@@ -668,9 +708,15 @@ def _infer_stage_from_task_name(usr_conf, logger):
         return None
     mode = str(terrain_conf.get("mode", "standard")).lower()
     if mode == "track" and "Camera" in task_name:
+        if Config.CURRENT in {P2NavPPOConfig, P2NavEvalConfig}:
+            logger.info(
+                "[eval] Track+Camera task retained the P2 checkpoint lineage "
+                "without an explicit policy entry; selected p2_nav_eval"
+            )
+            return P2NavEvalConfig
         logger.info(
             "[eval] Track+Camera task selected nav_eval without an explicit "
-            "policy entry; this keeps platform Camera routing deploy-shaped"
+            "policy entry from the legacy Nav lineage"
         )
         return NavEvalConfig
     if mode != "standard":

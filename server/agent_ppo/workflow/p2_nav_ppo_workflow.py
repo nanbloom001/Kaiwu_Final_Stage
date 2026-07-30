@@ -1,0 +1,1174 @@
+#!/usr/bin/env python3
+"""Four-session-hour P2 Track semi-MDP PPO workflow."""
+
+from __future__ import annotations
+
+import math
+import json
+import os
+import signal
+import threading
+import time
+from collections import deque
+
+import torch
+
+from agent_ppo.checkpoint_io import CheckpointSaveError
+from agent_ppo.conf.conf import Config
+from agent_ppo.feature import nav_contract, p2_contract
+
+
+class _CollisionTraceRecorder:
+    """Bounded 5 Hz event traces; aggregate every event, log few raw examples."""
+
+    def __init__(self, *, pre_ticks=5, post_ticks=10, max_raw_events=12):
+        self.history = deque(maxlen=int(pre_ticks))
+        self.post_ticks = int(post_ticks)
+        self.max_raw_events = int(max_raw_events)
+        self.pending = []
+        self.completed = []
+        self.total_onsets = 0
+        self.rollout_onsets = 0
+        self.rollout_observations = 0
+
+    @staticmethod
+    def _row(snapshot, env_id: int) -> dict[str, float | int]:
+        return {
+            name: int(value[env_id]) if name in {"segment", "column", "reason"}
+            else float(value[env_id])
+            for name, value in snapshot.items()
+        }
+
+    def observe(self, *, iteration: int, tick: int, onset: torch.Tensor, **values) -> None:
+        snapshot = {
+            name: torch.as_tensor(value).detach().reshape(-1).cpu()
+            for name, value in values.items()
+        }
+        for event in self.pending:
+            event["post"].append(self._row(snapshot, event["env_id"]))
+        ready = [event for event in self.pending if len(event["post"]) >= self.post_ticks]
+        self.pending = [event for event in self.pending if len(event["post"]) < self.post_ticks]
+        self.completed.extend(ready)
+
+        onset_ids = torch.as_tensor(onset).detach().reshape(-1).bool().nonzero(
+            as_tuple=False
+        ).reshape(-1).tolist()
+        self.total_onsets += len(onset_ids)
+        self.rollout_onsets += len(onset_ids)
+        self.rollout_observations += int(torch.as_tensor(onset).numel())
+        for env_id in onset_ids:
+            if len(self.pending) + len(self.completed) >= self.max_raw_events:
+                break
+            self.pending.append(
+                {
+                    "iteration": int(iteration),
+                    "tick": int(tick),
+                    "env_id": int(env_id),
+                    "pre": [self._row(old, env_id) for old in self.history],
+                    "onset": self._row(snapshot, env_id),
+                    "post": [],
+                }
+            )
+        self.history.append(snapshot)
+
+    def drain(self, logger=None) -> dict[str, float]:
+        events = self.completed[: self.max_raw_events]
+        self.completed.clear()
+        if events and logger:
+            logger.info(
+                "[P2CollisionTrace] "
+                + json.dumps(events, ensure_ascii=True, separators=(",", ":"))
+            )
+        zero_latencies = []
+        reverse_latencies = []
+        progress_latencies = []
+        target_to_exec_wz_latencies = []
+        exec_to_true_wz_latencies = []
+        target_to_exec_vy_latencies = []
+        exec_to_true_vy_latencies = []
+        risk_lead_times = []
+        terminal_overlaps = 0
+        for event in events:
+            onset_wz = float(event["onset"]["exec_wz"])
+            onset_true_wz = float(event["onset"]["true_wz"])
+            onset_vy = float(event["onset"]["exec_vy"])
+            onset_true_vy = float(event["onset"]["true_vy"])
+            for index, row in enumerate(event["post"], start=1):
+                if not zero_latencies or abs(float(row["exec_wz"])) <= 0.05:
+                    if abs(float(row["exec_wz"])) <= 0.05:
+                        zero_latencies.append(index)
+                        break
+            if abs(onset_wz) > 0.05:
+                target_reverse_index = None
+                exec_reverse_index = None
+                for index, row in enumerate(event["post"], start=1):
+                    if target_reverse_index is None and float(row["target_wz"]) * onset_wz < 0.0:
+                        target_reverse_index = index
+                    if float(row["exec_wz"]) * onset_wz < 0.0:
+                        reverse_latencies.append(index)
+                        exec_reverse_index = index
+                        break
+                if target_reverse_index is not None and exec_reverse_index is not None:
+                    target_to_exec_wz_latencies.append(
+                        max(0, exec_reverse_index - target_reverse_index)
+                    )
+                if exec_reverse_index is not None and abs(onset_true_wz) > 0.05:
+                    for index, row in enumerate(event["post"], start=1):
+                        if index >= exec_reverse_index and float(row["true_wz"]) * onset_true_wz <= 0.0:
+                            exec_to_true_wz_latencies.append(index - exec_reverse_index)
+                            break
+            if abs(onset_vy) > 0.05:
+                target_reverse_index = None
+                exec_reverse_index = None
+                for index, row in enumerate(event["post"], start=1):
+                    if target_reverse_index is None and float(row["target_vy"]) * onset_vy < 0.0:
+                        target_reverse_index = index
+                    if float(row["exec_vy"]) * onset_vy < 0.0:
+                        exec_reverse_index = index
+                        break
+                if target_reverse_index is not None and exec_reverse_index is not None:
+                    target_to_exec_vy_latencies.append(
+                        max(0, exec_reverse_index - target_reverse_index)
+                    )
+                if exec_reverse_index is not None and abs(onset_true_vy) > 0.05:
+                    for index, row in enumerate(event["post"], start=1):
+                        if index >= exec_reverse_index and float(row["true_vy"]) * onset_true_vy <= 0.0:
+                            exec_to_true_vy_latencies.append(index - exec_reverse_index)
+                            break
+            pre_risks = [float(row.get("risk", 0.0)) for row in event["pre"]]
+            high_risk_indices = [index for index, value in enumerate(pre_risks) if value >= 0.5]
+            if high_risk_indices:
+                risk_lead_times.append(len(pre_risks) - high_risk_indices[0])
+            for index, row in enumerate(event["post"], start=1):
+                if float(row["progress"]) > 0.0:
+                    progress_latencies.append(index)
+                    break
+            terminal_overlaps += int(
+                any(int(row["reason"]) != 0 for row in event["post"])
+            )
+        count = max(len(events), 1)
+        rollout_onsets = self.rollout_onsets
+        rollout_observations = self.rollout_observations
+        self.rollout_onsets = 0
+        self.rollout_observations = 0
+        return {
+            "collision_trace_events": float(len(events)),
+            "collision_onset_count": float(rollout_onsets),
+            "collision_onset_rate": float(rollout_onsets) / max(rollout_observations, 1),
+            "collision_onset_total": float(self.total_onsets),
+            "collision_wz_zero_latency_s": (
+                sum(zero_latencies) / len(zero_latencies) * p2_contract.NAV_DT_S
+                if zero_latencies else 0.0
+            ),
+            "collision_wz_reverse_latency_s": (
+                sum(reverse_latencies) / len(reverse_latencies) * p2_contract.NAV_DT_S
+                if reverse_latencies else 0.0
+            ),
+            "collision_progress_recovery_latency_s": (
+                sum(progress_latencies) / len(progress_latencies) * p2_contract.NAV_DT_S
+                if progress_latencies else 0.0
+            ),
+            "collision_target_to_exec_wz_reverse_latency_s": (
+                sum(target_to_exec_wz_latencies) / len(target_to_exec_wz_latencies) * p2_contract.NAV_DT_S
+                if target_to_exec_wz_latencies else 0.0
+            ),
+            "collision_exec_to_true_wz_zero_latency_s": (
+                sum(exec_to_true_wz_latencies) / len(exec_to_true_wz_latencies) * p2_contract.NAV_DT_S
+                if exec_to_true_wz_latencies else 0.0
+            ),
+            "collision_target_to_exec_vy_reverse_latency_s": (
+                sum(target_to_exec_vy_latencies) / len(target_to_exec_vy_latencies) * p2_contract.NAV_DT_S
+                if target_to_exec_vy_latencies else 0.0
+            ),
+            "collision_exec_to_true_vy_zero_latency_s": (
+                sum(exec_to_true_vy_latencies) / len(exec_to_true_vy_latencies) * p2_contract.NAV_DT_S
+                if exec_to_true_vy_latencies else 0.0
+            ),
+            "collision_risk_lead_time_s": (
+                sum(risk_lead_times) / len(risk_lead_times) * p2_contract.NAV_DT_S
+                if risk_lead_times else 0.0
+            ),
+            "collision_terminal_overlap_rate": terminal_overlaps / count,
+        }
+
+
+def _extract_step(step_data):
+    if step_data is None:
+        raise RuntimeError("P2 env.step returned None")
+    frame_no, next_obs, rewards, terminated, truncated, extra = step_data
+    infos, privileged_obs = extra
+    return frame_no, next_obs, rewards, terminated, truncated, infos, privileged_obs
+
+
+def _frame_done_masks(terminated, truncated, infos, device, *, worker_aux=None):
+    terminated = torch.as_tensor(terminated, device=device).bool().reshape(-1)
+    truncated = torch.as_tensor(truncated, device=device).bool().reshape(-1)
+    if isinstance(infos, dict) and "time_outs" in infos:
+        timeout = torch.as_tensor(infos["time_outs"], device=device).bool().reshape(-1)
+    else:
+        timeout = truncated
+    if worker_aux is not None:
+        worker_aux = torch.as_tensor(worker_aux, device=device)
+        reset = worker_aux[:, 24] > 0.5
+        reason = worker_aux[:, 25].round().long()
+        worker_timeout = reason == 3
+        worker_hard = (reason == 1) | (reason == 2)
+        # Any reset not explained by a hard terminal is a timeout. This
+        # recovers the platform wrapper's known truncated/time_outs erasure.
+        timeout |= worker_timeout | (reset & ~worker_hard & ~terminated)
+        terminated |= worker_hard
+    done = terminated | truncated | timeout
+    return done, timeout
+
+
+def _resolve_terminal_outcome(
+    new_done: torch.Tensor,
+    frame_timeout: torch.Tensor,
+    raw_reason: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return authoritative reason and mutually exclusive hard/timeout masks."""
+    fallback_reason = torch.where(
+        frame_timeout,
+        torch.full_like(raw_reason, 3),
+        torch.full_like(raw_reason, 2),
+    )
+    valid_reason = (raw_reason >= 1) & (raw_reason <= 3)
+    reason = torch.where(valid_reason, raw_reason, fallback_reason)
+    hard = new_done & ((reason == 1) | (reason == 2))
+    timeout = new_done & (reason == 3)
+    return reason, hard, timeout
+
+
+def _terminal_safe_segment(
+    live_segment: torch.Tensor,
+    terminal_segment: torch.Tensor,
+    transition_done: torch.Tensor,
+) -> torch.Tensor:
+    """Keep the old episode's segment after auto-reset advances a new episode."""
+    return torch.where(
+        transition_done & (terminal_segment >= 0.0),
+        terminal_segment,
+        live_segment,
+    )
+
+
+def _terminal_safe_tensor(
+    live_value: torch.Tensor,
+    terminal_value: torch.Tensor,
+    done: torch.Tensor,
+) -> torch.Tensor:
+    """Select the frozen old-episode row after an in-window reset."""
+    if live_value.shape != terminal_value.shape:
+        raise ValueError("terminal-safe tensors must have matching shapes")
+    if live_value.shape[0] != done.numel():
+        raise ValueError("terminal-safe mask must match the tensor batch")
+    mask = done.reshape((-1,) + (1,) * (live_value.ndim - 1))
+    return torch.where(mask, terminal_value, live_value)
+
+
+def _curriculum_metrics(snapshot: dict[str, object]) -> dict[str, float]:
+    """Flatten the worker probe state into stable scalar monitor metrics."""
+    if not isinstance(snapshot, dict):
+        return {}
+    row_moves = snapshot.get("row_moves", ())
+    col_moves = snapshot.get("col_moves", ())
+    outcomes = snapshot.get("outcomes", ())
+    starts = snapshot.get("start_counts", ())
+    try:
+        outcome_totals = [
+            sum(int(cell[index]) for row in outcomes for cell in row)
+            for index in range(3)
+        ]
+        metrics = {
+            "curriculum_row_demotions": float(row_moves[0]),
+            "curriculum_row_unchanged": float(row_moves[1]),
+            "curriculum_row_promotions": float(row_moves[2]),
+            "curriculum_column_unchanged": float(col_moves[0]),
+            "curriculum_column_changed": float(col_moves[1]),
+            "curriculum_successes": float(outcome_totals[0]),
+            "curriculum_failures": float(outcome_totals[1]),
+            "curriculum_timeouts": float(outcome_totals[2]),
+            "curriculum_slope_inv_starts": float(sum(int(v) for v in starts[0])),
+            "curriculum_stairs_inv_starts": float(sum(int(v) for v in starts[1])),
+            "curriculum_maze_entry_starts": float(sum(int(v) for v in starts[2])),
+        }
+        column_histogram = snapshot.get("last_terrain_types_histogram", ())
+        column_total = max(1, sum(int(value) for value in column_histogram))
+        for index, value in enumerate(column_histogram):
+            metrics[f"terrain_column_l{index}_share"] = float(value) / column_total
+        row_histogram = snapshot.get("last_terrain_levels_histogram", ())
+        row_total = max(1, sum(int(value) for value in row_histogram))
+        for index, value in enumerate(row_histogram):
+            metrics[f"terrain_spawn_row_{index}_share"] = float(value) / row_total
+        return metrics
+    except (IndexError, TypeError, ValueError):
+        return {}
+
+
+def _tick_diagnostic_values(
+    *,
+    target: torch.Tensor,
+    executed: torch.Tensor,
+    response_aux: torch.Tensor,
+    confidence: torch.Tensor,
+    actions: torch.Tensor,
+    start_goal: torch.Tensor,
+    end_goal: torch.Tensor,
+    done: torch.Tensor,
+    hard: torch.Tensor,
+    timeout: torch.Tensor,
+    terminal_reason: torch.Tensor,
+    duration_frames: torch.Tensor,
+    stuck: torch.Tensor,
+    feedback_age_clip_s: float,
+) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
+    """Return per-env P2 telemetry without changing training semantics."""
+    measured = response_aux[:, 6:9]
+    valid = (response_aux[:, 9] > 0.5) & ~done
+    source = response_aux[:, 11].round().long()
+    true_velocity = response_aux[:, 12:15]
+    progress = start_goal - end_goal
+    duration_s = duration_frames.float().clamp_min(1.0) * p2_contract.CONTROL_DT_S
+    action_peak = actions.abs().amax(dim=-1)
+    equivalent_command_speed = torch.sqrt(
+        target[:, 0].square()
+        + target[:, 1].square()
+        + (p2_contract.CRAWL_BODY_RADIUS_M * target[:, 2]).square()
+    )
+    values = {
+        "target_vx": target[:, 0],
+        "target_vy": target[:, 1],
+        "target_wz": target[:, 2],
+        "target_abs_wz": target[:, 2].abs(),
+        "target_left": (target[:, 2] > 1.0e-4).float(),
+        "target_right": (target[:, 2] < -1.0e-4).float(),
+        "target_straight": (target[:, 2].abs() <= 0.05).float(),
+        "target_pure_yaw": (
+            (target[:, 0] <= 0.10) & (target[:, 2].abs() > 0.10)
+        ).float(),
+        "target_joint_turn": (
+            (target[:, 0] > 0.10) & (target[:, 2].abs() > 0.10)
+        ).float(),
+        "exec_vx": executed[:, 0],
+        "exec_vy": executed[:, 1],
+        "exec_wz": executed[:, 2],
+        "true_vx": true_velocity[:, 0],
+        "true_vy": true_velocity[:, 1],
+        "true_wz": true_velocity[:, 2],
+        "true_lateral_speed_abs": true_velocity[:, 1].abs(),
+        "target_exec_vx_error": (target[:, 0] - executed[:, 0]).abs(),
+        "target_exec_vy_error": (target[:, 1] - executed[:, 1]).abs(),
+        "target_exec_wz_error": (target[:, 2] - executed[:, 2]).abs(),
+        "slew_saturation_rate": (
+            (target - executed).abs().amax(dim=-1) > 1.0e-4
+        ).float(),
+        "feedback_valid": valid.float(),
+        "feedback_source_invalid": (source == 0).float(),
+        "feedback_source_sport": (source == 1).float(),
+        "feedback_source_contact": (source == 2).float(),
+        "adapter_confidence": confidence.reshape(-1),
+        "success_rate": (terminal_reason == 1).float(),
+        "failure_rate": (
+            (terminal_reason == 2) | (hard & (terminal_reason != 1))
+        ).float(),
+        "timeout_rate": timeout.float(),
+        "hard_termination": hard.float(),
+        "early_end_rate": (
+            done & (duration_frames < p2_contract.NAV_PERIOD_FRAMES)
+        ).float(),
+        "transition_duration_frames": duration_frames.float(),
+        "goal_distance": end_goal,
+        "goal_progress": progress,
+        "goal_progress_m_per_s": progress / duration_s,
+        "goal_progress_positive_rate": (progress > 0.0).float(),
+        "command_core_overflow_rate": (
+            (target[:, 0] > p2_contract.TRUSTED_CORE["vx"][1])
+            | (target[:, 1].abs() > p2_contract.TRUSTED_CORE["vy"][1])
+            | (target[:, 2].abs() > p2_contract.TRUSTED_CORE["wz"][1])
+        ).float(),
+        "vx_near_hard_boundary_rate": (target[:, 0] >= 1.20).float(),
+        "vy_nonzero_rate": (target[:, 1].abs() > 0.05).float(),
+        "vy_over_core_rate": (target[:, 1].abs() > 0.20).float(),
+        "vy_over_specialty_rate": (target[:, 1].abs() > 0.30).float(),
+        "vy_near_hard_boundary_rate": (target[:, 1].abs() >= 0.38).float(),
+        "vy_positive_rate": (target[:, 1] > 0.05).float(),
+        "vy_negative_rate": (target[:, 1] < -0.05).float(),
+        "wz_near_hard_boundary_rate": (target[:, 2].abs() >= 0.95).float(),
+        "stuck": stuck.float(),
+        "stuck_penalty": torch.zeros_like(stuck, dtype=torch.float32),
+        "zero_command_rate": (equivalent_command_speed <= 1.0e-4).float(),
+        "creep_command_rate": (
+            (equivalent_command_speed > 1.0e-4)
+            & (equivalent_command_speed < p2_contract.CRAWL_STABLE_MIN_MPS)
+        ).float(),
+        "stable_command_rate": (
+            equivalent_command_speed >= p2_contract.CRAWL_STABLE_MIN_MPS
+        ).float(),
+        "terrain_start_column": response_aux[:, 28],
+        "terrain_start_row": response_aux[:, 29],
+        "current_segment": response_aux[:, p2_contract.CURRENT_SEGMENT_INDEX],
+        "current_segment_valid": (
+            response_aux[:, p2_contract.CURRENT_SEGMENT_INDEX] >= 0.0
+        ).float(),
+        "gait_sensor_mapping_valid": response_aux[
+            :, p2_contract.GAIT_SENSOR_MAPPING_VALID_INDEX
+        ],
+        "body_collision_mapping_valid": response_aux[
+            :, p2_contract.BODY_COLLISION_MAPPING_VALID_INDEX
+        ],
+        "tilt_xy_norm": torch.linalg.vector_norm(response_aux[:, 21:23], dim=-1),
+        "low_level_action_abs_mean": actions.abs().mean(dim=-1),
+        "low_level_action_peak_mean": action_peak,
+        "low_level_action_saturation_rate": (action_peak >= 5.95).float(),
+    }
+    gait_valid = response_aux[:, p2_contract.GAIT_VALID_INDEX] > 0.5
+    for index, leg in enumerate(("fl", "fr", "rl", "rr")):
+        values[f"{leg}_duty_factor"] = response_aux[
+            :, p2_contract.GAIT_DUTY_SLICE.start + index
+        ]
+        values[f"{leg}_mean_swing_time"] = response_aux[
+            :, p2_contract.GAIT_MEAN_SWING_SLICE.start + index
+        ]
+        values[f"{leg}_max_air_time"] = response_aux[
+            :, p2_contract.GAIT_MAX_AIR_SLICE.start + index
+        ]
+        values[f"{leg}_prolonged_air_ratio"] = response_aux[
+            :, p2_contract.GAIT_PROLONGED_RATIO_SLICE.start + index
+        ]
+        values[f"{leg}_step_frequency"] = response_aux[
+            :, p2_contract.GAIT_STEP_FREQUENCY_SLICE.start + index
+        ]
+        values[f"{leg}_slip_speed"] = response_aux[
+            :, p2_contract.GAIT_SLIP_SPEED_SLICE.start + index
+        ]
+    values["gait_window_valid"] = gait_valid.float()
+    valid_values = {
+        "measured_vx": measured[:, 0],
+        "measured_vy": measured[:, 1],
+        "measured_wz": measured[:, 2],
+        "feedback_age_s": p2_contract.feedback_age_seconds(
+            response_aux[:, 10], age_clip_s=feedback_age_clip_s
+        ),
+        "vx_tracking_abs_error": (executed[:, 0] - measured[:, 0]).abs(),
+        "vy_tracking_abs_error": (executed[:, 1] - measured[:, 1]).abs(),
+        "wz_tracking_abs_error": (executed[:, 2] - measured[:, 2]).abs(),
+        "feedback_true_velocity_error": torch.linalg.vector_norm(
+            measured - true_velocity, dim=-1
+        ),
+    }
+    return values, valid_values, valid
+
+
+def _install_sigterm_handler(logger):
+    if not hasattr(signal, "SIGTERM") or threading.current_thread() is not threading.main_thread():
+        return None
+    previous = signal.getsignal(signal.SIGTERM)
+    if previous is signal.SIG_IGN:
+        return None
+
+    def handler(signum, frame):
+        if previous is not signal.SIG_DFL and callable(previous):
+            previous(signum, frame)
+        raise SystemExit(f"SIGTERM({signum})")
+
+    signal.signal(signal.SIGTERM, handler)
+    logger.info(f"[P2NavPPO] installed chained SIGTERM handler previous={previous!r}")
+    return previous
+
+
+def _final_save(agent, logger, reason: str) -> bool:
+    if getattr(agent, "_p2_final_save_done", False):
+        return False
+    try:
+        logger.warning(f"[P2NavPPO] final platform archive request reason={reason}")
+        agent.save_model()
+    except Exception as exc:
+        logger.error(
+            "[P2NavPPO] final save failed without replacing the original exit reason: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return False
+    agent._p2_final_save_done = True
+    return True
+
+
+def _request_periodic_save(agent, logger, reason: str) -> bool:
+    try:
+        logger.info(
+            f"[P2NavPPO] periodic platform archive request begin reason={reason}; "
+            "platform must inject path and model ID"
+        )
+        agent.save_model()
+    except Exception as exc:
+        logger.error(
+            "[P2NavPPO] checkpoint save failed; previous valid package remains and "
+            f"retry is due in 60s: {type(exc).__name__}: {exc}"
+        )
+        return False
+    return True
+
+
+def _monitor_put(monitor, metrics: dict[str, float], logger=None) -> bool:
+    if monitor is None:
+        return False
+    try:
+        monitor.put_data({os.getpid(): metrics})
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(
+                "[P2NavPPO] monitor upload failed; training continues: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        return False
+    return True
+
+
+def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
+    del args, kwargs
+    agent = agents[0]
+    env = envs[0]
+    if not getattr(agent, "is_p2_nav", False) or getattr(agent, "is_p2_nav_eval", False):
+        raise RuntimeError("p2_nav_ppo_workflow requires the P2 training assembly")
+    usr_conf, conf_path, _, stage = Config.load_conf(logger)
+    p2_conf = usr_conf.get("p2_nav_ppo", {})
+    feedback_conf = p2_conf.get("feedback_profile", {})
+    if not isinstance(feedback_conf, dict):
+        feedback_conf = {}
+    feedback_age_clip_s = float(feedback_conf.get("age_clip_s", 0.8))
+    algorithm = agent.algorithm
+    logger.info(
+        "[P2NavPPO] start "
+        f"conf={conf_path} envs={agent.num_envs} parent={agent._p2_parent_model_id} "
+        "rollout=32 ticks tbptt=16 minibatch=64seq microbatch=4seq "
+        f"target_hours={p2_contract.TRAINING_HOURS:.1f} performance_gates=none"
+    )
+    data = env.reset(usr_conf)
+    if data is None:
+        raise RuntimeError("P2 env.reset returned None")
+    obs, critic_wire = data
+    obs = torch.as_tensor(obs).to(agent.device).clone()
+    critic_wire = torch.as_tensor(critic_wire).to(agent.device).clone()
+    if obs.shape != (agent.num_envs, nav_contract.POLICY_OBS_DIM):
+        raise ValueError(f"P2 reset policy shape drift: {tuple(obs.shape)}")
+    if critic_wire.shape != (agent.num_envs, p2_contract.PRIVILEGED_WIRE_DIM):
+        raise ValueError(f"P2 reset critic wire shape drift: {tuple(critic_wire.shape)}")
+    algorithm.reset_live_state()
+
+    resumed_seconds = float(algorithm.session_effective_seconds)
+    session_started = time.monotonic()
+    first_save_s = float(p2_conf.get("first_save_minutes", 5.0)) * 60.0
+    save_interval_s = float(p2_conf.get("save_interval_minutes", 10.0)) * 60.0
+    if first_save_s <= 0.0 or save_interval_s <= 0.0:
+        raise ValueError("P2 checkpoint intervals must be positive")
+    if resumed_seconds <= 0.0:
+        next_save_effective = first_save_s
+    else:
+        next_save_effective = (
+            math.floor(resumed_seconds / save_interval_s) + 1
+        ) * save_interval_s
+    retry_save_at = None
+    unfreeze_save_done = bool(algorithm.cnn_unfrozen)
+    lifecycle_success = 0
+    lifecycle_failures = 0
+    collision_traces = _CollisionTraceRecorder()
+    goal_history = deque(maxlen=11)
+    schedule_boundaries = (
+        p2_contract.SAFETY_WARM_END_SECONDS,
+        p2_contract.SAFETY_STABILIZE_SECONDS,
+    )
+    saved_schedule_boundaries = {
+        boundary for boundary in schedule_boundaries if boundary <= resumed_seconds
+    }
+    previous_sigterm = _install_sigterm_handler(logger)
+    agent._p2_training_started = True
+    agent._p2_final_save_done = False
+    last_log = time.monotonic()
+    target_seconds = p2_contract.TRAINING_HOURS * 3600.0
+
+    try:
+        while algorithm.session_effective_seconds < target_seconds:
+            rollout_started = time.monotonic()
+            env_step_time_s = 0.0
+            diagnostic_sums: dict[str, torch.Tensor] = {}
+            diagnostic_maxima: dict[str, torch.Tensor] = {}
+            diagnostic_valid_sums: dict[str, torch.Tensor] = {}
+            diagnostic_count = 0
+            diagnostic_valid_count = torch.zeros((), device=agent.device)
+            command_bin_counts = torch.zeros(5, 4, device=agent.device)
+            command_bin_progress = torch.zeros_like(command_bin_counts)
+            command_bin_tracking = torch.zeros_like(command_bin_counts)
+            command_bin_tracking_counts = torch.zeros_like(command_bin_counts)
+            command_bin_target_vx = torch.zeros_like(command_bin_counts)
+            command_bin_exec_vx = torch.zeros_like(command_bin_counts)
+            command_bin_true_vx = torch.zeros_like(command_bin_counts)
+            command_bin_target_wz = torch.zeros_like(command_bin_counts)
+            command_bin_exec_wz = torch.zeros_like(command_bin_counts)
+            command_bin_true_wz = torch.zeros_like(command_bin_counts)
+            command_bin_gait = torch.zeros_like(command_bin_counts)
+            command_bin_success = torch.zeros_like(command_bin_counts)
+            command_bin_failure = torch.zeros_like(command_bin_counts)
+            command_bin_timeout = torch.zeros_like(command_bin_counts)
+            command_bin_vy_nonzero = torch.zeros_like(command_bin_counts)
+            command_bin_abs_vy = torch.zeros_like(command_bin_counts)
+            command_bin_vy_outer = torch.zeros_like(command_bin_counts)
+            row_counts = torch.zeros(3, device=agent.device)
+            row_progress = torch.zeros_like(row_counts)
+            row_target_vx = torch.zeros_like(row_counts)
+            row_exec_vx = torch.zeros_like(row_counts)
+            row_true_vx = torch.zeros_like(row_counts)
+            row_target_wz = torch.zeros_like(row_counts)
+            row_stop = torch.zeros_like(row_counts)
+            row_creep = torch.zeros_like(row_counts)
+            row_spin = torch.zeros_like(row_counts)
+            row_gait = torch.zeros_like(row_counts)
+            row_predictive_clearance = torch.zeros_like(row_counts)
+            row_predictive_risk = torch.zeros_like(row_counts)
+            row_predictive_penalty = torch.zeros_like(row_counts)
+            row_teacher_risk = torch.zeros_like(row_counts)
+            row_teacher_high_risk = torch.zeros_like(row_counts)
+            row_success = torch.zeros_like(row_counts)
+            row_failure = torch.zeros_like(row_counts)
+            row_timeout = torch.zeros_like(row_counts)
+            segment_diagnostic_count = torch.zeros((), device=agent.device)
+            quantile_names = (
+                "target_vx", "target_vy", "target_wz",
+                "exec_vx", "exec_vy", "exec_wz",
+                "true_vx", "true_vy", "true_wz",
+                "measured_vx", "measured_vy", "measured_wz",
+            )
+            quantile_samples = {
+                name: torch.full(
+                    (p2_contract.NAV_ROLLOUT_TICKS, agent.num_envs),
+                    float("nan"),
+                    device=agent.device,
+                )
+                for name in quantile_names
+            }
+            for _tick in range(p2_contract.NAV_ROLLOUT_TICKS):
+                start_goal = (
+                    critic_wire[:, nav_contract.CRITIC_GOAL3_START + 2]
+                    * nav_contract.GOAL_DIST_SCALE_M
+                ).detach()
+                frame_safety_reward = torch.zeros(agent.num_envs, device=agent.device)
+                terminal_goal = torch.full(
+                    (agent.num_envs,), float("nan"), device=agent.device
+                )
+                terminal_segment = torch.full(
+                    (agent.num_envs,), -1.0, device=agent.device
+                )
+                terminal_target = torch.zeros(
+                    agent.num_envs, 3, device=agent.device
+                )
+                terminal_executed = torch.zeros_like(terminal_target)
+                terminal_aux = torch.zeros(
+                    agent.num_envs,
+                    p2_contract.WORKER_AUX_DIM,
+                    device=agent.device,
+                )
+                duration = torch.zeros(agent.num_envs, dtype=torch.long, device=agent.device)
+                hard = torch.zeros(agent.num_envs, dtype=torch.bool, device=agent.device)
+                timeout = torch.zeros_like(hard)
+                terminal_reason = torch.zeros(
+                    agent.num_envs, dtype=torch.long, device=agent.device
+                )
+                active = torch.ones_like(hard)
+                result = None
+                for frame in range(p2_contract.NAV_PERIOD_FRAMES):
+                    result, _critic_obs, aux = algorithm.frame_begin(obs, critic_wire)
+                    actions = torch.clamp(result["actions"], -6.0, 6.0)
+                    frame_target = algorithm.command.active_target
+                    frame_executed = algorithm.command.exec_cmd
+                    frame_aux = aux
+                    if frame > 0 and bool((~active).any()):
+                        # Done envs stay on the reset zero-command path for the
+                        # remainder of this transition; their rewards are masked.
+                        algorithm.command.active_target[~active] = 0.0
+                        algorithm.command.exec_cmd[~active] = 0.0
+                    env_step_started = time.perf_counter()
+                    step_data = env.step(actions)
+                    env_step_time_s += time.perf_counter() - env_step_started
+                    _, next_obs, rewards, terminated, truncated, infos, next_critic = _extract_step(step_data)
+                    next_obs = torch.as_tensor(next_obs).to(agent.device)
+                    next_critic = torch.as_tensor(next_critic).to(agent.device)
+                    rewards = torch.as_tensor(rewards).to(agent.device).reshape(-1)
+                    next_aux = next_critic[:, p2_contract.CRITIC_OBS_DIM :]
+                    frame_done, frame_timeout = _frame_done_masks(
+                        terminated,
+                        truncated,
+                        infos,
+                        agent.device,
+                        worker_aux=next_aux,
+                    )
+                    weight = p2_contract.GAMMA_FRAME ** frame
+                    frame_safety_reward += rewards * active.float() * weight
+                    duration += active.long()
+                    new_done = active & frame_done
+                    reason, new_hard, new_timeout = _resolve_terminal_outcome(
+                        new_done,
+                        frame_timeout,
+                        next_aux[:, 25].round().long(),
+                    )
+                    terminal_reason[new_done] = reason[new_done]
+                    if bool(new_done.any()):
+                        terminal_target[new_done] = frame_target[new_done]
+                        terminal_executed[new_done] = frame_executed[new_done]
+                        terminal_aux[new_done] = frame_aux[new_done]
+                        terminal_goal[new_done] = next_aux[
+                            new_done, p2_contract.PRE_STEP_GOAL_DISTANCE_INDEX
+                        ]
+                        terminal_segment[new_done] = next_aux[
+                            new_done, p2_contract.CURRENT_SEGMENT_INDEX
+                        ]
+                    hard |= new_hard
+                    timeout |= new_timeout
+                    active &= ~frame_done
+                    algorithm.frame_end(aux, frame_done)
+                    obs, critic_wire = next_obs, next_critic
+                    try:
+                        agent.learn(None)
+                    except Exception as exc:
+                        lifecycle_failures += 1
+                        if isinstance(exc, CheckpointSaveError) and retry_save_at is None:
+                            retry_save_at = time.monotonic() + 60.0
+                        if lifecycle_failures == 1 or lifecycle_failures % 100 == 0:
+                            logger.error(
+                                "[P2NavPPO] lifecycle callback failed; training continues "
+                                f"failures={lifecycle_failures} error={type(exc).__name__}: {exc}"
+                            )
+                    else:
+                        lifecycle_success += 1
+
+                live_end_goal = (
+                    critic_wire[:, nav_contract.CRITIC_GOAL3_START + 2]
+                    * nav_contract.GOAL_DIST_SCALE_M
+                )
+                transition_done = hard | timeout
+                end_goal = torch.where(
+                    transition_done & torch.isfinite(terminal_goal),
+                    terminal_goal,
+                    live_end_goal,
+                )
+                if bool(transition_done.any()):
+                    for previous_goal in goal_history:
+                        previous_goal[transition_done] = float("nan")
+                goal_history.append(end_goal.detach().clone())
+                if len(goal_history) == 11:
+                    ten_tick_progress = goal_history[0] - goal_history[-1]
+                    history_valid = torch.stack(tuple(goal_history)).isfinite().all(dim=0)
+                    stuck = (
+                        history_valid
+                        & (end_goal > 0.8)
+                        & (ten_tick_progress < 0.05)
+                    )
+                else:
+                    stuck = torch.zeros_like(hard)
+                pending = algorithm.pending_tick
+                if pending is None:
+                    raise RuntimeError("P2 pending transition disappeared before finish_tick")
+                target = _terminal_safe_tensor(
+                    algorithm.command.active_target,
+                    terminal_target,
+                    transition_done,
+                )
+                executed = _terminal_safe_tensor(
+                    algorithm.command.exec_cmd,
+                    terminal_executed,
+                    transition_done,
+                )
+                diagnostic_aux = _terminal_safe_tensor(
+                    next_aux, terminal_aux, transition_done
+                )
+                values, valid_values, valid_mask = _tick_diagnostic_values(
+                    target=target,
+                    executed=executed,
+                    response_aux=diagnostic_aux,
+                    confidence=pending["confidence"],
+                    actions=actions,
+                    start_goal=start_goal,
+                    end_goal=end_goal,
+                    done=transition_done,
+                    hard=hard,
+                    timeout=timeout,
+                    terminal_reason=terminal_reason,
+                    duration_frames=duration,
+                    stuck=stuck,
+                    feedback_age_clip_s=feedback_age_clip_s,
+                )
+                for name, value in values.items():
+                    diagnostic_sums[name] = diagnostic_sums.get(
+                        name, torch.zeros((), device=agent.device)
+                    ) + value.sum()
+                diagnostic_valid_count += valid_mask.float().sum()
+                for name, value in valid_values.items():
+                    diagnostic_valid_sums[name] = diagnostic_valid_sums.get(
+                        name, torch.zeros((), device=agent.device)
+                    ) + torch.where(valid_mask, value, torch.zeros_like(value)).sum()
+                for name in (
+                    "target_vx",
+                    "target_vy",
+                    "target_wz",
+                    "exec_vx",
+                    "exec_vy",
+                    "exec_wz",
+                    "true_vx",
+                    "true_vy",
+                    "true_wz",
+                ):
+                    quantile_samples[name][_tick].copy_(values[name].detach())
+                for name in ("measured_vx", "measured_vy", "measured_wz"):
+                    quantile_samples[name][_tick].copy_(
+                        torch.where(
+                            valid_mask,
+                            valid_values[name].detach(),
+                            torch.full_like(valid_values[name], float("nan")),
+                        )
+                    )
+                vx_bin = torch.bucketize(
+                    target[:, 0],
+                    torch.tensor((0.1, 0.4, 0.8, 1.0), device=agent.device),
+                )
+                wz_bin = torch.bucketize(
+                    target[:, 2].abs(),
+                    torch.tensor((0.1, 0.4, 0.8), device=agent.device),
+                )
+                true_tracking = (
+                    (executed - diagnostic_aux[:, 12:15]).abs()
+                    / torch.tensor(
+                        p2_contract.COMMAND_NORMALIZATION, device=agent.device
+                    )
+                ).mean(dim=-1)
+                flat_bin = vx_bin * 4 + wz_bin
+                def add_command_bin(target_buffer, source):
+                    target_buffer.view(-1).scatter_add_(0, flat_bin, source.float())
+
+                add_command_bin(command_bin_counts, torch.ones_like(target[:, 0]))
+                add_command_bin(command_bin_vy_nonzero, target[:, 1].abs() > 0.05)
+                add_command_bin(command_bin_abs_vy, target[:, 1].abs())
+                add_command_bin(command_bin_vy_outer, target[:, 1].abs() > 0.20)
+                add_command_bin(command_bin_progress, values["goal_progress_m_per_s"])
+                tracking_valid = (~transition_done).float()
+                add_command_bin(command_bin_tracking, true_tracking * tracking_valid)
+                add_command_bin(command_bin_tracking_counts, tracking_valid)
+                add_command_bin(command_bin_target_vx, target[:, 0])
+                add_command_bin(command_bin_exec_vx, executed[:, 0])
+                add_command_bin(command_bin_true_vx, diagnostic_aux[:, 12])
+                add_command_bin(command_bin_target_wz, target[:, 2].abs())
+                add_command_bin(command_bin_exec_wz, executed[:, 2].abs())
+                add_command_bin(command_bin_true_wz, diagnostic_aux[:, 14].abs())
+                add_command_bin(command_bin_success, values["success_rate"])
+                add_command_bin(command_bin_failure, values["failure_rate"])
+                add_command_bin(command_bin_timeout, values["timeout_rate"])
+                live_segment = diagnostic_aux[:, p2_contract.CURRENT_SEGMENT_INDEX]
+                raw_segment = _terminal_safe_segment(
+                    live_segment,
+                    terminal_segment,
+                    transition_done,
+                )
+                segment_valid = raw_segment >= 0.0
+                row_index = raw_segment.round().long()
+                segment_diagnostic_count += segment_valid.float().sum()
+                valid_row_index = row_index.clamp(0, 2)
+                def add_segment(target_buffer, source):
+                    target_buffer.scatter_add_(
+                        0, valid_row_index, source.float() * segment_valid.float()
+                    )
+
+                add_segment(row_counts, torch.ones_like(target[:, 0]))
+                add_segment(row_progress, values["goal_progress_m_per_s"])
+                add_segment(row_target_vx, target[:, 0])
+                add_segment(row_exec_vx, executed[:, 0])
+                add_segment(row_true_vx, diagnostic_aux[:, 12])
+                add_segment(row_target_wz, target[:, 2].abs())
+                add_segment(row_stop, values["zero_command_rate"])
+                add_segment(row_creep, values["creep_command_rate"])
+                add_segment(row_spin, values["target_pure_yaw"])
+                add_segment(row_success, values["success_rate"])
+                add_segment(row_failure, values["failure_rate"])
+                add_segment(row_timeout, values["timeout_rate"])
+                diagnostic_count += agent.num_envs
+                full = algorithm.finish_tick(
+                    obs,
+                    critic_wire,
+                    frame_safety_reward=frame_safety_reward,
+                    start_goal_distance=start_goal,
+                    end_goal_distance=end_goal,
+                    terminal_reason=terminal_reason,
+                    duration_frames=duration,
+                    hard_terminated=hard,
+                    timeout=timeout,
+                    terminal_safe_aux=diagnostic_aux,
+                    terminal_safe_exec_cmd=executed,
+                )
+                for component, value in algorithm.last_tick_penalties.items():
+                    name = f"reward_{component}"
+                    diagnostic_sums[name] = diagnostic_sums.get(
+                        name, torch.zeros((), device=agent.device)
+                    ) + value.sum()
+                for name, value in algorithm.last_tick_diagnostics.items():
+                    diagnostic_sums[name] = diagnostic_sums.get(
+                        name, torch.zeros((), device=agent.device)
+                    ) + value.sum()
+                    if name == "body_collision_force":
+                        diagnostic_maxima[f"{name}_max"] = torch.maximum(
+                            diagnostic_maxima.get(
+                                f"{name}_max",
+                                torch.zeros((), device=agent.device),
+                            ),
+                            value.max(),
+                        )
+                collision_traces.observe(
+                    iteration=algorithm.current_iteration,
+                    tick=_tick,
+                    onset=algorithm.last_tick_diagnostics[
+                        "body_collision_onset"
+                    ],
+                    target_vx=target[:, 0],
+                    target_vy=target[:, 1],
+                    target_wz=target[:, 2],
+                    exec_vx=executed[:, 0],
+                    exec_vy=executed[:, 1],
+                    exec_wz=executed[:, 2],
+                    measured_vx=diagnostic_aux[:, 6],
+                    measured_vy=diagnostic_aux[:, 7],
+                    measured_wz=diagnostic_aux[:, 8],
+                    true_vx=diagnostic_aux[:, 12],
+                    true_vy=diagnostic_aux[:, 13],
+                    true_wz=diagnostic_aux[:, 14],
+                    collision_force=diagnostic_aux[
+                        :, p2_contract.BODY_COLLISION_FORCE_INDEX
+                    ],
+                    progress=start_goal - end_goal,
+                    segment=diagnostic_aux[:, p2_contract.CURRENT_SEGMENT_INDEX],
+                    column=diagnostic_aux[:, p2_contract.PRE_STEP_TERRAIN_TYPE_INDEX],
+                    reason=terminal_reason,
+                    risk=algorithm.last_tick_diagnostics[
+                        "predictive_collision_risk"
+                    ],
+                )
+                gait_reward = algorithm.last_tick_penalties["gait_symmetry"].reshape(-1)
+                predictive_clearance = algorithm.last_tick_diagnostics[
+                    "predictive_collision_clearance_m"
+                ].reshape(-1)
+                predictive_risk = algorithm.last_tick_diagnostics[
+                    "predictive_collision_risk"
+                ].reshape(-1)
+                predictive_penalty = algorithm.last_tick_penalties[
+                    "predictive_collision_risk"
+                ].reshape(-1)
+                teacher_risk = torch.stack(
+                    tuple(
+                        algorithm.last_tick_diagnostics[f"teacher_risk_{name}"].reshape(-1)
+                        for name in ("left", "center", "right")
+                    ),
+                    dim=1,
+                ).amax(dim=1)
+                add_command_bin(command_bin_gait, gait_reward)
+                add_segment(row_gait, gait_reward)
+                add_segment(row_predictive_clearance, predictive_clearance)
+                add_segment(row_predictive_risk, predictive_risk)
+                add_segment(row_predictive_penalty, predictive_penalty)
+                add_segment(row_teacher_risk, teacher_risk)
+                add_segment(row_teacher_high_risk, teacher_risk >= 0.5)
+                if _tick < p2_contract.NAV_ROLLOUT_TICKS - 1 and full:
+                    raise RuntimeError("P2 rollout filled before the 32-tick boundary")
+                if _tick == p2_contract.NAV_ROLLOUT_TICKS - 1 and not full:
+                    raise RuntimeError("P2 rollout did not fill at the 32-tick boundary")
+
+            metrics = algorithm.update()
+            now = time.monotonic()
+            algorithm.update_training_clocks(
+                resumed_seconds + (now - session_started)
+            )
+            curriculum_snapshot = algorithm.curriculum_probe.state_dict()
+            agent.training_elapsed_h = algorithm.effective_training_seconds / 3600.0
+            unfrozen_now = algorithm.maybe_unfreeze_cnn(algorithm.session_effective_seconds)
+            if unfrozen_now and not unfreeze_save_done:
+                _request_periodic_save(agent, logger, "cnn_unfreeze_boundary")
+                unfreeze_save_done = True
+                saved_schedule_boundaries.add(p2_contract.SAFETY_WARM_END_SECONDS)
+            for boundary in schedule_boundaries:
+                if (
+                    boundary <= algorithm.session_effective_seconds
+                    and boundary not in saved_schedule_boundaries
+                ):
+                    _request_periodic_save(
+                        agent, logger, f"schedule_boundary_{int(boundary)}s"
+                    )
+                    saved_schedule_boundaries.add(boundary)
+
+            due = algorithm.session_effective_seconds >= next_save_effective
+            retry_due = retry_save_at is not None and now >= retry_save_at
+            if due or retry_due:
+                if _request_periodic_save(agent, logger, "wall_clock" if due else "retry"):
+                    retry_save_at = None
+                    while next_save_effective <= algorithm.session_effective_seconds:
+                        next_save_effective += save_interval_s
+                else:
+                    retry_save_at = now + 60.0
+
+            metrics.update(algorithm.memory_metrics())
+            metrics.update(collision_traces.drain(logger))
+            if diagnostic_count:
+                success_count = float(
+                    diagnostic_sums.get(
+                        "success_rate", torch.zeros((), device=agent.device)
+                    ).detach().cpu()
+                )
+                failure_count = float(
+                    diagnostic_sums.get(
+                        "failure_rate", torch.zeros((), device=agent.device)
+                    ).detach().cpu()
+                )
+                timeout_count = float(
+                    diagnostic_sums.get(
+                        "timeout_rate", torch.zeros((), device=agent.device)
+                    ).detach().cpu()
+                )
+                terminal_count = success_count + failure_count + timeout_count
+                metrics.update(
+                    {
+                        "rollout_success_count": success_count,
+                        "rollout_failure_count": failure_count,
+                        "rollout_timeout_count": timeout_count,
+                        "rollout_terminal_count": terminal_count,
+                        "episode_success_fraction": success_count
+                        / max(terminal_count, 1.0),
+                        "episode_timeout_fraction": timeout_count
+                        / max(terminal_count, 1.0),
+                    }
+                )
+                metrics.update(
+                    {
+                        name: float(value.detach().cpu()) / diagnostic_count
+                        for name, value in diagnostic_sums.items()
+                    }
+                )
+                eligible_safe_choices = float(
+                    diagnostic_sums.get(
+                        "safe_alternative_available",
+                        torch.zeros((), device=agent.device),
+                    ).detach().cpu()
+                )
+                selected_safest_choices = float(
+                    diagnostic_sums.get(
+                        "selected_safest_direction",
+                        torch.zeros((), device=agent.device),
+                    ).detach().cpu()
+                )
+                metrics["selected_safest_direction_rate"] = (
+                    selected_safest_choices / max(eligible_safe_choices, 1.0)
+                )
+                metrics.update(
+                    {
+                        name: float(value.detach().cpu())
+                        for name, value in diagnostic_maxima.items()
+                    }
+                )
+            valid_count = float(diagnostic_valid_count.detach().cpu())
+            if valid_count > 0.0:
+                metrics.update(
+                    {
+                        name: float(value.detach().cpu()) / valid_count
+                        for name, value in diagnostic_valid_sums.items()
+                    }
+                )
+            metrics.update(_curriculum_metrics(curriculum_snapshot))
+            for name, buffer in quantile_samples.items():
+                sample = buffer.reshape(-1)
+                sample = sample[torch.isfinite(sample)]
+                if not sample.numel():
+                    continue
+                for label, quantile in (("p10", 0.10), ("p50", 0.50), ("p90", 0.90)):
+                    metrics[f"{name}_{label}"] = float(torch.quantile(sample.float(), quantile))
+            for vx_index in range(5):
+                for wz_index in range(4):
+                    count = float(command_bin_counts[vx_index, wz_index])
+                    prefix = f"cmd_v{vx_index}_w{wz_index}"
+                    metrics[f"{prefix}_count"] = count
+                    metrics[f"{prefix}_share"] = count / max(1.0, diagnostic_count)
+                    denominator = max(1.0, count)
+                    for suffix, source in (
+                        ("progress", command_bin_progress),
+                        ("tracking_mae", command_bin_tracking),
+                        ("target_vx", command_bin_target_vx),
+                        ("exec_vx", command_bin_exec_vx),
+                        ("true_vx", command_bin_true_vx),
+                        ("target_abs_wz", command_bin_target_wz),
+                        ("exec_abs_wz", command_bin_exec_wz),
+                        ("true_abs_wz", command_bin_true_wz),
+                        ("gait_penalty", command_bin_gait),
+                        ("success", command_bin_success),
+                        ("failure", command_bin_failure),
+                        ("timeout", command_bin_timeout),
+                        ("vy_nonzero_share", command_bin_vy_nonzero),
+                        ("target_abs_vy", command_bin_abs_vy),
+                        ("vy_outer_share", command_bin_vy_outer),
+                    ):
+                        metric_denominator = denominator
+                        if suffix == "tracking_mae":
+                            metric_denominator = max(
+                                1.0,
+                                float(command_bin_tracking_counts[vx_index, wz_index]),
+                            )
+                        metrics[f"{prefix}_{suffix}"] = float(
+                            source[vx_index, wz_index]
+                        ) / metric_denominator
+            for index, label in enumerate(("slope_inv", "stairs_inv", "maze")):
+                denominator = max(1.0, float(row_counts[index]))
+                metrics[f"{label}_sample_share"] = float(row_counts[index]) / max(
+                    1.0, float(segment_diagnostic_count)
+                )
+                for suffix, source in (
+                    ("progress_mps", row_progress),
+                    ("target_vx", row_target_vx),
+                    ("exec_vx", row_exec_vx),
+                    ("true_vx", row_true_vx),
+                    ("target_abs_wz", row_target_wz),
+                    ("stop_ratio", row_stop),
+                    ("creep_ratio", row_creep),
+                    ("spin_ratio", row_spin),
+                    ("gait_penalty", row_gait),
+                    ("success", row_success),
+                    ("failure", row_failure),
+                    ("timeout", row_timeout),
+                    ("predictive_clearance_m", row_predictive_clearance),
+                    ("predictive_risk", row_predictive_risk),
+                    ("predictive_penalty", row_predictive_penalty),
+                    ("teacher_risk", row_teacher_risk),
+                    ("teacher_high_risk_rate", row_teacher_high_risk),
+                ):
+                    metrics[f"{label}_{suffix}"] = float(source[index]) / denominator
+            metrics.update(
+                {
+                    "effective_training_seconds": algorithm.effective_training_seconds,
+                    "session_effective_seconds": algorithm.session_effective_seconds,
+                    "lifetime_effective_seconds": algorithm.lifetime_effective_seconds,
+                    "lifecycle_success": float(lifecycle_success),
+                    "lifecycle_failures": float(lifecycle_failures),
+                    "rollout_time_s": now - rollout_started,
+                    "env_step_time_s": env_step_time_s,
+                    "samples_per_s": (
+                        p2_contract.NAV_ROLLOUT_TICKS * agent.num_envs
+                        / max(now - rollout_started, 1.0e-6)
+                    ),
+                    "cnn_unfrozen": float(algorithm.cnn_unfrozen),
+                }
+            )
+            if now - last_log >= 60.0 or algorithm.current_iteration == 1:
+                logger.info(
+                    "[P2NavPPO] "
+                    f"iter={algorithm.current_iteration} effective_min={algorithm.effective_training_seconds / 60.0:.1f} "
+                    f"phase={algorithm.current_phase} actor={metrics.get('actor_loss', 0.0):.4f} "
+                    f"critic={metrics.get('critic_loss', 0.0):.4f} adapter={metrics.get('adapter_loss', 0.0):.4f} "
+                    f"micro_frames={algorithm.micro_sequences * 16} lifecycle={lifecycle_success} "
+                    f"lifecycle_fail={lifecycle_failures} memory={algorithm.memory_metrics()}"
+                )
+                _monitor_put(monitor, metrics, logger)
+                last_log = now
+        _final_save(agent, logger, "four_session_hours_complete")
+    except (SystemExit, KeyboardInterrupt) as exc:
+        _final_save(agent, logger, type(exc).__name__)
+        raise
+    finally:
+        if previous_sigterm is not None:
+            signal.signal(signal.SIGTERM, previous_sigterm)

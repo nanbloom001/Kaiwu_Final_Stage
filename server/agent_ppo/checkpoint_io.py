@@ -79,6 +79,17 @@ P15_RESPONSE_PHASE_LABELS = (
     "responsecalib",
 )
 
+P2_NAV_PHASE_LABELS = (
+    "navwarm",
+    "navadapt",
+    "vywarm",
+    "vyadapt",
+    "navfull",
+    "safewarm",
+    "safefull",
+    "safestable",
+)
+
 _PROBE_NAME = re.compile(r"^model\.ckpt-[a-z]*-*[0-9]+\.[^.]+$")
 
 
@@ -176,6 +187,104 @@ def p15_response_parent_candidates(path: str, model_id: str | int) -> list[str]:
     return result
 
 
+def p2_nav_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
+    """Prefer same-ID P2 resume/evaluation candidates, newest phase first."""
+    model_id = str(model_id)
+    return [
+        os.path.join(path, f"model.ckpt-{label}-{model_id}.pkl")
+        for label in reversed(P2_NAV_PHASE_LABELS)
+    ]
+
+
+def p2_nav_discovery_candidates(path: str) -> list[str]:
+    """Discover P2 bundles without treating the platform model ID as a gate.
+
+    The Arena-provided ID is useful selection metadata, but stale or rewritten
+    IDs must not make an otherwise compatible bundle unloadable.  Phase
+    priority remains deterministic; within one phase the newest file wins.
+    Structural compatibility is still validated by the P2 loader.
+    """
+    result: list[str] = []
+    for label in reversed(P2_NAV_PHASE_LABELS):
+        discovered = sorted(
+            glob.glob(os.path.join(path, f"model.ckpt-{label}-*.pkl")),
+            key=lambda filename: (os.path.getmtime(filename), filename),
+            reverse=True,
+        )
+        for candidate in discovered:
+            if os.path.isfile(candidate) and candidate not in result:
+                result.append(candidate)
+    return result
+
+
+def p2_nav_parent_candidates(path: str, model_id: str | int) -> list[str]:
+    """Return the preferred P1.5 responsecalib parent for one lineage ID."""
+    candidate = os.path.join(
+        path,
+        f"model.ckpt-responsecalib-{str(model_id)}.pkl",
+    )
+    return [candidate] if os.path.isfile(candidate) else []
+
+
+def p2_nav_parent_discovery_candidates(path: str) -> list[str]:
+    """Discover responsecalib parents as a warning-only identity fallback."""
+    return sorted(
+        (
+            candidate
+            for candidate in glob.glob(
+                os.path.join(path, "model.ckpt-responsecalib-*.pkl")
+            )
+            if os.path.isfile(candidate)
+        ),
+        key=lambda filename: (os.path.getmtime(filename), filename),
+        reverse=True,
+    )
+
+
+def p2_nav_evaluation_candidates(
+    path: str, model_id: str | int
+) -> list[str]:
+    """Prefer the requested P2 ID, then discover bundles when files are absent.
+
+    Candidate fallback is existence-only. Once a file is selected, deserialization
+    and structural compatibility failures must remain hard errors.
+    """
+    result: list[str] = []
+    for candidate in (
+        *p2_nav_checkpoint_candidates(path, model_id),
+        *p2_nav_discovery_candidates(path),
+    ):
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+
+def p2_nav_training_candidates(
+    path: str,
+    model_id: str | int,
+    *,
+    parent_model_id: str | int,
+) -> list[str]:
+    """Prefer exact resume, then the configured parent, then absent-file fallbacks.
+
+    A requested-ID mismatch is diagnostic only.  The configured parent is
+    always considered, even when the platform injects another preload ID.
+    Once an existing file is selected, structural failures must not silently
+    downgrade exact resume or replace the configured parent.
+    """
+    result: list[str] = []
+    for candidate in (
+        *p2_nav_checkpoint_candidates(path, model_id),
+        *p2_nav_checkpoint_candidates(path, parent_model_id),
+        *p2_nav_parent_candidates(path, parent_model_id),
+        *p2_nav_discovery_candidates(path),
+        *p2_nav_parent_discovery_candidates(path),
+    ):
+        if candidate not in result:
+            result.append(candidate)
+    return result
+
+
 def low_level_only_parent_candidates(path: str, model_id: str | int) -> list[str]:
     """Explicit opt-in candidates for extracting only Standard low-level state."""
     result: list[str] = []
@@ -189,7 +298,9 @@ def low_level_only_parent_candidates(path: str, model_id: str | int) -> list[str
     return result
 
 
-def classify_locomotion_eval_high_level(bundle: dict[str, Any]) -> str:
+def classify_locomotion_eval_high_level(
+    bundle: dict[str, Any], *, allow_complete_hier_nav_low_level_only: bool = False
+) -> str:
     """Classify optional high-level state before low-level Camera evaluation.
 
     P1.5 stores its auxiliary ResponseAdapter under ``modules.high_level`` even
@@ -206,6 +317,13 @@ def classify_locomotion_eval_high_level(bundle: dict[str, Any]) -> str:
         return "absent"
 
     high_level = modules.get("high_level")
+    if (
+        allow_complete_hier_nav_low_level_only
+        and bundle.get("stage_type") == "p2_nav_ppo"
+        and isinstance(high_level, dict)
+        and high_level.get("component_status") == "complete"
+    ):
+        return "complete_hier_nav_ignored_by_explicit_low_level_only_eval"
     expected_spec = {
         "class_name": "CommandResponseAdapter",
         "input_dim": 32,

@@ -22,6 +22,32 @@ from tools.base_env.base_reward import RewardProcessBase
 
 
 class RewardProcess(RewardProcessBase):
+    def _p2_goal_geometry(self):
+        goal = getattr(self.env, "goal_positions", None)
+        if not torch.is_tensor(goal):
+            zeros = torch.zeros(self.env.num_envs, 2, device=self.env.device)
+            return zeros, torch.zeros(self.env.num_envs, device=self.env.device), zeros
+        robot = self._get_robot_asset()
+        delta_w = goal[:, :2] - robot.data.root_pos_w[:, :2]
+        distance = torch.linalg.vector_norm(delta_w, dim=-1)
+        quat = robot.data.root_quat_w
+        w, x, y, z = quat.unbind(-1)
+        yaw = torch.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y.square() + z.square()),
+        )
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        local = torch.stack(
+            (
+                cos_yaw * delta_w[:, 0] + sin_yaw * delta_w[:, 1],
+                -sin_yaw * delta_w[:, 0] + cos_yaw * delta_w[:, 1],
+            ),
+            dim=-1,
+        )
+        direction = torch.nn.functional.normalize(local, dim=-1, eps=1.0e-6)
+        return local, distance, direction
+
     def _p15_contact_statistics(self, ema_tau_s: float = 1.0):
         """Return current air time and a once-per-step contact-duty EMA."""
         sensor_cfg = self._get_foot_sensor_cfg()
@@ -410,15 +436,52 @@ class RewardProcess(RewardProcessBase):
         robot_pos = robot.data.root_pos_w[:, :2]
         goal_pos = self.env.goal_positions[:, :2]
         current_dist = torch.norm(goal_pos - robot_pos, dim=1)
-        if not hasattr(self.env, "_previous_goal_dist") or self.env._previous_goal_dist is None:
-            self.env._previous_goal_dist = current_dist.clone()
+        previous = getattr(self.env, "_p2_previous_goal_dist", None)
+        valid = getattr(self.env, "_p2_previous_goal_valid", None)
+        if not torch.is_tensor(previous) or previous.shape != current_dist.shape:
+            self.env._p2_previous_goal_dist = current_dist.clone()
+            self.env._p2_previous_goal_valid = torch.zeros_like(current_dist, dtype=torch.bool)
+            self.env._p2_last_goal_progress = torch.zeros_like(current_dist)
             return torch.zeros(self.env.num_envs, device=self.env.device)
-        delta_dist = current_dist - self.env._previous_goal_dist
+        if not torch.is_tensor(valid) or valid.shape != current_dist.shape:
+            valid = torch.zeros_like(current_dist, dtype=torch.bool)
+        raw_progress = previous - current_dist
         term_mgr = self.env.termination_manager
         reset_mask = term_mgr.terminated | term_mgr.time_outs
-        delta_dist[reset_mask] = 0.0
-        self.env._previous_goal_dist = current_dist.clone()
-        return -delta_dist
+        progress = torch.where(
+            valid & ~reset_mask,
+            raw_progress,
+            torch.zeros_like(raw_progress),
+        )
+        self.env._p2_previous_goal_dist = current_dist.clone()
+        self.env._p2_previous_goal_valid = ~reset_mask
+        # Curriculum diagnostics need the terminal-frame distance delta even
+        # though the reward itself masks reset boundaries.
+        self.env._p2_last_goal_progress = torch.where(
+            valid,
+            raw_progress,
+            torch.zeros_like(raw_progress),
+        ).detach().clone()
+        return progress
+
+    def _reward_goal_heading_alignment(self, std: float = 0.75):
+        _, distance, direction = self._p2_goal_geometry()
+        error = torch.atan2(direction[:, 1], direction[:, 0])
+        return torch.exp(-torch.square(error / max(float(std), 1.0e-6))) * (distance > 0.6)
+
+    def _reward_goal_velocity_projection(self, max_speed: float = 0.75):
+        robot = self._get_robot_asset()
+        _, distance, direction = self._p2_goal_geometry()
+        projection = torch.sum(robot.data.root_lin_vel_b[:, :2] * direction, dim=-1)
+        return torch.clamp(projection / max(float(max_speed), 1.0e-6), -1.0, 1.0) * (distance > 0.6)
+
+    def _reward_goal_distance(self, scale: float = 8.0):
+        _, distance, _ = self._p2_goal_geometry()
+        return torch.exp(-distance / max(float(scale), 1.0e-6))
+
+    def _reward_task_complete(self, threshold: float = 0.6):
+        _, distance, _ = self._p2_goal_geometry()
+        return (distance < float(threshold)).float()
 
     def _reward_heading_velocity(self):
         """Reward velocity projected toward the goal."""
