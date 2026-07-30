@@ -1,0 +1,99 @@
+{
+  "profile": "/home/unitree/Kaiwu-test/sim2real_test_378413_hardened/runtime/unitree_rl_lab_test/deploy/robots/go2_loco/config/transparent_guard_candidate.json",
+  "results": [
+    {
+      "effort_available": false,
+      "maxima": {
+        "raw_abs": 7.137994,
+        "raw_step": 3.145302
+      },
+      "motion_frames": 1191,
+      "output_guard_pass": true,
+      "path": "/home/unitree/Kaiwu-test/sim2real_test_loco/runtime/unitree_rl_lab_test/logs/loco/logs/visloco_diag_1783840888.csv",
+      "provisional_effort_trip": null,
+      "role": "historical",
+      "sha256": "118d8e3d02f026da48e0d874169bcefde5c5379df4325f6068ea05c9c238d296",
+      "violations": {
+        "raw_abs": 0,
+        "raw_step": 0,
+        "target_range": 0
+      }
+    },
+    {
+      "effort_available": false,
+      "maxima": {
+        "raw_abs": 7.569293,
+        "raw_step": 2.604486
+      },
+      "motion_frames": 4173,
+      "output_guard_pass": true,
+      "path": "/home/unitree/Kaiwu-test/sim2real_test_loco/runtime/unitree_rl_lab_test/logs/loco/logs/visloco_diag_1783840935.csv",
+      "provisional_effort_trip": null,
+      "role": "historical",
+      "sha256": "ac9bd3fbc2e3aa51c9295c6cb73d601a17a111d432cce6b9e512f0fa8b40000d",
+      "violations": {
+        "raw_abs": 0,
+        "raw_step": 0,
+        "target_range": 0
+      }
+    },
+    {
+      "effort_available": false,
+      "maxima": {
+        "raw_abs": 6.872056,
+        "raw_step": 3.5306480000000002
+      },
+      "motion_frames": 4066,
+      "output_guard_pass": true,
+      "path": "/home/unitree/Kaiwu-test/sim2real_test_loco/runtime/unitree_rl_lab_test/logs/loco/logs/visloco_diag_1783841034.csv",
+      "provisional_effort_trip": null,
+      "role": "historical",
+      "sha256": "6d90228d77c599c5dae857ac2aa7591d2aab73a128bce70787732ddacccc40a7",
+      "violations": {
+        "raw_abs": 0,
+        "raw_step": 0,
+        "target_range": 0
+      }
+    },
+    {
+      "effort_available": true,
+      "maxima": {
+        "raw_abs": 4.349298,
+        "raw_step": 1.921974
+      },
+      "motion_frames": 98,
+      "output_guard_pass": true,
+      "path": "logs/20260730_174509_loco_suspended_parity_378413/visloco_diag_1785404730.csv",
+      "provisional_effort_trip": null,
+      "role": "candidate",
+      "sha256": "87037719ccfbc554cbfe24e7adc32eef41029481bb37f43fe1639d1dbf17f2b7",
+      "violations": {
+        "raw_abs": 0,
+        "raw_step": 0,
+        "target_range": 0
+      }
+    },
+    {
+      "effort_available": true,
+      "maxima": {
+        "raw_abs": 4.893317,
+        "raw_step": 2.554916
+      },
+      "motion_frames": 64,
+      "output_guard_pass": true,
+      "path": "logs/20260730_153540_loco_keyboard_378413_hardened/visloco_diag_1785396976.csv",
+      "provisional_effort_trip": [
+        28,
+        9,
+        12.802061
+      ],
+      "role": "negative",
+      "sha256": "de8a222d790c60ad8dd6add50c4fdd6d07676e6e367ffe4ad361d94c27d9e501",
+      "violations": {
+        "raw_abs": 0,
+        "raw_step": 0,
+        "target_range": 0
+      }
+    }
+  ]
+}

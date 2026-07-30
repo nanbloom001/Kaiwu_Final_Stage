@@ -1,0 +1,198 @@
+FSM:
+  initial_state: Passive
+  safety:
+    max_tilt_deg: 25.0
+  FixStand:
+    kd:
+    - 5
+    - 4
+    - 4
+    - 5
+    - 4
+    - 4
+    - 5
+    - 4
+    - 4
+    - 5
+    - 4
+    - 4
+    kp:
+    - 60
+    - 80
+    - 80
+    - 60
+    - 80
+    - 80
+    - 60
+    - 80
+    - 80
+    - 60
+    - 80
+    - 80
+    qs:
+    - []
+    - - 0.0
+      - 1.36
+      - -2.65
+      - 0.0
+      - 1.36
+      - -2.65
+      - 0.0
+      - 1.36
+      - -2.65
+      - 0.0
+      - 1.36
+      - -2.65
+    - - -0.1
+      - 0.8
+      - -1.5
+      - 0.1
+      - 0.8
+      - -1.5
+      - -0.1
+      - 1.0
+      - -1.5
+      - 0.1
+      - 1.0
+      - -1.5
+    transitions:
+      Passive: LT + B.on_pressed
+      VisionLoco: LT + X.on_pressed
+    ts:
+    - 0
+    - 1
+    - 2
+  Passive:
+    kd:
+    - 3
+    - 3
+    - 3
+    - 3
+    - 3
+    - 3
+    - 3
+    - 3
+    - 3
+    - 3
+    - 3
+    - 3
+    mode:
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    transitions:
+      FixStand: LT + A.on_pressed
+  Velocity:
+    policy_dir: ../../../logs/rsl_rl/unitree_go2_velocity
+    transitions:
+      Passive: LT + B.on_pressed
+  VisionLoco:
+    command_source: keyboard
+    entry_blend_s: 1.0
+    ready_stand:
+      gain_blend_s: 1.5
+      max_joint_velocity: 0.5
+      max_support_target_offset_rad: 0.2
+      max_tracking_error_rad: 0.3
+      max_wait_s: 5.0
+      min_stable_s: 0.5
+    depth:
+      constant_value: 0.6
+      filters:
+        mode: light_spatial
+        spatial_magnitude: 2
+        spatial_smooth_alpha: 0.5
+        spatial_smooth_delta: 20
+        temporal_alpha: 0.25
+        temporal_delta: 20
+      source: realsense
+    fixed_cmd:
+    - 0.15
+    - 0.0
+    - 0.0
+    goal:
+    - 0.1
+    - 0.0
+    - 0.05
+    - 0.0
+    keyboard:
+      idle_timeout_s: 10.0
+      max_vx: 0.15
+      max_wz: 0.1
+      max_nonzero_s: 0.0
+      step_vx: 0.15
+      step_wz: 0.1
+      target_hz: 5.0
+    logging:
+      enabled: true
+      flush_every: 50
+      max_consecutive_errors: 1
+    harness_guard:
+      profile: transparent_guard_candidate_v1
+      raw_action_abs_max: [4.75, 5.5, 4.25, 4.5, 4.75, 7.0, 7.0, 4.5, 7.5, 7.5, 5.5, 8.0]
+      raw_action_step_max: [2.0, 3.0, 2.0, 2.0, 2.75, 3.25, 3.5, 2.0, 3.5, 3.25, 2.75, 4.0]
+      target_min_rad: [-1.1, -0.65, -1.0, -0.8, -0.2, -0.95, 0.2, 0.2, -3.4, -2.45, -2.55, -2.9]
+      target_max_rad: [1.3, 1.35, 0.65, 1.05, 2.05, 1.85, 2.8, 2.15, 0.2, 0.45, -0.1, 0.5]
+      joint_effort_abs_nm: 12.0
+      effort_trip_frames: 3
+    safety:
+      action_step_trip_frames: 3
+      grace_s: 2.0
+      max_raw_action_abs: 6.0
+      max_raw_action_step: 1.0
+      max_target_step_rad: 0.03
+      max_tilt_deg: 25.0
+      max_tracking_error_rad: 0.5
+      max_motion_tracking_error_rad: 1.0
+      motion_tracking_error_trip_frames: 25
+      tracking_error_trip_frames: 10
+      zero_command_hold_threshold: 0.02
+    policy_dir: ../../../logs/loco
+    transitions:
+      Passive: LT + B.on_pressed
+    uwb:
+      buffer_seconds: 3.0
+      cmd_slew_rate:
+      - 0.3
+      - 0.3
+      - 1.0
+      cmd_vx_mode: goal_08
+      cruise_cmd:
+      - 0.8
+      - 0.0
+      - 0.0
+      diagnostic_feedback: true
+      filter_tau: 0.1
+      goal_driven: false
+      hold_timeout: 1.5
+      max_vx: 0.3
+      max_vy: 0.0
+      max_wz: 0.4
+      median_window: 0.2
+      slow_distance: 1.0
+      sport_state_topic: rt/sportmodestate
+      stale_timeout: 0.5
+      stop_distance: 0.35
+      stop_hysteresis: 0.15
+      stop_once: false
+      topic: rt/uwbstate
+      turn_in_place_angle: 1.0472
+      velocity_filter_alpha: 0.2
+      yaw_kp: 0.8
+  _:
+    FixStand:
+      id: 2
+    Passive:
+      id: 1
+    VisionLoco:
+      id: 4
+      type: VisionLoco

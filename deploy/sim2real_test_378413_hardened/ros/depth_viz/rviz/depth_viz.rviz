@@ -1,0 +1,112 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 0
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /PointCloud21
+        - /DepthCloud1
+      Splitter Ratio: 0.5
+    Tree Height: 600
+  - Class: rviz_common/Views
+    Expanded: []
+    Name: Views
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Cell Size: 0.5
+      Color: 100; 100; 100
+      Line Style:
+        Line Width: 0.03
+        Value: Lines
+      Normal Cell Count: X: 10 Y: 2 Z: 10
+      Offset: {X: 0, Y: 0, Z: 0}
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+
+    - Class: rviz_default_plugins/Axes
+      Name: Origin
+      Length: 0.5
+      Radius: 0.03
+      Reference Frame: <Fixed Frame>
+
+    - Class: rviz_default_plugins/PointCloud2
+      Name: PointCloud2
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /depth_camera/depth/points
+      Alpha: 1
+      Color Transformer: AxisColor
+      Axis: Z
+      Max Color: 255; 255; 255
+      Min Color: 0; 0; 0
+      Use Fixed Frame: true
+      Size (Pixels): 3
+      Size (m): 0.03
+      Style: Spheres
+      Decay Time: 0
+      Use rainbow: true
+      Invert Rainbow: false
+      Min Color Distance: 0.3
+      Max Color Distance: 5.0
+
+    - Class: rviz_default_plugins/Image
+      Name: Depth Image
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /depth_camera/depth/image_rect_raw
+      Max Value: 5.0
+      Median window: 5
+      Min Value: 0.0
+      Normalize Range: true
+
+    - Class: rviz_default_plugins/Image
+      Name: Color Image
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /depth_camera/color/image_raw
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: depth_camera_depth_optical_frame
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 3.0
+      Focal Point: {X: 0.5, Y: 0.0, Z: 0.0}
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Pitch: 0.35
+      Target Frame: depth_camera_depth_optical_frame
+      Yaw: 4.71
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Width: 1600
+  X: 50
+  Y: 50
+  Views:
+    collapsed: true
