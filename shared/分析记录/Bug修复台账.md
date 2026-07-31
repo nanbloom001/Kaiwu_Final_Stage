@@ -2834,12 +2834,14 @@
   `215 passed, 5 skipped`；5 个 skip 均为真实 `highslow-884257` checkpoint 未暂存的集成测试。
   覆盖 mirror 双次恢复、显式 joint order、命令范围/符号平衡、分桶基线回退与未完成 reservoir
   resume、事件奖励独立触发、Adapter calibration Actor step 禁用、P3 Track worker bridge 和双评估
-  装配。Python 编译、全部 TOML 解析与 `git diff --check` 通过；平台 Monitor builder、真实
-  884257 联合 rollout/update/save/resume 和 15-30 分钟 smoke 尚未执行，不能升级为平台已验证。
+  装配。Python 编译、全部 TOML 解析与 `git diff --check` 通过；本地 fake builder 验证 P3
+  44 个面板且每个 line 面板最多 20 指标。平台真实 Monitor builder、884257 联合 rollout/update/
+  save/resume 和 15-30 分钟 smoke 尚未执行，不能升级为平台已验证。
 - 防复发与回滚：新增阶段标签必须同步 checkpoint candidate 和 round-trip 测试；P3 wire 维度只可
   在训练 stage 扩展；足端/ContactSensor/joint mapping 或 tensor shape 异常时关闭镜像及步态奖励并
   告警。回滚可禁用 gait fraction 和 worker sampler、恢复旧 P3 contract，不需要改变 checkpoint
   低层/高层模块；再次遇到时最短路径为 `worker wire shape -> mapping valid -> baseline samples/
   fallback -> mirror gradient ratio -> gait reward terms -> Adapter pool ratios -> Standard/Track eval stage`。
-- 关联：父 checkpoint `p3nav8h-r1_884257`；当前实现 commit、合并 commit、PR、新 checkpoint、
-  容器同步与平台任务均待产生，产生后追加，不得预填。
+- 关联：父 checkpoint `p3nav8h-r1_884257`；实现 commit `49b0cb5`，双评估 merge commit
+  `0b03a8b`（含 `codex/p3-dual-eval` 的 `09889b1`）。PR、新 checkpoint、容器同步与平台任务
+  均待产生，产生后追加，不得预填。
