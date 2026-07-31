@@ -268,7 +268,6 @@ class P3EvalWorkerBridgeTest(unittest.TestCase):
         from agent_ppo.feature import p2_worker_bridge
 
         stage = type("Stage", (), {"algorithm": algorithm})()
-
         with mock.patch.object(
             Config,
             "load_conf",
