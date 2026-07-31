@@ -34,12 +34,18 @@ error was `7.2e-7`.
 
 ```yaml
 command_source: fixed
-fixed_cmd: [0.20, 0.0, 0.0]
+fixed_cmd: [0.0, 0.0, 0.0]
 ```
 
 The command is deliberately conservative for first hardware bring-up. The
 runner still writes the command into `proprio[6:9]`, preserves the previous
 action in `proprio[33:45]`, and feeds the LSTM state frame to frame.
+
+The runtime enters the policy from the exact mapped default joint posture,
+uses the light RealSense spatial filter (hole filling and temporal filtering
+disabled), and records action/target step sizes plus tracking error. A target
+step above `0.35` rad or tracking error above `0.45` rad is held for safety;
+two consecutive violations request Passive.
 
 ## Export
 
@@ -61,8 +67,8 @@ built on the Jetson and its runtime libraries resolve correctly.
 Validated on 2026-07-31:
 
 - `scripts/run_loco_stage_fixed_test.sh --check` passed on `eth0`.
-- Fixed command: `[0.20, 0.0, 0.0]`.
-- Controller SHA256: `41963e8ac7dc36f83673df052be8fa339884d7f72f5c2d6f11327a44793b2de5`.
+- Fixed command: `[0.0, 0.0, 0.0]`.
+- Controller was rebuilt on Jetson after the runtime safety/filter changes.
 - No controller process was left running and no motor command was started.
 
 After confirming the robot is supported safely and the area is clear, run:
