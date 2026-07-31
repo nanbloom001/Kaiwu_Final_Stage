@@ -137,6 +137,8 @@ def analyze(path: Path) -> dict:
     qerr_names = [f"qerr{i}" for i in range(12) if f"qerr{i}" in c]
     tau_names = [f"tau{i}" for i in range(12) if f"tau{i}" in c]
     pd_tau_names = [f"pd_tau{i}" for i in range(12) if f"pd_tau{i}" in c]
+    target_delta_names = [f"target_delta{i}" for i in range(12) if f"target_delta{i}" in c]
+    power_names = [f"power{i}" for i in range(12) if f"power{i}" in c]
     foot_force_names = [f"foot_force{i}" for i in range(4) if f"foot_force{i}" in c]
     foot_force_est_names = [
         f"foot_force_est{i}" for i in range(4) if f"foot_force_est{i}" in c
@@ -162,6 +164,14 @@ def analyze(path: Path) -> dict:
                 abs(c[f"action{i}"][row] - c[f"action{i}"][row - 1])
                 for i in range(12)
             ))
+
+    target_applied_errors: list[float] = []
+    if len(target_names) == 12 and len(applied_target_names) == 12:
+        for i in range(12):
+            target_applied_errors.extend(
+                abs(target - applied)
+                for target, applied in zip(c[f"target{i}"], c[f"applied_target{i}"])
+            )
 
     cmd = {axis: stats(c[axis]) for axis in ("vx", "vy", "wz")}
     override_detected = (
@@ -315,6 +325,33 @@ def analyze(path: Path) -> dict:
             stats(c["mechanical_power_abs_sum"])
             if "mechanical_power_abs_sum" in c else stats([])
         ),
+        "mechanical_power_abs_max": (
+            stats(c["mechanical_power_abs_max"])
+            if "mechanical_power_abs_max" in c else stats([])
+        ),
+        "joint_velocity_abs_max": (
+            stats(c["joint_velocity_abs_max"])
+            if "joint_velocity_abs_max" in c else stats([])
+        ),
+        "tracking_error_rms": (
+            stats(c["tracking_error_rms"])
+            if "tracking_error_rms" in c else stats([])
+        ),
+        "direct_policy_actions": {
+            "enabled": (
+                "direct_action_mode" in c
+                and bool(c["direct_action_mode"])
+                and min(c["direct_action_mode"]) >= 0.5
+            ),
+            "target_applied_abs_error": stats(target_applied_errors),
+            "target_delta_abs": {
+                name: stats([abs(value) for value in c[name]])
+                for name in target_delta_names
+            },
+            "joint_power_abs": {
+                name: stats([abs(value) for value in c[name]]) for name in power_names
+            },
+        },
         "foot_force": {
             "raw_abs": {
                 name: stats([abs(value) for value in c[name]]) for name in foot_force_names
@@ -334,6 +371,10 @@ def analyze(path: Path) -> dict:
             "estimated_abs_max": (
                 stats(c["foot_force_est_abs_max"])
                 if "foot_force_est_abs_max" in c else stats([])
+            ),
+            "balance": (
+                stats(c["foot_force_balance"])
+                if "foot_force_balance" in c else stats([])
             ),
         },
         "action_step": stats(action_steps),
@@ -564,13 +605,22 @@ def print_report(report: dict, compact: bool = False) -> None:
             f"absolute mechanical power P95 "
             f"{fmt(report['mechanical_power_abs_sum']['p95'], 2)} W"
         )
+    direct = report["direct_policy_actions"]
+    if direct["enabled"]:
+        print(
+            f"Direct policy action mode | target-to-applied error max "
+            f"{fmt(direct['target_applied_abs_error']['max'], 6)} rad | "
+            f"joint velocity max {fmt(report['joint_velocity_abs_max']['max'], 2)} rad/s | "
+            f"single-joint power max {fmt(report['mechanical_power_abs_max']['max'], 2)} W"
+        )
     foot_force = report["foot_force"]
     if math.isfinite(foot_force["estimated_abs_sum"]["p95"]):
         print(
             f"Foot force raw/estimated absolute-sum P95 "
             f"{fmt(foot_force['raw_abs_sum']['p95'], 1)}/"
             f"{fmt(foot_force['estimated_abs_sum']['p95'], 1)} raw units | "
-            f"estimated channel max {fmt(foot_force['estimated_abs_max']['max'], 1)}"
+            f"estimated channel max {fmt(foot_force['estimated_abs_max']['max'], 1)} | "
+            f"balance P95 {fmt(foot_force['balance']['p95'], 3)}"
         )
     print(f"命令与运控: {report['control_status']}")
     for issue in report["control_issues"]:
