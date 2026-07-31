@@ -15,6 +15,9 @@
   VisionEncoder+Actor77，Track 只装低层+NavigationEncoder+三轴 Actor+ResponseAdapter，
   两者都不创建 Critic/SafetyHead/optimizer/scheduler/训练 buffer。Track 继续复用 P2
   eval transport 与 terminal-return bridge，`goal_reached` 进入平台 scorer 完成数不再恒为 0。
+  Track 首次平台评估（任务 `599777`）发现 worker transport 的 stage 闸门未包含
+  `p3_track_eval`，首次 reset 在 `p2_response_aux()` 报 bridge disabled；现已启用该 eval
+  stage，并确保其读取 `[p3_standard_joint]` 配置而不是误读 P2 配置。
 - **[P3 15 分钟 lifecycle 回归修复]** P3 自定义 workflow 现与已验证的 Nav 边界一致：每个
   成功 `env.step()` 完成 observation/terminal/storage 处理后调用一次平台 lifecycle no-op，低层
   80 帧和高层 320 帧路径均覆盖；失败 step 不推进。新增成功/失败回调面板，普通回调异常只告警，

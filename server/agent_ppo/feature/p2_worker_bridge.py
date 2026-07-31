@@ -526,11 +526,21 @@ def _resolve_config() -> tuple[bool, dict[str, Any], int]:
 
     usr_conf, _, is_eval, stage = Config.load_conf(_Logger())
     algorithm = getattr(stage, "algorithm", "")
-    enabled = algorithm in {"p2_nav_ppo", "p2_nav_eval", "p3_standard_joint"}
+    enabled = algorithm in {
+        "p2_nav_ppo",
+        "p2_nav_eval",
+        "p3_standard_joint",
+        "p3_track_eval",
+    }
     enabled = enabled and (
-        not is_eval or algorithm in {"p2_nav_eval", "p3_standard_joint"}
+        not is_eval
+        or algorithm in {"p2_nav_eval", "p3_standard_joint", "p3_track_eval"}
     )
-    config_key = "p3_standard_joint" if algorithm == "p3_standard_joint" else "p2_nav_ppo"
+    config_key = (
+        "p3_standard_joint"
+        if algorithm in {"p3_standard_joint", "p3_track_eval"}
+        else "p2_nav_ppo"
+    )
     stage_conf = usr_conf.get(config_key, {}) if isinstance(usr_conf, dict) else {}
     stage_conf = dict(stage_conf or {})
     stage_conf["_worker_stage_type"] = algorithm

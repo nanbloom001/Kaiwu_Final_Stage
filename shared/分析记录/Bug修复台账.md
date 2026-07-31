@@ -2675,6 +2675,26 @@
   或 `p3_track_eval` → 同 ID P3 candidate（highslow...lowbase）→ `eval_disposition`/
   loaded modules → 有限前向；禁止从末尾 `NoneType` 反推模型损坏。
 
+### 2026-07-31 补充：Track eval worker bridge stage 闸门遗漏
+
+- 状态：本地已验证，平台 Track 复评待验证。
+- 复现：平台 Track 评估任务 `599777` / 运行 `18564415` 已正确进入 `p3_track_eval`，但首次
+  reset 在 `P2CriticObservationProcess -> p2_response_aux()` 报
+  `RuntimeError: P2 response aux requested while bridge is disabled`，尚未进入 checkpoint 推理。
+- 根因：双评估入口已注册到 agent 与 observation 路由，但 `p2_worker_bridge._resolve_config()`
+  的启用/eval 白名单仍只包含 `p2_nav_ppo`、`p2_nav_eval` 和 `p3_standard_joint`，遗漏
+  `p3_track_eval`；即便只补启用项，旧配置分支也会让它误读 `[p2_nav_ppo]` 而不是
+  `[p3_standard_joint]`。
+- 修复：仅为 `p3_track_eval` 启用共享 worker response transport，并让
+  `p3_standard_joint/p3_track_eval` 共同读取 P3 配置；`p3_standard_eval` 与历史 `lbc_loco`
+  继续禁用该桥，避免 Standard 评估无意装配 P2/P3 Track aux。新增回归覆盖以上三个边界。
+- 修改文件：`server/agent_ppo/feature/p2_worker_bridge.py`、
+  `server/agent_ppo/tests/test_p3_eval.py`、`server/CHANGELOG.md` 与本台账；checkpoint、网络权重、
+  eval action contract 和平台托管 `base_env.py` 均未修改。
+- 防复发：新增任何复用 P2 Track observation/transport 的 eval stage 时，必须同时验证 agent
+  装配、feature 路由、worker bridge stage gate 和配置 section；只验证 `Stage:` 或 checkpoint
+  候选不足以证明首次 reset 可用。
+
 ## 3. 已知高频误判
 
 以下现象可能伴随真实 Bug，但不能单独作为根因：
