@@ -260,6 +260,48 @@ class P3EvalValidatorTest(unittest.TestCase):
             validate_p3_eval_bundle(bundle, mode="deploy")
 
 
+class P3EvalWorkerBridgeTest(unittest.TestCase):
+    """P3 track eval must enable the shared P2 worker transport."""
+
+    def _resolve(self, algorithm, *, is_eval):
+        from agent_ppo.conf.conf import Config
+        from agent_ppo.feature import p2_worker_bridge
+
+        stage = type("Stage", (), {"algorithm": algorithm})()
+
+        with mock.patch.object(
+            Config,
+            "load_conf",
+            classmethod(
+                lambda cls, logger: (
+                    {
+                        "env_conf": {"seed": 7},
+                        "p3_standard_joint": {"run_name": "p3-track-eval"},
+                    },
+                    "eval",
+                    is_eval,
+                    stage,
+                )
+            ),
+        ):
+            return p2_worker_bridge._resolve_config()
+
+    def test_track_eval_enables_bridge_and_reads_p3_section(self):
+        enabled, config, seed = self._resolve("p3_track_eval", is_eval=True)
+        self.assertTrue(enabled)
+        self.assertEqual(config["run_name"], "p3-track-eval")
+        self.assertEqual(config["_worker_stage_type"], "p3_track_eval")
+        self.assertEqual(seed, 7)
+
+    def test_standard_eval_does_not_enable_bridge(self):
+        enabled, _config, _seed = self._resolve("p3_standard_eval", is_eval=True)
+        self.assertFalse(enabled)
+
+    def test_legacy_loco_still_disables_bridge(self):
+        enabled, _config, _seed = self._resolve("lbc_loco", is_eval=True)
+        self.assertFalse(enabled)
+
+
 class P3EvalStageRoutingTest(unittest.TestCase):
     def test_explicit_standard_eval(self):
         usr_conf = {

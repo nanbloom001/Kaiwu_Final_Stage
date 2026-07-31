@@ -29,6 +29,7 @@ from agent_ppo.checkpoint_io import (
     validate_low_level_spec,
 )
 from agent_ppo.feature.definition import RecurrentRolloutStorage
+from agent_ppo.feature import p3_contract
 
 # Recognized schedule modes. ``visual_anchor_anneal_v2`` is the Anchor R2 active
 # branch; the rest are kept as explicit branches so historical checkpoints can
@@ -744,6 +745,10 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             "action_anchor_loss": 0.0,
             "latent_anchor_loss": 0.0,
             "anchor_action_mse": 0.0,
+            "mirror_loss": 0.0,
+            "mirror_sequence_share": 0.0,
+            "mirror_gradient_ratio": 0.0,
+            "mirror_gradient_cosine": 0.0,
         }
         applied_updates = 0
         generator = self.storage.recurrent_mini_batch_generator(
@@ -822,6 +827,71 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 + self.action_anchor_weight * action_anchor_loss
                 + self.latent_anchor_weight_current * latent_anchor_loss
             )
+            mirror_aux = getattr(self, "p3_mirror_aux", None)
+            mirror_metrics = {}
+            if mirror_aux is not None:
+                mirror_loss, mirror_metrics = mirror_aux.loss(
+                    self.actor_critic,
+                    self.storage.observations[: self.storage.step],
+                    self.storage.dones[: self.storage.step],
+                )
+                if bool(mirror_loss.requires_grad) and float(mirror_loss.detach()) > 0.0:
+                    selected_parameters = [
+                        *self.actor_critic.vision_encoder.rnn.parameters(),
+                        *self.actor_critic.vision_encoder.rnn_output_layer.parameters(),
+                        self.actor_critic.actor[-1].weight,
+                        self.actor_critic.actor[-1].bias,
+                    ]
+                    selected_parameters = [p for p in selected_parameters if p is not None and p.requires_grad]
+                    calibrate = (
+                        mirror_aux.gradient_multiplier is None
+                        or sample_index % self.num_mini_batches == 0
+                    )
+                    if calibrate and selected_parameters:
+                        ppo_grad = torch.autograd.grad(
+                            policy_loss, selected_parameters, retain_graph=True, allow_unused=True
+                        )
+                        mirror_grad = torch.autograd.grad(
+                            mirror_loss, selected_parameters, retain_graph=True, allow_unused=True
+                        )
+                        ppo_parts = [g.reshape(-1) for g in ppo_grad if g is not None]
+                        mirror_parts = [g.reshape(-1) for g in mirror_grad if g is not None]
+                        if ppo_parts and mirror_parts:
+                            ppo_flat = torch.cat(ppo_parts)
+                            mirror_flat = torch.cat(mirror_parts)
+                            ppo_norm = ppo_flat.norm().clamp_min(1.0e-12)
+                            mirror_norm = mirror_flat.norm().clamp_min(1.0e-12)
+                            mirror_aux.gradient_multiplier = float(
+                                p3_contract.MIRROR_TARGET_GRADIENT_RATIO
+                                * ppo_norm
+                                / mirror_norm
+                            )
+                            mirror_aux.gradient_ratio = float(
+                                mirror_aux.gradient_multiplier * mirror_norm / ppo_norm
+                            )
+                            mirror_aux.gradient_cosine = float(
+                                F.cosine_similarity(ppo_flat, mirror_flat, dim=0)
+                            )
+                        else:
+                            mirror_aux.gradient_multiplier = 0.0
+                            mirror_aux.gradient_ratio = 0.0
+                            mirror_aux.gradient_cosine = 0.0
+                    multiplier = min(
+                        float(mirror_aux.gradient_multiplier or 0.0),
+                        float(p3_contract.MIRROR_MAX_GRADIENT_RATIO)
+                        / max(float(mirror_aux.gradient_ratio), 1.0e-12)
+                        * float(mirror_aux.gradient_multiplier or 0.0),
+                    )
+                    gradient_ratio = min(
+                        float(mirror_aux.gradient_ratio),
+                        float(p3_contract.MIRROR_MAX_GRADIENT_RATIO),
+                    )
+                    cosine = float(mirror_aux.gradient_cosine)
+                    loss = loss + mirror_loss * multiplier
+                    mirror_metrics.update(
+                        mirror_gradient_ratio=gradient_ratio,
+                        mirror_gradient_cosine=cosine,
+                    )
             if not torch.isfinite(loss):
                 self.skipped_nonfinite_updates += 1
                 if self.logger:
@@ -875,6 +945,13 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             totals["action_anchor_loss"] += float(action_anchor_loss.item())
             totals["latent_anchor_loss"] += float(latent_anchor_loss.item())
             totals["anchor_action_mse"] += float(anchor_action_mse.item())
+            for name in (
+                "mirror_loss", "mirror_sequence_share", "mirror_gradient_ratio",
+                "mirror_gradient_cosine", "mirror_error_fl", "mirror_error_fr",
+                "mirror_error_rl", "mirror_error_rr",
+            ):
+                if name in mirror_metrics:
+                    totals[name] = totals.get(name, 0.0) + float(mirror_metrics[name])
             applied_updates += 1
 
         divisor = max(1, applied_updates)

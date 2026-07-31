@@ -4,7 +4,8 @@
 
 ## [未发布]
 
-- **[P3 Standard 径向完成与 2.5 小时恢复课程]** 新任务 `p3std2h30-s2r-radial` 从
+- **[P3 Standard 双评估、径向完成与步态专项 2.5 小时课程]** 新任务
+  `p3std2h30-gait-radial` 从
   `p3nav8h-r1_884257` warm start。局部目标改为相对真实出生点的 M1 `1.3-1.6m`、M2
   `2.5-2.9m` 与平台 Standard M3；默认 8m 地块使用 `3.90m` proxy、`3.93m` 控制目标和
   `4.00m` 边界，最后 0.20m/0.04m 只限制向外线速度并在完成后归零。正常里程碑晋级保持方向，
@@ -14,7 +15,13 @@
   继续归零；raw frontier clawback 改为有效 timeout 的加权均值。低层成功更新后立即推进 Adapter
   version/history 边界并执行 1/2 次 Adapter update，集中校准阶段每轮 4 次，高层后段每两轮 1 次。
   监控拆分 M1/M2、proxy/platform/joint、一致率、径向距离/历史最佳/M3 hold、低高层 reward mean
-  和 Adapter attempts/applied/skipped。
+  和 Adapter attempts/applied/skipped。低层新增 4 类地形 × 4 类运动的健康父策略基线、25% 完整
+  TBPTT sequence 镜像一致性，以及只在超出基线时生效的接触滑移/冲击、交叉落脚和步态饥饿
+  惩罚；旧 air-time/duty/participation shaping 权重归零。镜像梯度只进入低层 LSTM、RNN 输出层
+  与最终 action head，首 15 分钟 shadow/baseline 阶段冻结 Actor，CNN 始终冻结。P3 worker wire
+  在训练入口扩展为 `critic323 | P2 aux62 | P3 gait/runtime35 = 420`，Track/Standard eval 仍使用各自
+  原有装配且忽略 training-only gait 状态。Adapter replay 改为最新版本 50%、近期 P3 25%、父记录
+  25%；`adaptercalib` 完全跳过高层 Actor backward/step，避免 Adam moments 漂移。
 
 - **[P3 双评估入口回归修复]** 新增两个显式评估入口 `p3_standard_eval`（Standard+Camera 低层-only，
   obs 57901）与 `p3_track_eval`（Track+Camera 完整高低层，obs 57905），供同一个 P3 包 `highslow`
@@ -27,6 +34,11 @@
   VisionEncoder+Actor77，Track 只装低层+NavigationEncoder+三轴 Actor+ResponseAdapter，
   两者都不创建 Critic/SafetyHead/optimizer/scheduler/训练 buffer。Track 继续复用 P2
   eval transport 与 terminal-return bridge，`goal_reached` 进入平台 scorer 完成数不再恒为 0。
+  Track 首次平台评估（任务 `599777`）发现 `P2WorkerBridge._resolve_config()` 的 stage 闸门
+  不含 `p3_track_eval`，worker 首次 env reset 即在 `p2_response_aux()` 报
+  `P2 response aux requested while bridge is disabled`；现已将 `p3_track_eval` 纳入共享
+  feedback/gait transport 启用集合并从 `[p3_standard_joint]` 读配置（`_terminal_safe_root_pose`
+  与 curriculum probe 保持 P2 eval 语义不变）。
 - **[P3 15 分钟 lifecycle 回归修复]** P3 自定义 workflow 现与已验证的 Nav 边界一致：每个
   成功 `env.step()` 完成 observation/terminal/storage 处理后调用一次平台 lifecycle no-op，低层
   80 帧和高层 320 帧路径均覆盖；失败 step 不推进。新增成功/失败回调面板，普通回调异常只告警，

@@ -47,18 +47,18 @@ noise_level = 0.50
 pos = [0.0, 0.0, 0.35]
 
 [commands]
-resampling_time = [2.0, 8.0]
+resampling_time = [300.0, 300.0]
 heading_command = false
 [commands.ranges]
-lin_vel_x = [0.0, 1.0]
+lin_vel_x = [-0.25, 1.0]
 lin_vel_y = [-0.30, 0.30]
 ang_vel_yaw = [-0.90, 0.90]
 [commands.limit]
-lin_vel_x = [0.0, 1.0]
+lin_vel_x = [-0.25, 1.0]
 lin_vel_y = [-0.30, 0.30]
 ang_vel_z = [-0.90, 0.90]
 [commands.worker_progressive]
-enabled = false
+enabled = true
 log_interval_steps = 500
 
 [camera.depth_camera]
@@ -69,7 +69,7 @@ max_depth = 5.0
 enabled = false
 
 [p3_standard_joint]
-run_name = "p3std2h30-s2r-radial"
+run_name = "p3std2h30-gait-radial"
 schedule_mode = "p3_low_recovery_v1"
 parent_model_id = 884257
 parent_model_label = "p3nav8h-r1"
@@ -89,6 +89,7 @@ init_noise_std = 0.15
 first_save_minutes = 5.0
 save_interval_minutes = 10.0
 log_interval = 5
+mirror_seed = 3197
 subgoal_seed = 3107
 milestone_success_reward = 1.5
 m3_success_reward = 15.0
@@ -104,6 +105,12 @@ m3_boundary_margin_m = 0.03
 replan_angle_offsets_deg = [-60.0, -30.0, 30.0, 60.0]
 tile_inner_margin_m = 1.0
 tile_reset_local_abs_m = 3.2
+
+[p3_standard_joint.command_schedule]
+step_dt_s = 0.02
+target_hold_s = [2.0, 8.0]
+zero_hold_s = [2.0, 4.0]
+bucket_weights = [0.25, 0.15, 0.20, 0.15, 0.10, 0.10, 0.05]
 
 [p3_standard_joint.response_adapter]
 learning_rate = 3.0e-5
@@ -140,7 +147,7 @@ weight = 1.25
 std = 0.25
 command_name = "base_velocity"
 [rewards.feet_air_time]
-weight = 0.28
+weight = 0.0
 [rewards.flat_orientation]
 weight = -0.05
 [rewards.p3_posture_stability]
@@ -165,18 +172,18 @@ threshold = 1
 [rewards.air_time_variance_penalty]
 weight = 0.0
 [rewards.max_continuous_air_time_penalty]
-weight = -0.05
+weight = 0.0
 [rewards.max_continuous_air_time_penalty.params]
 soft_limit_s = 0.55
 hard_limit_s = 1.20
 [rewards.contact_duty_factor_symmetry]
-weight = -0.05
+weight = 0.0
 [rewards.contact_duty_factor_symmetry.params]
 ema_tau_s = 1.0
 full_symmetry_wz = 0.15
 minimum_scale = 0.25
 [rewards.foot_contact_participation]
-weight = -0.05
+weight = 0.0
 [rewards.foot_contact_participation.params]
 ema_tau_s = 1.0
 minimum_duty_factor = 0.12

@@ -289,7 +289,7 @@ class Agent(BaseAgent):
             optimizer=self.low_level_optimizer,
             sequence_length=int(conf.get("tbptt_sequence_length", 16)),
             schedule_mode=str(conf.get("schedule_mode", "p3_low_recovery_v1")),
-            run_name=str(conf.get("run_name", "p3std2h30-s2r-radial")),
+            run_name=str(conf.get("run_name", "p3std2h30-gait-radial")),
             source_parent_model_id=conf.get("parent_model_id"),
             anchor_schedule_hours=[], action_anchor_schedule=None,
             latent_anchor_schedule=None, anchor_phase_labels=None,
@@ -324,6 +324,7 @@ class Agent(BaseAgent):
             sequence_length=int(response_conf.get("sequence_length", 16)),
             burn_in_steps=int(response_conf.get("burn_in_steps", 8)),
         )
+        self.response_aux_buffer.replay_policy = "p3_versioned_50_25_25"
         self.high_level_algorithm = AlgorithmP3HighPPO(
             low_level_encoder=self.low_level_model.vision_encoder,
             low_level_actor=self.low_level_model.actor,

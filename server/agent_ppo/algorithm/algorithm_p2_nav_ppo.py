@@ -1734,9 +1734,10 @@ class AlgorithmP2NavPPO:
                 ]
                 minibatch_steps = len(minibatch) * self.rollout.sequence_length
                 actor_started = time.perf_counter()
+                actor_enabled = bool(self._actor_update_enabled())
                 self.actor_optimizer.zero_grad(set_to_none=True)
-                actor_finite = True
-                for micro_start in range(0, len(minibatch), self.micro_sequences):
+                actor_finite = actor_enabled
+                for micro_start in range(0, len(minibatch), self.micro_sequences) if actor_enabled else ():
                     micro = minibatch[micro_start : micro_start + self.micro_sequences]
                     actor_batch = self._actor_sequence_batch(
                         micro,
@@ -1762,7 +1763,7 @@ class AlgorithmP2NavPPO:
                     for name in ("safety_bce", "approx_kl", "clip_fraction", "entropy"):
                         epoch_totals[name] += float(actor_metrics[name]) * scale
                     epoch_totals["micro_weight"] += scale
-                if actor_finite and all(
+                if actor_enabled and actor_finite and all(
                     p.grad is None or bool(torch.isfinite(p.grad).all())
                     for g in self.actor_optimizer.param_groups for p in g["params"]
                 ):
@@ -1776,7 +1777,7 @@ class AlgorithmP2NavPPO:
                             p2_contract.LOG_STD_MIN, p2_contract.LOG_STD_MAX
                         )
                     self.actor_gradient_steps += 1
-                else:
+                elif actor_enabled:
                     self.actor_optimizer.zero_grad(set_to_none=True)
                     self.skipped_nonfinite += 1
                 totals["actor_update_time_s"] += time.perf_counter() - actor_started
@@ -1830,6 +1831,9 @@ class AlgorithmP2NavPPO:
             for name, value in metrics.items():
                 totals[f"epoch_{index + 1}_{name}"] = value
         return totals
+
+    def _actor_update_enabled(self) -> bool:
+        return True
 
     @staticmethod
     def _masked_mean(value, mask):
@@ -1931,7 +1935,11 @@ class AlgorithmP2NavPPO:
                 )
             )
         metadata = batch.metadata if isinstance(batch.metadata, dict) else {}
-        track_batch = float(metadata.get("track_batch_envs", 0.0))
+        latest_batch = float(metadata.get("latest_batch_envs", 0.0))
+        recent_batch = float(metadata.get("recent_batch_envs", 0.0))
+        track_batch = float(
+            metadata.get("track_batch_envs", latest_batch + recent_batch)
+        )
         parent_batch = float(metadata.get("parent_batch_envs", 0.0))
         replay_total = track_batch + parent_batch
         zero_baseline = self._masked_mean(
@@ -2085,6 +2093,11 @@ class AlgorithmP2NavPPO:
             ),
             "adapter_track_records": track_batch,
             "adapter_parent_records": parent_batch,
+            "adapter_latest_records": latest_batch,
+            "adapter_recent_records": recent_batch,
+            "adapter_latest_replay_ratio": latest_batch / replay_total if replay_total > 0.0 else 0.0,
+            "adapter_recent_replay_ratio": recent_batch / replay_total if replay_total > 0.0 else 0.0,
+            "adapter_low_level_version_lag": float(metadata.get("active_version_lag", 0.0)),
             **{
                 f"adapter_{axis}_mae_{label}": float(axis_mae[horizon][axis_index].detach())
                 for horizon, label in enumerate(("02s", "06s", "10s"))

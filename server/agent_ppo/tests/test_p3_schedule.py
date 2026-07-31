@@ -218,7 +218,7 @@ def test_coordinator_keeps_std_frozen_and_scales_low_lrs():
         logger=None,
     )
     assert not visual.actor_critic.std.requires_grad
-    assert [group["lr"] for group in visual.optimizer.param_groups] == pytest.approx([2e-6, 1e-6, 1e-4])
+    assert [group["lr"] for group in visual.optimizer.param_groups] == pytest.approx([0.0, 0.0, 1e-4])
     joint.update_clock(7200.0)
     assert [group["lr"] for group in visual.optimizer.param_groups] == pytest.approx([0.0, 0.0, 0.0])
 
@@ -490,5 +490,5 @@ def test_p3_high_reward_profile_disables_track_only_shaping():
         "frontier_stagnation",
     ):
         assert torch.equal(result[name], torch.zeros(2))
-    assert torch.equal(result["frontier_shaping"], torch.ones(2))
+    assert torch.equal(result["frontier_shaping"], torch.zeros(2))
     assert torch.equal(result["frame_safety"], torch.ones(2))

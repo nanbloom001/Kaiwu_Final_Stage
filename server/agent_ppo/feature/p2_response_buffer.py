@@ -56,6 +56,7 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
             self.num_envs, dtype=torch.bool, device=self.device
         )
         self.resized_completed_records = 0
+        self.replay_policy = "track_parent_75_25"
 
     def clear_unfinished_history(self) -> None:
         super().clear_unfinished_history()
@@ -201,6 +202,8 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
         return ResponseBatch(**values)
 
     def sample(self, *, batch_envs: int, generator=None) -> ResponseBatch | None:
+        if self.replay_policy == "p3_versioned_50_25_25":
+            return self._sample_p3_versioned(batch_envs=batch_envs, generator=generator)
         requested = max(1, int(batch_envs))
         parent_count = int(round(requested * p2_contract.PARENT_RESPONSE_REPLAY_RATIO))
         track_count = requested - parent_count
@@ -246,6 +249,56 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
             return track_batch
         return self._concat_batches(track_batch, parent_batch)
 
+    def _sample_pool(self, records, count, generator):
+        if count <= 0 or not records:
+            return None
+        original = self._records
+        self._records = records
+        try:
+            return super().sample(batch_envs=max(1, count), generator=generator)
+        finally:
+            self._records = original
+
+    def _sample_p3_versioned(self, *, batch_envs: int, generator=None):
+        requested = max(1, int(batch_envs))
+        current = list(self._records)
+        iterations = sorted({int(record.get("low_level_iteration", -1)) for record in current})
+        latest_iteration = iterations[-1] if iterations else -1
+        latest = deque(
+            (record for record in current if int(record.get("low_level_iteration", -1)) == latest_iteration),
+            maxlen=self.capacity_steps,
+        )
+        recent = deque(
+            (record for record in current if int(record.get("low_level_iteration", -1)) < latest_iteration),
+            maxlen=self.capacity_steps,
+        )
+        latest_count = int(round(requested * 0.50))
+        recent_count = int(round(requested * 0.25))
+        parent_count = max(0, requested - latest_count - recent_count)
+        batches = [
+            self._sample_pool(latest, latest_count, generator),
+            self._sample_pool(recent, recent_count, generator),
+            self._sample_pool(self._parent_records, parent_count, generator),
+        ]
+        available = [batch for batch in batches if batch is not None]
+        if not available:
+            return None
+        result = available[0]
+        for batch in available[1:]:
+            result = self._concat_batches(result, batch)
+        counts = [
+            0 if batch is None else int(batch.observations.shape[1]) for batch in batches
+        ]
+        result.metadata.update(
+            replay_origin="p3_latest_recent_parent",
+            latest_batch_envs=counts[0],
+            recent_batch_envs=counts[1],
+            parent_batch_envs=counts[2],
+            latest_completed_iteration=latest_iteration,
+            active_version_lag=max(0, int(self.low_level_iteration) - latest_iteration),
+        )
+        return result
+
     def checkpoint_state(self) -> dict[str, object]:
         state = super().checkpoint_state()
         state["num_envs"] = self.num_envs
@@ -253,6 +306,7 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
         state["parent_records"] = [
             self._cpu_record(record) for record in self._parent_records
         ]
+        state["replay_policy"] = self.replay_policy
         return state
 
     def _resize_completed_records(self, state: dict[str, object]) -> dict[str, object]:
@@ -311,6 +365,7 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
                 )
         self._parent_records.clear()
         if isinstance(state, dict):
+            self.replay_policy = str(state.get("replay_policy", self.replay_policy))
             for record in state.get("parent_records", []):
                 if not isinstance(record, dict):
                     continue

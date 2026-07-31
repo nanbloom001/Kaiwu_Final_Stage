@@ -9,6 +9,7 @@ import torch
 from agent_ppo.algorithm.algorithm_p2_nav_ppo import AlgorithmP2NavPPO
 from agent_ppo.checkpoint_io import normalize_kaiwu_train_bundle
 from agent_ppo.feature import p2_contract, p3_contract
+from agent_ppo.feature.p3_gait import P3GaitBaseline, P3MirrorAuxiliary
 from agent_ppo.model.p2_high_level import (
     navigation_safety_head_spec,
 )
@@ -43,6 +44,7 @@ class AlgorithmP3HighPPO(AlgorithmP2NavPPO):
         # stagnation terms remain diagnostics and must not train this policy.
         for name in (
             "success",
+            "frontier_shaping",
             "tracking",
             "gait_symmetry",
             "body_collision",
@@ -91,6 +93,9 @@ class AlgorithmP3HighPPO(AlgorithmP2NavPPO):
         batch = dict(batch)
         batch["safety_valid"] = torch.zeros_like(batch["safety_valid"])
         return super()._actor_micro_loss(batch)
+
+    def _actor_update_enabled(self) -> bool:
+        return self.current_phase != "adaptercalib"
 
     def update_adapter_after_policy(self):
         self.defer_adapter_update = False
@@ -240,6 +245,20 @@ class AlgorithmP3StandardJoint:
             device=self.high_algorithm.device,
         )
         self.m3_proxy_latched = torch.zeros_like(self.episode_origin_valid)
+        self.mirror_mapping_valid = False
+        self.gait_baseline = P3GaitBaseline(self.high_algorithm.device)
+        storage = getattr(self.low_algorithm, "storage", None)
+        self.mirror_aux = P3MirrorAuxiliary(
+            num_steps=int(
+                getattr(storage, "num_transitions_per_env", self.config.get("num_steps_per_env", 80))
+            ),
+            num_envs=self.high_algorithm.num_envs,
+            obs_dim=77,
+            sequence_length=int(getattr(self.low_algorithm, "sequence_length", 16)),
+            device=self.high_algorithm.device,
+            seed=int(self.config.get("mirror_seed", 3197)),
+        )
+        self.low_algorithm.p3_mirror_aux = self.mirror_aux
         terrain_size_x = float(self.config.get("terrain_size_x_m", 8.0))
         (
             self.platform_complete_radius_m,
@@ -263,7 +282,8 @@ class AlgorithmP3StandardJoint:
         self.low_algorithm._set_trainable_phase(phase.name)
         self.low_algorithm.actor_critic.std.requires_grad_(False)
         low_scales = {
-            "lowbase": {"actor": 0.20, "lstm": 0.20, "critic": 1.00},
+            "gaitcalib": {"actor": 0.00, "lstm": 0.00, "critic": 1.00},
+            "lowbase": {"actor": 0.50, "lstm": 0.50, "critic": 1.00},
             "lowmild": {"actor": 0.50, "lstm": 0.50, "critic": 1.00},
             "lowmedium": {"actor": 0.35, "lstm": 0.35, "critic": 0.50},
             "adaptercalib": {"actor": 0.00, "lstm": 0.00, "critic": 0.00},
@@ -273,6 +293,10 @@ class AlgorithmP3StandardJoint:
         for index, group in enumerate(self.low_algorithm.optimizer.param_groups):
             name = str(group.get("name", index))
             group["lr"] = self._low_base_lrs[name] * low_scales.get(name, 0.0)
+            trainable = group["lr"] > 0.0
+            for parameter in group["params"]:
+                parameter.requires_grad_(trainable)
+        self.low_algorithm.actor_critic.std.requires_grad_(False)
         self.high_algorithm.update_training_clocks(self.session_effective_seconds)
 
     def update_clock(self, elapsed_s):
@@ -291,6 +315,16 @@ class AlgorithmP3StandardJoint:
         self.m3_proxy_latched.zero_()
         self.high_algorithm.reset_live_state()
         self.low_algorithm.initialize_recurrent_states(self.high_algorithm.num_envs)
+
+    def update_runtime_terrain_size(self, values: torch.Tensor) -> None:
+        finite = values[torch.isfinite(values) & (values > 0.0)]
+        if finite.numel() == 0:
+            return
+        terrain_size = float(finite.median())
+        complete, target, boundary = p3_contract.platform_completion_radii(terrain_size)
+        self.platform_complete_radius_m = complete
+        self.m3_target_radius_m = target
+        self.platform_boundary_radius_m = boundary
 
     def _ensure_radial_state(self, worker_aux: torch.Tensor | None = None) -> None:
         """Initialize transient radial state for compatibility construction paths."""
@@ -468,7 +502,7 @@ class AlgorithmP3StandardJoint:
         return digest
 
     def should_collect_low_rollout(self):
-        return self.current_phase in {"lowbase", "lowmild", "lowmedium"}
+        return self.current_phase in {"gaitcalib", "lowbase", "lowmild", "lowmedium"}
 
     def should_collect_high_rollout(self):
         return self.current_phase in {"adaptercalib", "highadapt", "highslow"}
@@ -594,6 +628,12 @@ class AlgorithmP3StandardJoint:
             self.low_algorithm._restore_rng_state(
                 state.get("rng_state"), self.logger
             )
+            mirror_state = state.get("mirror_rng_state")
+            if torch.is_tensor(mirror_state):
+                self.mirror_aux.generator.set_state(mirror_state.cpu())
+            gait_state = state.get("gait_baseline")
+            if isinstance(gait_state, dict):
+                self.gait_baseline.load_state_dict(gait_state)
 
     def load_parent(self, path, *, platform_model_id):
         mode = self.high_algorithm.load_p2_parent_bundle(
@@ -759,6 +799,11 @@ class AlgorithmP3StandardJoint:
             "gradient_steps": self.low_updates,
             "current_iteration": self.low_algorithm.current_iteration,
             "rng_state": self.low_algorithm._capture_rng_state(),
+            "mirror_rng_state": self.mirror_aux.generator.get_state(),
+            "mirror_training_fraction": p3_contract.gait_training_fraction(
+                self.session_effective_seconds
+            ),
+            "gait_baseline": self.gait_baseline.state_dict(),
         })
         payload["contracts"]["p3_standard_joint"] = p3_contract.contract()
         payload["deployable"] = False

@@ -91,6 +91,7 @@ P2_NAV_PHASE_LABELS = (
 )
 
 P3_STANDARD_JOINT_PHASE_LABELS = (
+    "gaitcalib",
     "lowbase",
     "lowmild",
     "lowmedium",

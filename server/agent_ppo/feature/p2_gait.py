@@ -44,6 +44,9 @@ class P2GaitWindowProbe:
         self.previous_contact = torch.ones(
             self.num_envs, 4, device=self.device, dtype=torch.bool
         )
+        self.previous_foot_vz = torch.zeros(self.num_envs, 4, device=self.device)
+        self.continuous_stance = torch.zeros(self.num_envs, 4, device=self.device)
+        self.last_p3_detail = torch.zeros(self.num_envs, 20, device=self.device)
         shape = (self.window_frames, self.num_envs, 4)
         self.contact = torch.zeros(shape, device=self.device)
         self.swing_duration = torch.zeros(shape, device=self.device)
@@ -189,9 +192,13 @@ class P2GaitWindowProbe:
         self.contact_event[:, reset_mask] = 0.0
         self.slip_speed[:, reset_mask] = 0.0
         self.previous_contact[reset_mask] = True
+        self.previous_foot_vz[reset_mask] = 0.0
+        self.continuous_stance[reset_mask] = 0.0
+        self.last_p3_detail[reset_mask] = 0.0
         self.env_counts[reset_mask] = 0
 
     def step(self, reset_mask: torch.Tensor) -> torch.Tensor:
+        self.last_p3_detail.zero_()
         output = torch.zeros(
             self.num_envs,
             p2_contract.GAIT_DIAGNOSTIC_DIM,
@@ -231,7 +238,46 @@ class P2GaitWindowProbe:
                 self._invalidate("runtime_last_air_time_shape_mismatch")
                 return output
             last_air = last_air[:, self.sensor_foot_ids]
-        foot_velocity = robot_velocity[:, self.robot_foot_ids, :2].norm(dim=-1)
+        foot_velocity3 = robot_velocity[:, self.robot_foot_ids, :3]
+        foot_velocity = foot_velocity3[:, :, :2].norm(dim=-1)
+        impact_speed = torch.clamp(-self.previous_foot_vz, min=0.0) * events.float()
+        self.continuous_stance = torch.where(
+            contact, self.continuous_stance + p2_contract.CONTROL_DT_S, 0.0
+        )
+        body_position = getattr(self.robot.data, "body_pos_w", None)
+        root_position = getattr(self.robot.data, "root_pos_w", None)
+        root_quat = getattr(self.robot.data, "root_quat_w", None)
+        touchdown_y = torch.zeros_like(foot_velocity)
+        if (
+            torch.is_tensor(body_position)
+            and torch.is_tensor(root_position)
+            and torch.is_tensor(root_quat)
+            and body_position.ndim == 3
+            and body_position.shape[0] == self.num_envs
+        ):
+            foot_xy = body_position[:, self.robot_foot_ids, :2] - root_position[:, None, :2]
+            w, x, y, z = root_quat.unbind(-1)
+            yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
+            touchdown_y = -torch.sin(yaw).unsqueeze(-1) * foot_xy[:, :, 0] + torch.cos(yaw).unsqueeze(-1) * foot_xy[:, :, 1]
+            touchdown_y = touchdown_y * events.float()
+        force_impulse = torch.zeros_like(foot_velocity)
+        forces = getattr(data, "net_forces_w", None)
+        if torch.is_tensor(forces) and forces.ndim == 3 and forces.shape[1] == len(self.sensor_body_names):
+            force_impulse = (
+                forces[:, self.sensor_foot_ids, :].norm(dim=-1)
+                * p2_contract.CONTROL_DT_S
+                * events.float()
+            )
+        self.last_p3_detail[:, 0:4] = events.float()
+        self.last_p3_detail[:, 4:8] = impact_speed
+        side = torch.tensor((1.0, -1.0, 1.0, -1.0), device=self.device)
+        self.last_p3_detail[:, 8:12] = touchdown_y * side
+        self.last_p3_detail[:, 12:16] = self.continuous_stance
+        self.last_p3_detail[:, 16:20] = force_impulse
+        self.last_p3_detail[reset] = 0.0
+        self.previous_foot_vz = torch.where(
+            reset.unsqueeze(-1), torch.zeros_like(self.previous_foot_vz), foot_velocity3[:, :, 2]
+        )
 
         slot = self.index
         self.contact[slot] = contact.float()

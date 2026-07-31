@@ -14,6 +14,17 @@ PROPRIO_SCAN_DIM = 301
 GOAL4_SLICE = slice(301, 305)
 DEPTH_SLICE = slice(305, 57905)
 SESSION_TARGET_SECONDS = 9000.0
+P3_WORKER_EXTRA_DIM = 35
+P3_PRIVILEGED_WIRE_DIM = 420
+RUNTIME_TERRAIN_SIZE_INDEX = 0
+GAIT_CONTACT_ONSET_SLICE = slice(1, 5)
+GAIT_IMPACT_SPEED_SLICE = slice(5, 9)
+GAIT_TOUCHDOWN_Y_SLICE = slice(9, 13)
+GAIT_CONTINUOUS_STANCE_SLICE = slice(13, 17)
+GAIT_FORCE_IMPULSE_SLICE = slice(17, 21)
+JOINT_TORQUE_SLICE = slice(21, 33)
+MECHANICAL_POWER_INDEX = 33
+JOINT_MAPPING_VALID_INDEX = 34
 SUBGOAL_SUCCESS_DISTANCE_M = 0.50
 SUBGOAL_MIN_DISTANCE_M = 1.30
 SUBGOAL_MAX_DISTANCE_M = 2.90
@@ -48,13 +59,47 @@ class P3Phase:
 
 
 PHASES = (
-    P3Phase("lowbase", 0.0, 1800.0, True, True, False),
+    P3Phase("gaitcalib", 0.0, 900.0, True, True, False),
+    P3Phase("lowbase", 900.0, 1800.0, True, True, False),
     P3Phase("lowmild", 1800.0, 3600.0, True, True, False),
     P3Phase("lowmedium", 3600.0, 5400.0, True, True, False),
     P3Phase("adaptercalib", 5400.0, 6000.0, False, True, True),
     P3Phase("highadapt", 6000.0, 7200.0, False, True, True),
     P3Phase("highslow", 7200.0, SESSION_TARGET_SECONDS, False, True, True),
 )
+
+MIRROR_SEQUENCE_SHARE = 0.25
+MIRROR_TARGET_GRADIENT_RATIO = 0.035
+MIRROR_MAX_GRADIENT_RATIO = 0.10
+GAIT_CONTACT_REWARD_CAP = 0.18
+GAIT_CROSS_REWARD_CAP = 0.14
+GAIT_STARVATION_REWARD_CAP = 0.08
+GAIT_TOTAL_REWARD_CAP = 0.40
+GAIT_BASELINE_CONTINUOUS_STRIDE = 5
+
+
+def gait_training_fraction(elapsed_s: float) -> float:
+    elapsed = max(0.0, float(elapsed_s))
+    if elapsed < 900.0:
+        return 0.0
+    if elapsed < 1800.0:
+        return 0.25 * (elapsed - 900.0) / 900.0
+    if elapsed < 3600.0:
+        return 0.25 + 0.75 * (elapsed - 1800.0) / 1800.0
+    return 1.0
+
+
+def asymmetric_local_progress(
+    start_distance: torch.Tensor,
+    end_distance: torch.Tensor,
+    duration_frames: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    duration = duration_frames.to(start_distance).clamp_min(1.0)
+    normalized = (start_distance - end_distance) * 10.0 / duration
+    positive = 1.5 * torch.clamp(normalized, 0.0, 0.25)
+    negative = 0.4 * torch.clamp(normalized, -0.25, 0.0)
+    finite = torch.isfinite(start_distance) & torch.isfinite(end_distance)
+    return torch.where(finite, positive, 0.0), torch.where(finite, negative, 0.0)
 
 
 def phase_for_elapsed(elapsed_s: float) -> P3Phase:
@@ -111,8 +156,8 @@ def materialize_environment_config(usr_conf: dict, elapsed_s: float) -> dict:
     result["p3_runtime"] = {
         "phase_index": index,
         "base_added_mass_kg": added_mass,
-        "worker_command_override": False,
-        "low_phase_command_owner": "platform_native_2_to_8_seconds",
+        "worker_command_override": True,
+        "low_phase_command_owner": "p3_worker_recovery_sampler_2_to_8_seconds",
     }
     return result
 
@@ -290,7 +335,7 @@ def joint_episode_success(standard_completed, subgoal_success_count, hard_failur
 
 def contract():
     return {
-        "name": "p3_standard_radial_v4",
+        "name": "p3_standard_gait_radial_v5",
         "policy_observation_dim": POLICY_OBS_DIM,
         "low_level_policy_observation_dim": LOW_LEVEL_POLICY_OBS_DIM,
         "high_level_actor_input_dim": 85,
@@ -318,9 +363,31 @@ def contract():
         "anchor_cnn_reuse_requires_identical_frozen_weights": True,
         "physics_randomization": "platform_friction_and_base_mass_only",
         "observation_noise": "platform_explicit_term_bounds_by_phase_level",
-        "step_transport": {"action_dim": P3_ACTION_DIM},
-        "low_phase_command_owner": "platform_native_2_to_8_seconds",
+        "step_transport": {
+            "action_dim": P3_ACTION_DIM,
+            "privileged_wire_dim": P3_PRIVILEGED_WIRE_DIM,
+            "runtime_extra_dim": P3_WORKER_EXTRA_DIM,
+        },
+        "low_phase_command_owner": "p3_worker_recovery_sampler_2_to_8_seconds",
         "high_phase_command_owner": "p3_high_level_policy",
         "low_level_frozen_while_high_level_owns_command": True,
         "local_out_of_bounds": "diagnostic_only_platform_reset_unavailable",
+        "local_progress": {
+            "positive_scale": 1.5,
+            "negative_scale": 0.4,
+            "normalized_by_duration_frames": True,
+        },
+        "mirror_consistency": {
+            "sequence_share": MIRROR_SEQUENCE_SHARE,
+            "target_gradient_ratio": MIRROR_TARGET_GRADIENT_RATIO,
+            "hard_gradient_ratio": MIRROR_MAX_GRADIENT_RATIO,
+            "training_only": True,
+        },
+        "gait_event_caps": {
+            "contact": GAIT_CONTACT_REWARD_CAP,
+            "cross": GAIT_CROSS_REWARD_CAP,
+            "starvation": GAIT_STARVATION_REWARD_CAP,
+            "total": GAIT_TOTAL_REWARD_CAP,
+        },
+        "gait_baseline_continuous_stride": GAIT_BASELINE_CONTINUOUS_STRIDE,
     }

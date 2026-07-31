@@ -20,7 +20,7 @@
 ## 活动基线
 
 - **当前 P3 功能分支入口**：`P3StandardJointConfig`（`p3_standard_joint`），任务名
-  `p3std2h30-s2r-radial`，父包为 `p3nav8h-r1_884257`。P3 在一个 Standard+Camera 任务中按
+  `p3std2h30-gait-radial`，父包为 `p3nav8h-r1_884257`。P3 在一个 Standard+Camera 任务中按
   rollout 边界执行 90 分钟低层恢复、10 分钟高层 Critic/Adapter 校准和 50 分钟高层适应；低层 CNN 始终冻结，
   高低层 optimizer 参数不重叠。完整 policy observation 仍为 57905，高层 Actor85 不变；
   低层在线输入适配器只删除 goal4，得到原有 57901 低层输入，不改变低层网络结构；PPO storage
@@ -30,12 +30,15 @@
   `3.93m`，并在最后 `0.20m/0.04m` 对向外线速度软制动；达到阈值后命令归零等待 scorer。
   正常晋级保持方向，timeout 只允许相对原方向左右 `30/60` 度重规划。局部里程碑不触发环境 reset；
   Standard 正式成功仍由平台 scorer 判定，并单独统计 proxy/platform 一致率。
-  平台会覆盖 `isaac_env/base_env.py`，因此 P3 不依赖任何 BaseEnv 补丁：低层恢复阶段使用平台原生
-  2-8 秒三轴命令，使 observation、worker reward 与实际执行一致；高层接管命令后低层全程冻结，
+  平台会覆盖 `isaac_env/base_env.py`，因此 P3 不依赖任何 BaseEnv 补丁：低层恢复阶段由 worker
+  专用采样器通过公开 `base_velocity` tensor 写入并 readback 2-8 秒三轴命令，使 observation、
+  worker reward 与实际执行一致；高层接管命令后低层全程冻结，
   只训练高层 PPO 与 Adapter。checkpoint 标签为
   `lowbase/lowmild/lowmedium/lowfull/adaptercalib/highadapt/highslow`，保存 immutable low-level anchor、
   低层和高层模块、optimizer、RNG、独立更新计数、DR phase 及 session/lifetime 时钟，保持
-  `deployable=false`。同阶段包 exact resume；P2 父包走显式 warm start。模型 ID 或 lineage
+  `deployable=false`。训练入口的 privileged wire 为 420 维，其中末 35 维只携带运行时地块尺寸、
+  contact onset/impact/touchdown/stance、joint torque/power 与映射有效位；评估入口不消费这些
+  training-only 字段。同阶段包 exact resume；P2 父包走显式 warm start。模型 ID 或 lineage
   不一致只告警，选中文件的反序列化、必需模块、spec/shape 或有限值错误仍会停止。
 - P3 评估使用两个显式入口：`p3_standard_eval`（Standard+Camera，低层-only，obs 57901，
   只加载 `modules.low_level.locomotion_encoder/actor`）与 `p3_track_eval`（Track+Camera，
@@ -49,6 +52,11 @@
   低层 optimizer 成功后立即推进版本并更新 Adapter，60-90 分钟每轮更新两次；集中校准阶段每轮
   四次，高层后段每两次 PPO rollout 更新一次。真实 Isaac runtime 分布与 128 环境资源占用仍必须
   以开发容器 smoke 为准。
+- 低层步态专项不奖励固定 trot、高步频或固定抬腿高度。前 15 分钟按正/逆坡、正/逆楼梯 ×
+  低速、前进、后退、转向/横移采集健康父策略 P95/P05 基线；样本不足按同地形、全局逐级回退，
+  全局仍不足则禁用对应奖励。15-60 分钟渐进启用接触质量、交叉落脚、步态饥饿和 25% TBPTT
+  sequence 镜像 loss。镜像 loss 只更新低层 LSTM、RNN 输出层和最终 action head，目标梯度约占
+  PPO Actor 梯度 3.5%、硬上限 10%；足端/关节映射异常时全部归零并告警。
 
 - **当前功能分支入口**：`P2NavPPOConfig`（`p2_nav_ppo`），任务名 `p2nav2hsafedir`。
   它显式从最新验证通过的完整三轴 `p2nav10hvyavoid2` 包做

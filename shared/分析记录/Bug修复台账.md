@@ -2674,6 +2674,25 @@
   不修改 checkpoint 或训练。再次遇到的最短检查路径：最早 `Stage:` → 是否 `p3_standard_eval`
   或 `p3_track_eval` → 同 ID P3 candidate（highslow...lowbase）→ `eval_disposition`/
   loaded modules → 有限前向；禁止从末尾 `NoneType` 反推模型损坏。
+- 2026-07-31 Track 首评失败补充（状态仍为"代码已修复待本地/开发容器复核，平台双评估待验证"）：
+  用户上传 v1 修复 ZIP 创建 Track+Camera 评估（任务 `599777` / 运行 `18564415`）。路由已正确
+  进入 `Stage: p3_track_eval`、`[P3] Track eval-only assembly initialized`，`save_model id=0`
+  正确跳过；但 worker 首次 env reset 失败，aisrv 报 `episode 0, reset failed`。worker
+  `base_env_process` 栈顶为
+  `agent_ppo/feature/p2_observation_process.py:43 -> p2_response_aux(self.env)` →
+  `p2_worker_bridge.py:557 raise RuntimeError("P2 response aux requested while bridge is disabled")`。
+  根因：`P2WorkerBridge._resolve_config()` 的启用集合只有
+  `{"p2_nav_ppo","p2_nav_eval","p3_standard_joint"}`，不含新 `p3_track_eval`；worker 的
+  `P2CriticObservationProcess.process()` 无条件调用 `p2_response_aux`，bridge 被禁用即抛错。
+  与 BUG-20260731-001 训练期"P3 critic observation 复用 P2 response transport 被 stage 闸门
+  拒绝"同类。修复：`_resolve_config` 把 `p3_track_eval` 纳入启用集合与 eval 模式集合，配置从
+  `[p3_standard_joint]` 读取；`track_diagnostics_enabled` 与 `_terminal_safe_root_pose` 保持
+  P2 eval 语义（不启用 P3 训练专属的 curriculum probe / terminal-safe root pose）。新增回归：
+  `p3_track_eval` eval 下 `_resolve_config` 返回 `enabled=True` 且读 `[p3_standard_joint]`、
+  `_worker_stage_type=p3_track_eval`；`p3_standard_eval`/`lbc_loco` 仍返回 disabled。
+  本地 P3/P2/Nav 定向回归 `164 passed, 5 skipped`（skipped 为真实 checkpoint 未暂存）。
+  修复 ZIP 升级为 `p3nav8h-r1_884257-evalfix-v2.zip`，checkpoint 仍逐字节不变
+  （SHA256 `8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23`）。
 
 ## 3. 已知高频误判
 
@@ -2754,3 +2773,53 @@
 - 关联：基线提交 `1a5641d`，本轮实现提交 `4230fc8`；PR、新 checkpoint、容器同步、平台任务与
   评估结果均尚未产生。回滚方式是切回 `codex/p3-dual-eval`；再次遇到时最短检查路径为 worker reset 行
   root pose → M1/M2 event → 3.90m proxy → platform reason/completed → Adapter attempts/applied。
+
+## BUG-20260731-004：P3 径向续训缺少步态专项闭环，Adapter/冻结/奖励与双评估合同不一致
+
+- 日期：2026-07-31；状态：本地已验证，开发容器、平台 smoke 与评估待验证。
+- 影响：分支 `codex/p3-sim2real-radial-nav`，任务 `p3std2h30-gait-radial`，父包
+  `p3nav8h-r1_884257`。本轮保持低层 observation 57901、动作 12 维和部署接口不变，不修改平台
+  覆盖的 `server/isaac_env/base_env.py`，模型 ID/标签/lineage 不作为结构正确时的单点门禁。
+- 用户可见症状与审查证据：低层评估视频反复出现右后腿低速拖行、右前腿外摆、楼梯硬触地和
+  后退交叉落脚；原计划的固定 gait envelope 无法按地形/运动区分这些事件。代码审查同时发现：
+  Adapter 真更新后又被 deferred 空调用把面板覆盖为 0；M3 worker runtime terrain size 与 aisrv
+  固定 8m 形成双数据源；`adaptercalib` 虽 LR=0 仍执行 Actor Adam step；局部进度仍复用 P2
+  frontier；Adapter replay 没有按低层版本分层。`codex/p3-dual-eval` 的 `09889b1` worker bridge
+  修复也尚未进入当前分支祖先。
+- 根因：P3 低层 rollout 只有 compact PPO/anchor 路径，没有训练专属 contact onset、触地前速度、
+  body-frame touchdown-y、continuous stance、joint torque/power 和 runtime terrain size transport；
+  gait probe 只能监控，不能形成正常区间为零的事件奖励。旧阶段控制只调整 LR，未冻结 optimizer
+  state；Adapter buffer 仍按 P2 的 current/parent 两池采样；高层 reward 面板同时展示包含项和子项，
+  造成看似无法闭合的奖励分解。
+- 修复：P3 训练 worker wire 扩展为 `critic323 | P2 aux62 | P3 extra35 = 420`，仅
+  `p3_standard_joint` 使用；Track/Standard eval 不消费该 training-only 尾部。新增 worker 公开
+  `base_velocity` 写入/readback 的 2-8 秒三轴恢复采样器，后退 `[-0.25,-0.05]`、左右转向和横移
+  严格对称。前 15 分钟冻结低层 Actor，按正/逆坡、正/逆楼梯 × 低速/前进/后退/转向横移采集
+  健康基线；单桶不足依次回退同地形、全局，全局仍不足则对应奖励禁用。之后渐进启用接触
+  滑移/冲击、contact-onset 交叉落脚、1.5 秒步态饥饿，旧 air-time/duty/participation shaping
+  权重归零。25% 完整 16-step TBPTT sequence 使用镜像一致性，CNN feature 由冻结 CNN 对水平
+  翻转 depth 计算；loss 只连接低层 LSTM、RNN 输出层和最终 action head，梯度比例每 PPO epoch
+  首 minibatch 标定到 3.5%，硬上限 10%。
+- 其他闭环：删除重复 Adapter 空更新；replay 改为最新低层版本 50%、近期 P3 25%、父 records
+  25%，记录版本 lag；worker tail 的 runtime terrain size 成为 M3 proxy/目标/软制动共同来源；
+  `adaptercalib` 完全跳过 Actor backward、optimizer 和 scheduler step；高层改用正 1.5×、负 0.4×
+  的 duration-normalized 局部进度，平台 success terminal 保留本 tick 局部/radial 进展，failure/
+  timeout 不领取 radial new-best。奖励面板只展示互不重叠加权项，storage reward 另作总和核对。
+  checkpoint 保存未完成 baseline reservoir、冻结后的分桶阈值/digest、mirror RNG/进度、Adapter
+  三池和 runtime M3 合同；评估忽略全部 training-only gait 状态。
+- 双评估：保留 `p3_standard_eval` 低层-only 与 `p3_track_eval` 完整层级装配；Track worker bridge
+  启用 `[p3_standard_joint]` 的反馈/步态 transport，Standard eval 和旧 LBC 不启用。SafetyHead、
+  gait baseline/mirror、Critic、optimizer、scheduler 和训练 buffer 均不进入 eval。
+- 本地验证：P3 gait/radial/phase/eval、P2 core/nav observation 与 P1.5 邻近回归共
+  `215 passed, 5 skipped`；5 个 skip 均为真实 `highslow-884257` checkpoint 未暂存的集成测试。
+  覆盖 mirror 双次恢复、显式 joint order、命令范围/符号平衡、分桶基线回退与未完成 reservoir
+  resume、事件奖励独立触发、Adapter calibration Actor step 禁用、P3 Track worker bridge 和双评估
+  装配。Python 编译、全部 TOML 解析与 `git diff --check` 通过；平台 Monitor builder、真实
+  884257 联合 rollout/update/save/resume 和 15-30 分钟 smoke 尚未执行，不能升级为平台已验证。
+- 防复发与回滚：新增阶段标签必须同步 checkpoint candidate 和 round-trip 测试；P3 wire 维度只可
+  在训练 stage 扩展；足端/ContactSensor/joint mapping 或 tensor shape 异常时关闭镜像及步态奖励并
+  告警。回滚可禁用 gait fraction 和 worker sampler、恢复旧 P3 contract，不需要改变 checkpoint
+  低层/高层模块；再次遇到时最短路径为 `worker wire shape -> mapping valid -> baseline samples/
+  fallback -> mirror gradient ratio -> gait reward terms -> Adapter pool ratios -> Standard/Track eval stage`。
+- 关联：父 checkpoint `p3nav8h-r1_884257`；当前实现 commit、合并 commit、PR、新 checkpoint、
+  容器同步与平台任务均待产生，产生后追加，不得预填。

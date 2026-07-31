@@ -13,7 +13,8 @@ import torch
 from agent_ppo.feature.feedback_emulator import FeedbackEmulator
 from agent_ppo.feature.p2_gait import P2GaitWindowProbe
 from agent_ppo.feature.p2_curriculum_probe import P2TrackCurriculumProbe
-from agent_ppo.feature import p2_contract
+from agent_ppo.feature import p2_contract, p3_contract
+from agent_ppo.feature.p3_gait import validate_joint_order
 
 
 _STATE_ATTR = "_agent_ppo_p2_worker_bridge"
@@ -276,6 +277,9 @@ class P2WorkerBridge:
         self.runtime_stage_type = str(
             self.config.pop("_worker_stage_type", "p2_nav_ppo")
         )
+        # ``track_diagnostics_enabled`` stays training-oriented (and P2 eval).
+        # ``p3_track_eval`` intentionally keeps the curriculum probe off so the
+        # eval worker has no dependency on training-only curriculum state.
         self.track_diagnostics_enabled = self.runtime_stage_type in {
             "p2_nav_ppo",
             "p2_nav_eval",
@@ -287,6 +291,12 @@ class P2WorkerBridge:
         self.last_aux = torch.zeros(
             self.num_envs,
             p2_contract.WORKER_AUX_DIM,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.last_p3_extra = torch.zeros(
+            self.num_envs,
+            p3_contract.P3_WORKER_EXTRA_DIM,
             device=self.device,
             dtype=torch.float32,
         )
@@ -366,6 +376,47 @@ class P2WorkerBridge:
             if torch.is_tensor(value) and value.numel() == self.num_envs:
                 target.copy_(value.to(self.device, dtype=torch.float32).reshape(-1))
         return family, level
+
+    def _runtime_terrain_size_x(self) -> float:
+        terrain = getattr(getattr(self.env, "scene", None), "terrain", None)
+        generator = getattr(getattr(terrain, "cfg", None), "terrain_generator", None)
+        size = getattr(generator, "size", None)
+        try:
+            value = float(size[0])
+        except (TypeError, ValueError, IndexError):
+            value = 2.0 * p3_contract.TILE_HALF_EXTENT_M
+        return value
+
+    def _p3_extra(self, robot, reset: torch.Tensor) -> torch.Tensor:
+        extra = torch.zeros_like(self.last_p3_extra)
+        extra[:, p3_contract.RUNTIME_TERRAIN_SIZE_INDEX] = self._runtime_terrain_size_x()
+        if self._gait_window.valid:
+            extra[:, 1:21] = self._gait_window.last_p3_detail
+        torque = getattr(robot.data, "applied_torque", None)
+        velocity = getattr(robot.data, "joint_vel", None)
+        joint_names = getattr(robot.data, "joint_names", getattr(robot, "joint_names", ()))
+        extra[:, p3_contract.JOINT_MAPPING_VALID_INDEX] = float(
+            validate_joint_order(joint_names)
+        )
+        if (
+            torch.is_tensor(torque)
+            and torque.shape == (self.num_envs, 12)
+            and torch.is_tensor(velocity)
+            and velocity.shape == torque.shape
+        ):
+            finite = torch.isfinite(torque).all(dim=-1) & torch.isfinite(velocity).all(dim=-1)
+            safe_torque = torch.where(finite.unsqueeze(-1), torque, 0.0)
+            safe_velocity = torch.where(finite.unsqueeze(-1), velocity, 0.0)
+            extra[:, p3_contract.JOINT_TORQUE_SLICE] = safe_torque
+            extra[:, p3_contract.MECHANICAL_POWER_INDEX] = (
+                safe_torque * safe_velocity
+            ).abs().sum(dim=-1)
+        # Reset only episode-local measurements.  The joint-name mapping is a
+        # static assembly invariant and must remain valid on reset rows;
+        # clearing it would disable gait/mirror training for every rollout
+        # containing any reset environment.
+        extra[reset, 1 : p3_contract.JOINT_MAPPING_VALID_INDEX] = 0.0
+        return extra
 
     def _goal_distance(self, robot) -> torch.Tensor:
         goal = getattr(self.env, "_p3_goal_positions", None)
@@ -508,6 +559,8 @@ class P2WorkerBridge:
             self._gait_window.collision_valid
         )
         self.last_aux = aux
+        if self.runtime_stage_type == "p3_standard_joint":
+            self.last_p3_extra = self._p3_extra(robot, reset)
         if self.curriculum_probe is not None:
             self.curriculum_probe.observe(self.env)
         gait_metrics = {}
@@ -545,6 +598,10 @@ class P2WorkerBridge:
         self.step()
         return self.last_aux.clone()
 
+    def p3_extra(self) -> torch.Tensor:
+        self.step()
+        return self.last_p3_extra.clone()
+
 
 def _resolve_config() -> tuple[bool, dict[str, Any], int]:
     from agent_ppo.conf.conf import Config
@@ -557,11 +614,21 @@ def _resolve_config() -> tuple[bool, dict[str, Any], int]:
 
     usr_conf, _, is_eval, stage = Config.load_conf(_Logger())
     algorithm = getattr(stage, "algorithm", "")
-    enabled = algorithm in {"p2_nav_ppo", "p2_nav_eval", "p3_standard_joint"}
+    enabled = algorithm in {
+        "p2_nav_ppo",
+        "p2_nav_eval",
+        "p3_standard_joint",
+        "p3_track_eval",
+    }
     enabled = enabled and (
-        not is_eval or algorithm in {"p2_nav_eval", "p3_standard_joint"}
+        not is_eval
+        or algorithm in {"p2_nav_eval", "p3_standard_joint", "p3_track_eval"}
     )
-    config_key = "p3_standard_joint" if algorithm == "p3_standard_joint" else "p2_nav_ppo"
+    config_key = (
+        "p3_standard_joint"
+        if algorithm in {"p3_standard_joint", "p3_track_eval"}
+        else "p2_nav_ppo"
+    )
     stage_conf = usr_conf.get(config_key, {}) if isinstance(usr_conf, dict) else {}
     stage_conf = dict(stage_conf or {})
     stage_conf["_worker_stage_type"] = algorithm
@@ -587,3 +654,10 @@ def p2_response_aux(env) -> torch.Tensor:
     if bridge is None:
         raise RuntimeError("P2 response aux requested while bridge is disabled")
     return bridge.response_aux()
+
+
+def p3_training_extra(env) -> torch.Tensor:
+    bridge = get_p2_worker_bridge(env)
+    if bridge is None or bridge.runtime_stage_type != "p3_standard_joint":
+        raise RuntimeError("P3 training extra requested while P3 worker bridge is disabled")
+    return bridge.p3_extra()

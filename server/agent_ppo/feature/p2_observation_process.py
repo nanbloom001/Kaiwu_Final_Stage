@@ -10,10 +10,12 @@ from agent_ppo.feature.nav_observation_process import (
     NavCriticObservationProcess,
 )
 from agent_ppo.feature.p2_worker_bridge import (
+    get_p2_worker_bridge,
     install_p2_terminal_return_bridge,
     p2_response_aux,
+    p3_training_extra,
 )
-from agent_ppo.feature import p2_contract
+from agent_ppo.feature import p2_contract, p3_contract
 
 
 class P2PolicyObservationProcess(NavPolicyObservationProcess):
@@ -51,4 +53,10 @@ class P2CriticObservationProcess(NavCriticObservationProcess):
         wire = torch.cat((critic, aux), dim=-1)
         if wire.shape[1] != p2_contract.PRIVILEGED_WIRE_DIM:
             raise AssertionError("P2 privileged transport dimension drift")
+        bridge = get_p2_worker_bridge(self.env)
+        if bridge is not None and bridge.runtime_stage_type == "p3_standard_joint":
+            extra = p3_training_extra(self.env).to(critic)
+            wire = torch.cat((wire, extra), dim=-1)
+            if wire.shape[1] != p3_contract.P3_PRIVILEGED_WIRE_DIM:
+                raise AssertionError("P3 privileged transport dimension drift")
         return wire

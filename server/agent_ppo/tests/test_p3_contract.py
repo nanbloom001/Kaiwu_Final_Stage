@@ -50,7 +50,10 @@ def test_materialized_domain_randomization_uses_phase_values():
     assert realized["domain_rand"]["friction_range"] == [0.55, 1.35]
     assert realized["domain_rand"]["added_mass_range"] == [-0.85, 0.85]
     assert realized["domain_rand"]["push_robots"] is False
-    assert realized["p3_runtime"]["worker_command_override"] is False
+    assert realized["p3_runtime"]["worker_command_override"] is True
+    assert realized["p3_runtime"]["low_phase_command_owner"] == (
+        "p3_worker_recovery_sampler_2_to_8_seconds"
+    )
     assert realized["noise"]["noise_level"] == 0.55
 
 
@@ -72,7 +75,8 @@ def test_local_bounds_and_phase_boundaries():
     origin = torch.tensor([[10.0, -5.0], [10.0, -5.0]])
     root = torch.tensor([[13.2, -5.0], [13.2001, -5.0]])
     assert p3.local_out_of_bounds(root, origin).tolist() == [False, True]
-    assert p3.phase_for_elapsed(0).name == "lowbase"
+    assert p3.phase_for_elapsed(0).name == "gaitcalib"
+    assert p3.phase_for_elapsed(900).name == "lowbase"
     assert p3.phase_for_elapsed(1800).name == "lowmild"
     assert p3.phase_for_elapsed(3600).name == "lowmedium"
     assert p3.phase_for_elapsed(5400).name == "adaptercalib"
@@ -269,7 +273,7 @@ def test_p3_production_config_and_monitor_are_standard_specific():
     }
     assert config["terrain"]["mode"] == "standard"
     assert config["terrain"]["curriculum"] is False
-    assert config["p3_standard_joint"]["run_name"] == "p3std2h30-s2r-radial"
+    assert config["p3_standard_joint"]["run_name"] == "p3std2h30-gait-radial"
     assert config["p3_standard_joint"]["target_effective_seconds"] == 9000
     monitor_source = (root / "conf/monitor_builder.py").read_text()
     p3_builder = monitor_source.split("def _build_p3_monitor():", 1)[1].split(

@@ -74,7 +74,7 @@ def main() -> int:
         )
         _assert_shape("policy", obs, (1, p3_contract.POLICY_OBS_DIM))
         _assert_shape(
-            "critic_wire", critic_wire, (1, p2_contract.PRIVILEGED_WIRE_DIM)
+            "critic_wire", critic_wire, (1, p3_contract.P3_PRIVILEGED_WIRE_DIM)
         )
         if not bool(torch.isfinite(obs).all()):
             raise AssertionError("policy observation contains non-finite values")
@@ -93,7 +93,7 @@ def main() -> int:
             _assert_shape(
                 "next_critic_wire",
                 next_wire,
-                (1, p2_contract.PRIVILEGED_WIRE_DIM),
+                (1, p3_contract.P3_PRIVILEGED_WIRE_DIM),
             )
             if not bool(torch.isfinite(next_obs).all()):
                 raise AssertionError("next policy observation contains non-finite values")

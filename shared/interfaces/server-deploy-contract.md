@@ -423,10 +423,12 @@ high actor input   = nav_feat32 | nav_nonvisual36 | response16 | confidence1 = 8
 low action         = joint12 at 50Hz
 high action        = [vx,vy,wz] at 5Hz
 environment step   = joint12 (platform contract unchanged)
+training worker wire = critic323 | response+diagnostic62 | p3_runtime+gait35 = 420
 ```
 
-平台会覆盖 `isaac_env/base_env.py`，P3 不依赖该文件的本地补丁。低层恢复阶段读取平台原生
-2-8 秒三轴命令，低层 observation、worker reward 与实际执行保持一致；高层开始拥有命令后低层
+平台会覆盖 `isaac_env/base_env.py`，P3 不依赖该文件的本地补丁。低层恢复阶段由 P3 worker
+采样器通过公开 `base_velocity` tensor 写入并 readback 2-8 秒三轴命令，低层 observation、worker
+reward 与实际执行保持一致；高层开始拥有命令后低层
 冻结，worker 低层 reward 不进入任何低层更新。P3 的
 `_p3_goal_positions` 是训练 worker 私有局部目标，不替换平台 Standard scorer 的任务定义。
 局部目标使用相对真实出生点的径向里程碑：M1 `1.3-1.6m`、M2 `2.5-2.9m`；M3 使用
@@ -446,14 +448,15 @@ modules.high_level.navigation_encoder / navigation_safety_head(training_only)
 modules.high_level.actor / critic / response_adapter
 optimizers.low_level / high_level_actor / high_level_critic / response_adapter
 training_states.low_level / high_level / response_adapter / global
+training_states.low_level.gait_baseline / mirror_rng_state / mirror_training_fraction (training_only)
 training_states.global.session_effective_seconds / lifetime_effective_seconds
 training_states.global.low_updates / high_updates / compound_schedule_phase
 training_states.global.p3_anchor_digest / low_level_version
 training_states.global.domain_randomization_phase / domain_randomization_realized
-contracts.p3_standard_joint.name = "p3_standard_radial_v4"
+contracts.p3_standard_joint.name = "p3_standard_gait_radial_v5"
 ```
 
-阶段文件标签固定为 `lowbase`、`lowmild`、`lowmedium`、`lowfull`、`adaptercalib`、
+阶段文件标签固定为 `gaitcalib`、`lowbase`、`lowmild`、`lowmedium`、`lowfull`、`adaptercalib`、
 `highadapt`、`highslow`。候选文件缺失时可继续查找配置父包；一旦选中文件，格式、模块、
 spec/shape、optimizer exact-resume 状态或有限值不兼容必须停止。平台模型 ID、文件名 ID 和
 lineage 只用于选择、告警与追溯，不得形成单点硬门禁。live hidden、未完成 rollout、未完成
@@ -475,7 +478,13 @@ P2/LBC/随机权重：
   policy observation 保持 57905，高层 5Hz / 低层 50Hz，高层发布 `[vx,vy,wz]`，低层
   最终输出 12 维关节动作。reset/termination/timeout 正确清空 recurrent hidden，
   保留已验证的 Track goal-reached→scorer 链（完成数不再恒为 0）。
-  SafetyHead/Critic/optimizer/scheduler/训练 buffer 一律不创建。
+SafetyHead/Critic/optimizer/scheduler/训练 buffer 一律不创建。
+
+P3 训练专属步态状态不改变 57901 低层输入、12 维动作或部署接口。镜像合同固定为
+`FL<->FR`、`RL<->RR`，`vy/wz` 与左右相关轴取反，Hip 按机械轴交换并取反、Thigh/Calf 仅交换；
+depth 水平翻转，scan 置换由真实 lateral ray 坐标生成。前 15 分钟采集 4 类地形 × 4 类运动健康
+基线；样本不足按同地形、全局逐级回退，全局仍不足时对应接触/交叉/饥饿奖励归零。镜像和步态
+baseline/RNG 仅写入 training state，`p3_standard_eval` 与 `p3_track_eval` 必须忽略它们。
 
 P3 评估候选标签优先级为 `highslow > highadapt > adaptercalib > lowfull > lowmedium >
 lowmild > lowbase`；无同 ID P3 文件时只允许唯一 discovery，多个候选明确报歧义。请求 ID、
