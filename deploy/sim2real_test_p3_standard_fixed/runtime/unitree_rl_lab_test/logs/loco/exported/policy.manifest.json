@@ -1,0 +1,25 @@
+{
+  "fixed_mode": true,
+  "ignored_modules": [
+    "modules.high_level"
+  ],
+  "model_spec": {
+    "action_dim": 12,
+    "depth_channels": 1,
+    "depth_height": 180,
+    "depth_width": 320,
+    "goal_dim": 0,
+    "latent_dim": 32,
+    "proprio_dim": 45,
+    "scan_dim": 256
+  },
+  "onnx": "policy.onnx",
+  "phase_label": "highslow",
+  "platform_model_id": "884257",
+  "selected_modules": [
+    "modules.low_level.locomotion_encoder",
+    "modules.low_level.actor"
+  ],
+  "source_sha256": "8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23",
+  "stage_type": "p3_standard_joint"
+}

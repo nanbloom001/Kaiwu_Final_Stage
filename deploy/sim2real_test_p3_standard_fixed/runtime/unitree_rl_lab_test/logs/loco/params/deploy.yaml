@@ -1,0 +1,44 @@
+# P3 standard low-level policy, extracted from highslow-884257.
+# Actor input is proprio45 + normalized visual latent32 = 77; goal_dim is 0.
+
+joint_ids_map: [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8]
+step_dt: 0.02
+stiffness: [25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0]
+damping: [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+default_joint_pos: [0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5]
+
+actions:
+  JointPositionAction:
+    scale: 0.25
+    offset: [0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5]
+    clip: [-100.0, 100.0]
+
+proprio_scales:
+  ang_vel: 0.25
+  projected_gravity: 1.0
+  vel_cmd: 1.0
+  joint_pos_rel: 1.0
+  joint_vel_rel: 0.05
+  last_action: 1.0
+proprio_clip: [-100.0, 100.0]
+
+cmd_ranges:
+  ranges:
+    lin_vel_x: [0.0, 1.0]
+    lin_vel_y: [-0.3, 0.3]
+    ang_vel_yaw: [-1.0, 1.0]
+  limit:
+    lin_vel_x: [0.0, 1.0]
+    lin_vel_y: [-0.3, 0.3]
+    ang_vel_z: [-0.9, 0.9]
+  resampling_time_s: [2.0, 8.0]
+
+meta:
+  source_ckpt: "model.ckpt-highslow-884257.pkl"
+  source_ckpt_format: "kaiwu_train_v1"
+  source_stage_type: "p3_standard_joint"
+  selected_modules: "modules.low_level.locomotion_encoder + modules.low_level.actor"
+  ignored_modules: "modules.high_level (track navigation)"
+  paired_onnx: "policy.onnx"
+  notes:
+    - "P3 standard fixed-mode first bring-up at vx=0.20 m/s"
