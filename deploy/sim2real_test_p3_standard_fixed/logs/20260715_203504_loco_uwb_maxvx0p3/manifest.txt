@@ -1,0 +1,11 @@
+started_at=2026-07-15T20:35:04+08:00
+network=eth0
+command_source=uwb
+fixed_cmd=0.7,0.0,0.0
+uwb_max_vx=0.3
+depth_source=realsense
+hostname=ubuntu
+Linux ubuntu 5.10.104-tegra #1 SMP PREEMPT Sun Mar 19 07:55:28 PDT 2023 aarch64 aarch64 aarch64 GNU/Linux
+26fec301a690a60cd04905c546ee70e8a3f5a32b9eaab2326a21a79872ce8438  /home/unitree/Kaiwu-test/sim2real_test_standard/runtime/unitree_rl_lab_test/deploy/robots/go2_loco/build/go2_loco_ctrl
+97fa1af6c7a282c34043951d0e2dfd5ebf323d605f8e6fc88686c34188b367d1  /home/unitree/Kaiwu-test/sim2real_test_standard/runtime/unitree_rl_lab_test/logs/loco/exported/policy.onnx
+97005450d565409f311369616765b05f7175ed77462ea5dc0bcc01c268360110  /home/unitree/Kaiwu-test/sim2real_test_standard/runtime/unitree_rl_lab_test/deploy/robots/go2_loco/config/config.yaml

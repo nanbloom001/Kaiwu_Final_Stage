@@ -1,0 +1,11 @@
+# P3 standard fixed-mode Go2 deployment
+
+Use this package for the first hardware test of checkpoint `highslow-884257`.
+The model has two logical layers: a standard low-level locomotion policy and a
+track/high-level navigation policy. Fixed mode uses only the standard layer;
+the host-side `fixed_cmd` supplies velocity commands.
+
+The Jetson copy is built and passes
+`scripts/run_loco_stage_fixed_test.sh --check`. See `ARTIFACTS.md` for the
+checkpoint schema, ONNX contract, export command, checksums, and the remaining
+motor-side smoke test.
