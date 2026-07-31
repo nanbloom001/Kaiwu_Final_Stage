@@ -535,7 +535,8 @@ void State_VisionLoco::enter()
                      "action_step_max,requested_target_step_max,target_step_max,tracking_error_max,"
                      "motion_rejected,motion_violations,"
                      "avx,avy,avz,pgx,pgy,pgz,"
-                     "tau_abs_max,pd_tau_abs_max,mechanical_power_abs_sum";
+                     "tau_abs_max,pd_tau_abs_max,mechanical_power_abs_sum,"
+                     "foot_force_abs_sum,foot_force_est_abs_sum,foot_force_est_abs_max";
             for (int i = 0; i < 12; ++i) diag_ << ",q" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",dq" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",tau" << i;
@@ -544,6 +545,8 @@ void State_VisionLoco::enter()
             for (int i = 0; i < 12; ++i) diag_ << ",applied_target" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",qerr" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",pd_tau" << i;
+            for (int i = 0; i < 4; ++i) diag_ << ",foot_force" << i;
+            for (int i = 0; i < 4; ++i) diag_ << ",foot_force_est" << i;
             diag_ << '\n';
             diag_ << std::fixed << std::setprecision(6);
             spdlog::info("[VisionLoco] 诊断日志: {}", diag_path_);
@@ -699,6 +702,17 @@ void State_VisionLoco::policy_loop()
             pd_tau_abs_max = std::max(pd_tau_abs_max, std::fabs(pd_torque[i]));
             mechanical_power_abs_sum += std::fabs(policy_tau[i] * policy_dq[i]);
         }
+        const auto& foot_force = robot_->data.foot_force;
+        const auto& foot_force_est = robot_->data.foot_force_est;
+        float foot_force_abs_sum = 0.0f;
+        float foot_force_est_abs_sum = 0.0f;
+        float foot_force_est_abs_max = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            foot_force_abs_sum += std::fabs(foot_force[i]);
+            foot_force_est_abs_sum += std::fabs(foot_force_est[i]);
+            foot_force_est_abs_max = std::max(
+                foot_force_est_abs_max, std::fabs(foot_force_est[i]));
+        }
 
         const auto work_end = clock::now();
         const float loop_ms =
@@ -710,6 +724,7 @@ void State_VisionLoco::policy_loop()
                          "exec=[{:.3f},{:.3f},{:.3f}] uwb_ok={} goal=[{:.2f},{:.2f},{:.2f},{:.2f}] "
                          "clr=[{:.2f},{:.2f},{:.2f}] step(a/r/t/e)=[{:.2f},{:.2f},{:.2f},{:.2f}] "
                          "reject={} effort(meas/pd/pwr)=[{:.1f},{:.1f},{:.1f}] "
+                         "foot(raw/est)=[{:.0f},{:.0f}] "
                          "infer={:.2f}ms loop={:.2f}ms miss={}",
                          command_source_, theory_cmd[0], theory_cmd[1], theory_cmd[2],
                          out.cmd[0], out.cmd[1], out.cmd[2],
@@ -719,6 +734,7 @@ void State_VisionLoco::policy_loop()
                          tracking_error_max,
                          motion_rejected, tau_abs_max, pd_tau_abs_max,
                          mechanical_power_abs_sum,
+                         foot_force_abs_sum, foot_force_est_abs_sum,
                          out.inference_ms, loop_ms, deadline_misses_);
         }
 
@@ -800,7 +816,9 @@ void State_VisionLoco::policy_loop()
                   << ',' << av[0] << ',' << av[1] << ',' << av[2]
                   << ',' << pg[0] << ',' << pg[1] << ',' << pg[2]
                   << ',' << tau_abs_max << ',' << pd_tau_abs_max
-                  << ',' << mechanical_power_abs_sum;
+                  << ',' << mechanical_power_abs_sum
+                  << ',' << foot_force_abs_sum << ',' << foot_force_est_abs_sum
+                  << ',' << foot_force_est_abs_max;
             for (int i = 0; i < q.size(); ++i) diag_ << ',' << q[i];
             for (int i = 0; i < dq.size(); ++i) diag_ << ',' << dq[i];
             for (int i = 0; i < tau.size(); ++i) diag_ << ',' << tau[i];
@@ -809,6 +827,8 @@ void State_VisionLoco::policy_loop()
             write_values(diag_, accepted_target);
             write_values(diag_, joint_error);
             write_values(diag_, pd_torque);
+            write_values(diag_, foot_force);
+            write_values(diag_, foot_force_est);
             diag_ << '\n';
             if ((frame_ % log_flush_every_) == 0) diag_.flush();
         }

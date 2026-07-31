@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <eigen3/Eigen/Dense>
 #include "unitree/dds_wrapper/common/unitree_joystick.hpp"
 
@@ -30,6 +31,11 @@ struct ArticulationData
 
     // Estimated joint efforts reported by the motor state.
     Eigen::VectorXf joint_effort;
+
+    // Foot-force channels in the SDK-provided order. Values are logged as
+    // raw/estimated units until a hardware calibration is available.
+    std::array<float, 4> foot_force{};
+    std::array<float, 4> foot_force_est{};
 
     // Root angular velocity in base world frame.
     Eigen::Vector3f root_ang_vel_b;

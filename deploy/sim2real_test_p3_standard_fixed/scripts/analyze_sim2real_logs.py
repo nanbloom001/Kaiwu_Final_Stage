@@ -137,6 +137,10 @@ def analyze(path: Path) -> dict:
     qerr_names = [f"qerr{i}" for i in range(12) if f"qerr{i}" in c]
     tau_names = [f"tau{i}" for i in range(12) if f"tau{i}" in c]
     pd_tau_names = [f"pd_tau{i}" for i in range(12) if f"pd_tau{i}" in c]
+    foot_force_names = [f"foot_force{i}" for i in range(4) if f"foot_force{i}" in c]
+    foot_force_est_names = [
+        f"foot_force_est{i}" for i in range(4) if f"foot_force_est{i}" in c
+    ]
 
     tracking_errors: list[float] = []
     if len(qerr_names) == 12:
@@ -311,6 +315,27 @@ def analyze(path: Path) -> dict:
             stats(c["mechanical_power_abs_sum"])
             if "mechanical_power_abs_sum" in c else stats([])
         ),
+        "foot_force": {
+            "raw_abs": {
+                name: stats([abs(value) for value in c[name]]) for name in foot_force_names
+            },
+            "estimated_abs": {
+                name: stats([abs(value) for value in c[name]])
+                for name in foot_force_est_names
+            },
+            "raw_abs_sum": (
+                stats(c["foot_force_abs_sum"])
+                if "foot_force_abs_sum" in c else stats([])
+            ),
+            "estimated_abs_sum": (
+                stats(c["foot_force_est_abs_sum"])
+                if "foot_force_est_abs_sum" in c else stats([])
+            ),
+            "estimated_abs_max": (
+                stats(c["foot_force_est_abs_max"])
+                if "foot_force_est_abs_max" in c else stats([])
+            ),
+        },
         "action_step": stats(action_steps),
         "joint_tracking_abs_error": stats(tracking_errors),
         "external_control": external_control,
@@ -538,6 +563,14 @@ def print_report(report: dict, compact: bool = False) -> None:
             f"nominal PD torque max {report['max_abs_pd_torque']:.2f} Nm | "
             f"absolute mechanical power P95 "
             f"{fmt(report['mechanical_power_abs_sum']['p95'], 2)} W"
+        )
+    foot_force = report["foot_force"]
+    if math.isfinite(foot_force["estimated_abs_sum"]["p95"]):
+        print(
+            f"Foot force raw/estimated absolute-sum P95 "
+            f"{fmt(foot_force['raw_abs_sum']['p95'], 1)}/"
+            f"{fmt(foot_force['estimated_abs_sum']['p95'], 1)} raw units | "
+            f"estimated channel max {fmt(foot_force['estimated_abs_max']['max'], 1)}"
         )
     print(f"命令与运控: {report['control_status']}")
     for issue in report["control_issues"]:
