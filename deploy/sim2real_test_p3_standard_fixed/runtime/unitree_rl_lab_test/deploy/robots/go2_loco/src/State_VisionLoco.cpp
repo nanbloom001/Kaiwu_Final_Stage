@@ -236,6 +236,8 @@ State_VisionLoco::State_VisionLoco(int state_mode, std::string state_string)
             std::max(1.0f, yaml_get<float>(cfg["logging"], "max_raw_action_abs", 20.0f));
         max_target_step_rad_ = std::max(
             0.05f, yaml_get<float>(cfg["logging"], "max_target_step_rad", 0.35f));
+        target_slew_rate_rad_s_ = std::max(
+            0.1f, yaml_get<float>(cfg["logging"], "target_slew_rate_rad_s", 3.0f));
         max_tracking_error_rad_ = std::max(
             0.10f, yaml_get<float>(cfg["logging"], "max_tracking_error_rad", 0.45f));
         max_consecutive_motion_violations_ = std::max(
@@ -251,6 +253,9 @@ State_VisionLoco::State_VisionLoco(int state_mode, std::string state_string)
     this->registered_checks.emplace_back(std::make_pair(
         [this]() -> bool { return policy_fault_.load(); },
         FSMStringMap.right.at("Passive")));
+    this->registered_checks.emplace_back(std::make_pair(
+        [this]() -> bool { return motion_fault_.load(); },
+        FSMStringMap.right.at("FixStand")));
 
     spdlog::info("[VisionLoco] 就绪：step_dt={:.3f}s scale={:.3f} source={} "
                  "goal=[{:.2f},{:.2f},{:.2f},{:.2f}] depth={} logging={}",
@@ -470,6 +475,7 @@ void State_VisionLoco::enter()
     deadline_misses_ = 0;
     consecutive_errors_ = 0;
     policy_fault_ = false;
+    motion_fault_ = false;
     last_exec_cmd_ = {0.0f, 0.0f, 0.0f};
 
     // fixed/uwb 始终外部覆盖；nav 使用 config.yaml 固定 goal（loco 阶段等价零速度）。
@@ -525,7 +531,7 @@ void State_VisionLoco::enter()
                      "feedback_err_vx,feedback_err_vy,feedback_err_wz,"
                      "clr_L,clr_F,clr_R,"
                      "dep_inval,dep_meanv,front_inval,front_min,front_mean,"
-                     "action_step_max,target_step_max,tracking_error_max,"
+                     "action_step_max,requested_target_step_max,target_step_max,tracking_error_max,"
                      "motion_rejected,motion_violations,"
                      "avx,avy,avz,pgx,pgy,pgz";
             for (int i = 0; i < 12; ++i) diag_ << ",q" << i;
@@ -551,8 +557,10 @@ void State_VisionLoco::policy_loop()
         std::chrono::duration<double>(step_dt_));
     auto next_tick = clock::now() + dt;
     const auto t_start = clock::now();
-    std::vector<float> accepted_action(12, 0.0f);
     std::vector<float> accepted_target = default_joint_pos_;
+    std::vector<float> requested_action(12, 0.0f);
+    std::vector<float> requested_target = default_joint_pos_;
+    bool have_requested_motion = false;
     int motion_violations = 0;
 
     while (running_) {
@@ -613,38 +621,61 @@ void State_VisionLoco::policy_loop()
             tgt[i] = std::clamp(v, act_clip_lo_, act_clip_hi_);
         }
         float action_step_max = 0.0f;
+        float requested_target_step_max = 0.0f;
         float target_step_max = 0.0f;
         float tracking_error_max = 0.0f;
         const auto& policy_q = robot_->data.joint_pos;
         for (int i = 0; i < 12; ++i) {
-            action_step_max = std::max(
-                action_step_max, std::fabs(out.joint[i] - accepted_action[i]));
-            target_step_max = std::max(
-                target_step_max, std::fabs(tgt[i] - accepted_target[i]));
+            if (have_requested_motion) {
+                action_step_max = std::max(
+                    action_step_max, std::fabs(out.joint[i] - requested_action[i]));
+                requested_target_step_max = std::max(
+                    requested_target_step_max,
+                    std::fabs(tgt[i] - requested_target[i]));
+            }
             tracking_error_max = std::max(
                 tracking_error_max, std::fabs(policy_q[i] - accepted_target[i]));
         }
-        const bool motion_rejected = target_step_max > max_target_step_rad_ ||
+        const bool motion_rejected =
+                                     (have_requested_motion &&
+                                      requested_target_step_max > max_target_step_rad_) ||
                                      tracking_error_max > max_tracking_error_rad_;
+        // Compare safety against adjacent policy requests, even when the current
+        // request is held back. A stable request after one spike must not be
+        // repeatedly compared with an older accepted target.
+        requested_action = out.joint;
+        requested_target = tgt;
+        have_requested_motion = true;
         if (motion_rejected) {
             ++motion_violations;
             spdlog::warn(
-                "[VisionLoco] rejected motion frame: target_step={:.3f}rad "
+                "[VisionLoco] rejected motion frame: requested_step={:.3f}rad "
                 "tracking_error={:.3f}rad ({}/{})",
-                target_step_max, tracking_error_max, motion_violations,
+                requested_target_step_max, tracking_error_max, motion_violations,
                 max_consecutive_motion_violations_);
             if (motion_violations >= max_consecutive_motion_violations_) {
-                spdlog::critical("[VisionLoco] repeated unsafe motion; requesting Passive");
-                policy_fault_ = true;
+                spdlog::critical("[VisionLoco] repeated unsafe motion; requesting FixStand");
+                motion_fault_ = true;
                 running_ = false;
             }
         } else {
             motion_violations = 0;
-            accepted_action = out.joint;
-            accepted_target = tgt;
+            const float max_applied_step = target_slew_rate_rad_s_ * step_dt_;
+            std::vector<float> applied_target(12);
+            std::vector<float> applied_action(12);
+            for (int i = 0; i < 12; ++i) {
+                applied_target[i] = accepted_target[i] + std::clamp(
+                    tgt[i] - accepted_target[i], -max_applied_step, max_applied_step);
+                applied_action[i] = std::fabs(act_scale_) > 1e-6f
+                    ? (applied_target[i] - act_offset_[i]) / act_scale_
+                    : 0.0f;
+                target_step_max = std::max(
+                    target_step_max, std::fabs(applied_target[i] - accepted_target[i]));
+            }
+            accepted_target = applied_target;
             std::lock_guard<std::mutex> lk(tgt_mtx_);
-            joint_target_    = tgt;
-            last_action_raw_ = out.joint;
+            joint_target_    = applied_target;
+            last_action_raw_ = applied_action;
             have_target_     = true;
         }
 
@@ -656,13 +687,14 @@ void State_VisionLoco::policy_loop()
         if ((frame_ % 50) == 0) {
             spdlog::info("[VisionLoco] source={} theory=[{:.3f},{:.3f},{:.3f}] "
                          "exec=[{:.3f},{:.3f},{:.3f}] uwb_ok={} goal=[{:.2f},{:.2f},{:.2f},{:.2f}] "
-                         "clr=[{:.2f},{:.2f},{:.2f}] step(a/t/e)=[{:.2f},{:.2f},{:.2f}] "
+                         "clr=[{:.2f},{:.2f},{:.2f}] step(a/r/t/e)=[{:.2f},{:.2f},{:.2f},{:.2f}] "
                          "reject={} infer={:.2f}ms loop={:.2f}ms miss={}",
                          command_source_, theory_cmd[0], theory_cmd[1], theory_cmd[2],
                          out.cmd[0], out.cmd[1], out.cmd[2],
                          uwb_valid, goal[0], goal[1], goal[2], goal[3],
                          out.clearance[0], out.clearance[1], out.clearance[2],
-                         action_step_max, target_step_max, tracking_error_max,
+                         action_step_max, requested_target_step_max, target_step_max,
+                         tracking_error_max,
                          motion_rejected, out.inference_ms, loop_ms, deadline_misses_);
         }
 
@@ -736,7 +768,8 @@ void State_VisionLoco::policy_loop()
             write_values(diag_, out.clearance);
             diag_ << ',' << ds.invalid_frac << ',' << ds.mean_valid
                   << ',' << ds.front_invalid << ',' << ds.front_min << ',' << ds.front_mean
-                  << ',' << action_step_max << ',' << target_step_max
+                  << ',' << action_step_max << ',' << requested_target_step_max
+                  << ',' << target_step_max
                   << ',' << tracking_error_max << ',' << (motion_rejected ? 1 : 0)
                   << ',' << motion_violations
                   << ',' << av[0] << ',' << av[1] << ',' << av[2]

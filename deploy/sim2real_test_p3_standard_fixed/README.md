@@ -9,3 +9,7 @@ The Jetson copy is built and passes
 `scripts/run_loco_stage_fixed_test.sh --check`. See `ARTIFACTS.md` for the
 checkpoint schema, ONNX contract, export command, checksums, and the remaining
 motor-side smoke test.
+
+The first policy target is slew-limited from the mapped FixStand posture.
+Motion guards compare adjacent policy requests and return to FixStand after
+repeated violations; they do not drop an upright robot into Passive.

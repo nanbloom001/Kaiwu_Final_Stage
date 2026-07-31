@@ -43,9 +43,12 @@ action in `proprio[33:45]`, and feeds the LSTM state frame to frame.
 
 The runtime enters the policy from the exact mapped default joint posture,
 uses the light RealSense spatial filter (hole filling and temporal filtering
-disabled), and records action/target step sizes plus tracking error. A target
-step above `0.35` rad or tracking error above `0.45` rad is held for safety;
-two consecutive violations request Passive.
+disabled), and records adjacent policy action/target step sizes plus tracking
+error. Policy targets are applied with a `3.0 rad/s` per-joint slew limit, so
+the first recurrent output is blended in instead of being sent as a step. An
+adjacent requested-target step above `0.35` rad or tracking error above `0.45`
+rad is held for safety; two consecutive violations request FixStand so the
+robot keeps standing instead of dropping into Passive.
 
 ## Export
 
@@ -64,11 +67,14 @@ The package is installed at
 Set `LOCO_TEST_ROOT` if using a different path. The aarch64 controller was
 built on the Jetson and its runtime libraries resolve correctly.
 
-Validated on 2026-07-31:
+Validated on 2026-08-01:
 
 - `scripts/run_loco_stage_fixed_test.sh --check` passed on `eth0`.
 - Fixed command: `[0.0, 0.0, 0.0]`.
 - Controller was rebuilt on Jetson after the runtime safety/filter changes.
+- The two short logs that previously dropped to Passive were replayed through
+  the corrected guard. Their second-frame requested steps were `0.0421` and
+  `0.0339` rad, so neither is rejected by the adjacent-frame check.
 - No controller process was left running and no motor command was started.
 
 After confirming the robot is supported safely and the area is clear, run:

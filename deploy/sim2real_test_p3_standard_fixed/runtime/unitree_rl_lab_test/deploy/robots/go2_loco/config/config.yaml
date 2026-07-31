@@ -88,5 +88,6 @@ FSM:
       max_raw_action_abs: 20.0
       # Reject an anomalous policy frame instead of sending its joint targets.
       max_target_step_rad: 0.35
+      target_slew_rate_rad_s: 3.0
       max_tracking_error_rad: 0.45
       max_consecutive_motion_violations: 2
