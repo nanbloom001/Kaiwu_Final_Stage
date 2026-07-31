@@ -28,6 +28,9 @@ struct ArticulationData
     // Joint velocities of all joints.
     Eigen::VectorXf joint_vel;
 
+    // Estimated joint efforts reported by the motor state.
+    Eigen::VectorXf joint_effort;
+
     // Root angular velocity in base world frame.
     Eigen::Vector3f root_ang_vel_b;
 

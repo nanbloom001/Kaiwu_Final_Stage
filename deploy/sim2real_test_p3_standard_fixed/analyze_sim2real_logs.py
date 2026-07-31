@@ -132,10 +132,22 @@ def analyze(path: Path) -> dict:
 
     action_names = [f"action{i}" for i in range(12) if f"action{i}" in c]
     target_names = [f"target{i}" for i in range(12) if f"target{i}" in c]
+    applied_target_names = [f"applied_target{i}" for i in range(12) if f"applied_target{i}" in c]
     q_names = [f"q{i}" for i in range(12) if f"q{i}" in c]
+    qerr_names = [f"qerr{i}" for i in range(12) if f"qerr{i}" in c]
+    tau_names = [f"tau{i}" for i in range(12) if f"tau{i}" in c]
+    pd_tau_names = [f"pd_tau{i}" for i in range(12) if f"pd_tau{i}" in c]
 
     tracking_errors: list[float] = []
-    if len(target_names) == 12 and len(q_names) == 12:
+    if len(qerr_names) == 12:
+        for name in qerr_names:
+            tracking_errors.extend(abs(value) for value in c[name])
+    elif len(applied_target_names) == 12 and len(q_names) == 12:
+        for i in range(12):
+            tracking_errors.extend(
+                abs(t - q) for t, q in zip(c[f"applied_target{i}"], c[f"q{i}"])
+            )
+    elif len(target_names) == 12 and len(q_names) == 12:
         for i in range(12):
             tracking_errors.extend(abs(t - q) for t, q in zip(c[f"target{i}"], c[f"q{i}"]))
 
@@ -287,6 +299,18 @@ def analyze(path: Path) -> dict:
         },
         "tilt_deg": stats(tilt_deg),
         "max_abs_action": max_abs(c, action_names) if action_names else math.nan,
+        "max_abs_joint_effort": max_abs(c, tau_names) if tau_names else math.nan,
+        "joint_effort_abs": {
+            name: stats([abs(value) for value in c[name]]) for name in tau_names
+        },
+        "max_abs_pd_torque": max_abs(c, pd_tau_names) if pd_tau_names else math.nan,
+        "pd_torque_abs": {
+            name: stats([abs(value) for value in c[name]]) for name in pd_tau_names
+        },
+        "mechanical_power_abs_sum": (
+            stats(c["mechanical_power_abs_sum"])
+            if "mechanical_power_abs_sum" in c else stats([])
+        ),
         "action_step": stats(action_steps),
         "joint_tracking_abs_error": stats(tracking_errors),
         "external_control": external_control,
@@ -508,6 +532,13 @@ def print_report(report: dict, compact: bool = False) -> None:
         f"最大动作 {fmt(report['max_abs_action'], 2)} | "
         f"关节误差P95 {fmt(report['joint_tracking_abs_error']['p95'], 3)} rad"
     )
+    if math.isfinite(report["max_abs_joint_effort"]):
+        print(
+            f"Joint effort max {report['max_abs_joint_effort']:.2f} Nm | "
+            f"nominal PD torque max {report['max_abs_pd_torque']:.2f} Nm | "
+            f"absolute mechanical power P95 "
+            f"{fmt(report['mechanical_power_abs_sum']['p95'], 2)} W"
+        )
     print(f"命令与运控: {report['control_status']}")
     for issue in report["control_issues"]:
         print(f"  [{issue['level']}] {issue['message']}")

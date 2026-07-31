@@ -23,3 +23,8 @@ LOCO_DEPTH_SOURCE=constant ./scripts/run_loco_stage_fixed_test.sh --network eth0
 
 The wrapper restores the original RealSense configuration on normal exit or
 `Ctrl+C`.
+
+Extended diagnostics include per-joint measured position/velocity, motor
+`tau_est`, requested/applied targets, position error, nominal PD torque, and
+mechanical power. The bundled analyzer reports effort, tracking, timing, and
+depth statistics after each run.
