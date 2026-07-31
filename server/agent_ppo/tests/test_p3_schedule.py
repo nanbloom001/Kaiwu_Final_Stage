@@ -22,6 +22,7 @@ from agent_ppo.workflow.p3_standard_joint_workflow import (
     _low_policy_action,
     _native_command_epoch,
     _requires_environment_rebuild,
+    _run_adapter_updates,
     _storage_bytes,
     _zero_inactive_high_commands,
 )
@@ -218,17 +219,16 @@ def test_coordinator_keeps_std_frozen_and_scales_low_lrs():
     )
     assert not visual.actor_critic.std.requires_grad
     assert [group["lr"] for group in visual.optimizer.param_groups] == pytest.approx([2e-6, 1e-6, 1e-4])
-    joint.update_clock(6.5 * 3600)
+    joint.update_clock(7200.0)
     assert [group["lr"] for group in visual.optimizer.param_groups] == pytest.approx([0.0, 0.0, 0.0])
 
 
 def test_only_domain_randomization_boundaries_rebuild_environment():
     assert _requires_environment_rebuild(1799.0, 1800.0)
-    assert _requires_environment_rebuild(7199.0, 7200.0)
-    assert _requires_environment_rebuild(12599.0, 12600.0)
-    assert not _requires_environment_rebuild(17999.0, 18000.0)
-    assert not _requires_environment_rebuild(21599.0, 21600.0)
-    assert not _requires_environment_rebuild(23399.0, 23400.0)
+    assert not _requires_environment_rebuild(3599.0, 3600.0)
+    assert not _requires_environment_rebuild(5399.0, 5400.0)
+    assert not _requires_environment_rebuild(5999.0, 6000.0)
+    assert not _requires_environment_rebuild(7199.0, 7200.0)
 
 
 def test_high_adapter_updates_every_second_policy_rollout():
@@ -237,6 +237,24 @@ def test_high_adapter_updates_every_second_policy_rollout():
     assert _high_adapter_update_due(2, config)
     assert not _high_adapter_update_due(3, config)
     assert _high_adapter_update_due(4, config)
+
+
+def test_adapter_update_metrics_distinguish_attempts_applied_and_skipped():
+    results = iter(
+        (
+            {"adapter_loss": 0.2, "adapter_updates": 1.0},
+            {"adapter_loss": 0.0, "adapter_updates": 0.0},
+        )
+    )
+    agent = SimpleNamespace(
+        high_level_algorithm=SimpleNamespace(
+            update_adapter_after_policy=lambda: next(results)
+        )
+    )
+    metrics = _run_adapter_updates(agent, 2)
+    assert metrics["adapter_update_attempts"] == 2.0
+    assert metrics["adapter_updates"] == 1.0
+    assert metrics["adapter_skipped_updates"] == 1.0
 
 
 def test_native_command_epoch_tracks_each_environment_independently():
@@ -344,12 +362,38 @@ def test_joint_success_monitor_persists_across_rollouts_and_resets():
     coordinator.observe_subgoal_and_terminal(aux)
     coordinator.observe_subgoal_and_terminal(aux)
     terminal = torch.zeros(2, p2_contract.WORKER_AUX_DIM)
+    terminal[0, 15] = 3.91
     terminal[0, 24] = 1
     terminal[0, 25] = 1
     metrics = coordinator.observe_subgoal_and_terminal(terminal)
     assert metrics["p3_standard_success_count"].item() == 1.0
+    assert metrics["p3_platform_success_count"].item() == 1.0
+    assert metrics["p3_proxy_platform_agreement_count"].item() == 1.0
     assert metrics["p3_joint_success_count"].item() == 1.0
     assert coordinator.episode_subgoal_successes.tolist() == [0, 0]
+
+
+def test_terminal_safe_pose_is_not_reused_as_next_episode_origin():
+    coordinator = object.__new__(AlgorithmP3StandardJoint)
+    coordinator.config = {}
+    terminal = torch.zeros(1, p2_contract.WORKER_AUX_DIM)
+    terminal[0, 15] = 3.91
+    terminal[0, 24] = 1
+    terminal[0, 25] = 1
+    first = coordinator.observe_subgoal_and_terminal(terminal)
+    assert first["p3_standard_success_count"].item() == 1.0
+    coordinator.sync_episode_origins(terminal)
+    assert not bool(coordinator.episode_origin_valid[0])
+
+    next_episode = torch.zeros(1, p2_contract.WORKER_AUX_DIM)
+    next_episode[0, 15:17] = torch.tensor([0.25, -0.10])
+    second = coordinator.observe_subgoal_and_terminal(next_episode)
+    assert second["p3_standard_success_count"].item() == 0.0
+    assert coordinator.episode_origin_valid.tolist() == [True]
+    assert torch.allclose(
+        coordinator.episode_origin_xy[0], torch.tensor([0.25, -0.10])
+    )
+    assert second["p3_radial_distance_mean"].item() == pytest.approx(0.0)
 
 
 def test_inactive_high_commands_are_zeroed_without_touching_live_envs():
@@ -400,17 +444,17 @@ def test_high_schedule_applies_real_adapter_learning_rates():
     algorithm._apply_training_schedule(0.0)
     assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(3.0e-5)
 
-    algorithm._apply_training_schedule(5.0 * 3600)
+    algorithm._apply_training_schedule(5400.0)
     assert algorithm.current_phase == "adaptercalib"
     assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(2.0e-4)
     assert all(group["lr"] == 0.0 for group in algorithm.actor_optimizer.param_groups)
-    assert algorithm.critic_optimizer.param_groups[0]["lr"] == 0.0
+    assert algorithm.critic_optimizer.param_groups[0]["lr"] == pytest.approx(9.0e-5)
 
-    algorithm._apply_training_schedule(6.0 * 3600)
+    algorithm._apply_training_schedule(6000.0)
     assert algorithm.current_phase == "highadapt"
     assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-5)
 
-    algorithm._apply_training_schedule(6.5 * 3600)
+    algorithm._apply_training_schedule(7200.0)
     assert algorithm.current_phase == "highslow"
     assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-5)
 

@@ -61,6 +61,21 @@ def _high_adapter_update_due(high_updates: int, response_config: dict) -> bool:
     return int(high_updates) % interval == 0
 
 
+def _run_adapter_updates(agent, count: int) -> dict[str, float]:
+    attempts = max(0, int(count))
+    latest: dict[str, float] = {}
+    applied = 0.0
+    for _ in range(attempts):
+        current = agent.high_level_algorithm.update_adapter_after_policy()
+        if isinstance(current, dict):
+            latest.update(current)
+            applied += float(current.get("adapter_updates", 0.0))
+    latest["adapter_update_attempts"] = float(attempts)
+    latest["adapter_updates"] = applied
+    latest["adapter_skipped_updates"] = float(attempts) - applied
+    return latest
+
+
 def _native_command_epoch(agent, target_command: torch.Tensor) -> torch.Tensor:
     """Track asynchronous platform-native command changes per environment."""
     previous = getattr(agent, "_p3_native_target_cmd", None)
@@ -237,7 +252,14 @@ def _command_accumulator(device):
         "terrain_levels": torch.zeros(10, device=device),
         "outcomes": torch.zeros(3, device=device),
         "standard_successes": torch.zeros((), device=device),
+        "platform_successes": torch.zeros((), device=device),
         "joint_successes": torch.zeros((), device=device),
+        "proxy_platform_agreements": torch.zeros((), device=device),
+        "m1_successes": torch.zeros((), device=device),
+        "m2_successes": torch.zeros((), device=device),
+        "radial_distance": torch.zeros((), device=device),
+        "best_radial_distance": torch.zeros((), device=device),
+        "m3_hold": torch.zeros((), device=device),
     }
 
 
@@ -291,8 +313,21 @@ def _accumulate_outcomes(accumulator, aux):
 
 def _accumulate_joint_success(agent, accumulator, aux):
     metrics = agent.algorithm.observe_subgoal_and_terminal(aux)
+    batch = float(aux.shape[0])
     accumulator["standard_successes"] += metrics["p3_standard_success_count"]
+    accumulator["platform_successes"] += metrics["p3_platform_success_count"]
     accumulator["joint_successes"] += metrics["p3_joint_success_count"]
+    accumulator["proxy_platform_agreements"] += metrics[
+        "p3_proxy_platform_agreement_count"
+    ]
+    accumulator["m1_successes"] += metrics["p3_m1_success_count"]
+    accumulator["m2_successes"] += metrics["p3_m2_success_count"]
+    accumulator["radial_distance"] += metrics["p3_radial_distance_mean"] * batch
+    accumulator["best_radial_distance"] += metrics[
+        "p3_best_radial_distance_mean"
+    ] * batch
+    accumulator["m3_hold"] += metrics["p3_m3_hold_share"] * batch
+    return metrics
 
 
 def _zero_inactive_high_commands(command, active: torch.Tensor) -> None:
@@ -347,7 +382,18 @@ def _command_metrics(accumulator):
     for index, label in enumerate(("completed", "failure", "timeout")):
         result[f"p3_window_{label}_count"] = accumulator["outcomes"][index]
     result["p3_standard_success_count"] = accumulator["standard_successes"]
+    result["p3_platform_success_count"] = accumulator["platform_successes"]
     result["p3_joint_success_count"] = accumulator["joint_successes"]
+    result["p3_proxy_platform_agreement_count"] = accumulator[
+        "proxy_platform_agreements"
+    ]
+    result["p3_m1_success_count"] = accumulator["m1_successes"]
+    result["p3_m2_success_count"] = accumulator["m2_successes"]
+    result["p3_radial_distance_mean"] = accumulator["radial_distance"] / count
+    result["p3_best_radial_distance_mean"] = (
+        accumulator["best_radial_distance"] / count
+    )
+    result["p3_m3_hold_share"] = accumulator["m3_hold"] / count
     keys = tuple(result)
     values = torch.stack([result[key].reshape(()) for key in keys]).detach().cpu().tolist()
     return dict(zip(keys, values))
@@ -468,7 +514,12 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
             last_values = algorithm.actor_critic.evaluate(next_critic).detach()
         storage.compute_returns(last_values, algorithm.gamma, algorithm.lam)
         metrics = algorithm.learn(agent.training_elapsed_h)
-        _finalize_low_level_update(agent, metrics)
+        low_updated = _finalize_low_level_update(agent, metrics)
+        if low_updated:
+            update_count = 2 if agent.algorithm.current_phase == "lowmedium" else 1
+            metrics.update(_run_adapter_updates(agent, update_count))
+        else:
+            metrics.update(_run_adapter_updates(agent, 0))
     else:
         metrics = {"applied_updates": 0.0, "policy_loss": 0.0, "value_loss": 0.0}
     storage_bytes = _storage_bytes(storage)
@@ -495,12 +546,20 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
     reward_component_sum = {}
     reward_component_ticks = 0
     frontier_clawback = torch.zeros((), device=agent.device)
+    frontier_clawback_count = torch.zeros((), device=agent.device)
+    radial_reward_sum = torch.zeros((), device=agent.device)
     for _ in range(p2_contract.NAV_ROLLOUT_TICKS):
         _, start_aux = split_p2_transport(critic_wire)
+        agent.algorithm.sync_episode_origins(start_aux)
+        tick_origin = agent.algorithm.episode_origin_xy.clone()
+        tick_best_radius = agent.algorithm.best_radial_distance.clone()
         start_goal = start_aux[:, p2_contract.PRE_STEP_GOAL_DISTANCE_INDEX].clone()
         event_goal = torch.full_like(start_goal, float("nan"))
         local_success = torch.zeros(agent.num_envs, dtype=torch.bool, device=agent.device)
         local_timeout = torch.zeros_like(local_success)
+        m1_success = torch.zeros_like(local_success)
+        m2_success = torch.zeros_like(local_success)
+        m3_success = torch.zeros_like(local_success)
         duration = torch.zeros(agent.num_envs, dtype=torch.long, device=agent.device)
         hard = torch.zeros(agent.num_envs, dtype=torch.bool, device=agent.device)
         timeout = torch.zeros_like(hard)
@@ -512,6 +571,8 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
         )
         terminal_exec = torch.zeros(agent.num_envs, 3, device=agent.device)
         for _frame in range(p2_contract.NAV_PERIOD_FRAMES):
+            _, current_aux = split_p2_transport(critic_wire)
+            agent.algorithm.guard_high_commands(current_aux)
             if _frame > 0:
                 # A vectorized environment may reset one member while the other
                 # members are still completing this high-level transition. Feed
@@ -519,6 +580,7 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
                 # command. This is agent-side and never patches platform BaseEnv.
                 _zero_inactive_high_commands(algorithm.command, active)
             result, _, aux = algorithm.frame_begin(obs, critic_wire)
+            agent.algorithm.guard_high_commands(aux)
             if _frame > 0:
                 # frame_begin can open a new 5 Hz tick and sample a target. The
                 # inactive member still belongs to the previous transition.
@@ -544,7 +606,12 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
                 worker_aux=next_aux,
             )
             _accumulate_outcomes(command_accumulator, next_aux)
-            _accumulate_joint_success(agent, command_accumulator, next_aux)
+            p3_events = _accumulate_joint_success(
+                agent, command_accumulator, next_aux
+            )
+            m1_success |= active & p3_events["m1_reached_mask"]
+            m2_success |= active & p3_events["m2_reached_mask"]
+            m3_success |= active & p3_events["m3_proxy_new_mask"]
             duration += active.long()
             new_done = active & frame_done
             resolved, new_hard, new_timeout = _resolve_terminal_outcome(
@@ -572,13 +639,25 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
         _, live_aux = split_p2_transport(critic_wire)
         live_goal = live_aux[:, p2_contract.PRE_STEP_GOAL_DISTANCE_INDEX]
         end_goal = torch.where(torch.isfinite(event_goal), event_goal, live_goal)
-        frame_reward += local_success.float() * float(
-            agent.algorithm.config.get("subgoal_success_reward", 8.0)
+        transition_done = hard | timeout
+        diagnostic_pose = torch.where(
+            transition_done.unsqueeze(-1), terminal_aux[:, 15:17], live_aux[:, 15:17]
+        )
+        end_radius = p3_contract.radial_distance(diagnostic_pose, tick_origin)
+        radial_reward, _ = p3_contract.radial_new_best(
+            end_radius, tick_best_radius
+        )
+        radial_reward = torch.where(transition_done, torch.zeros_like(radial_reward), radial_reward)
+        frame_reward += radial_reward
+        frame_reward += (m1_success | m2_success).float() * float(
+            agent.algorithm.config.get("milestone_success_reward", 1.5)
+        )
+        frame_reward += m3_success.float() * float(
+            agent.algorithm.config.get("m3_success_reward", 15.0)
         )
         frame_reward += local_timeout.float() * float(
-            agent.algorithm.config.get("subgoal_timeout_penalty", -1.0)
+            agent.algorithm.config.get("subgoal_timeout_penalty", -0.5)
         )
-        transition_done = hard | timeout
         diagnostic_aux = torch.where(
             transition_done.unsqueeze(-1), terminal_aux, live_aux
         )
@@ -613,6 +692,7 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
             frontier_clawback += torch.clamp(
                 frontier_value.reshape(-1)[local_timeout], max=0.0
             ).sum().detach()
+            frontier_clawback_count += local_timeout.float().sum().detach()
         reset_reward_state = local_success | local_timeout
         if bool(reset_reward_state.any()):
             algorithm.best_goal_distance[reset_reward_state] = float("inf")
@@ -620,17 +700,26 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
             algorithm._reset_navigation_reward_state(reset_reward_state)
         local_successes += local_success.float().sum()
         local_timeouts += local_timeout.float().sum()
+        radial_reward_sum += radial_reward.mean().detach()
         if full and algorithm.rollout.step != p2_contract.NAV_ROLLOUT_TICKS:
             raise RuntimeError("P3 high rollout filled at an invalid boundary")
     if not algorithm.rollout.full:
         raise RuntimeError("P3 high rollout did not fill at 32 ticks")
     metrics = algorithm.update()
+    metrics["high_reward_mean"] = float(metrics.get("rollout_reward_mean", 0.0))
     agent.algorithm.high_updates += 1
     response_config = agent.algorithm.config.get("response_adapter", {})
-    if _high_adapter_update_due(agent.algorithm.high_updates, response_config):
-        metrics.update(algorithm.update_adapter_after_policy())
+    if agent.algorithm.current_phase == "adaptercalib":
+        metrics.update(
+            _run_adapter_updates(
+                agent,
+                int(response_config.get("calibration_updates_per_iteration", 4)),
+            )
+        )
+    elif _high_adapter_update_due(agent.algorithm.high_updates, response_config):
+        metrics.update(_run_adapter_updates(agent, 1))
     else:
-        metrics.update({"adapter_loss": 0.0, "adapter_updates": 0.0})
+        metrics.update(_run_adapter_updates(agent, 0))
     reward_metric_keys = tuple(reward_component_sum)
     reward_metric_values = (
         torch.stack(
@@ -642,8 +731,9 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
         if reward_metric_keys
         else []
     )
+    frontier_settlement_mean = frontier_clawback / frontier_clawback_count.clamp_min(1.0)
     terminal_values = torch.stack(
-        (local_successes, local_timeouts, frontier_clawback)
+        (local_successes, local_timeouts, frontier_settlement_mean)
     ).detach().cpu().tolist()
     metrics.update(
         {
@@ -657,7 +747,10 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
                 f"reward_{name}": value
                 for name, value in zip(reward_metric_keys, reward_metric_values)
             },
-            "p3_frontier_clawback": terminal_values[2],
+            "reward_frontier_settlement_mean": terminal_values[2],
+            "reward_radial_new_best": float(
+                radial_reward_sum / p2_contract.NAV_ROLLOUT_TICKS
+            ),
         }
     )
     return obs, critic_wire, metrics
@@ -722,7 +815,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 obs, critic_wire, metrics = _collect_low_rollout(
                     env, agent, obs, critic_wire, train_low=train_low
                 )
-                updates = 4 if phase_before == "adaptercalib" else 1
+                updates = 2 if phase_before == "lowmedium" else 1
                 adapter_metrics = {}
                 for _ in range(updates):
                     adapter_metrics = agent.high_level_algorithm._adapter_update()

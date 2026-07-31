@@ -177,6 +177,16 @@ class RewardProcess(RewardProcessBase):
         asset = self._get_robot_asset()
         return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
 
+    def _reward_p3_posture_stability(self, raw_cap: float = 0.24):
+        """Terrain-relative roll/pitch and body-rate cost without a height target."""
+        asset = self._get_robot_asset()
+        gravity = asset.data.projected_gravity_b[:, :2]
+        angular = asset.data.root_ang_vel_b[:, :2]
+        roll_like = gravity[:, 1].square()
+        pitch_like = gravity[:, 0].square()
+        raw = roll_like + 0.35 * pitch_like + 0.15 * angular.square().sum(dim=-1)
+        return torch.clamp(raw, 0.0, float(raw_cap))
+
     def _reward_joint_vel(self):
         asset = self._get_robot_asset()
         return torch.sum(torch.square(asset.data.joint_vel), dim=1)

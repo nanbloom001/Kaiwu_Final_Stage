@@ -429,9 +429,12 @@ environment step   = joint12 (platform contract unchanged)
 2-8 秒三轴命令，低层 observation、worker reward 与实际执行保持一致；高层开始拥有命令后低层
 冻结，worker 低层 reward 不进入任何低层更新。P3 的
 `_p3_goal_positions` 是训练 worker 私有局部目标，不替换平台 Standard scorer 的任务定义。
-局部目标距离 1.5-2.8m，限制在 8m 地块的 1m 内边界；进入 0.6m 只结算高层事件奖励并重采样，
-不终止或 reset Standard episode。正式 Standard success 仍只由平台 scorer 产生；二者的联合
-成功仅可作为监控指标，不能反向改变 scorer。
+局部目标使用相对真实出生点的径向里程碑：M1 `1.3-1.6m`、M2 `2.5-2.9m`；M3 使用
+`terrain_width/2-0.1m` 的平台完成公式。默认 8m 地块对应 proxy `3.90m`、控制目标 `3.93m`
+与边界 `4.00m`。M1/M2 进入 0.5m 只结算一次事件奖励，不终止或 reset Standard episode；
+M3 达到 proxy 后命令归零等待平台 scorer。正常晋级保持方向，timeout 只允许相对 episode
+初始方向左右 30/60 度重规划。正式 Standard success 仍由平台 scorer 产生；proxy/platform
+一致率和 joint success 仅作监控，不能反向改变 scorer。
 
 ```text
 format = "kaiwu_train_v1"
@@ -447,7 +450,7 @@ training_states.global.session_effective_seconds / lifetime_effective_seconds
 training_states.global.low_updates / high_updates / compound_schedule_phase
 training_states.global.p3_anchor_digest / low_level_version
 training_states.global.domain_randomization_phase / domain_randomization_realized
-contracts.p3_standard_joint.name = "p3_standard_joint_v3"
+contracts.p3_standard_joint.name = "p3_standard_radial_v4"
 ```
 
 阶段文件标签固定为 `lowbase`、`lowmild`、`lowmedium`、`lowfull`、`adaptercalib`、
@@ -480,9 +483,10 @@ lowmild > lowbase`；无同 ID P3 文件时只允许唯一 discovery，多个候
 错误必须硬失败，禁止继续用随机参数评分。
 
 每个阶段边界先保存 checkpoint，再通过平台公开 `env.reset(config)` 开始新 episode；不修改或
-依赖平台托管的 `BaseEnv`。只有 0.5h/2h/3.5h 边界改变 friction/base-mass/noise 配置，其余边界
-使用同一环境配置完成职责切换。`adaptercalib` 只执行冻结低层推理和 Adapter 数据采集，不生成
-低层 PPO transition；高层阶段按 `high_update_interval=2` 更新 Adapter。
+依赖平台托管的 `BaseEnv`。本轮只在 0.5h 边界增强 friction/base-mass/noise，未验证的 COM、PD、
+action gain/delay 与按环境 push 不属于运行合同。低层 optimizer 成功后先推进 low-level digest/version
+并清除未完成 future history，再执行 Adapter update；0-60 分钟每轮 1 次、60-90 分钟每轮 2 次，
+`adaptercalib` 每轮 4 次，高层后段按 `high_update_interval=2` 更新。
 
 文件数字 ID 完全使用开悟框架传入值，不由业务代码从 iteration 或父模型 ID
 计算。R2 每次保存同一 payload 的阶段文件和评估兼容别名：

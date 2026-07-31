@@ -68,15 +68,15 @@ def _build_joint(config: dict) -> AlgorithmP3StandardJoint:
         optimizer=optimizer,
         sequence_length=16,
         schedule_mode="p3_low_recovery_v1",
-        run_name="p3-parent-smoke",
-        source_parent_model_id=648278,
+        run_name=str(config.get("run_name", "p3-parent-smoke")),
+        source_parent_model_id=config.get("parent_model_id"),
         anchor_schedule_hours=[],
         action_anchor_schedule=None,
         latent_anchor_schedule=None,
         anchor_phase_labels=None,
         anchor_phase_end_hours=[],
         critic_warmup_learning_rate=None,
-        task_end_hours=8.0,
+        task_end_hours=float(config.get("task_end_hours", 2.5)),
         warning_only_safety=True,
         max_anchor_action_mse=0.1,
         max_hard_termination_delta=0.05,
@@ -209,9 +209,10 @@ def main() -> int:
     with args.config.open("rb") as stream:
         config = tomllib.load(stream)["p3_standard_joint"]
     joint = _build_joint(config)
+    parent_model_id = str(config.get("parent_model_id", "")) or None
     warm_start = joint.load_checkpoint(
         args.checkpoint,
-        platform_model_id="648278",
+        platform_model_id=parent_model_id,
     )
     parent = torch.load(args.checkpoint, weights_only=False, map_location="cpu")
     expected_std = parent["modules"]["low_level"]["action_distribution"][

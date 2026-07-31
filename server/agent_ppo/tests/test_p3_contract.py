@@ -10,7 +10,7 @@ import pytest
 from agent_ppo.checkpoint_io import p3_standard_joint_candidates
 from agent_ppo.feature import p3_contract as p3
 from agent_ppo.feature.goal_features import build_track_goal_raw
-from agent_ppo.feature.p2_worker_bridge import P2WorkerBridge
+from agent_ppo.feature.p2_worker_bridge import P2WorkerBridge, _terminal_safe_root_pose
 from agent_ppo.feature.p3_goal_provider import (
     StandardFarGoalProvider,
     p3_local_out_of_bounds,
@@ -40,18 +40,18 @@ def test_materialized_domain_randomization_uses_phase_values():
     config = {
         "p3_standard_joint": {
             "domain_randomization": {
-                "friction_ranges": [[0.9, 1.1], [0.8, 1.2], [0.7, 1.25], [0.6, 1.3]],
-                "base_added_mass_kg": [0.0, 0.25, 0.5, 0.75],
-                "noise_levels": [0, 0.25, 0.5, 0.5],
+                "friction_ranges": [[0.6, 1.3], [0.55, 1.35]],
+                "base_added_mass_kg": [0.75, 0.85],
+                "noise_levels": [0.50, 0.55],
             }
         }
     }
-    realized = p3.materialize_environment_config(config, 3.6 * 3600)
-    assert realized["domain_rand"]["friction_range"] == [0.6, 1.3]
-    assert realized["domain_rand"]["added_mass_range"] == [-0.75, 0.75]
+    realized = p3.materialize_environment_config(config, 1800.0)
+    assert realized["domain_rand"]["friction_range"] == [0.55, 1.35]
+    assert realized["domain_rand"]["added_mass_range"] == [-0.85, 0.85]
     assert realized["domain_rand"]["push_robots"] is False
     assert realized["p3_runtime"]["worker_command_override"] is False
-    assert realized["noise"]["noise_level"] == 0.5
+    assert realized["noise"]["noise_level"] == 0.55
 
 
 def test_success_contracts_are_independent():
@@ -74,9 +74,10 @@ def test_local_bounds_and_phase_boundaries():
     assert p3.local_out_of_bounds(root, origin).tolist() == [False, True]
     assert p3.phase_for_elapsed(0).name == "lowbase"
     assert p3.phase_for_elapsed(1800).name == "lowmild"
-    assert p3.phase_for_elapsed(5 * 3600).name == "adaptercalib"
-    assert p3.phase_for_elapsed(6 * 3600).name == "highadapt"
-    assert p3.phase_for_elapsed(6.5 * 3600).name == "highslow"
+    assert p3.phase_for_elapsed(3600).name == "lowmedium"
+    assert p3.phase_for_elapsed(5400).name == "adaptercalib"
+    assert p3.phase_for_elapsed(6000).name == "highadapt"
+    assert p3.phase_for_elapsed(7200).name == "highslow"
 
 
 class _Scene:
@@ -105,6 +106,7 @@ def test_goal_provider_keeps_success_visible_for_one_observation():
     provider = StandardFarGoalProvider(env, seed=7)
     provider.update(dt_s=0.02)
     first_goal = provider.goal_xy.clone()
+    first_direction = provider.direction_angle.clone()
     env.episode_length_buf.fill_(1)
     env.scene.robot.data.root_pos_w[0, :2] = first_goal[0]
     env.common_step_counter = 1
@@ -114,6 +116,38 @@ def test_goal_provider_keeps_success_visible_for_one_observation():
     env.common_step_counter = 2
     provider.update(dt_s=0.02)
     assert not torch.equal(provider.goal_xy, first_goal)
+    assert torch.equal(provider.direction_angle, first_direction)
+    assert provider.milestone_index.tolist() == [1]
+
+
+def test_goal_timeout_replans_only_with_allowed_angular_offsets():
+    root = torch.tensor([[0.0, 0.0, 0.35]])
+    env = SimpleNamespace(
+        num_envs=1,
+        device="cpu",
+        common_step_counter=0,
+        episode_length_buf=torch.zeros(1, dtype=torch.long),
+    )
+    env.scene = _Scene(
+        SimpleNamespace(data=SimpleNamespace(root_pos_w=root)),
+        torch.zeros(1, 3),
+    )
+    provider = StandardFarGoalProvider(env, seed=11)
+    provider.update(dt_s=0.02)
+    base = provider.base_direction_angle.clone()
+    provider.goal_timeout_s.zero_()
+    env.episode_length_buf.fill_(1)
+    env.common_step_counter = 1
+    provider.update(dt_s=0.02)
+    env.common_step_counter = 2
+    provider.update(dt_s=0.02)
+    offset = torch.rad2deg(
+        torch.atan2(
+            torch.sin(provider.direction_angle - base),
+            torch.cos(provider.direction_angle - base),
+        )
+    ).abs()
+    assert offset.item() == pytest.approx(30.0) or offset.item() == pytest.approx(60.0)
 
 
 def test_invalid_subgoal_uses_non_rewarding_tile_recovery_target():
@@ -131,7 +165,7 @@ def test_invalid_subgoal_uses_non_rewarding_tile_recovery_target():
     provider = StandardFarGoalProvider(env, seed=7)
     provider.update(dt_s=0.02)
     assert bool(provider.sample_invalid[0])
-    assert torch.equal(provider.goal_xy[0], provider.tile_origin_xy[0])
+    assert torch.equal(provider.goal_xy[0], provider.episode_origin_xy[0])
     assert not bool(env._p3_subgoal_reached[0])
 
 
@@ -235,8 +269,8 @@ def test_p3_production_config_and_monitor_are_standard_specific():
     }
     assert config["terrain"]["mode"] == "standard"
     assert config["terrain"]["curriculum"] is False
-    assert config["p3_standard_joint"]["run_name"] == "p3std8h-sim2real"
-    assert config["p3_standard_joint"]["target_effective_seconds"] == 28800
+    assert config["p3_standard_joint"]["run_name"] == "p3std2h30-s2r-radial"
+    assert config["p3_standard_joint"]["target_effective_seconds"] == 9000
     monitor_source = (root / "conf/monitor_builder.py").read_text()
     p3_builder = monitor_source.split("def _build_p3_monitor():", 1)[1].split(
         "def build_monitor():", 1
@@ -244,3 +278,48 @@ def test_p3_production_config_and_monitor_are_standard_specific():
     assert "p2_curriculum" not in p3_builder
     assert "p2_track_segments" not in p3_builder
     assert "p3_command_feedback" in p3_builder
+    assert "p3_radial_milestones" in p3_builder
+    assert "p3_frontier_clawback" not in p3_builder
+
+
+def test_platform_completion_radii_keep_a_boundary_margin():
+    complete, target, boundary = p3.platform_completion_radii(8.0)
+    assert complete == pytest.approx(3.90)
+    assert target == pytest.approx(3.93)
+    assert boundary == pytest.approx(4.00)
+    assert complete < target < boundary
+
+
+def test_p3_terminal_transport_keeps_pre_reset_root_pose():
+    live = torch.tensor([[0.0, 0.0, 0.1], [1.0, 2.0, 0.2]])
+    previous = torch.tensor([[3.91, 0.0, 0.0], [0.5, 0.5, 0.1]])
+    reset = torch.tensor([True, False])
+    selected = _terminal_safe_root_pose(live, previous, reset, enabled=True)
+    assert torch.equal(selected[0], previous[0])
+    assert torch.equal(selected[1], live[1])
+    assert torch.equal(
+        _terminal_safe_root_pose(live, previous, reset, enabled=False), live
+    )
+
+
+def test_radial_new_best_cannot_be_replayed_at_the_same_radius():
+    radius = torch.tensor([1.25, 1.25, 1.40])
+    best = torch.tensor([1.00, 1.25, 1.35])
+    reward, next_best = p3.radial_new_best(radius, best)
+    assert reward.tolist() == pytest.approx([0.8, 0.0, 0.2])
+    replay, replay_best = p3.radial_new_best(radius, next_best)
+    assert torch.equal(replay, torch.zeros_like(replay))
+    assert torch.equal(replay_best, next_best)
+
+
+def test_radial_soft_brake_caps_only_outward_motion():
+    command = torch.tensor([[1.0, 0.0, 0.2], [-0.4, 0.0, -0.2], [0.8, 0.0, 0.1]])
+    root = torch.tensor([[3.72, 0.0], [3.88, 0.0], [3.91, 0.0]])
+    origin = torch.zeros_like(root)
+    guarded, hold = p3.cap_outward_body_command(
+        command, root, origin, torch.zeros(3), 3.90
+    )
+    assert guarded[0, 0].item() == pytest.approx(0.30)
+    assert guarded[1, 0].item() == pytest.approx(-0.40)
+    assert torch.equal(guarded[2], torch.zeros(3))
+    assert hold.tolist() == [False, False, True]

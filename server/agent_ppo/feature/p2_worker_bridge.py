@@ -125,6 +125,18 @@ def _termination_reason_codes(env, reset: torch.Tensor) -> torch.Tensor:
     return result
 
 
+def _terminal_safe_root_pose(
+    live_pose: torch.Tensor,
+    previous_pose: torch.Tensor,
+    reset: torch.Tensor,
+    *,
+    enabled: bool,
+) -> torch.Tensor:
+    if not enabled:
+        return live_pose
+    return torch.where(reset.unsqueeze(-1), previous_pose, live_pose)
+
+
 def _merge_worker_terminal_returns(
     terminated,
     truncated,
@@ -307,6 +319,15 @@ class P2WorkerBridge:
         self._previous_segment = torch.full(
             (self.num_envs,), -1.0, device=self.device
         )
+        initial_quat = getattr(robot.data, "root_quat_w", None)
+        initial_yaw = (
+            _yaw_from_wxyz(initial_quat)
+            if torch.is_tensor(initial_quat)
+            else torch.zeros(self.num_envs, device=self.device)
+        )
+        self._previous_root_pose = torch.cat(
+            (robot.data.root_pos_w[:, :2].detach(), initial_yaw.unsqueeze(-1)), dim=-1
+        ).to(self.device)
         self._last_gait_log_step = -3000
         terrain = getattr(getattr(self.env, "scene", None), "terrain", None)
         initial_segment, segment_status = _track_segment_index(
@@ -441,7 +462,14 @@ class P2WorkerBridge:
         aux[:, 10:11] = feedback.velocity_age
         aux[:, 11:12] = feedback.feedback_source
         aux[:, 12:15] = true_velocity
-        aux[:, 15:18] = torch.cat((data.root_pos_w[:, :2], yaw.unsqueeze(-1)), dim=-1)
+        root_pose = torch.cat((data.root_pos_w[:, :2], yaw.unsqueeze(-1)), dim=-1)
+        root_pose = _terminal_safe_root_pose(
+            root_pose,
+            self._previous_root_pose,
+            reset,
+            enabled=self.runtime_stage_type == "p3_standard_joint",
+        )
+        aux[:, 15:18] = root_pose
         aux[:, 18:21] = feedback.ang_vel
         aux[:, 21:24] = feedback.projected_gravity
         # Evaluation does not receive frame_end(dones). Carry the worker-known
@@ -508,6 +536,9 @@ class P2WorkerBridge:
         self._previous_level.copy_(level)
         self._previous_goal_distance.copy_(goal_distance)
         self._previous_segment.copy_(current_segment.float())
+        self._previous_root_pose.copy_(
+            torch.cat((data.root_pos_w[:, :2], yaw.unsqueeze(-1)), dim=-1)
+        )
         self.last_step = step
 
     def response_aux(self) -> torch.Tensor:

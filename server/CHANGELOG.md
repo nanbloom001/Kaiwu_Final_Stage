@@ -4,6 +4,18 @@
 
 ## [未发布]
 
+- **[P3 Standard 径向完成与 2.5 小时恢复课程]** 新任务 `p3std2h30-s2r-radial` 从
+  `p3nav8h-r1_884257` warm start。局部目标改为相对真实出生点的 M1 `1.3-1.6m`、M2
+  `2.5-2.9m` 与平台 Standard M3；默认 8m 地块使用 `3.90m` proxy、`3.93m` 控制目标和
+  `4.00m` 边界，最后 0.20m/0.04m 只限制向外线速度并在完成后归零。正常里程碑晋级保持方向，
+  timeout 仅从原方向左右 30/60 度重规划。P3 worker transport 在 reset 行保留终止前 root pose，
+  使 M3 proxy、平台 success 和 terminal transition 使用同一 episode；不修改平台覆盖的 BaseEnv。
+  高层新增不可重复的 radial new-best 与 M1/M2/M3 事件奖励，Track-only safety/tracking/gait shaping
+  继续归零；raw frontier clawback 改为有效 timeout 的加权均值。低层成功更新后立即推进 Adapter
+  version/history 边界并执行 1/2 次 Adapter update，集中校准阶段每轮 4 次，高层后段每两轮 1 次。
+  监控拆分 M1/M2、proxy/platform/joint、一致率、径向距离/历史最佳/M3 hold、低高层 reward mean
+  和 Adapter attempts/applied/skipped。
+
 - **[P3 双评估入口回归修复]** 新增两个显式评估入口 `p3_standard_eval`（Standard+Camera 低层-only，
   obs 57901）与 `p3_track_eval`（Track+Camera 完整高低层，obs 57905），供同一个 P3 包 `highslow`
   等阶段文件分别评标准/赛道。修复平台任务 `599578` 中 P3 包被 `_infer_stage_from_task_name`

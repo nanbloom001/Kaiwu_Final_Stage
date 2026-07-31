@@ -20,13 +20,16 @@
 ## 活动基线
 
 - **当前 P3 功能分支入口**：`P3StandardJointConfig`（`p3_standard_joint`），任务名
-  `p3std8h-sim2real`，父包为 `p2nav2h-r2_648278`。P3 在一个 Standard+Camera 任务中按
-  rollout 边界执行低层恢复、Adapter 校准和高层适应；低层 CNN 始终冻结，
+  `p3std2h30-s2r-radial`，父包为 `p3nav8h-r1_884257`。P3 在一个 Standard+Camera 任务中按
+  rollout 边界执行 90 分钟低层恢复、10 分钟高层 Critic/Adapter 校准和 50 分钟高层适应；低层 CNN 始终冻结，
   高低层 optimizer 参数不重叠。完整 policy observation 仍为 57905，高层 Actor85 不变；
   低层在线输入适配器只删除 goal4，得到原有 57901 低层输入，不改变低层网络结构；PPO storage
-  只保存 `proprio45 + frozen_cnn_feat32 = 77`，避免 64 环境完整深度 rollout 常驻 GPU。
-- P3 私有目标从机器人当前位置采样 1.5-2.8m，并限制在 8m 地块的 1m 内边界。进入 0.6m
-  只产生一次局部目标奖励并重采样，不触发环境 reset；Standard 正式成功仍由平台 scorer 判定。
+  只保存 `proprio45 + frozen_cnn_feat32 = 77`，避免 128 环境完整深度 rollout 常驻 GPU。
+- P3 私有目标改为相对真实出生点的径向里程碑：M1 `1.3-1.6m`、M2 `2.5-2.9m`，M3 使用
+  Standard 平台公式 `terrain_width/2-0.1m`。默认 8m 地块的 proxy 阈值为 `3.90m`，控制目标为
+  `3.93m`，并在最后 `0.20m/0.04m` 对向外线速度软制动；达到阈值后命令归零等待 scorer。
+  正常晋级保持方向，timeout 只允许相对原方向左右 `30/60` 度重规划。局部里程碑不触发环境 reset；
+  Standard 正式成功仍由平台 scorer 判定，并单独统计 proxy/platform 一致率。
   平台会覆盖 `isaac_env/base_env.py`，因此 P3 不依赖任何 BaseEnv 补丁：低层恢复阶段使用平台原生
   2-8 秒三轴命令，使 observation、worker reward 与实际执行一致；高层接管命令后低层全程冻结，
   只训练高层 PPO 与 Adapter。checkpoint 标签为
@@ -42,9 +45,10 @@
   SafetyHead/Critic/optimizer/训练 buffer 均不创建。
 - `local_abs>3.2m` 仅作诊断，不能宣称触发平台 reset。分阶段环境重建只使用平台公开支持的摩擦、
   base added mass 与显式 observation noise；COM、PD、action gain/delay 和按环境 push 已删除。
-  所有职责边界均在保存后调用平台公开 `env.reset()`；只有 0.5h/2h/3.5h 边界改变 DR 参数。
-  Adapter 校准阶段不构造低层 PPO metadata，高层阶段每两次 PPO rollout 更新一次 Adapter。
-  真实 Isaac runtime 分布与 64 环境资源占用仍必须以开发容器 smoke 为准。
+  所有职责边界均在保存后调用平台公开 `env.reset()`；本轮只有 0.5h 边界增强 DR 参数。
+  低层 optimizer 成功后立即推进版本并更新 Adapter，60-90 分钟每轮更新两次；集中校准阶段每轮
+  四次，高层后段每两次 PPO rollout 更新一次。真实 Isaac runtime 分布与 128 环境资源占用仍必须
+  以开发容器 smoke 为准。
 
 - **当前功能分支入口**：`P2NavPPOConfig`（`p2_nav_ppo`），任务名 `p2nav2hsafedir`。
   它显式从最新验证通过的完整三轴 `p2nav10hvyavoid2` 包做

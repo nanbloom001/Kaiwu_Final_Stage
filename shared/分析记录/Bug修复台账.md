@@ -2718,3 +2718,39 @@
 - [`2026-07-25_Standard命令泛化下半四小时实施计划.md`](./2026-07-25_Standard命令泛化下半四小时实施计划.md)
 - [`server/tests/test_local_sync_client.py`](../../server/tests/test_local_sync_client.py)
 - [`server/tests/test_visual_policy_optimization.py`](../../server/tests/test_visual_policy_optimization.py)
+
+## BUG-20260731-003：P3 局部目标与 Standard 3.9m 完成口径脱节且低层阶段 Adapter 未更新
+
+- 日期：2026-07-31；状态：本地已验证，开发容器与平台待验证。
+- 影响：分支 `codex/p3-sim2real-radial-nav`，任务 `p3std2h30-s2r-radial`，父包
+  `p3nav8h-r1_884257`。本轮不修改平台覆盖的 `server/isaac_env/base_env.py`。
+- 用户可见症状：旧 P3 随机生成 1.5-2.8m 局部目标，完成后继续随机采样，无法保证机器人相对
+  真实出生点走到 Standard scorer 的 3.9m 走穿半径；局部完成数、平台完成数和超时无法对齐。
+  同时低层阶段只向 ResponseBuffer 写 records，optimizer step 后未调用 Adapter update，面板长期
+  显示 `adapter_updates=0`。旧 `p3_frontier_clawback` 还是整个 rollout 的原始求和，纵轴异常大。
+- 根因：局部目标状态只跟踪 goal distance，没有 episode origin、径向历史最佳和平台完成公式；
+  worker 对 terrain/goal distance 做了 reset 前快照，但 root pose 仍使用 reset 后新 episode 状态。
+  Adapter 的 deferred-update 只在高层每两轮路径解除，低层 update/version 边界没有实际 optimizer
+  调用。面板把累计 settlement 总和与单 tick reward mean 混在同一尺度。
+- 修复：按 `terrain_width/2-0.1m` 统一 M3 proxy；默认 8m 地块使用 3.90m 判定、3.93m 控制目标、
+  4.00m 边界。新增 M1 1.3-1.6m、M2 2.5-2.9m；正常晋级保持当前方向，timeout 仅允许相对原
+  方向左右 30/60 度重规划。径向 new-best 只奖励历史最大半径新增部分；最后 0.20m/0.04m
+  只裁剪向外速度，达到阈值后命令归零。P3 worker aux 的 root pose 在 reset 行改用上一帧旧
+  episode pose，wire shape 不变，P2/评估路径保持原行为。低层 PPO 真正完成 optimizer step 后先
+  更新 low digest/version 并清 history，再执行 Adapter 1 次，lowmedium 执行 2 次；adaptercalib
+  每轮 4 次，高层后段每两轮 1 次。新增 attempts/applied/skipped 面板；frontier settlement 改为
+  有效 timeout 的加权均值。
+- 排除方向：4.2m 已超过默认 8m 地块的 4.0m 边界，不能用作安全目标；未通过修改 BaseEnv
+  强行增加 termination，也未把模型 ID/lineage 设为单点门禁。未验证的 push、action delay/gain、
+  PD、COM 和相机随机化没有写成已生效合同。
+- 本地验证：P3 contract/schedule/eval 定向测试 `57 passed, 5 skipped`；加入 Adapter 更新与
+  P2 邻近回归后 `154 passed, 5 skipped`；除仓库已知失效 J9/ST9 旧测试外的完整测试为
+  `339 passed, 5 skipped, 3 subtests passed`。覆盖 3.90/3.93/4.00 半径、径向奖励不可重复、
+  向外软制动、reset 前 root pose、M1 到 M2 方向连续、timeout 角度集合、proxy/platform 同帧一致和
+  Adapter attempts/applied/skipped。使用真实 `p3nav8h-r1_884257.zip` 中
+  `model.ckpt-highslow-884257.pkl` 完成 radial warm start、一次低层 PPO update、P3 保存和 exact
+  resume；Actor/Critic 均发生有限更新，动作方差与低层 digest 正确恢复。Python 编译、全部 TOML
+  解析与 `git diff --check` 通过；本机缺少平台 `kaiwudrl` 包，monitor 的真实 builder 实例化留待容器。
+- 关联：基线提交 `1a5641d`；本轮 commit/PR、新 checkpoint、容器同步、平台任务与评估结果均
+  尚未产生。回滚方式是切回 `codex/p3-dual-eval`；再次遇到时最短检查路径为 worker reset 行
+  root pose → M1/M2 event → 3.90m proxy → platform reason/completed → Adapter attempts/applied。

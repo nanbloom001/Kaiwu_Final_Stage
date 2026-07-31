@@ -37,13 +37,12 @@ class AlgorithmP3HighPPO(AlgorithmP2NavPPO):
         for parameter in self.safety_head.parameters():
             parameter.requires_grad_(False)
 
-    def _override_reward_components(self, components, **_context):
+    def _override_reward_components(self, components, **context):
         # P3 Standard keeps task progress and local-goal events as the high-
         # level objective. Track-specific safety, gait, collision, tracking and
         # stagnation terms remain diagnostics and must not train this policy.
         for name in (
             "success",
-            "timeout",
             "tracking",
             "gait_symmetry",
             "body_collision",
@@ -52,6 +51,17 @@ class AlgorithmP3HighPPO(AlgorithmP2NavPPO):
             "frontier_stagnation",
         ):
             components[name] = torch.zeros_like(components[name])
+        reason = context.get("reason")
+        if torch.is_tensor(reason):
+            components["failure"] = (reason == 2).to(
+                components["failure"]
+            ) * -8.0
+            components["timeout"] = (reason == 3).to(
+                components["timeout"]
+            ) * -4.0
+        else:
+            components["failure"] = torch.zeros_like(components["failure"])
+            components["timeout"] = torch.zeros_like(components["timeout"])
         return components
 
     def _apply_external_reset(self, aux: torch.Tensor) -> None:
@@ -109,7 +119,7 @@ class AlgorithmP3HighPPO(AlgorithmP2NavPPO):
         self.current_vy_trusted_limit, self.current_vy_hard_limit = 0.20, 0.40
         if phase.name == "highadapt":
             nav, actor, critic, adapter_lr, entropy = (
-                0.10,
+                0.15,
                 0.10,
                 0.30,
                 high_adapt_lr,
@@ -117,9 +127,9 @@ class AlgorithmP3HighPPO(AlgorithmP2NavPPO):
             )
         elif phase.name == "highslow":
             nav, actor, critic, adapter_lr, entropy = (
-                0.15,
-                0.15,
                 0.20,
+                0.15,
+                0.25,
                 high_adapt_lr,
                 0.005,
             )
@@ -127,7 +137,7 @@ class AlgorithmP3HighPPO(AlgorithmP2NavPPO):
             nav, actor, critic, adapter_lr, entropy = (
                 0.0,
                 0.0,
-                0.0,
+                0.30,
                 calibration_adapter_lr,
                 0.0,
             )
@@ -210,6 +220,32 @@ class AlgorithmP3StandardJoint:
             dtype=torch.long,
             device=self.high_algorithm.device,
         )
+        self.episode_origin_xy = torch.zeros(
+            self.high_algorithm.num_envs,
+            2,
+            dtype=torch.float32,
+            device=self.high_algorithm.device,
+        )
+        self.episode_origin_valid = torch.zeros(
+            self.high_algorithm.num_envs,
+            dtype=torch.bool,
+            device=self.high_algorithm.device,
+        )
+        self.episode_origin_reset_pending = torch.zeros_like(
+            self.episode_origin_valid
+        )
+        self.best_radial_distance = torch.zeros(
+            self.high_algorithm.num_envs,
+            dtype=torch.float32,
+            device=self.high_algorithm.device,
+        )
+        self.m3_proxy_latched = torch.zeros_like(self.episode_origin_valid)
+        terrain_size_x = float(self.config.get("terrain_size_x_m", 8.0))
+        (
+            self.platform_complete_radius_m,
+            self.m3_target_radius_m,
+            self.platform_boundary_radius_m,
+        ) = p3_contract.platform_completion_radii(terrain_size_x)
         self._low_base_lrs = {
             str(group.get("name", index)): float(group["lr"])
             for index, group in enumerate(self.low_algorithm.optimizer.param_groups)
@@ -229,8 +265,7 @@ class AlgorithmP3StandardJoint:
         low_scales = {
             "lowbase": {"actor": 0.20, "lstm": 0.20, "critic": 1.00},
             "lowmild": {"actor": 0.50, "lstm": 0.50, "critic": 1.00},
-            "lowmedium": {"actor": 1.00, "lstm": 1.00, "critic": 1.00},
-            "lowfull": {"actor": 0.50, "lstm": 0.50, "critic": 0.50},
+            "lowmedium": {"actor": 0.35, "lstm": 0.35, "critic": 0.50},
             "adaptercalib": {"actor": 0.00, "lstm": 0.00, "critic": 0.00},
             "highadapt": {"actor": 0.00, "lstm": 0.00, "critic": 0.00},
             "highslow": {"actor": 0.00, "lstm": 0.00, "critic": 0.00},
@@ -247,30 +282,165 @@ class AlgorithmP3StandardJoint:
         return self.current_phase != old
 
     def reset_live_state(self):
+        self._ensure_radial_state()
         self.episode_subgoal_successes.zero_()
+        self.episode_origin_xy.zero_()
+        self.episode_origin_valid.zero_()
+        self.episode_origin_reset_pending.zero_()
+        self.best_radial_distance.zero_()
+        self.m3_proxy_latched.zero_()
         self.high_algorithm.reset_live_state()
         self.low_algorithm.initialize_recurrent_states(self.high_algorithm.num_envs)
+
+    def _ensure_radial_state(self, worker_aux: torch.Tensor | None = None) -> None:
+        """Initialize transient radial state for compatibility construction paths."""
+        if hasattr(self, "episode_origin_xy"):
+            if not hasattr(self, "episode_origin_reset_pending"):
+                self.episode_origin_reset_pending = torch.zeros_like(
+                    self.episode_origin_valid
+                )
+            return
+        if worker_aux is not None:
+            num_envs = int(worker_aux.shape[0])
+            device = worker_aux.device
+        else:
+            num_envs = int(self.high_algorithm.num_envs)
+            device = self.high_algorithm.device
+        self.episode_subgoal_successes = torch.zeros(
+            num_envs, dtype=torch.long, device=device
+        )
+        self.episode_origin_xy = torch.zeros(
+            num_envs, 2, dtype=torch.float32, device=device
+        )
+        self.episode_origin_valid = torch.zeros(
+            num_envs, dtype=torch.bool, device=device
+        )
+        self.episode_origin_reset_pending = torch.zeros_like(
+            self.episode_origin_valid
+        )
+        self.best_radial_distance = torch.zeros(
+            num_envs, dtype=torch.float32, device=device
+        )
+        self.m3_proxy_latched = torch.zeros(num_envs, dtype=torch.bool, device=device)
+        terrain_size_x = float(getattr(self, "config", {}).get("terrain_size_x_m", 8.0))
+        (
+            self.platform_complete_radius_m,
+            self.m3_target_radius_m,
+            self.platform_boundary_radius_m,
+        ) = p3_contract.platform_completion_radii(terrain_size_x)
+
+    def sync_episode_origins(self, worker_aux: torch.Tensor) -> torch.Tensor:
+        self._ensure_radial_state(worker_aux)
+        pose_xy = worker_aux[:, 15:17].to(self.episode_origin_xy)
+        reset = worker_aux[:, 24] > 0.5
+        initialize = ~self.episode_origin_valid & ~(
+            reset & self.episode_origin_reset_pending
+        )
+        if bool(initialize.any()):
+            self.episode_origin_xy[initialize] = pose_xy[initialize]
+            self.episode_origin_valid[initialize] = True
+            self.episode_origin_reset_pending[initialize] = False
+            self.best_radial_distance[initialize] = 0.0
+            self.m3_proxy_latched[initialize] = False
+        return reset
+
+    def radial_snapshot(self, worker_aux: torch.Tensor) -> dict[str, torch.Tensor]:
+        self._ensure_radial_state(worker_aux)
+        self.sync_episode_origins(worker_aux)
+        pose_xy = worker_aux[:, 15:17].to(self.episode_origin_xy)
+        radius = p3_contract.radial_distance(pose_xy, self.episode_origin_xy)
+        best_before = self.best_radial_distance.clone()
+        reward, best = p3_contract.radial_new_best(radius, best_before)
+        return {
+            "radius": radius,
+            "best_before": best_before,
+            "best_after": best,
+            "new_best_reward": reward,
+            "hold": self.m3_proxy_latched | (radius >= self.platform_complete_radius_m),
+        }
+
+    def guard_high_commands(self, worker_aux: torch.Tensor) -> torch.Tensor:
+        snapshot = self.radial_snapshot(worker_aux)
+        root_xy = worker_aux[:, 15:17].to(self.episode_origin_xy)
+        yaw = worker_aux[:, 17].to(self.episode_origin_xy)
+        target, hold = p3_contract.cap_outward_body_command(
+            self.high_algorithm.command.active_target,
+            root_xy,
+            self.episode_origin_xy,
+            yaw,
+            self.platform_complete_radius_m,
+        )
+        executed, _ = p3_contract.cap_outward_body_command(
+            self.high_algorithm.command.exec_cmd,
+            root_xy,
+            self.episode_origin_xy,
+            yaw,
+            self.platform_complete_radius_m,
+        )
+        self.high_algorithm.command.active_target.copy_(target)
+        self.high_algorithm.command.exec_cmd.copy_(executed)
+        if bool(hold.any()):
+            self.high_algorithm.command.active_target[hold] = 0.0
+            self.high_algorithm.command.exec_cmd[hold] = 0.0
+        return hold
 
     def observe_subgoal_and_terminal(
         self, worker_aux: torch.Tensor
     ) -> dict[str, torch.Tensor]:
-        """Maintain monitoring-only Standard/subgoal conjunction across rollouts."""
+        """Maintain radial proxy and platform outcome accounting across rollouts."""
+        self._ensure_radial_state(worker_aux)
         event = worker_aux[:, p2_contract.CURRENT_SEGMENT_INDEX].round().long()
         reached = event == p3_contract.SUBGOAL_EVENT_REACHED
+        successes_before = self.episode_subgoal_successes.clone()
+        m1_reached = reached & (successes_before == 0)
+        m2_reached = reached & (successes_before == 1)
         self.episode_subgoal_successes += reached.long()
         reset = worker_aux[:, 24] > 0.5
         reason = worker_aux[:, 25].round().long()
-        standard_success = reset & (reason == 1)
+        platform_success = reset & (reason == 1)
+        previous_proxy = self.m3_proxy_latched.clone()
+        previous_subgoals = self.episode_subgoal_successes.clone()
+        pose_xy = worker_aux[:, 15:17].to(self.episode_origin_xy)
+        initialize = ~self.episode_origin_valid & ~reset
+        if bool(initialize.any()):
+            self.episode_origin_xy[initialize] = pose_xy[initialize]
+            self.episode_origin_valid[initialize] = True
+            self.episode_origin_reset_pending[initialize] = False
+        radius = p3_contract.radial_distance(pose_xy, self.episode_origin_xy)
+        proxy_new = ~self.m3_proxy_latched & (
+            radius >= self.platform_complete_radius_m
+        )
+        self.m3_proxy_latched |= proxy_new
+        _, next_best = p3_contract.radial_new_best(
+            radius, self.best_radial_distance
+        )
+        self.best_radial_distance.copy_(next_best)
         joint_success = p3_contract.joint_episode_success(
-            standard_success,
-            self.episode_subgoal_successes,
+            platform_success,
+            previous_subgoals,
             reset & (reason == 2),
         )
+        agreement = platform_success & (previous_proxy | proxy_new)
         result = {
-            "p3_standard_success_count": standard_success.float().sum(),
+            "m1_reached_mask": m1_reached,
+            "m2_reached_mask": m2_reached,
+            "m3_proxy_new_mask": proxy_new,
+            "p3_m1_success_count": m1_reached.float().sum(),
+            "p3_m2_success_count": m2_reached.float().sum(),
+            "p3_standard_success_count": proxy_new.float().sum(),
+            "p3_platform_success_count": platform_success.float().sum(),
             "p3_joint_success_count": joint_success.float().sum(),
+            "p3_proxy_platform_agreement_count": agreement.float().sum(),
+            "p3_radial_distance_mean": radius.mean(),
+            "p3_best_radial_distance_mean": self.best_radial_distance.mean(),
+            "p3_m3_hold_share": self.m3_proxy_latched.float().mean(),
         }
-        self.episode_subgoal_successes.masked_fill_(reset, 0)
+        if bool(reset.any()):
+            self.episode_subgoal_successes.masked_fill_(reset, 0)
+            self.episode_origin_valid[reset] = False
+            self.episode_origin_reset_pending[reset] = True
+            self.best_radial_distance[reset] = 0.0
+            self.m3_proxy_latched[reset] = False
         return result
 
     def _validate_anchor_cnn_reuse(self) -> None:
@@ -298,10 +468,71 @@ class AlgorithmP3StandardJoint:
         return digest
 
     def should_collect_low_rollout(self):
-        return self.current_phase in {"lowbase", "lowmild", "lowmedium", "lowfull"}
+        return self.current_phase in {"lowbase", "lowmild", "lowmedium"}
 
     def should_collect_high_rollout(self):
-        return self.current_phase in {"highadapt", "highslow"}
+        return self.current_phase in {"adaptercalib", "highadapt", "highslow"}
+
+    def _load_p3_radial_warm_start(self, raw, path, *, platform_model_id):
+        bundle, _ = normalize_kaiwu_train_bundle(raw)
+        mode = self.high_algorithm._load_p2_reward_warm_start(
+            bundle, path, platform_model_id
+        )
+        self._restore_low_state(raw, exact=False)
+        optimizers = raw.get("optimizers") or {}
+        low_optimizer = optimizers.get("low_level")
+        if isinstance(low_optimizer, dict):
+            self.low_algorithm.optimizer.load_state_dict(low_optimizer)
+        actor_optimizer = optimizers.get("high_level_actor")
+        if isinstance(actor_optimizer, dict):
+            try:
+                self.high_algorithm.actor_optimizer.load_state_dict(actor_optimizer)
+            except (ValueError, RuntimeError) as exc:
+                if self.logger:
+                    self.logger.warning(
+                        "[P3] radial warm start kept fresh actor optimizer because "
+                        f"the parent state was incompatible: {exc}"
+                    )
+        low = (raw.get("modules") or {}).get("low_level") or {}
+        anchor = low.get("p3_anchor") if isinstance(low, dict) else None
+        if isinstance(anchor, dict):
+            encoder_state = anchor.get("encoder_state_dict")
+            actor_state = anchor.get("actor_state_dict")
+            if isinstance(encoder_state, dict) and isinstance(actor_state, dict):
+                self.low_algorithm.anchor_encoder.load_state_dict(
+                    encoder_state, strict=True
+                )
+                self.low_algorithm.anchor_actor.load_state_dict(actor_state, strict=True)
+        else:
+            self.low_algorithm.anchor_encoder.load_state_dict(
+                self.low_algorithm.actor_critic.vision_encoder.state_dict(), strict=True
+            )
+            self.low_algorithm.anchor_actor.load_state_dict(
+                self.low_algorithm.actor_critic.actor.state_dict(), strict=True
+            )
+        low_state = (raw.get("training_states") or {}).get("low_level") or {}
+        self.low_updates = int(low_state.get("gradient_steps", 0))
+        global_state = (raw.get("training_states") or {}).get("global") or {}
+        lifetime = float(
+            global_state.get(
+                "lifetime_effective_seconds",
+                global_state.get("session_effective_seconds", 0.0),
+            )
+        )
+        self.lifetime_base_seconds = max(0.0, lifetime)
+        self.high_algorithm.lifetime_base_seconds = self.lifetime_base_seconds
+        self.session_effective_seconds = 0.0
+        self.current_iteration = 0
+        self.high_updates = 0
+        self.high_algorithm.session_effective_seconds = 0.0
+        self.high_algorithm.effective_training_seconds = 0.0
+        self.high_algorithm.lifetime_effective_seconds = self.lifetime_base_seconds
+        self.note_low_level_update()
+        self._validate_anchor_cnn_reuse()
+        self.parent_loaded = True
+        self.reset_live_state()
+        self._apply_phase()
+        return f"p3_radial_warm_start:{mode}"
 
     def _restore_low_state(self, raw, *, exact: bool) -> None:
         low = ((raw.get("modules") or {}).get("low_level") or {})
@@ -396,6 +627,10 @@ class AlgorithmP3StandardJoint:
             return self.load_parent(path, platform_model_id=platform_model_id)
         contracts = raw.get("contracts") or {}
         if contracts.get("p3_standard_joint") != p3_contract.contract():
+            if str(self.config.get("load_mode", "")) == "p3_radial_warm_start":
+                return self._load_p3_radial_warm_start(
+                    raw, path, platform_model_id=platform_model_id
+                )
             raise ValueError("P3 exact resume contract mismatch")
         mode = self.high_algorithm.load_p3_exact_bundle(
             raw, path, platform_model_id=platform_model_id

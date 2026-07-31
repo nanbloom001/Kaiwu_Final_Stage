@@ -55,6 +55,17 @@ def _env_origins(env, root_xy):
     return root_xy.clone()
 
 
+def _terrain_size_x(env) -> float:
+    terrain = getattr(getattr(env, "scene", None), "terrain", None)
+    generator = getattr(getattr(terrain, "cfg", None), "terrain_generator", None)
+    size = getattr(generator, "size", None)
+    try:
+        value = float(size[0])
+    except (TypeError, ValueError, IndexError):
+        value = 2.0 * p3_contract.TILE_HALF_EXTENT_M
+    return value
+
+
 class StandardFarGoalProvider:
     def __init__(self, env, *, config=None, seed=None):
         self.env = env
@@ -67,6 +78,17 @@ class StandardFarGoalProvider:
         )
         self.goal_xy = torch.zeros(self.num_envs, 2, device=self.device)
         self.tile_origin_xy = torch.zeros_like(self.goal_xy)
+        self.episode_origin_xy = torch.zeros_like(self.goal_xy)
+        self.base_direction_angle = torch.zeros(self.num_envs, device=self.device)
+        self.direction_angle = torch.zeros_like(self.base_direction_angle)
+        self.milestone_index = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.replan_count = torch.zeros_like(self.milestone_index)
+        self.best_radius = torch.zeros(self.num_envs, device=self.device)
+        self.m3_proxy_latched = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self.goal_age_s = torch.zeros(self.num_envs, device=self.device)
         self.goal_timeout_s = torch.zeros(self.num_envs, device=self.device)
         self.goal_epoch = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -74,10 +96,16 @@ class StandardFarGoalProvider:
         self.last_reached = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.last_goal_changed = torch.zeros_like(self.last_reached)
         self.pending_resample = torch.zeros_like(self.last_reached)
+        self.pending_replan = torch.zeros_like(self.last_reached)
         self.last_timed_out = torch.zeros_like(self.last_reached)
         self.sample_invalid = torch.zeros_like(self.last_reached)
         self._initialized = False
         self._last_step_key = None
+        (
+            self.complete_radius_m,
+            self.m3_target_radius_m,
+            self.boundary_radius_m,
+        ) = p3_contract.platform_completion_radii(_terrain_size_x(env))
 
     def _step_key(self):
         for name in ("common_step_counter", "_sim_step_counter"):
@@ -92,32 +120,77 @@ class StandardFarGoalProvider:
             return ("episode", int(lengths.long().sum().item()))
         return None
 
-    def _sample(self, ids, root_xy):
+    def _direction_is_valid(self, ids, angle):
+        unit = torch.stack((torch.cos(angle), torch.sin(angle)), dim=-1)
+        target = self.episode_origin_xy[ids] + unit * self.m3_target_radius_m
+        local = torch.abs(target - self.tile_origin_xy[ids])
+        return (local <= self.boundary_radius_m - p3_contract.M3_BOUNDARY_MARGIN_M).all(
+            dim=-1
+        )
+
+    def _choose_direction(self, ids, *, replan):
+        if ids.numel() == 0:
+            return torch.zeros(0, dtype=torch.bool, device=self.device)
+        chosen = self.direction_angle[ids].clone()
+        valid = torch.zeros(ids.numel(), dtype=torch.bool, device=self.device)
+        offsets = torch.tensor(
+            p3_contract.REPLAN_ANGLE_OFFSETS_DEG,
+            device=self.device,
+            dtype=chosen.dtype,
+        ) * (torch.pi / 180.0)
+        for _ in range(64):
+            pending = ~valid
+            if not bool(pending.any()):
+                break
+            pending_ids = pending.nonzero(as_tuple=False).flatten()
+            if replan:
+                choice = torch.randint(
+                    offsets.numel(),
+                    (pending_ids.numel(),),
+                    generator=self.generator,
+                    device=self.device,
+                )
+                candidate = self.base_direction_angle[ids[pending_ids]] + offsets[choice]
+            else:
+                candidate = torch.empty(
+                    pending_ids.numel(), device=self.device, dtype=chosen.dtype
+                ).uniform_(-torch.pi, torch.pi, generator=self.generator)
+            accepted = self._direction_is_valid(ids[pending_ids], candidate)
+            if bool(accepted.any()):
+                accepted_slots = pending_ids[accepted]
+                chosen[accepted_slots] = candidate[accepted]
+                valid[accepted_slots] = True
+        self.direction_angle[ids] = chosen
+        if not replan:
+            self.base_direction_angle[ids] = chosen
+        return valid
+
+    def _sample(self, ids, *, replan=False, new_direction=False):
         if ids.numel() == 0:
             return
-        distance = self.config.get(
-            "subgoal_distance_m",
-            [p3_contract.SUBGOAL_MIN_DISTANCE_M, p3_contract.SUBGOAL_MAX_DISTANCE_M],
+        if replan or new_direction:
+            valid = self._choose_direction(ids, replan=bool(replan))
+        else:
+            valid = self._direction_is_valid(ids, self.direction_angle[ids])
+        milestone = self.milestone_index[ids]
+        radius = torch.full(
+            (ids.numel(),), self.m3_target_radius_m, device=self.device
         )
-        goals, valid = p3_contract.sample_local_subgoals_with_validity(
-            root_xy[ids],
-            self.tile_origin_xy[ids],
-            generator=self.generator,
-            min_distance_m=float(distance[0]),
-            max_distance_m=float(distance[1]),
-            tile_inner_margin_m=float(
-                self.config.get("tile_inner_margin_m", p3_contract.TILE_INNER_MARGIN_M)
-            ),
-            max_attempts=64,
+        for index, bounds in enumerate(p3_contract.MILESTONE_RADIUS_RANGES_M):
+            selected = milestone == index
+            if bool(selected.any()):
+                radius[selected] = torch.empty(
+                    int(selected.sum()), device=self.device
+                ).uniform_(float(bounds[0]), float(bounds[1]), generator=self.generator)
+        unit = torch.stack(
+            (torch.cos(self.direction_angle[ids]), torch.sin(self.direction_angle[ids])),
+            dim=-1,
         )
-        self.goal_xy[ids] = goals
+        self.goal_xy[ids] = self.episode_origin_xy[ids] + unit * radius.unsqueeze(-1)
         self.sample_invalid[ids] = ~valid
         if bool((~valid).any()):
             invalid_ids = ids[~valid]
-            # Platform-owned BaseEnv cannot be patched to force a reset. Use
-            # the tile origin as a no-success recovery target until the robot
-            # re-enters the configured local bound, then resume strict sampling.
-            self.goal_xy[invalid_ids] = self.tile_origin_xy[invalid_ids]
+            self.goal_xy[invalid_ids] = self.episode_origin_xy[invalid_ids]
         timeout_range = self.config.get("subgoal_time_limit_s", [6.0, 12.0])
         timeout = torch.empty(ids.numel(), device=self.device)
         timeout.uniform_(
@@ -126,6 +199,8 @@ class StandardFarGoalProvider:
         self.goal_timeout_s[ids] = timeout
         self.goal_age_s[ids] = 0.0
         self.goal_epoch[ids] += 1
+        if replan:
+            self.replan_count[ids] += 1
         self.last_goal_changed[ids] = True
 
     def update(self, *, dt_s):
@@ -148,12 +223,21 @@ class StandardFarGoalProvider:
         self.last_reached.zero_()
         self.last_timed_out.zero_()
         pending = self.pending_resample.clone()
+        pending_replan = self.pending_replan.clone()
         self.pending_resample.zero_()
+        self.pending_replan.zero_()
         if bool(reset.any()):
             self.tile_origin_xy[reset] = _env_origins(self.env, root_xy)[reset]
+            self.episode_origin_xy[reset] = root_xy[reset]
             self.subgoal_success_count[reset] = 0
             self.goal_epoch[reset] = 0
+            self.milestone_index[reset] = 0
+            self.replan_count[reset] = 0
+            self.best_radius[reset] = 0.0
+            self.m3_proxy_latched[reset] = False
+            self.sample_invalid[reset] = False
             pending[reset] = False
+            pending_replan[reset] = False
         local_out = p3_contract.local_out_of_bounds(
             root_xy,
             self.tile_origin_xy,
@@ -165,8 +249,20 @@ class StandardFarGoalProvider:
         )
         pending |= self.sample_invalid & ~local_out
         if bool(pending.any()):
-            self._sample(pending.nonzero(as_tuple=False).reshape(-1), root_xy)
-        reached = p3_contract.subgoal_reached(
+            retry_ids = pending.nonzero(as_tuple=False).reshape(-1)
+            replan_ids = retry_ids[pending_replan[retry_ids]]
+            invalid_ids = retry_ids[
+                ~pending_replan[retry_ids] & self.sample_invalid[retry_ids]
+            ]
+            advance_ids = retry_ids[
+                ~pending_replan[retry_ids] & ~self.sample_invalid[retry_ids]
+            ]
+            self._sample(advance_ids)
+            self._sample(invalid_ids, new_direction=True)
+            self._sample(replan_ids, replan=True)
+        radius = p3_contract.radial_distance(root_xy, self.episode_origin_xy)
+        self.best_radius.copy_(torch.maximum(self.best_radius, radius))
+        local_reached = p3_contract.subgoal_reached(
             root_xy,
             self.goal_xy,
             threshold_m=float(
@@ -175,20 +271,31 @@ class StandardFarGoalProvider:
                     p3_contract.SUBGOAL_SUCCESS_DISTANCE_M,
                 )
             ),
-        ) & ~reset & ~self.sample_invalid
+        )
+        m3_reached = (radius >= self.complete_radius_m) & (self.milestone_index >= 2)
+        reached = torch.where(self.milestone_index >= 2, m3_reached, local_reached)
+        reached &= ~reset & ~self.sample_invalid & ~self.m3_proxy_latched
         self.last_reached.copy_(reached)
         self.subgoal_success_count += reached.long()
+        m3_new = reached & (self.milestone_index >= 2)
+        self.m3_proxy_latched |= m3_new
+        advance = reached & ~m3_new
+        self.milestone_index[advance] += 1
         self.goal_age_s += float(dt_s)
         timed_out = (
             (self.goal_age_s >= self.goal_timeout_s)
             & ~reset
             & ~reached
+            & ~self.m3_proxy_latched
         )
         self.last_timed_out.copy_(timed_out)
         # Keep the completed/expired goal visible for one observation so the
         # aisrv can attribute the event to the transition that caused it.
-        self.pending_resample |= reached | timed_out
-        self._sample(reset.nonzero(as_tuple=False).reshape(-1), root_xy)
+        self.pending_resample |= advance | timed_out
+        self.pending_replan |= timed_out
+        self._sample(
+            reset.nonzero(as_tuple=False).reshape(-1), new_direction=True
+        )
         self.env._p3_goal_positions = torch.cat(
             (self.goal_xy, robot.data.root_pos_w[:, 2:3].detach()), dim=-1
         )
@@ -198,6 +305,15 @@ class StandardFarGoalProvider:
         self.env._p3_goal_changed = self.last_goal_changed.clone()
         self.env._p3_subgoal_timed_out = self.last_timed_out.clone()
         self.env._p3_local_out_of_bounds = local_out | self.sample_invalid
+        self.env._p3_episode_origin_xy = self.episode_origin_xy.clone()
+        self.env._p3_radial_distance = radius.clone()
+        self.env._p3_best_radial_distance = self.best_radius.clone()
+        self.env._p3_milestone_index = self.milestone_index.clone()
+        self.env._p3_m3_proxy_success = self.m3_proxy_latched.clone()
+        self.env._p3_goal_replan_count = self.replan_count.clone()
+        self.env._p3_platform_complete_radius = float(self.complete_radius_m)
+        self.env._p3_m3_target_radius = float(self.m3_target_radius_m)
+        self.env._p3_platform_boundary_radius = float(self.boundary_radius_m)
 
 
 def p3_local_out_of_bounds(env):
