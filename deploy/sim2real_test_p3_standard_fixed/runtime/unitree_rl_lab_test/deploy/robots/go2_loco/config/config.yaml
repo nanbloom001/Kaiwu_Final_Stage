@@ -85,11 +85,3 @@ FSM:
       enabled: true
       flush_every: 50
       max_consecutive_errors: 5
-      max_raw_action_abs: 20.0
-      # Reject an anomalous policy frame instead of sending its joint targets.
-      max_target_step_rad: 0.35
-      target_slew_rate_rad_s: 3.0
-      startup_slew_rate_rad_s: 0.5
-      startup_blend_duration_s: 1.5
-      # Diagnostic only; exceeding this value no longer rejects policy targets.
-      max_tracking_error_rad: 0.45

@@ -97,12 +97,6 @@ private:
     bool logging_enabled_ = true;
     int log_flush_every_ = 50;
     int max_consecutive_errors_ = 5;
-    float max_raw_action_abs_ = 20.0f;
-    float max_target_step_rad_ = 0.35f;
-    float target_slew_rate_rad_s_ = 3.0f;
-    float startup_slew_rate_rad_s_ = 0.5f;
-    float startup_blend_duration_s_ = 1.5f;
-    float max_tracking_error_rad_ = 0.45f;
     std::string log_dir_;
     std::ofstream diag_;
     std::string   diag_path_;

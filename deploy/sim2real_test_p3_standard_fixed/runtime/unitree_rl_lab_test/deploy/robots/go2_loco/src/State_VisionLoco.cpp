@@ -32,10 +32,10 @@ T yaml_get(const YAML::Node& n, const char* key, T fallback)
     return fallback;
 }
 
-inline bool finite_and_bounded(const std::vector<float>& values, float abs_limit)
+inline bool all_finite(const std::vector<float>& values)
 {
     for (float value : values)
-        if (!std::isfinite(value) || std::fabs(value) > abs_limit) return false;
+        if (!std::isfinite(value)) return false;
     return true;
 }
 
@@ -233,20 +233,6 @@ State_VisionLoco::State_VisionLoco(int state_mode, std::string state_string)
         log_flush_every_ = std::max(1, yaml_get<int>(cfg["logging"], "flush_every", 50));
         max_consecutive_errors_ =
             std::max(1, yaml_get<int>(cfg["logging"], "max_consecutive_errors", 5));
-        max_raw_action_abs_ =
-            std::max(1.0f, yaml_get<float>(cfg["logging"], "max_raw_action_abs", 20.0f));
-        max_target_step_rad_ = std::max(
-            0.05f, yaml_get<float>(cfg["logging"], "max_target_step_rad", 0.35f));
-        target_slew_rate_rad_s_ = std::max(
-            0.1f, yaml_get<float>(cfg["logging"], "target_slew_rate_rad_s", 3.0f));
-        startup_slew_rate_rad_s_ = std::min(
-            target_slew_rate_rad_s_,
-            std::max(0.05f, yaml_get<float>(
-                cfg["logging"], "startup_slew_rate_rad_s", 0.5f)));
-        startup_blend_duration_s_ = std::max(
-            0.0f, yaml_get<float>(cfg["logging"], "startup_blend_duration_s", 1.5f));
-        max_tracking_error_rad_ = std::max(
-            0.10f, yaml_get<float>(cfg["logging"], "max_tracking_error_rad", 0.45f));
     }
 
     // ---------- 安全转移：翻倒 → Passive ----------
@@ -464,27 +450,17 @@ void State_VisionLoco::enter()
 
     robot_->update();
 
-    // Start from the measured FixStand pose so entering VisionLoco cannot
-    // introduce a nominal-pose jump before the policy handoff begins.
+    // Match the policy reset state exactly. Once inference starts, model
+    // targets are applied directly without runtime smoothing or rejection.
     {
         std::lock_guard<std::mutex> lk(tgt_mtx_);
-        joint_target_.resize(12);
-        last_action_raw_.resize(12);
-        for (int i = 0; i < 12; ++i) {
-            const float measured_q = std::isfinite(robot_->data.joint_pos[i])
-                ? robot_->data.joint_pos[i]
-                : default_joint_pos_[i];
-            joint_target_[i] = measured_q;
-            last_action_raw_[i] = std::fabs(act_scale_) > 1e-6f
-                ? (measured_q - act_offset_[i]) / act_scale_
-                : 0.0f;
-        }
+        joint_target_    = default_joint_pos_;
+        last_action_raw_ = std::vector<float>(12, 0.0f);
         have_target_     = true;
     }
     spdlog::info(
-        "[VisionLoco] startup handoff: measured pose, {:.2f}rad/s for {:.2f}s; "
-        "tracking error {:.2f}rad is log-only",
-        startup_slew_rate_rad_s_, startup_blend_duration_s_, max_tracking_error_rad_);
+        "[VisionLoco] direct policy action mode: no slew limit, step rejection, "
+        "or tracking-error gate");
     runner_->reset();
     frame_ = 0;
     deadline_misses_ = 0;
@@ -546,11 +522,14 @@ void State_VisionLoco::enter()
                      "clr_L,clr_F,clr_R,"
                      "dep_inval,dep_meanv,front_inval,front_min,front_mean,"
                      "action_step_max,requested_target_step_max,target_step_max,tracking_error_max,"
-                     "motion_rejected,motion_violations,tracking_error_exceeded,"
-                     "startup_blend,target_slew_rate_rad_s,"
+                     "direct_action_mode,action_abs_max,target_abs_max,"
+                     "tracking_error_abs_mean,tracking_error_rms,"
+                     "joint_velocity_abs_max,joint_velocity_rms,"
                      "avx,avy,avz,pgx,pgy,pgz,"
-                     "tau_abs_max,pd_tau_abs_max,mechanical_power_abs_sum,"
-                     "foot_force_abs_sum,foot_force_est_abs_sum,foot_force_est_abs_max";
+                     "tilt_deg,tau_abs_max,tau_abs_sum,pd_tau_abs_max,pd_tau_abs_sum,"
+                     "mechanical_power_abs_sum,mechanical_power_abs_max,"
+                     "foot_force_abs_sum,foot_force_abs_max,foot_force_balance,"
+                     "foot_force_est_abs_sum,foot_force_est_abs_max";
             for (int i = 0; i < 12; ++i) diag_ << ",q" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",dq" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",tau" << i;
@@ -559,6 +538,8 @@ void State_VisionLoco::enter()
             for (int i = 0; i < 12; ++i) diag_ << ",applied_target" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",qerr" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",pd_tau" << i;
+            for (int i = 0; i < 12; ++i) diag_ << ",target_delta" << i;
+            for (int i = 0; i < 12; ++i) diag_ << ",power" << i;
             for (int i = 0; i < 4; ++i) diag_ << ",foot_force" << i;
             for (int i = 0; i < 4; ++i) diag_ << ",foot_force_est" << i;
             diag_ << '\n';
@@ -580,25 +561,12 @@ void State_VisionLoco::policy_loop()
         std::chrono::duration<double>(step_dt_));
     auto next_tick = clock::now() + dt;
     const auto t_start = clock::now();
-    std::vector<float> accepted_target;
-    std::vector<float> requested_action;
-    {
-        std::lock_guard<std::mutex> lk(tgt_mtx_);
-        accepted_target = joint_target_;
-        requested_action = last_action_raw_;
-    }
-    std::vector<float> requested_target = accepted_target;
+    std::vector<float> accepted_target = default_joint_pos_;
+    std::vector<float> requested_action(12, 0.0f);
     bool have_requested_motion = false;
-    int motion_violations = 0;
 
     while (running_) {
         const auto loop_start = clock::now();
-        const float elapsed_s =
-            std::chrono::duration<float>(loop_start - t_start).count();
-        const bool startup_blend = elapsed_s < startup_blend_duration_s_;
-        const float active_target_slew_rate = startup_blend
-            ? startup_slew_rate_rad_s_
-            : target_slew_rate_rad_s_;
         robot_->update();                          // 刷新 IMU/关节（策略序）
         auto proprio = build_proprio();            // 45
         auto depth   = depth_->get();              // 57600（归一化）
@@ -617,10 +585,9 @@ void State_VisionLoco::policy_loop()
         isaaclab::LocoOutput out;
         try {
             out = runner_->act(depth, proprio, goal);  // joint(12,raw) + cmd(回显) + clearance(0)
-            if (!finite_and_bounded(out.joint, max_raw_action_abs_) ||
-                !finite_and_bounded(out.cmd, 10.0f) ||
-                !finite_and_bounded(out.clearance, 2.0f)) {
-                throw std::runtime_error("ONNX 输出包含非有限值或越过安全量级");
+            if (!all_finite(out.joint) || !all_finite(out.cmd) ||
+                !all_finite(out.clearance)) {
+                throw std::runtime_error("ONNX 输出包含非有限值");
             }
             if (!learned_nav_active) {
                 for (int i = 0; i < 3; ++i)
@@ -648,7 +615,7 @@ void State_VisionLoco::policy_loop()
             continue;
         }
 
-        // 处理动作：target = clamp(offset + scale*raw, clip)
+        // Apply the model-defined action transform from deploy.yaml directly.
         std::vector<float> tgt(12);
         for (int i = 0; i < 12; ++i) {
             float v = act_offset_[i] + act_scale_ * out.joint[i];
@@ -658,53 +625,38 @@ void State_VisionLoco::policy_loop()
         float requested_target_step_max = 0.0f;
         float target_step_max = 0.0f;
         float tracking_error_max = 0.0f;
+        float action_abs_max = 0.0f;
+        float target_abs_max = 0.0f;
+        float tracking_error_abs_sum = 0.0f;
+        float tracking_error_sq_sum = 0.0f;
+        std::vector<float> target_delta(12);
         const auto& policy_q = robot_->data.joint_pos;
         for (int i = 0; i < 12; ++i) {
+            action_abs_max = std::max(action_abs_max, std::fabs(out.joint[i]));
+            target_abs_max = std::max(target_abs_max, std::fabs(tgt[i]));
             if (have_requested_motion) {
                 action_step_max = std::max(
                     action_step_max, std::fabs(out.joint[i] - requested_action[i]));
                 requested_target_step_max = std::max(
                     requested_target_step_max,
-                    std::fabs(tgt[i] - requested_target[i]));
+                    std::fabs(tgt[i] - accepted_target[i]));
             }
-            tracking_error_max = std::max(
-                tracking_error_max, std::fabs(policy_q[i] - accepted_target[i]));
+            target_delta[i] = tgt[i] - accepted_target[i];
+            target_step_max = std::max(target_step_max, std::fabs(target_delta[i]));
+            const float tracking_error = std::fabs(policy_q[i] - tgt[i]);
+            tracking_error_max = std::max(tracking_error_max, tracking_error);
+            tracking_error_abs_sum += tracking_error;
+            tracking_error_sq_sum += tracking_error * tracking_error;
         }
-        const bool tracking_error_exceeded =
-            tracking_error_max > max_tracking_error_rad_;
-        const bool motion_rejected =
-            have_requested_motion &&
-            requested_target_step_max > max_target_step_rad_;
-        // Compare safety against adjacent policy requests, even when the current
-        // request is held back. A stable request after one spike must not be
-        // repeatedly compared with an older accepted target.
+        const float tracking_error_abs_mean = tracking_error_abs_sum / 12.0f;
+        const float tracking_error_rms = std::sqrt(tracking_error_sq_sum / 12.0f);
         requested_action = out.joint;
-        requested_target = tgt;
         have_requested_motion = true;
-        if (motion_rejected) {
-            ++motion_violations;
-            spdlog::warn(
-                "[VisionLoco] rejected motion frame: requested_step={:.3f}rad "
-                "tracking_error={:.3f}rad (log-only) consecutive={}",
-                requested_target_step_max, tracking_error_max, motion_violations);
-        } else {
-            motion_violations = 0;
-            const float max_applied_step = active_target_slew_rate * step_dt_;
-            std::vector<float> applied_target(12);
-            std::vector<float> applied_action(12);
-            for (int i = 0; i < 12; ++i) {
-                applied_target[i] = accepted_target[i] + std::clamp(
-                    tgt[i] - accepted_target[i], -max_applied_step, max_applied_step);
-                applied_action[i] = std::fabs(act_scale_) > 1e-6f
-                    ? (applied_target[i] - act_offset_[i]) / act_scale_
-                    : 0.0f;
-                target_step_max = std::max(
-                    target_step_max, std::fabs(applied_target[i] - accepted_target[i]));
-            }
-            accepted_target = applied_target;
+        accepted_target = tgt;
+        {
             std::lock_guard<std::mutex> lk(tgt_mtx_);
-            joint_target_    = applied_target;
-            last_action_raw_ = applied_action;
+            joint_target_    = tgt;
+            last_action_raw_ = out.joint;
             have_target_     = true;
         }
 
@@ -712,27 +664,55 @@ void State_VisionLoco::policy_loop()
         const auto& policy_tau = robot_->data.joint_effort;
         std::vector<float> joint_error(12);
         std::vector<float> pd_torque(12);
+        std::vector<float> mechanical_power(12);
+        float joint_velocity_abs_max = 0.0f;
+        float joint_velocity_sq_sum = 0.0f;
         float tau_abs_max = 0.0f;
+        float tau_abs_sum = 0.0f;
         float pd_tau_abs_max = 0.0f;
+        float pd_tau_abs_sum = 0.0f;
         float mechanical_power_abs_sum = 0.0f;
+        float mechanical_power_abs_max = 0.0f;
         for (int i = 0; i < 12; ++i) {
             joint_error[i] = accepted_target[i] - policy_q[i];
             pd_torque[i] = stiffness_[i] * joint_error[i] - damping_[i] * policy_dq[i];
-            tau_abs_max = std::max(tau_abs_max, std::fabs(policy_tau[i]));
-            pd_tau_abs_max = std::max(pd_tau_abs_max, std::fabs(pd_torque[i]));
-            mechanical_power_abs_sum += std::fabs(policy_tau[i] * policy_dq[i]);
+            mechanical_power[i] = policy_tau[i] * policy_dq[i];
+            const float dq_abs = std::fabs(policy_dq[i]);
+            const float tau_abs = std::fabs(policy_tau[i]);
+            const float pd_tau_abs = std::fabs(pd_torque[i]);
+            const float power_abs = std::fabs(mechanical_power[i]);
+            joint_velocity_abs_max = std::max(joint_velocity_abs_max, dq_abs);
+            joint_velocity_sq_sum += policy_dq[i] * policy_dq[i];
+            tau_abs_max = std::max(tau_abs_max, tau_abs);
+            tau_abs_sum += tau_abs;
+            pd_tau_abs_max = std::max(pd_tau_abs_max, pd_tau_abs);
+            pd_tau_abs_sum += pd_tau_abs;
+            mechanical_power_abs_sum += power_abs;
+            mechanical_power_abs_max = std::max(mechanical_power_abs_max, power_abs);
         }
+        const float joint_velocity_rms = std::sqrt(joint_velocity_sq_sum / 12.0f);
+        const auto& projected_gravity = robot_->data.projected_gravity_b;
+        const float tilt_deg = std::acos(std::clamp(
+            -projected_gravity[2], -1.0f, 1.0f)) * 57.2957795f;
         const auto& foot_force = robot_->data.foot_force;
         const auto& foot_force_est = robot_->data.foot_force_est;
         float foot_force_abs_sum = 0.0f;
+        float foot_force_abs_max = 0.0f;
+        float foot_force_abs_min = std::numeric_limits<float>::infinity();
         float foot_force_est_abs_sum = 0.0f;
         float foot_force_est_abs_max = 0.0f;
         for (int i = 0; i < 4; ++i) {
-            foot_force_abs_sum += std::fabs(foot_force[i]);
+            const float force_abs = std::fabs(foot_force[i]);
+            foot_force_abs_sum += force_abs;
+            foot_force_abs_max = std::max(foot_force_abs_max, force_abs);
+            foot_force_abs_min = std::min(foot_force_abs_min, force_abs);
             foot_force_est_abs_sum += std::fabs(foot_force_est[i]);
             foot_force_est_abs_max = std::max(
                 foot_force_est_abs_max, std::fabs(foot_force_est[i]));
         }
+        const float foot_force_balance = foot_force_abs_sum > 1e-6f
+            ? (foot_force_abs_max - foot_force_abs_min) / foot_force_abs_sum
+            : 0.0f;
 
         const auto work_end = clock::now();
         const float loop_ms =
@@ -743,8 +723,10 @@ void State_VisionLoco::policy_loop()
             spdlog::info("[VisionLoco] source={} theory=[{:.3f},{:.3f},{:.3f}] "
                          "exec=[{:.3f},{:.3f},{:.3f}] uwb_ok={} goal=[{:.2f},{:.2f},{:.2f},{:.2f}] "
                          "clr=[{:.2f},{:.2f},{:.2f}] step(a/r/t/e)=[{:.2f},{:.2f},{:.2f},{:.2f}] "
-                         "reject={} blend={} slew={:.2f} effort(meas/pd/pwr)=[{:.1f},{:.1f},{:.1f}] "
-                         "foot(raw/est)=[{:.0f},{:.0f}] "
+                         "direct=true action/target=[{:.2f},{:.2f}] qerr(mean/rms)=[{:.2f},{:.2f}] "
+                         "dq(max/rms)=[{:.2f},{:.2f}] tilt={:.1f}deg "
+                         "effort(meas/pd/pwr)=[{:.1f},{:.1f},{:.1f}] "
+                         "foot(raw/est/bal)=[{:.0f},{:.0f},{:.2f}] "
                          "infer={:.2f}ms loop={:.2f}ms miss={}",
                          command_source_, theory_cmd[0], theory_cmd[1], theory_cmd[2],
                          out.cmd[0], out.cmd[1], out.cmd[2],
@@ -752,10 +734,12 @@ void State_VisionLoco::policy_loop()
                          out.clearance[0], out.clearance[1], out.clearance[2],
                          action_step_max, requested_target_step_max, target_step_max,
                          tracking_error_max,
-                         motion_rejected, startup_blend, active_target_slew_rate,
+                         action_abs_max, target_abs_max,
+                         tracking_error_abs_mean, tracking_error_rms,
+                         joint_velocity_abs_max, joint_velocity_rms, tilt_deg,
                          tau_abs_max, pd_tau_abs_max,
                          mechanical_power_abs_sum,
-                         foot_force_abs_sum, foot_force_est_abs_sum,
+                         foot_force_abs_sum, foot_force_est_abs_sum, foot_force_balance,
                          out.inference_ms, loop_ms, deadline_misses_);
         }
 
@@ -831,18 +815,20 @@ void State_VisionLoco::policy_loop()
             diag_ << ',' << ds.invalid_frac << ',' << ds.mean_valid
                   << ',' << ds.front_invalid << ',' << ds.front_min << ',' << ds.front_mean
                   << ',' << action_step_max << ',' << requested_target_step_max
-                   << ',' << target_step_max
-                   << ',' << tracking_error_max << ',' << (motion_rejected ? 1 : 0)
-                   << ',' << motion_violations
-                   << ',' << (tracking_error_exceeded ? 1 : 0)
-                   << ',' << (startup_blend ? 1 : 0)
-                   << ',' << active_target_slew_rate
+                  << ',' << target_step_max
+                  << ',' << tracking_error_max
+                  << ",1" << ',' << action_abs_max << ',' << target_abs_max
+                  << ',' << tracking_error_abs_mean << ',' << tracking_error_rms
+                  << ',' << joint_velocity_abs_max << ',' << joint_velocity_rms
                   << ',' << av[0] << ',' << av[1] << ',' << av[2]
                   << ',' << pg[0] << ',' << pg[1] << ',' << pg[2]
-                  << ',' << tau_abs_max << ',' << pd_tau_abs_max
-                  << ',' << mechanical_power_abs_sum
-                  << ',' << foot_force_abs_sum << ',' << foot_force_est_abs_sum
-                  << ',' << foot_force_est_abs_max;
+                  << ',' << tilt_deg
+                  << ',' << tau_abs_max << ',' << tau_abs_sum
+                  << ',' << pd_tau_abs_max << ',' << pd_tau_abs_sum
+                  << ',' << mechanical_power_abs_sum << ',' << mechanical_power_abs_max
+                  << ',' << foot_force_abs_sum << ',' << foot_force_abs_max
+                  << ',' << foot_force_balance
+                  << ',' << foot_force_est_abs_sum << ',' << foot_force_est_abs_max;
             for (int i = 0; i < q.size(); ++i) diag_ << ',' << q[i];
             for (int i = 0; i < dq.size(); ++i) diag_ << ',' << dq[i];
             for (int i = 0; i < tau.size(); ++i) diag_ << ',' << tau[i];
@@ -851,6 +837,8 @@ void State_VisionLoco::policy_loop()
             write_values(diag_, accepted_target);
             write_values(diag_, joint_error);
             write_values(diag_, pd_torque);
+            write_values(diag_, target_delta);
+            write_values(diag_, mechanical_power);
             write_values(diag_, foot_force);
             write_values(diag_, foot_force_est);
             diag_ << '\n';
