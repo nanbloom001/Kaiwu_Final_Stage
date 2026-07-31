@@ -2665,8 +2665,9 @@
   `lbc_loco`。评估验收依次确认 `Stage: p3_standard_eval/p3_track_eval` → selected 为
   highslow → `eval_disposition` → loaded modules → 无 lbc_loco/nav_eval 回退 →
   Standard scorer 正常统计、Track 完成数非恒 0。
-- 血缘：分支 `codex/p3-dual-eval`（自 `codex/p3-standard-joint-recovery` 创建）；当前工作树
-  未提交（沿用 P2 eval 热修复先例）；父 checkpoint `highslow-884257`，SHA256
+- 血缘：分支 `codex/p3-dual-eval`（自 `codex/p3-standard-joint-recovery` 创建）；实现提交
+  `6fb20ad`（`feat(server): add P3 standard joint recovery and dual eval`）；父 checkpoint
+  `highslow-884257`，SHA256
   `8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23`；P3 父模型
   `p2nav2h-r2_648278`。
 - 回滚：恢复 eval 路由到旧 `lbc_loco`/`nav_eval` 映射即复现本 Bug；仅需回滚评估装配代码，
