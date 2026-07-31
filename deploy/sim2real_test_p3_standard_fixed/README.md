@@ -13,3 +13,13 @@ motor-side smoke test.
 The first policy target is slew-limited from the mapped FixStand posture.
 Motion guards compare adjacent policy requests and return to FixStand after
 repeated violations; they do not drop an upright robot into Passive.
+
+For a suspended depth-isolation test, temporarily replace RealSense input
+without editing the persistent config:
+
+```bash
+LOCO_DEPTH_SOURCE=constant ./scripts/run_loco_stage_fixed_test.sh --network eth0
+```
+
+The wrapper restores the original RealSense configuration on normal exit or
+`Ctrl+C`.
