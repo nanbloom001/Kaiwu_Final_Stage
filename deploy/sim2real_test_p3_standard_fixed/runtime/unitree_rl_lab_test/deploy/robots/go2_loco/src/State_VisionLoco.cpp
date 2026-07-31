@@ -241,8 +241,6 @@ State_VisionLoco::State_VisionLoco(int state_mode, std::string state_string)
             0.1f, yaml_get<float>(cfg["logging"], "target_slew_rate_rad_s", 3.0f));
         max_tracking_error_rad_ = std::max(
             0.10f, yaml_get<float>(cfg["logging"], "max_tracking_error_rad", 0.45f));
-        max_consecutive_motion_violations_ = std::max(
-            1, yaml_get<int>(cfg["logging"], "max_consecutive_motion_violations", 2));
     }
 
     // ---------- 安全转移：翻倒 → Passive ----------
@@ -254,10 +252,6 @@ State_VisionLoco::State_VisionLoco(int state_mode, std::string state_string)
     this->registered_checks.emplace_back(std::make_pair(
         [this]() -> bool { return policy_fault_.load(); },
         FSMStringMap.right.at("Passive")));
-    this->registered_checks.emplace_back(std::make_pair(
-        [this]() -> bool { return motion_fault_.load(); },
-        FSMStringMap.right.at("FixStand")));
-
     spdlog::info("[VisionLoco] 就绪：step_dt={:.3f}s scale={:.3f} source={} "
                  "goal=[{:.2f},{:.2f},{:.2f},{:.2f}] depth={} logging={}",
                  step_dt_, act_scale_, command_source_,
@@ -476,7 +470,6 @@ void State_VisionLoco::enter()
     deadline_misses_ = 0;
     consecutive_errors_ = 0;
     policy_fault_ = false;
-    motion_fault_ = false;
     last_exec_cmd_ = {0.0f, 0.0f, 0.0f};
 
     // fixed/uwb 始终外部覆盖；nav 使用 config.yaml 固定 goal（loco 阶段等价零速度）。
@@ -659,14 +652,8 @@ void State_VisionLoco::policy_loop()
             ++motion_violations;
             spdlog::warn(
                 "[VisionLoco] rejected motion frame: requested_step={:.3f}rad "
-                "tracking_error={:.3f}rad ({}/{})",
-                requested_target_step_max, tracking_error_max, motion_violations,
-                max_consecutive_motion_violations_);
-            if (motion_violations >= max_consecutive_motion_violations_) {
-                spdlog::critical("[VisionLoco] repeated unsafe motion; requesting FixStand");
-                motion_fault_ = true;
-                running_ = false;
-            }
+                "tracking_error={:.3f}rad consecutive={}",
+                requested_target_step_max, tracking_error_max, motion_violations);
         } else {
             motion_violations = 0;
             const float max_applied_step = target_slew_rate_rad_s_ * step_dt_;
