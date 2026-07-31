@@ -99,6 +99,7 @@ private:
     int max_consecutive_errors_ = 5;
     float max_raw_action_abs_ = 20.0f;
     float max_target_step_rad_ = 0.35f;
+    float target_slew_rate_rad_s_ = 3.0f;
     float max_tracking_error_rad_ = 0.45f;
     int max_consecutive_motion_violations_ = 2;
     std::string log_dir_;
@@ -146,6 +147,7 @@ private:
     std::thread policy_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> policy_fault_{false};
+    std::atomic<bool> motion_fault_{false};
     int consecutive_errors_ = 0;
     long deadline_misses_ = 0;
     long frame_ = 0;
