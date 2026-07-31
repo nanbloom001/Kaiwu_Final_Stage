@@ -2751,6 +2751,6 @@
   `model.ckpt-highslow-884257.pkl` 完成 radial warm start、一次低层 PPO update、P3 保存和 exact
   resume；Actor/Critic 均发生有限更新，动作方差与低层 digest 正确恢复。Python 编译、全部 TOML
   解析与 `git diff --check` 通过；本机缺少平台 `kaiwudrl` 包，monitor 的真实 builder 实例化留待容器。
-- 关联：基线提交 `1a5641d`；本轮 commit/PR、新 checkpoint、容器同步、平台任务与评估结果均
-  尚未产生。回滚方式是切回 `codex/p3-dual-eval`；再次遇到时最短检查路径为 worker reset 行
+- 关联：基线提交 `1a5641d`，本轮实现提交 `4230fc8`；PR、新 checkpoint、容器同步、平台任务与
+  评估结果均尚未产生。回滚方式是切回 `codex/p3-dual-eval`；再次遇到时最短检查路径为 worker reset 行
   root pose → M1/M2 event → 3.90m proxy → platform reason/completed → Adapter attempts/applied。
