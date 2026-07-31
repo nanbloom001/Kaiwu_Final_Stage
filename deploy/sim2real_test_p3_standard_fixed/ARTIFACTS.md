@@ -50,6 +50,12 @@ adjacent requested-target step above `0.35` rad or tracking error above `0.45`
 rad is held for safety; two consecutive violations request FixStand so the
 robot keeps standing instead of dropping into Passive.
 
+Each diagnostic frame also records policy-order joint position and velocity,
+motor-reported estimated effort (`tau_est`), raw policy action, requested and
+actually applied targets, per-joint tracking error, nominal PD torque, and
+absolute mechanical power. The analyzer remains compatible with older CSVs
+that do not contain these extended columns.
+
 ## Export
 
 ```bash

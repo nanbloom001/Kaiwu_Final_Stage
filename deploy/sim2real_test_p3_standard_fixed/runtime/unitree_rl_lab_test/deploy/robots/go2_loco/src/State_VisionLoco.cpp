@@ -164,6 +164,7 @@ State_VisionLoco::State_VisionLoco(int state_mode, std::string state_string)
     robot_->data.joint_ids_map.assign(joint_ids_map_.begin(), joint_ids_map_.end()); // vector<float>
     robot_->data.joint_pos.resize(joint_ids_map_.size());
     robot_->data.joint_vel.resize(joint_ids_map_.size());
+    robot_->data.joint_effort.resize(joint_ids_map_.size());
     robot_->data.default_joint_pos =
         Eigen::VectorXf::Map(default_joint_pos_.data(), default_joint_pos_.size());
     robot_->data.joint_stiffness = stiffness_;
@@ -533,11 +534,16 @@ void State_VisionLoco::enter()
                      "dep_inval,dep_meanv,front_inval,front_min,front_mean,"
                      "action_step_max,requested_target_step_max,target_step_max,tracking_error_max,"
                      "motion_rejected,motion_violations,"
-                     "avx,avy,avz,pgx,pgy,pgz";
+                     "avx,avy,avz,pgx,pgy,pgz,"
+                     "tau_abs_max,pd_tau_abs_max,mechanical_power_abs_sum";
             for (int i = 0; i < 12; ++i) diag_ << ",q" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",dq" << i;
+            for (int i = 0; i < 12; ++i) diag_ << ",tau" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",action" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",target" << i;
+            for (int i = 0; i < 12; ++i) diag_ << ",applied_target" << i;
+            for (int i = 0; i < 12; ++i) diag_ << ",qerr" << i;
+            for (int i = 0; i < 12; ++i) diag_ << ",pd_tau" << i;
             diag_ << '\n';
             diag_ << std::fixed << std::setprecision(6);
             spdlog::info("[VisionLoco] 诊断日志: {}", diag_path_);
@@ -679,6 +685,21 @@ void State_VisionLoco::policy_loop()
             have_target_     = true;
         }
 
+        const auto& policy_dq = robot_->data.joint_vel;
+        const auto& policy_tau = robot_->data.joint_effort;
+        std::vector<float> joint_error(12);
+        std::vector<float> pd_torque(12);
+        float tau_abs_max = 0.0f;
+        float pd_tau_abs_max = 0.0f;
+        float mechanical_power_abs_sum = 0.0f;
+        for (int i = 0; i < 12; ++i) {
+            joint_error[i] = accepted_target[i] - policy_q[i];
+            pd_torque[i] = stiffness_[i] * joint_error[i] - damping_[i] * policy_dq[i];
+            tau_abs_max = std::max(tau_abs_max, std::fabs(policy_tau[i]));
+            pd_tau_abs_max = std::max(pd_tau_abs_max, std::fabs(pd_torque[i]));
+            mechanical_power_abs_sum += std::fabs(policy_tau[i] * policy_dq[i]);
+        }
+
         const auto work_end = clock::now();
         const float loop_ms =
             std::chrono::duration<float, std::milli>(work_end - loop_start).count();
@@ -688,14 +709,17 @@ void State_VisionLoco::policy_loop()
             spdlog::info("[VisionLoco] source={} theory=[{:.3f},{:.3f},{:.3f}] "
                          "exec=[{:.3f},{:.3f},{:.3f}] uwb_ok={} goal=[{:.2f},{:.2f},{:.2f},{:.2f}] "
                          "clr=[{:.2f},{:.2f},{:.2f}] step(a/r/t/e)=[{:.2f},{:.2f},{:.2f},{:.2f}] "
-                         "reject={} infer={:.2f}ms loop={:.2f}ms miss={}",
+                         "reject={} effort(meas/pd/pwr)=[{:.1f},{:.1f},{:.1f}] "
+                         "infer={:.2f}ms loop={:.2f}ms miss={}",
                          command_source_, theory_cmd[0], theory_cmd[1], theory_cmd[2],
                          out.cmd[0], out.cmd[1], out.cmd[2],
                          uwb_valid, goal[0], goal[1], goal[2], goal[3],
                          out.clearance[0], out.clearance[1], out.clearance[2],
                          action_step_max, requested_target_step_max, target_step_max,
                          tracking_error_max,
-                         motion_rejected, out.inference_ms, loop_ms, deadline_misses_);
+                         motion_rejected, tau_abs_max, pd_tau_abs_max,
+                         mechanical_power_abs_sum,
+                         out.inference_ms, loop_ms, deadline_misses_);
         }
 
         // 逐帧 CSV：时延 / cmd / clearance / depth / IMU / q,dq / action,target。
@@ -738,6 +762,7 @@ void State_VisionLoco::policy_loop()
             const float feedback_wz = sport_valid ? sport.yaw_speed : av[2];
             const auto& q = robot_->data.joint_pos;
             const auto& dq = robot_->data.joint_vel;
+            const auto& tau = robot_->data.joint_effort;
             long t_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             clock::now() - t_start).count();
             diag_ << frame_ << ',' << t_ms << ',' << loop_ms << ',' << out.inference_ms
@@ -773,11 +798,17 @@ void State_VisionLoco::policy_loop()
                   << ',' << tracking_error_max << ',' << (motion_rejected ? 1 : 0)
                   << ',' << motion_violations
                   << ',' << av[0] << ',' << av[1] << ',' << av[2]
-                  << ',' << pg[0] << ',' << pg[1] << ',' << pg[2];
+                  << ',' << pg[0] << ',' << pg[1] << ',' << pg[2]
+                  << ',' << tau_abs_max << ',' << pd_tau_abs_max
+                  << ',' << mechanical_power_abs_sum;
             for (int i = 0; i < q.size(); ++i) diag_ << ',' << q[i];
             for (int i = 0; i < dq.size(); ++i) diag_ << ',' << dq[i];
+            for (int i = 0; i < tau.size(); ++i) diag_ << ',' << tau[i];
             write_values(diag_, out.joint);
             write_values(diag_, tgt);
+            write_values(diag_, accepted_target);
+            write_values(diag_, joint_error);
+            write_values(diag_, pd_torque);
             diag_ << '\n';
             if ((frame_ % log_flush_every_) == 0) diag_.flush();
         }

@@ -33,10 +33,12 @@ public:
             lowstate->msg_.imu_state().quaternion()[3]
         );
         data.projected_gravity_b = data.root_quat_w.conjugate() * data.GRAVITY_VEC_W;
-        // joint positions and velocities
+        // joint positions, velocities, and estimated efforts
         for(int i(0); i< data.joint_ids_map.size(); i++) {
-            data.joint_pos[i] = lowstate->msg_.motor_state()[data.joint_ids_map[i]].q();
-            data.joint_vel[i] = lowstate->msg_.motor_state()[data.joint_ids_map[i]].dq();
+            const auto& motor = lowstate->msg_.motor_state()[data.joint_ids_map[i]];
+            data.joint_pos[i] = motor.q();
+            data.joint_vel[i] = motor.dq();
+            data.joint_effort[i] = motor.tau_est();
         }
     }
 
