@@ -30,9 +30,9 @@ from local_sync_client import (
 
 
 DEFAULT_REMOTE_PREFIX = PurePosixPath("agent_ppo/test_artifacts")
-DEFAULT_PART_BYTES = 4 * 1024 * 1024
+DEFAULT_PART_BYTES = 1 * 1024 * 1024
 DEFAULT_PART_WORKERS = 2
-DEFAULT_CHUNK_WORKERS = 4
+DEFAULT_CHUNK_WORKERS = 2
 DEFAULT_RETRIES = 3
 
 
@@ -60,6 +60,24 @@ def validate_remote_path(raw: str) -> str:
             f"remote path must be below {DEFAULT_REMOTE_PREFIX.as_posix()}/"
         )
     return normalized.as_posix()
+
+
+def manifest_file_entry(
+    manifest: dict[str, Any], remote_path: str
+) -> dict[str, Any]:
+    """Read a file entry from either rooted or scope-relative manifests."""
+    files = manifest.get("files", {})
+    if not isinstance(files, dict):
+        return {}
+    entry = files.get(remote_path)
+    if isinstance(entry, dict):
+        return entry
+    scope_prefix = "agent_ppo/"
+    if remote_path.startswith(scope_prefix):
+        entry = files.get(remote_path[len(scope_prefix) :])
+        if isinstance(entry, dict):
+            return entry
+    return {}
 
 
 def split_file(
@@ -238,8 +256,7 @@ def upload_model(
         source, remote_path, part_bytes
     )
     manifest = client.get("/manifest", scope="agent_ppo")
-    remote_files = manifest.get("files", {})
-    if remote_files.get(remote_path, {}).get("sha256") == whole_sha256:
+    if manifest_file_entry(manifest, remote_path).get("sha256") == whole_sha256:
         print(
             f"remote file already verified: {remote_path} "
             f"bytes={whole_size} sha256={whole_sha256}"
@@ -248,7 +265,8 @@ def upload_model(
     pending = [
         part
         for part in parts
-        if remote_files.get(part.remote_path, {}).get("sha256") != part.sha256
+        if manifest_file_entry(manifest, part.remote_path).get("sha256")
+        != part.sha256
     ]
     print(
         f"source={source} bytes={whole_size} parts={len(parts)} "
@@ -290,7 +308,7 @@ def upload_model(
     )
     run_remote_command(client, command, merge_timeout)
     final_manifest = client.get("/manifest", scope="agent_ppo")
-    remote_sha256 = final_manifest.get("files", {}).get(remote_path, {}).get(
+    remote_sha256 = manifest_file_entry(final_manifest, remote_path).get(
         "sha256"
     )
     if remote_sha256 != whole_sha256:

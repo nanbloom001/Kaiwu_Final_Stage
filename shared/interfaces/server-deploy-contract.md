@@ -409,6 +409,81 @@ P1.5 父包顶层的 legacy `action_distribution` 与 `s0_anchor` 在 P2 首存�
 `modules.low_level` 的规范 leaf，不能因 P2 低层只做 inference 就丢弃；这是后续
 `resume_low` 恢复动作方差和 S0 anchor 的必要透明状态。
 
+#### `p3_standard_joint`：Standard 高低层联合恢复包
+
+P3 从完整 P2 schema-2 包显式 warm start，在单个 Standard+Camera 任务内维护两条独立
+recurrent rollout 时间轴。外部 policy observation 与 P2 相同，低层仅通过输入适配器删除
+goal4；这不是低层网络结构变化：
+
+```text
+policy observation = proprio45 | scan256 | goal4 | depth57600 = 57905
+low input adapter  = proprio45 | scan256 | depth57600 = 57901
+low PPO storage    = proprio45 | frozen_cnn_feat32 = 77 (training-only)
+high actor input   = nav_feat32 | nav_nonvisual36 | response16 | confidence1 = 85
+low action         = joint12 at 50Hz
+high action        = [vx,vy,wz] at 5Hz
+environment step   = joint12 (platform contract unchanged)
+```
+
+平台会覆盖 `isaac_env/base_env.py`，P3 不依赖该文件的本地补丁。低层恢复阶段读取平台原生
+2-8 秒三轴命令，低层 observation、worker reward 与实际执行保持一致；高层开始拥有命令后低层
+冻结，worker 低层 reward 不进入任何低层更新。P3 的
+`_p3_goal_positions` 是训练 worker 私有局部目标，不替换平台 Standard scorer 的任务定义。
+局部目标距离 1.5-2.8m，限制在 8m 地块的 1m 内边界；进入 0.6m 只结算高层事件奖励并重采样，
+不终止或 reset Standard episode。正式 Standard success 仍只由平台 scorer 产生；二者的联合
+成功仅可作为监控指标，不能反向改变 scorer。
+
+```text
+format = "kaiwu_train_v1"
+schema_version = 2
+stage_type = "p3_standard_joint"
+deployable = false
+modules.low_level.locomotion_encoder / actor / critic / p3_critic / p3_anchor / action_distribution
+modules.high_level.navigation_encoder / navigation_safety_head(training_only)
+modules.high_level.actor / critic / response_adapter
+optimizers.low_level / high_level_actor / high_level_critic / response_adapter
+training_states.low_level / high_level / response_adapter / global
+training_states.global.session_effective_seconds / lifetime_effective_seconds
+training_states.global.low_updates / high_updates / compound_schedule_phase
+training_states.global.p3_anchor_digest / low_level_version
+training_states.global.domain_randomization_phase / domain_randomization_realized
+contracts.p3_standard_joint.name = "p3_standard_joint_v3"
+```
+
+阶段文件标签固定为 `lowbase`、`lowmild`、`lowmedium`、`lowfull`、`adaptercalib`、
+`highadapt`、`highslow`。候选文件缺失时可继续查找配置父包；一旦选中文件，格式、模块、
+spec/shape、optimizer exact-resume 状态或有限值不兼容必须停止。平台模型 ID、文件名 ID 和
+lineage 只用于选择、告警与追溯，不得形成单点硬门禁。live hidden、未完成 rollout、未完成
+future history和每环境局部目标状态不保存，resume 后统一 reset。
+
+同一个 P3 包支持两种独立评估入口，二者共用同一份候选发现与结构验证器
+（`p3_standard_joint_eval_candidates` + `validate_p3_eval_bundle`），绝不回退
+P2/LBC/随机权重：
+
+- **`p3_standard_eval`（Standard+Camera）**：只从 P3 包加载
+  `modules.low_level.locomotion_encoder` + `modules.low_level.actor`（冻结
+  VisionEncoder + Actor77）。policy observation 为低层合同 57901（proprio45 |
+  scan256 | depth57600，goal0），输出 12 维关节动作；使用平台 Standard 原生命令、
+  reward、termination 与 scorer。不创建/执行高层 Actor、NavigationEncoder、
+  ResponseAdapter、SafetyHead、Critic、optimizer 或训练 buffer，不使用 P3 局部目标、
+  goal4 或训练命令覆盖。
+- **`p3_track_eval`（Track+Camera）**：从同一 P3 包加载完整层级：冻结低层
+  VisionEncoder/Actor、NavigationEncoder、三轴 Actor/LSTM、ResponseAdapter。
+  policy observation 保持 57905，高层 5Hz / 低层 50Hz，高层发布 `[vx,vy,wz]`，低层
+  最终输出 12 维关节动作。reset/termination/timeout 正确清空 recurrent hidden，
+  保留已验证的 Track goal-reached→scorer 链（完成数不再恒为 0）。
+  SafetyHead/Critic/optimizer/scheduler/训练 buffer 一律不创建。
+
+P3 评估候选标签优先级为 `highslow > highadapt > adaptercalib > lowfull > lowmedium >
+lowmild > lowbase`；无同 ID P3 文件时只允许唯一 discovery，多个候选明确报歧义。请求 ID、
+文件名标签与 lineage 不一致只告警；选中文件的反序列化、必需模块、spec/shape 或非有限值
+错误必须硬失败，禁止继续用随机参数评分。
+
+每个阶段边界先保存 checkpoint，再通过平台公开 `env.reset(config)` 开始新 episode；不修改或
+依赖平台托管的 `BaseEnv`。只有 0.5h/2h/3.5h 边界改变 friction/base-mass/noise 配置，其余边界
+使用同一环境配置完成职责切换。`adaptercalib` 只执行冻结低层推理和 Adapter 数据采集，不生成
+低层 PPO transition；高层阶段按 `high_update_interval=2` 更新 Adapter。
+
 文件数字 ID 完全使用开悟框架传入值，不由业务代码从 iteration 或父模型 ID
 计算。R2 每次保存同一 payload 的阶段文件和评估兼容别名：
 

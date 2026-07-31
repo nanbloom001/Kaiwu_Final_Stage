@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-"""Stage-aware dashboards for P1.5 and P2 while preserving Nav panels."""
+"""Stage-aware dashboards for P1.5, P2 and P3 while preserving Nav panels."""
 
 from pathlib import Path
 
@@ -1226,10 +1226,101 @@ def _build_p2_monitor():
     return monitor.build()
 
 
+def _build_p3_monitor():
+    monitor = MonitorConfigBuilder()
+    monitor.title("P3 Standard分阶段恢复")
+    groups = (
+        (
+            "P3分阶段训练",
+            "p3_joint_training",
+            (
+                ("阶段与时钟", "p3_phase_clock", ("p3_phase", "p3_session_effective_seconds")),
+                ("高低层更新", "p3_update_counts", ("p3_low_updates", "p3_high_updates", "adapter_updates")),
+                ("平台生命周期", "p3_lifecycle", ("platform_lifecycle_callbacks", "platform_lifecycle_failures")),
+                ("低层收敛", "p3_low_losses", ("policy_loss", "value_loss", "low_reward_mean", "low_done_rate")),
+                ("高层收敛", "p3_high_losses", ("actor_loss", "critic_loss", "entropy", "approx_kl", "clip_fraction")),
+                ("局部目标事件", "p3_subgoal_events", ("subgoal_success_count", "subgoal_timeout_count", "p3_standard_success_count", "p3_joint_success_count")),
+                ("高层奖励分解", "p3_high_reward", ("reward_frontier_shaping", "reward_frame_safety", "reward_failure", "reward_time", "reward_crawl", "reward_command_rate", "reward_decomposed_total", "p3_frontier_clawback")),
+                ("窗口终止结果", "p3_window_outcomes", ("p3_window_completed_count", "p3_window_failure_count", "p3_window_timeout_count")),
+            ),
+        ),
+        (
+            "Standard地形覆盖",
+            "p3_standard_terrain",
+            (
+                ("四类地形占比", "p3_terrain_family", ("p3_terrain_slope_share", "p3_terrain_slope_inv_share", "p3_terrain_stairs_share", "p3_terrain_stairs_inv_share")),
+                ("地形等级L0-L9", "p3_terrain_level", tuple(f"p3_terrain_level_l{i}_share" for i in range(10))),
+                ("静态地形列0-19", "p3_terrain_column", tuple(f"p3_terrain_column_l{i}_share" for i in range(20))),
+            ),
+        ),
+        (
+            "高层命令与反馈",
+            "p3_command_feedback",
+            (
+                ("前进速度链", "p3_vx_response", ("target_vx", "exec_vx", "measured_vx", "true_vx")),
+                ("横向速度链", "p3_vy_response", ("target_vy", "exec_vy", "measured_vy", "true_vy")),
+                ("转向速度链", "p3_wz_response", ("target_wz", "exec_wz", "measured_wz", "true_wz")),
+                ("执行跟踪误差", "p3_tracking_error", ("vx_tracking_abs_error", "vy_tracking_abs_error", "wz_tracking_abs_error")),
+                ("指令正负覆盖", "p3_command_sign_share", ("target_vx_positive_share", "target_vy_positive_share", "target_vy_negative_share", "target_wz_positive_share", "target_wz_negative_share")),
+                ("反馈质量", "p3_feedback_quality", ("feedback_valid", "feedback_age_s", "feedback_true_velocity_error", "adapter_confidence")),
+            ),
+        ),
+        (
+            "低层步态回归",
+            "p3_low_gait",
+            (
+                ("四足接触占空比", "p3_gait_duty", ("fl_duty_factor", "fr_duty_factor", "rl_duty_factor", "rr_duty_factor")),
+                ("四足最长悬空", "p3_gait_max_air", ("fl_max_air_time", "fr_max_air_time", "rl_max_air_time", "rr_max_air_time")),
+                ("四足步频", "p3_gait_frequency", ("fl_step_frequency", "fr_step_frequency", "rl_step_frequency", "rr_step_frequency")),
+                ("四足滑移", "p3_gait_slip", ("fl_slip_speed", "fr_slip_speed", "rl_slip_speed", "rr_slip_speed")),
+                ("映射有效性", "p3_gait_mapping", ("gait_window_valid", "gait_sensor_mapping_valid", "body_collision_mapping_valid")),
+            ),
+        ),
+        (
+            "低层奖励与Sim2Real",
+            "p3_low_reward",
+            (
+                ("低层奖励分解", "p3_low_reward_terms", ("reward_track_lin_vel_xy", "reward_track_ang_vel_z", "reward_p3_sim2real_cost", "reward_energy", "reward_undesired_contacts", "reward_feet_air_time", "reward_joint_position_penalty")),
+            ),
+        ),
+        (
+            "ResponseAdapter",
+            "p3_response_adapter",
+            (
+                ("速度预测误差", "p3_adapter_mae", ("adapter_velocity_mae_02s", "adapter_velocity_mae_06s", "adapter_velocity_mae_10s")),
+                ("响应损失", "p3_adapter_losses", ("adapter_loss", "adapter_velocity_loss", "adapter_pose_loss", "adapter_stuck_loss", "adapter_nll_10s")),
+                ("标签有效率", "p3_adapter_valid", ("adapter_valid_02s", "adapter_valid_06s", "adapter_valid_10s")),
+                ("样本与梯度", "p3_adapter_samples", ("adapter_track_records", "adapter_parent_records", "adapter_gradient_norm", "adapter_reset_mask_ratio")),
+            ),
+        ),
+        (
+            "性能资源",
+            "p3_runtime",
+            (
+                ("阶段耗时", "p3_stage_timing", ("p3_rollout_time_s", "update_time_s", "env_step_time_s")),
+                ("采样吞吐", "p3_throughput", ("samples_per_s",)),
+                ("随机化阶段", "p3_domain_randomization", ("p3_dr_phase", "p3_friction_min", "p3_friction_max", "p3_base_added_mass_kg", "p3_noise_level")),
+                ("显存当前值", "p3_memory_current", ("memory_allocated", "memory_reserved")),
+                ("显存峰值", "p3_memory_peak", ("max_memory_allocated", "max_memory_reserved")),
+                ("深度缓存", "p3_depth_storage", ("pinned_depth_bytes", "h2d_time_s")),
+                ("低层紧凑缓存", "p3_low_compact_storage", ("p3_low_storage_bytes",)),
+            ),
+        ),
+    )
+    for group_name, group_name_en, panels in groups:
+        monitor.add_group(group_name=group_name, group_name_en=group_name_en)
+        for name, name_en, metrics in panels:
+            _add_multi_line_panel(monitor, name, name_en, metrics)
+        monitor.end_group()
+    return monitor.build()
+
+
 def build_monitor():
     policy_entry = _configured_policy_entry()
     if policy_entry == "p15_response":
         return _build_p15_monitor()
     if policy_entry in {"p2_nav_ppo", "p2_nav_eval"}:
         return _build_p2_monitor()
+    if policy_entry == "p3_standard_joint":
+        return _build_p3_monitor()
     return _build_nav_monitor()

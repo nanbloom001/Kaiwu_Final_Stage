@@ -55,6 +55,7 @@ class VisualActorCritic(ActorCritic):
         for value in self.depth_shape:
             self.depth_size *= value
         self.actor_observation_dim = self.num_proprio + self.num_scan + self.depth_size
+        self.compact_actor_observation_dim = self.num_proprio + int(cnn_output_dim)
         self.vision_encoder = VisionEncoder(
             image_shape=self.depth_shape,
             proprio_dim=self.num_proprio,
@@ -65,6 +66,7 @@ class VisualActorCritic(ActorCritic):
             use_lstm=True,
         )
         self._last_latent = None
+        self._last_cnn_features = None
 
     def _split_actor_observation(self, obs: torch.Tensor):
         if obs.shape[-1] != self.actor_observation_dim:
@@ -76,6 +78,12 @@ class VisualActorCritic(ActorCritic):
         depth_start = self.num_proprio + self.num_scan
         depth = obs[..., depth_start:].reshape(*obs.shape[:-1], *self.depth_shape)
         return proprio, depth
+
+    def _split_actor_input(self, obs: torch.Tensor):
+        if obs.shape[-1] == self.compact_actor_observation_dim:
+            return obs[..., : self.num_proprio], obs[..., self.num_proprio :], True
+        proprio, depth = self._split_actor_observation(obs)
+        return proprio, depth, False
 
     def _set_encoder_hidden(self, hidden_states):
         if hidden_states is None or hidden_states[0] is None:
@@ -91,7 +99,7 @@ class VisualActorCritic(ActorCritic):
         hidden_states=None,
         masks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        proprio, depth = self._split_actor_observation(obs)
+        proprio, encoded, compact = self._split_actor_input(obs)
         time_steps, batch_size = obs.shape[:2]
         rollout_hidden = self.vision_encoder.get_hidden_state()
         self._set_encoder_hidden(hidden_states)
@@ -108,10 +116,9 @@ class VisualActorCritic(ActorCritic):
                     step_mask = masks[step - 1].reshape(batch_size)
                 latents.append(
                     self.vision_encoder(
-                        depth[step],
-                        proprio[step],
-                        masks=step_mask,
-                        detach_hidden=False,
+                        encoded[step], proprio[step], masks=step_mask, detach_hidden=False
+                    ) if not compact else self.vision_encoder.forward_from_cnn_features(
+                        encoded[step], proprio[step], masks=step_mask, detach_hidden=False
                     )
                 )
             return torch.stack(latents, dim=0)
@@ -122,16 +129,20 @@ class VisualActorCritic(ActorCritic):
                 self.vision_encoder.set_hidden_state(rollout_hidden)
 
     def _actor_features(self, obs, hidden_states=None, masks=None):
-        proprio, depth = self._split_actor_observation(obs)
+        proprio, encoded, compact = self._split_actor_input(obs)
         if obs.dim() == 3:
             latent = self._encode_sequence(obs, hidden_states=hidden_states, masks=masks)
         elif obs.dim() == 2:
-            latent = self.vision_encoder(
-                depth,
-                proprio,
-                masks=masks,
-                detach_hidden=True,
-            )
+            if compact:
+                latent = self.vision_encoder.forward_from_cnn_features(
+                    encoded, proprio, masks=masks, detach_hidden=True
+                )
+            else:
+                cnn_features = self.vision_encoder.cnn(encoded)
+                self._last_cnn_features = cnn_features
+                latent = self.vision_encoder.forward_from_cnn_features(
+                    cnn_features, proprio, masks=masks, detach_hidden=True
+                )
         else:
             raise ValueError(
                 f"Visual actor expects [B,D] or [T,B,D], got {tuple(obs.shape)}"
@@ -145,15 +156,55 @@ class VisualActorCritic(ActorCritic):
             raise RuntimeError("Visual latent is unavailable before an actor forward pass")
         return self._last_latent
 
+    @property
+    def last_cnn_features(self):
+        if self._last_cnn_features is None:
+            raise RuntimeError("CNN features are unavailable before a full actor forward pass")
+        return self._last_cnn_features
+
     def update_distribution(self, obs, hidden_states=None, masks=None):
         mean = self.actor(
             self._actor_features(obs, hidden_states=hidden_states, masks=masks)
         )
+        self._set_distribution(mean)
+
+    def _set_distribution(self, mean):
         if self.noise_std_type == "scalar":
             std = self.std.clamp(min=1e-6).expand_as(mean)
         else:
             std = torch.exp(self.log_std).expand_as(mean)
         self.distribution = torch.distributions.Normal(mean, std)
+
+    def update_distribution_from_proprio_depth(
+        self, proprio, depth, hidden_states=None, masks=None
+    ):
+        """P3 collection fast path without allocating a 57901-D adapter tensor."""
+        if proprio.ndim != 2 or proprio.shape[-1] != self.num_proprio:
+            raise ValueError("P3 proprio input must be [B,num_proprio]")
+        if depth.shape[0] != proprio.shape[0] or tuple(depth.shape[1:]) != self.depth_shape:
+            raise ValueError(
+                f"P3 depth input must be [B,{self.depth_shape}], got {tuple(depth.shape)}"
+            )
+        if hidden_states is not None:
+            self._set_encoder_hidden(hidden_states)
+        if self.vision_encoder.get_hidden_state() is None:
+            self.vision_encoder.reset_hidden_state(proprio.shape[0], proprio.device)
+        cnn_features = self.vision_encoder.cnn(depth)
+        self._last_cnn_features = cnn_features
+        latent = self.vision_encoder.forward_from_cnn_features(
+            cnn_features,
+            proprio,
+            masks=masks,
+            detach_hidden=True,
+        )
+        self._last_latent = latent
+        self._set_distribution(self.actor(torch.cat((proprio, latent), dim=-1)))
+
+    def act_from_proprio_depth(self, proprio, depth, hidden_states=None, masks=None):
+        self.update_distribution_from_proprio_depth(
+            proprio, depth, hidden_states=hidden_states, masks=masks
+        )
+        return self.distribution.sample()
 
     def act(self, obs, hidden_states=None, masks=None):
         self.update_distribution(obs, hidden_states=hidden_states, masks=masks)

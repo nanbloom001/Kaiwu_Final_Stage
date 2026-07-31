@@ -16,6 +16,8 @@ RewardProcessBase and are activated directly from TOML.
 通用 Isaac Lab reward 仍继承自 RewardProcessBase，并直接由 TOML 激活。
 """
 
+import math
+
 import torch
 
 from tools.base_env.base_reward import RewardProcessBase
@@ -349,6 +351,120 @@ class RewardProcess(RewardProcessBase):
         if torque is None:
             return torch.zeros(self.env.num_envs, device=self.env.device)
         return torch.sum(torch.abs(torque * data.joint_vel), dim=1)
+
+    def _reward_p3_sim2real_cost(
+        self,
+        sustained_weight: float = 0.05,
+        peak_weight: float = 0.02,
+        action_rate_weight: float = 0.03,
+        action_jerk_weight: float = 0.01,
+        frame_cap: float = 0.12,
+        ema_window_s: float = 0.20,
+    ):
+        """Bounded P3 low-level torque and action smoothness cost."""
+        asset = self._get_robot_asset()
+        data = asset.data
+        torque = getattr(data, "applied_torque", None)
+        if torque is None:
+            torque = getattr(data, "torque", None)
+        joint_names = list(getattr(asset, "joint_names", ()) or ())
+        valid_mapping = (
+            torch.is_tensor(torque)
+            and torque.ndim == 2
+            and torque.shape[0] == self.env.num_envs
+            and len(joint_names) == torque.shape[1]
+        )
+        groups = []
+        if valid_mapping:
+            for name in joint_names:
+                lower = str(name).lower()
+                if "hip" in lower:
+                    groups.append((15.5, 20.0))
+                elif "thigh" in lower:
+                    groups.append((15.5, 20.0))
+                elif "calf" in lower:
+                    groups.append((21.0, 30.0))
+                else:
+                    valid_mapping = False
+                    break
+        if not valid_mapping:
+            if not bool(getattr(self.env, "_p3_torque_mapping_warned", False)):
+                print(
+                    "[P3Reward] torque/joint mapping invalid; disabling P3 torque cost"
+                )
+                self.env._p3_torque_mapping_warned = True
+            self.env._p3_torque_mapping_valid = torch.zeros(
+                self.env.num_envs, dtype=torch.bool, device=self.env.device
+            )
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        absolute_torque = torch.abs(torque)
+        state = getattr(self.env, "_p3_sim2real_reward_state", None)
+        action_manager = getattr(self.env, "action_manager", None)
+        current_action = getattr(action_manager, "action", None)
+        previous_action = getattr(action_manager, "prev_action", None)
+        if not isinstance(state, dict) or state.get("torque_ema") is None:
+            state = {
+                "torque_ema": absolute_torque.detach().clone(),
+                "previous_action": (
+                    previous_action.detach().clone()
+                    if torch.is_tensor(previous_action)
+                    else None
+                ),
+            }
+            self.env._p3_sim2real_reward_state = state
+        dt_s = float(getattr(self.env, "step_dt", 0.02))
+        alpha = 1.0 - math.exp(-max(dt_s, 0.0) / max(float(ema_window_s), 1.0e-3))
+        state["torque_ema"].mul_(1.0 - alpha).add_(absolute_torque * alpha)
+        soft = torch.tensor([item[0] for item in groups], device=torque.device, dtype=torque.dtype)
+        strong = torch.tensor([item[1] for item in groups], device=torque.device, dtype=torque.dtype)
+        scale = (strong - soft).clamp_min(1.0e-6)
+        sustained = torch.clamp((state["torque_ema"] - soft) / scale, 0.0, 1.0).mean(dim=1)
+        peak = torch.clamp((absolute_torque - strong) / strong, 0.0, 1.0).mean(dim=1)
+
+        if (
+            torch.is_tensor(current_action)
+            and torch.is_tensor(previous_action)
+            and current_action.shape == previous_action.shape
+        ):
+            older = state.get("previous_action")
+            if not torch.is_tensor(older) or older.shape != previous_action.shape:
+                older = previous_action.detach().clone()
+            rate = torch.clamp(
+                torch.abs(current_action - previous_action) / 0.25, 0.0, 1.0
+            ).mean(dim=1)
+            jerk = torch.clamp(
+                torch.abs(current_action - 2.0 * previous_action + older) / 0.25,
+                0.0,
+                1.0,
+            ).mean(dim=1)
+            state["previous_action"] = previous_action.detach().clone()
+        else:
+            rate = torch.zeros_like(sustained)
+            jerk = torch.zeros_like(sustained)
+
+        reset = getattr(self.env, "episode_length_buf", None)
+        if torch.is_tensor(reset):
+            reset = reset.reshape(-1) == 0
+            state["torque_ema"][reset] = absolute_torque[reset]
+            if torch.is_tensor(state.get("previous_action")) and torch.is_tensor(previous_action):
+                state["previous_action"][reset] = previous_action[reset]
+        self.env._p3_torque_mapping_valid = torch.ones(
+            self.env.num_envs, dtype=torch.bool, device=torque.device
+        )
+        self.env._p3_sim2real_components = {
+            "sustained_torque": sustained.detach(),
+            "torque_peak": peak.detach(),
+            "action_rate": rate.detach(),
+            "action_jerk": jerk.detach(),
+        }
+        total = (
+            float(sustained_weight) * sustained
+            + float(peak_weight) * peak
+            + float(action_rate_weight) * rate
+            + float(action_jerk_weight) * jerk
+        )
+        return torch.clamp(total, 0.0, float(frame_cap))
 
     def _reward_correct_base_height(self, target_height: float = 0.38):
         """Only penalize when the base is below target height."""

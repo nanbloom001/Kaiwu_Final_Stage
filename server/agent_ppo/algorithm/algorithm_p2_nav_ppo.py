@@ -16,6 +16,7 @@ from agent_ppo.checkpoint_io import (
     KAIWU_TRAIN_FORMAT,
     KAIWU_TRAIN_SCHEMA_V2,
     normalize_kaiwu_train_bundle,
+    validate_p3_eval_bundle,
     validate_state_dict_finite,
 )
 from agent_ppo.feature import nav_contract, p15_contract, p2_contract
@@ -625,11 +626,22 @@ class AlgorithmP2NavPPO:
             raise ValueError(f"P2 policy obs must be 57905, got {tuple(obs.shape)}")
         return {
             "proprio": obs[:, :45],
+            "height_scan": obs[:, 45:301],
             "goal4": obs[:, 301:305],
             "depth": obs[:, 305:].reshape(
                 obs.shape[0], p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH, 1
             ),
         }
+
+    def _low_level_frame(self, parts, critic_obs):
+        """Run one frozen low-level frame; P3 overrides this for joint capture."""
+        del critic_obs
+        with torch.inference_mode():
+            latent = self.low_level_encoder(parts["depth"], parts["proprio"], masks=None)
+            action = self.low_level_actor(
+                torch.cat((parts["proprio"], latent), dim=-1)
+            )
+        return action, {}
 
     def _nav_capability(self, batch: int, *, dtype=torch.float32) -> torch.Tensor:
         return torch.tensor(
@@ -701,9 +713,7 @@ class AlgorithmP2NavPPO:
         c0, c1 = nav_contract.CRITIC_CMD_SLICE
         parts["proprio"][:, p0:p1] = self.command.exec_cmd.to(parts["proprio"])
         critic_obs[:, c0:c1] = self.command.exec_cmd.to(critic_obs)
-        with torch.inference_mode():
-            latent = self.low_level_encoder(parts["depth"], parts["proprio"], masks=None)
-            low_action = self.low_level_actor(torch.cat((parts["proprio"], latent), dim=-1))
+        low_action, low_metadata = self._low_level_frame(parts, critic_obs)
         low_hidden = self.low_level_encoder.get_hidden_state()
         if low_hidden is not None:
             self.low_level_encoder.set_hidden_state(
@@ -721,7 +731,12 @@ class AlgorithmP2NavPPO:
             self.nonfinite_action_fallbacks += invalid_low_count
             self.invalid_transition_count += invalid_low_count
             self.rollout_invalid |= self.training_enabled
-        result = {"actions": low_action, "is_tick": False, "tick_penalty": None}
+        result = {
+            "actions": low_action,
+            "is_tick": False,
+            "tick_penalty": None,
+            **low_metadata,
+        }
         if self.frame_count % p2_contract.NAV_PERIOD_FRAMES == 0:
             reset = self.reset_since_tick.clone()
             self.actor_hidden = self._mask_hidden(self.actor_hidden, reset)
@@ -797,9 +812,19 @@ class AlgorithmP2NavPPO:
                 )
             value = None
             if self.training_enabled:
-                safe3, scanner_available, safety_teacher_diagnostics = (
-                    p2_contract.privileged_safe_directions(critic_obs)
-                )
+                if getattr(self, "track_safety_enabled", True):
+                    safe3, scanner_available, safety_teacher_diagnostics = (
+                        p2_contract.privileged_safe_directions(critic_obs)
+                    )
+                else:
+                    safe3 = torch.zeros(self.num_envs, 3, device=self.device)
+                    scanner_available = torch.zeros(
+                        self.num_envs, dtype=torch.bool, device=self.device
+                    )
+                    safety_teacher_diagnostics = {
+                        "nav_risk3": torch.zeros_like(safe3),
+                        "terrain_passable3": torch.zeros_like(safe3),
+                    }
                 critic_input = assemble_critic_input(
                     critic_obs,
                     self.command.active_target,
@@ -862,25 +887,50 @@ class AlgorithmP2NavPPO:
                 )
             )
             if self.training_enabled:
-                (
-                    predictive_collision_penalty,
-                    predictive_clearance_m,
-                    predictive_stopping_distance_m,
-                    predictive_collision_risk,
-                    predictive_collision_legacy_risk,
-                    predictive_collision_wallness,
-                    predictive_collision_sector_risk,
-                ) = p2_contract.predictive_collision_risk_penalty(
-                    parts["depth"], target
-                )
-                missed_safe_penalty, missed_safe_diagnostics = (
-                    p2_contract.missed_safe_direction_penalty(
-                        safe3,
-                        target,
-                        scanner_available,
-                        self.session_effective_seconds,
+                if getattr(self, "track_safety_enabled", True):
+                    (
+                        predictive_collision_penalty,
+                        predictive_clearance_m,
+                        predictive_stopping_distance_m,
+                        predictive_collision_risk,
+                        predictive_collision_legacy_risk,
+                        predictive_collision_wallness,
+                        predictive_collision_sector_risk,
+                    ) = p2_contract.predictive_collision_risk_penalty(
+                        parts["depth"], target
                     )
-                )
+                    missed_safe_penalty, missed_safe_diagnostics = (
+                        p2_contract.missed_safe_direction_penalty(
+                            safe3,
+                            target,
+                            scanner_available,
+                            self.session_effective_seconds,
+                        )
+                    )
+                else:
+                    zeros = torch.zeros(self.num_envs, device=self.device)
+                    predictive_collision_penalty = zeros
+                    predictive_clearance_m = torch.full_like(
+                        zeros, p2_contract.PREDICTIVE_COLLISION_MAX_DEPTH_M
+                    )
+                    predictive_stopping_distance_m = zeros
+                    predictive_collision_risk = zeros
+                    predictive_collision_legacy_risk = zeros
+                    predictive_collision_wallness = torch.zeros(
+                        self.num_envs, 3, device=self.device
+                    )
+                    predictive_collision_sector_risk = torch.zeros_like(
+                        predictive_collision_wallness
+                    )
+                    missed_safe_penalty = zeros
+                    missed_safe_diagnostics = {
+                        "selected_safe": zeros,
+                        "best_safe": zeros,
+                        "safe_gap": zeros,
+                        "active": zeros,
+                        "selection_eligible": zeros,
+                        "selected_safest": zeros,
+                    }
                 self.pending_tick = {
                     # Own the high-level visual sample immediately. Isaac may
                     # reuse its observation buffer on the next low-level step.
@@ -987,6 +1037,7 @@ class AlgorithmP2NavPPO:
         timeout: torch.Tensor,
         terminal_safe_aux: torch.Tensor | None = None,
         terminal_safe_exec_cmd: torch.Tensor | None = None,
+        frontier_settle_mask: torch.Tensor | None = None,
     ) -> bool:
         if self.pending_tick is None:
             raise RuntimeError("P2 finish_tick called without a pending nav transition")
@@ -1130,6 +1181,9 @@ class AlgorithmP2NavPPO:
             start_goal,
         )
         candidate_best = torch.minimum(best_before, end_goal)
+        settle_mask = terminal.reshape(-1)
+        if frontier_settle_mask is not None:
+            settle_mask = settle_mask | frontier_settle_mask.to(self.device).reshape(-1).bool()
         (
             frontier_shaping,
             frontier_potential_before,
@@ -1139,7 +1193,7 @@ class AlgorithmP2NavPPO:
             best_before,
             candidate_best,
             duration,
-            terminal,
+            settle_mask,
         )
         success_reward = (reason == 1).float() * p2_contract.SUCCESS_IMPULSE
         failure_reward = (reason == 2).float() * p2_contract.FAILURE_IMPULSE
@@ -1199,6 +1253,12 @@ class AlgorithmP2NavPPO:
             "missed_safe_direction": missed_safe_direction_penalty,
             "frontier_stagnation": stagnation_penalty,
         }
+        components = self._override_reward_components(
+            components,
+            settle_mask=settle_mask,
+            terminal=terminal.reshape(-1),
+            reason=reason,
+        )
         component_names = tuple(components)
         component_stack = torch.stack(
             tuple(components[name] for name in component_names), dim=0
@@ -1326,7 +1386,7 @@ class AlgorithmP2NavPPO:
             "frontier_potential_before": frontier_potential_before.detach().reshape(-1, 1),
             "frontier_potential_after": frontier_potential_after.detach().reshape(-1, 1),
             "terminal_potential_clawback": torch.where(
-                terminal.reshape(-1),
+                settle_mask,
                 -frontier_potential_before,
                 torch.zeros_like(frontier_potential_before),
             ).detach().reshape(-1, 1),
@@ -1367,6 +1427,10 @@ class AlgorithmP2NavPPO:
         self.rollout.add(**transition)
         self.pending_tick = None
         return self.rollout.full
+
+    def _override_reward_components(self, components, **_context):
+        """Stage-specific reward profile hook; P2 keeps its current contract."""
+        return components
 
     def maybe_unfreeze_cnn(self, effective_seconds: float) -> bool:
         previous = self.cnn_unfrozen
@@ -1579,15 +1643,23 @@ class AlgorithmP2NavPPO:
             ratio * batch["advantages"],
             torch.clamp(ratio, 0.8, 1.2) * batch["advantages"],
         ).mean()
-        safety_logits = self.safety_head(feat)
-        safety_element_loss = F.binary_cross_entropy_with_logits(
-            safety_logits,
-            batch["safety_target"],
-            reduction="none",
-        )
-        safety_mask = batch["safety_valid"].expand_as(safety_element_loss)
-        safety_denominator = safety_mask.sum()
-        safety_loss = (safety_element_loss * safety_mask).sum() / safety_denominator.clamp_min(1.0)
+        if getattr(self, "track_safety_enabled", True):
+            safety_logits = self.safety_head(feat)
+            safety_element_loss = F.binary_cross_entropy_with_logits(
+                safety_logits,
+                batch["safety_target"],
+                reduction="none",
+            )
+            safety_mask = batch["safety_valid"].expand_as(safety_element_loss)
+            safety_denominator = safety_mask.sum()
+            safety_loss = (
+                (safety_element_loss * safety_mask).sum()
+                / safety_denominator.clamp_min(1.0)
+            )
+            student_risk = torch.sigmoid(safety_logits).mean(dim=(0, 1))
+        else:
+            safety_loss = surrogate.new_zeros(())
+            student_risk = torch.zeros(3, device=surrogate.device)
         total_loss = (
             surrogate
             - self.entropy_coefficient * entropy.mean()
@@ -1604,9 +1676,9 @@ class AlgorithmP2NavPPO:
             "clip_fraction": clip_fraction.detach(),
             "safety_bce": safety_loss.detach(),
             "scanner_valid_share": batch["safety_valid"].float().mean().detach(),
-            "student_risk_left": torch.sigmoid(safety_logits[..., 0]).mean().detach(),
-            "student_risk_center": torch.sigmoid(safety_logits[..., 1]).mean().detach(),
-            "student_risk_right": torch.sigmoid(safety_logits[..., 2]).mean().detach(),
+            "student_risk_left": student_risk[0].detach(),
+            "student_risk_center": student_risk[1].detach(),
+            "student_risk_right": student_risk[2].detach(),
         }
 
     def _critic_micro_loss(self, batch):
@@ -3338,6 +3410,76 @@ class AlgorithmP2NavPPO:
         self.low_level_state_digest = self._module_digest(
             (("vision", self.low_level_encoder), ("actor", self.low_level_actor))
         )
+        self.reset_live_state()
+        return "evaluate_full_modules_only"
+
+    def load_p3_evaluation_bundle(self, path: str, *, platform_model_id) -> str:
+        """Load a P3 ``p3_standard_joint`` package for Track evaluation.
+
+        Mirrors ``load_evaluation_bundle`` but accepts the P3 package and runs
+        the shared ``validate_p3_eval_bundle`` structural validator first.
+        SafetyHead, high-level Critic, optimizers, schedulers, PPO storage and
+        the ResponseBuffer are never created or loaded; only the frozen
+        low-level VisionEncoder/Actor plus NavigationEncoder, three-axis Actor
+        and ResponseAdapter are instantiated (evaluate_full module-only).
+        """
+        if self.training_enabled:
+            raise RuntimeError("P3 evaluation must use a training=False runtime")
+        raw = torch.load(path, weights_only=False, map_location="cpu")
+        if not isinstance(raw, dict):
+            raise ValueError("P3 evaluation checkpoint must be a mapping")
+        self._warn_platform_identity(raw, platform_model_id)
+        disposition = validate_p3_eval_bundle(raw, mode="track")
+        bundle, _ = normalize_kaiwu_train_bundle(raw)
+        modules = bundle.get("modules", {})
+        low = modules.get("low_level", {})
+        high = modules.get("high_level", {})
+        self._load_leaf(
+            low,
+            "locomotion_encoder",
+            self.low_level_encoder,
+            class_name="VisionEncoder",
+            spec=self._low_encoder_spec(self.low_level_encoder),
+            context="P3 track evaluation low_level",
+        )
+        self._load_leaf(
+            low,
+            "actor",
+            self.low_level_actor,
+            class_name="Actor77Sequential",
+            spec=self._low_actor_spec(),
+            context="P3 track evaluation low_level",
+        )
+        for name, module, class_name, spec in (
+            (
+                "navigation_encoder",
+                self.navigation_encoder,
+                "NavigationEncoder",
+                navigation_encoder_spec(),
+            ),
+            ("actor", self.actor, "P2NavigationActor", navigation_actor_spec()),
+            (
+                "response_adapter",
+                self.response_adapter,
+                "CommandResponseAdapter",
+                response_adapter_spec(),
+            ),
+        ):
+            self._load_leaf(
+                high,
+                name,
+                module,
+                class_name=class_name,
+                spec=spec,
+                context="P3 track evaluation high_level",
+            )
+        self.loaded_platform_model_id = self._bundle_identity(
+            bundle, platform_model_id, path
+        )
+        self.low_level_state_digest = self._module_digest(
+            (("vision", self.low_level_encoder), ("actor", self.low_level_actor))
+        )
+        self._p3_eval_phase_label = disposition["phase_label"]
         self.reset_live_state()
         return "evaluate_full_modules_only"
 

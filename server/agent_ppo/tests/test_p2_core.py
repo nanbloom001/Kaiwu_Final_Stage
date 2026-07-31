@@ -127,8 +127,6 @@ def test_p2_production_config_locks_two_hour_safe_direction_contract():
         "prolonged_air_ratio": 0.10,
         "step_frequency_imbalance_hz": 1.50,
     }
-    conf_source = (Path(__file__).parents[1] / "conf" / "conf.py").read_text()
-    assert "CURRENT = P2NavPPOConfig" in conf_source
 
 
 def test_p2_monitor_uses_grouped_live_metrics_without_legacy_track_panels():
@@ -1166,6 +1164,10 @@ def test_p2_transport_split_and_aisrv_command_overwrite():
     assert torch.equal(patched[:, 0:3], target)
     assert torch.equal(patched[:, 3:6], executed)
     assert torch.equal(patched[:, 26], torch.full((2,), 17.0))
+    per_env = patch_owned_commands(aux, target, executed, torch.tensor([4, 9]))
+    assert torch.equal(per_env[:, 26], torch.tensor([4.0, 9.0]))
+    with pytest.raises(ValueError, match="one value per environment"):
+        patch_owned_commands(aux, target, executed, torch.tensor([1, 2, 3]))
 
 
 def test_p2_long_horizon_stability_checks_the_entire_target_window():

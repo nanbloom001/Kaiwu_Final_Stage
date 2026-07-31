@@ -4,6 +4,79 @@
 
 ## [未发布]
 
+- **[P3 双评估入口回归修复]** 新增两个显式评估入口 `p3_standard_eval`（Standard+Camera 低层-only，
+  obs 57901）与 `p3_track_eval`（Track+Camera 完整高低层，obs 57905），供同一个 P3 包 `highslow`
+  等阶段文件分别评标准/赛道。修复平台任务 `599578` 中 P3 包被 `_infer_stage_from_task_name`
+  回退到 `lbc_loco`、旧 LBC loader 又只搜 `responsecalib` 等候选、最终未加载任何 checkpoint 即
+  尝试 `exploit()` 并报 `'NoneType' object is not subscriptable` 的装配链。两个入口共用
+  `p3_standard_joint_eval_candidates` 与 `validate_p3_eval_bundle`：P3 标签优先级
+  `highslow>highadapt>adaptercalib>lowfull>lowmedium>lowmild>lowbase`，无同 ID 时唯一 discovery，
+  多候选明确报歧义，绝不回退 P2/LBC/随机权重；选中文件结构/有限值错误硬失败。Standard 只装
+  VisionEncoder+Actor77，Track 只装低层+NavigationEncoder+三轴 Actor+ResponseAdapter，
+  两者都不创建 Critic/SafetyHead/optimizer/scheduler/训练 buffer。Track 继续复用 P2
+  eval transport 与 terminal-return bridge，`goal_reached` 进入平台 scorer 完成数不再恒为 0。
+- **[P3 15 分钟 lifecycle 回归修复]** P3 自定义 workflow 现与已验证的 Nav 边界一致：每个
+  成功 `env.step()` 完成 observation/terminal/storage 处理后调用一次平台 lifecycle no-op，低层
+  80 帧和高层 320 帧路径均覆盖；失败 step 不推进。新增成功/失败回调面板，普通回调异常只告警，
+  checkpoint 写入失败仍中止。修复平台任务 `235452` 中 `succ_cnt=0`、5 分钟业务包已写出但
+  平台约 15 分钟仍发送外部 SIGTERM 的回归。
+- **[训练任务创建前容器清理工具]** 新增 `conf/container_training_cleanup.py`。工具默认 dry-run，
+  普通模式只清理测试制品、同步归档、Python/pytest 缓存与 P3 临时文件；显式
+  `--remove-dev-files` 才删除容器副本的 `.git`、`.vscode`、测试和 smoke 工具。根目录身份校验、
+  允许删除范围和 `.env` 保护均为硬安全边界，避免再次靠手工命令误删凭证或平台运行目录。
+- **[P3 正式环境数调整]** 真实开发容器完成 64/128 环境对照 smoke；128 环境在
+  80 帧低层 PPO、32-tick 高层 PPO、Adapter update 和 save/exact-resume 全链路中
+  峰值 GPU reserved 约 1.61 GiB（约 32.9%），端到端样本吞吐比 64 环境高约
+  31%。P3 正式配置因此从 64 调整为 128 环境，其余 rollout/network 合同不变。
+- **[P3 平台托管 BaseEnv 边界修正]** 撤回全部 `server/isaac_env/base_env.py` 修改。低层恢复阶段
+  改用平台原生 2-8 秒三轴命令，保证低层 observation、worker reward 与实际执行一致；高层接管
+  命令后冻结低层，只训练高层 PPO 与 Adapter。末段标签由 `jointslow` 改为 `highslow`，不再声称
+  存在无法闭环的同步低层更新。P3 高层明确关闭
+  Track SafetyHead/predictive collision/missed-safe、gait、body-collision、tracking 和 stagnation shaping；
+  local success/timeout 使用 +8/-1，timeout 回收 frontier potential。目标改为 64 次 rejection sampling，
+  严格保持 1.5-2.8m 与地块 1m 内边界；`local_abs>3.2m` 只保留诊断，不冒充平台 reset。
+- **[P3 Sim2Real、恢复与显存]** 四阶段 DR 仅使用平台公开支持的摩擦、base added mass 和显式
+  observation noise；删除无效的 COM、PD、action gain/delay 与按环境 push 声明。低层新增有界 torque EMA/peak 与 action rate/jerk 代价。
+  低层 PPO storage 改存 77 维 `proprio+frozen CNN feature`，在线/导出 observation 仍保持 57901。
+  checkpoint 保存 immutable anchor/digest、低层版本和实际 DR phase；exact
+  resume 校验 anchor 与 Adapter record 的低层 digest/version，候选 discovery 多解时明确报歧义。
+- **[P3 审查与性能收口]** 所有阶段职责切换都在 checkpoint 后通过公开 `env.reset()` 开始新
+  episode，不依赖 BaseEnv 补丁；仅 0.5h/2h/3.5h 改变 DR 参数。Adapter 校准阶段跳过低层 critic、
+  log-prob、anchor 与 PPO storage 写入，高层阶段按每两次 PPO update 更新一次 Adapter。命令、地形
+  和奖励统计改为 GPU 端累计并在 rollout 末一次性搬运，移除逐帧/逐 tick 的同步点；P3 TOML 显式
+  关闭未使用的旧 `worker_progressive` bridge。平台原生命令现按环境跟踪命令 epoch，避免异步
+  resample 被 Adapter 误当成同一 target；高层阶段删除永远不可达的低层联合 storage/update
+  分支和逐帧 no-op lifecycle 调用。低层 storage 指标覆盖 observation、critic、action、return、
+  anchor 与 recurrent hidden 等全部 tensor buffer。exact resume 额外校验阶段标签、训练状态阶段与
+  session 时钟一致；真实 smoke 将 Adapter interval 临时设为 1，生产配置仍保持每两轮更新一次。
+  高层 10 帧窗口内提前结束的环境会在余下帧保持零命令，禁止旧 episode 命令进入 reset 后的新
+  episode；Standard/joint-success 计数改为 GPU tensor 累积、rollout 末统一搬运，移除每个 50Hz
+  frame 的两次 `.item()` 同步。低层版本号现仅在至少一个 PPO minibatch 完成 optimizer step 后
+  推进；全部非有限更新被跳过时保留当前 digest/version 与 Adapter unfinished history。
+
+- **[P3 Standard 高低层联合恢复八小时]** 新增 `p3_standard_joint` 复合入口与
+  `p3std8h-sim2real` 配置，从完整 P2 `p2nav2h-r2_648278` 包执行结构校验后的 warm start。
+  单任务按 rollout 边界依次训练低层 Actor/LSTM/Critic、集中校准 ResponseAdapter、适配高层
+  PPO；高层开始训练后低层保持冻结。低层 CNN、动作方差和高层/低层
+  optimizer 参数集合保持隔离。P3 policy transport 继续为 57905，低层只通过输入适配器删除
+  goal4 得到 57901，不改变低层网络结构；高层 Actor85 与三轴命令合同不变。新增 1.5-2.8m
+  私有局部目标，目标限制在 8m 地块 1m 内边界，0.6m 到达只结算高层奖励并重采样，不终止
+  Standard episode；平台 Standard scorer 仍是正式成功口径。checkpoint 增加 P3 阶段标签、
+  低/高层 optimizer、独立计数、session/lifetime 时钟和 exact-resume，模型 ID/lineage 仅用于
+  候选选择与追溯，不作为单点硬门禁。
+- **[P3 运行时接线修复]** P3 的 observation 复用 P2 response transport 时，worker bridge
+  原先只允许 P2 stage，真实 critic observation 会因 aux bridge 未启用而直接失败；现将
+  `p3_standard_joint` 纳入共享反馈/步态 transport，并关闭不适用于 Standard 的 Track curriculum
+  worker probe。P3 使用独立 workflow 驱动 50Hz 低层与 5Hz 高层 rollout，补齐训练、推理、
+  save/load、SIGTERM final save 与真实父包 save/resume 闭环。监控不再复用 Track 课程、赛段和
+  迷宫面板，只展示 P3 阶段、局部目标、命令链、步态、Adapter 与资源指标。
+- **[P3 recurrent 模式交接与 Adapter LR 修复]** rollout 收集显式将共享低层 ActorCritic 置于
+  `eval`；进入低层 PPO replay 时显式恢复 Actor/Critic/LSTM 的训练模式，同时让冻结 CNN 的
+  BatchNorm 统计和 S0 anchor 保持 `eval`。这修复了早期开发版高层推理后进入低层 replay 时 CUDA 报
+  `cudnn RNN backward can only be called in training mode` 的交接错误。Adapter optimizer 也按
+  P3 阶段启用真实 LR：低层恢复阶段 `3e-5`、集中校准 `2e-4`、高层阶段 `1e-5`，避免
+  update 计数前进但参数不变。
+
 - **[P2 容器 smoke 合同校正]** `p2_continue_smoke.py` 改为使用专用
   `INITIAL_VY_LOG_STD=-1.1` 校验新增 `vy` head，避免把正确的二维到三维迁移
   误报为旧 `vx/wz` 初始值 `-0.7`。同步补齐 rollout 新增的
@@ -39,6 +112,9 @@
   断点续传；容器端按固定顺序写入 `.uploading` 临时文件，整文件大小/SHA256 正确后才原子
   替换目标，成功后默认清理分片。远端路径强制限制在 `agent_ppo/test_artifacts/`，模型、Cookie
   和 Token 均不进入常规源码同步清单。
+  默认并发调整为 `2×2`，单片从 4 MiB 收紧到 1 MiB；同时兼容
+  `scope=agent_ppo` 返回的相对 manifest 路径，避免已完成模型被误判为缺失并
+  重复上传。
 
 - **[P2 reward-v7 定向墙体风险与 terminal 统计]** 任务改为 `p2nav10hvyavoid2`。
   预测碰撞从中央 ROI 升级为 left/center/right 三方向与 upper/middle/lower 三高度带的 20%

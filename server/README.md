@@ -19,6 +19,33 @@
 
 ## 活动基线
 
+- **当前 P3 功能分支入口**：`P3StandardJointConfig`（`p3_standard_joint`），任务名
+  `p3std8h-sim2real`，父包为 `p2nav2h-r2_648278`。P3 在一个 Standard+Camera 任务中按
+  rollout 边界执行低层恢复、Adapter 校准和高层适应；低层 CNN 始终冻结，
+  高低层 optimizer 参数不重叠。完整 policy observation 仍为 57905，高层 Actor85 不变；
+  低层在线输入适配器只删除 goal4，得到原有 57901 低层输入，不改变低层网络结构；PPO storage
+  只保存 `proprio45 + frozen_cnn_feat32 = 77`，避免 64 环境完整深度 rollout 常驻 GPU。
+- P3 私有目标从机器人当前位置采样 1.5-2.8m，并限制在 8m 地块的 1m 内边界。进入 0.6m
+  只产生一次局部目标奖励并重采样，不触发环境 reset；Standard 正式成功仍由平台 scorer 判定。
+  平台会覆盖 `isaac_env/base_env.py`，因此 P3 不依赖任何 BaseEnv 补丁：低层恢复阶段使用平台原生
+  2-8 秒三轴命令，使 observation、worker reward 与实际执行一致；高层接管命令后低层全程冻结，
+  只训练高层 PPO 与 Adapter。checkpoint 标签为
+  `lowbase/lowmild/lowmedium/lowfull/adaptercalib/highadapt/highslow`，保存 immutable low-level anchor、
+  低层和高层模块、optimizer、RNG、独立更新计数、DR phase 及 session/lifetime 时钟，保持
+  `deployable=false`。同阶段包 exact resume；P2 父包走显式 warm start。模型 ID 或 lineage
+  不一致只告警，选中文件的反序列化、必需模块、spec/shape 或有限值错误仍会停止。
+- P3 评估使用两个显式入口：`p3_standard_eval`（Standard+Camera，低层-only，obs 57901，
+  只加载 `modules.low_level.locomotion_encoder/actor`）与 `p3_track_eval`（Track+Camera，
+  完整低层+NavigationEncoder+三轴 Actor+ResponseAdapter，obs 57905）。二者共用
+  `p3_standard_joint_eval_candidates` 与 `validate_p3_eval_bundle`，标签优先级
+  `highslow>highadapt>adaptercalib>lowfull>lowmedium>lowmild>lowbase`，绝不回退 P2/LBC/随机权重；
+  SafetyHead/Critic/optimizer/训练 buffer 均不创建。
+- `local_abs>3.2m` 仅作诊断，不能宣称触发平台 reset。分阶段环境重建只使用平台公开支持的摩擦、
+  base added mass 与显式 observation noise；COM、PD、action gain/delay 和按环境 push 已删除。
+  所有职责边界均在保存后调用平台公开 `env.reset()`；只有 0.5h/2h/3.5h 边界改变 DR 参数。
+  Adapter 校准阶段不构造低层 PPO metadata，高层阶段每两次 PPO rollout 更新一次 Adapter。
+  真实 Isaac runtime 分布与 64 环境资源占用仍必须以开发容器 smoke 为准。
+
 - **当前功能分支入口**：`P2NavPPOConfig`（`p2_nav_ppo`），任务名 `p2nav2hsafedir`。
   它显式从最新验证通过的完整三轴 `p2nav10hvyavoid2` 包做
   `p2_safe_direction_continue_warm_start`：保留冻结低层、NavigationEncoder、三轴 Actor/LSTM、
@@ -135,10 +162,32 @@ python3 model_chunk_uploader.py \
   --no-cookie-prompt
 ```
 
-默认按 4 MiB 分片，使用 `2 × 4 = 8` 个最大并发请求；每片和重组后的整文件都校验
+默认按 1 MiB 分片，使用 `2 × 2 = 4` 个最大并发请求；每片和重组后的整文件都校验
 SHA256。相同片段可断点续传，目标文件只在完整校验后通过原子替换出现，成功后默认删除分片；
 需要保留分片排障时显式传 `--keep-parts`。远端目标被限制在
 `agent_ppo/test_artifacts/`，避免覆盖训练代码、平台配置或凭据。
+
+正式创建训练任务前，可在开发容器的 `/workspace/code` 运行可复用清理工具。默认只预览：
+
+```bash
+python3 conf/container_training_cleanup.py
+```
+
+确认清单后删除测试制品、同步归档、Python/pytest 缓存和 P3 临时日志：
+
+```bash
+python3 conf/container_training_cleanup.py --apply
+```
+
+所有开发容器测试完成、模型已不再需要时，再执行训练快照精简：
+
+```bash
+python3 conf/container_training_cleanup.py --apply --remove-dev-files
+```
+
+最后一档还会删除容器副本中的 `.git`、`.vscode`、`agent_ppo/tests` 和
+`agent_ppo/tools`，但始终保留正式运行源码、`conf/` 与 `conf/.env`。脚本不会清理平台拥有的
+`kaiwudrl/tools`，也不会删除凭证、正式模型或训练日志。每次必须先看 dry-run 清单。
 
 hier-nav 需要验证真实 preload、rollout、TBPTT update 和 checkpoint lifecycle 时，
 在开发容器的 `server/` 根目录运行可复用完整 smoke：

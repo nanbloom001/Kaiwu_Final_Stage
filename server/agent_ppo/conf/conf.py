@@ -310,6 +310,55 @@ class P2NavEvalConfig(P2NavPPOConfig):
     algorithm = "p2_nav_eval"
 
 
+class P3StandardJointConfig(P2NavPPOConfig):
+    name = "p3_standard_joint"
+    task_type = "standard"
+    algorithm = "p3_standard_joint"
+    ckpt_name = "model.ckpt-lowrecover"
+    num_actor_observations = 57905
+    num_critic_observations = 323
+    num_steps_per_env = 80
+    model_save_interval = 500
+
+
+class P3StandardEvalConfig(P3StandardJointConfig):
+    """P3 Standard+Camera 低层-only 评估入口。
+
+    Only the frozen low-level VisionEncoder + Actor77 are loaded from the P3
+    package; observation is the low-level contract 57901 (goal0).  No
+    high-level Actor/NavigationEncoder/ResponseAdapter/SafetyHead/Critic,
+    optimizer or training buffer is constructed.  This entry must never build
+    the P3 training assembly.
+    """
+
+    name = "p3_standard_eval"
+    task_type = "standard"
+    algorithm = "p3_standard_eval"
+    num_goal_obs = 0
+    num_actor_observations = 57901
+    num_critic_observations = 323
+    model_class = "ActorCriticEncoder"
+
+
+class P3TrackEvalConfig(P3StandardJointConfig):
+    """P3 Track+Camera 完整高低层评估入口。
+
+    Loads the frozen low-level VisionEncoder/Actor plus the full high-level
+    hierarchy (NavigationEncoder, three-axis Actor/LSTM, ResponseAdapter) from
+    the same P3 package.  observation stays 57905; 5Hz high-level over 50Hz
+    low-level frames.  SafetyHead/Critic/optimizer/training buffer are never
+    constructed.
+    """
+
+    name = "p3_track_eval"
+    task_type = "track"
+    algorithm = "p3_track_eval"
+    num_goal_obs = 4
+    num_actor_observations = 57905
+    num_critic_observations = 323
+    model_class = "P2NavigationActor"
+
+
 class NavDaggerConfig(StageConfig):
     """hier-nav 高层导航 DAgger 训练阶段（Track + Camera，冻结低层）。
 
@@ -426,6 +475,7 @@ def _configured_training_stage(logger):
         "visual_ppo": StandardVisualPPOConfig,
         "p15_response": P15ResponseConfig,
         "p2_nav_ppo": P2NavPPOConfig,
+        "p3_standard_joint": P3StandardJointConfig,
         "lbc_loco": LBCLocoConfig,
         "locomotion": LocomotionConfig,
         "nav_dagger": NavDaggerConfig,
@@ -463,7 +513,7 @@ class Config:
     # Keep the literal default aligned with the branch's active training stage.
     # configure_app.toml remains authoritative for worker subprocesses and is
     # checked again below during module bootstrap.
-    CURRENT = P2NavPPOConfig
+    CURRENT = P3StandardJointConfig
 
     @staticmethod
     def load_conf(logger):
@@ -592,6 +642,9 @@ def _valid_explicit_policy_stage(usr_conf):
         "p15_response": P15ResponseConfig,
         "p2_nav_ppo": P2NavPPOConfig,
         "p2_nav_eval": P2NavEvalConfig,
+        "p3_standard_joint": P3StandardJointConfig,
+        "p3_standard_eval": P3StandardEvalConfig,
+        "p3_track_eval": P3TrackEvalConfig,
         "lbc_loco": LBCLocoConfig,
         "locomotion": LocomotionConfig,
         # hier-nav：训练与评估入口分离（评估类永不构造训练 Algorithm）。
@@ -681,6 +734,20 @@ def _infer_stage_from_task_name(usr_conf, logger):
                     selected = NavEvalConfig
                 elif selected is P2NavPPOConfig:
                     selected = P2NavEvalConfig
+                elif selected is P3StandardJointConfig:
+                    # P3 训练入口名不能构造训练 Agent；按地形模式映射到对应的
+                    # eval-only 入口（Standard 低层-only / Track 完整高低层）。
+                    terrain_conf = usr_conf.get("terrain", {})
+                    terrain_mode = (
+                        str(terrain_conf.get("mode", "standard")).lower()
+                        if isinstance(terrain_conf, dict)
+                        else "standard"
+                    )
+                    selected = (
+                        P3TrackEvalConfig
+                        if terrain_mode == "track"
+                        else P3StandardEvalConfig
+                    )
                 logger.info(
                     "[eval] Explicit policy entry selected: "
                     f"{explicit_entry} -> {selected.name}"
@@ -707,7 +774,18 @@ def _infer_stage_from_task_name(usr_conf, logger):
         )
         return None
     mode = str(terrain_conf.get("mode", "standard")).lower()
+    p3_lineage = Config.CURRENT in {
+        P3StandardJointConfig,
+        P3StandardEvalConfig,
+        P3TrackEvalConfig,
+    }
     if mode == "track" and "Camera" in task_name:
+        if p3_lineage:
+            logger.info(
+                "[eval] Track+Camera task retained the P3 checkpoint lineage "
+                "without an explicit policy entry; selected p3_track_eval"
+            )
+            return P3TrackEvalConfig
         if Config.CURRENT in {P2NavPPOConfig, P2NavEvalConfig}:
             logger.info(
                 "[eval] Track+Camera task retained the P2 checkpoint lineage "
@@ -727,6 +805,12 @@ def _infer_stage_from_task_name(usr_conf, logger):
         return None
 
     has_camera = "Camera" in task_name
+    if has_camera and p3_lineage:
+        logger.info(
+            "[eval] Standard+Camera task retained the P3 checkpoint lineage "
+            "without an explicit policy entry; selected p3_standard_eval"
+        )
+        return P3StandardEvalConfig
     return LBCLocoConfig if has_camera else LocomotionConfig
 
 

@@ -90,6 +90,16 @@ P2_NAV_PHASE_LABELS = (
     "safestable",
 )
 
+P3_STANDARD_JOINT_PHASE_LABELS = (
+    "lowbase",
+    "lowmild",
+    "lowmedium",
+    "lowfull",
+    "adaptercalib",
+    "highadapt",
+    "highslow",
+)
+
 _PROBE_NAME = re.compile(r"^model\.ckpt-[a-z]*-*[0-9]+\.[^.]+$")
 
 
@@ -283,6 +293,233 @@ def p2_nav_training_candidates(
         if candidate not in result:
             result.append(candidate)
     return result
+
+
+def p3_standard_joint_candidates(
+    path: str,
+    model_id: str | int,
+    *,
+    parent_model_id: str | int,
+) -> list[str]:
+    """Prefer exact P3 resume, then the explicitly configured P2 parent."""
+    result: list[str] = []
+    for selected_id in (str(model_id), str(parent_model_id)):
+        for label in reversed(P3_STANDARD_JOINT_PHASE_LABELS):
+            candidate = os.path.join(
+                path, f"model.ckpt-{label}-{selected_id}.pkl"
+            )
+            if candidate not in result:
+                result.append(candidate)
+    for candidate in p2_nav_checkpoint_candidates(path, parent_model_id):
+        if candidate not in result:
+            result.append(candidate)
+    if any(os.path.isfile(candidate) for candidate in result):
+        return result
+    explicit = {os.path.abspath(candidate) for candidate in result}
+    discovered_p3 = sorted(
+        {
+            candidate
+            for label in P3_STANDARD_JOINT_PHASE_LABELS
+            for candidate in glob.glob(os.path.join(path, f"model.ckpt-{label}-*.pkl"))
+            if os.path.abspath(candidate) not in explicit
+        }
+    )
+    discovered_p2 = [
+        candidate
+        for candidate in p2_nav_discovery_candidates(path)
+        if os.path.abspath(candidate) not in explicit
+    ]
+    discovered = discovered_p3 + discovered_p2
+    if len(discovered) > 1:
+        raise RuntimeError(
+            "P3 checkpoint discovery is ambiguous; configure the parent/model ID "
+            f"explicitly. candidates={discovered}"
+        )
+    if discovered:
+        result.append(discovered[0])
+    return result
+
+
+P3_EVAL_LOW_LEVEL_SPEC = {
+    "locomotion_encoder": {
+        "class_name": "VisionEncoder",
+        "spec": {
+            "image_shape": [180, 320, 1],
+            "proprio_dim": 45,
+            "cnn_output_dim": 32,
+            "rnn_hidden_dim": 64,
+            "rnn_num_layers": 2,
+            "rnn_output_dim": 32,
+            "use_lstm": True,
+        },
+    },
+    "actor": {
+        "class_name": "Actor77Sequential",
+        "spec": {
+            "input_dim": 77,
+            "hidden_dims": [512, 256, 128],
+            "output_dim": 12,
+            "activation": "elu",
+        },
+    },
+}
+
+
+def p3_standard_joint_eval_candidates(path: str, model_id: str | int) -> list[str]:
+    """Discover P3 checkpoints for the ``p3_standard_eval`` / ``p3_track_eval`` entries.
+
+    Candidate fallback is existence-only and never crosses stage families:
+
+      * Same-ID P3 phase files first, newest phase first
+        (``highslow > highadapt > adaptercalib > lowfull > lowmedium > lowmild
+        > lowbase``), exactly like the training resume priority.
+      * When no same-ID P3 file exists, discover *unique* P3 phase files across
+        any ID.  Multiple candidates are an explicit ambiguity error -- never a
+        by-mtime pick, and never a silent fallback to P2/LBC/random weights.
+
+    A requested-ID mismatch with the selected file is warning-only identity
+    metadata.  Once a file is selected, deserialization / structural failures
+    must remain hard errors in the loader.
+    """
+    model_id = str(model_id)
+    same_id = [
+        os.path.join(path, f"model.ckpt-{label}-{model_id}.pkl")
+        for label in reversed(P3_STANDARD_JOINT_PHASE_LABELS)
+    ]
+    if any(os.path.isfile(candidate) for candidate in same_id):
+        return same_id
+    discovered = sorted(
+        {
+            candidate
+            for label in P3_STANDARD_JOINT_PHASE_LABELS
+            for candidate in glob.glob(os.path.join(path, f"model.ckpt-{label}-*.pkl"))
+            if os.path.isfile(candidate)
+        },
+        key=lambda filename: (os.path.basename(filename), filename),
+    )
+    if len(discovered) > 1:
+        raise RuntimeError(
+            "P3 eval checkpoint discovery is ambiguous; configure the eval "
+            f"model ID explicitly. candidates={discovered}"
+        )
+    return discovered
+
+
+def validate_p3_eval_bundle(bundle: dict[str, Any], *, mode: str) -> dict[str, Any]:
+    """Shared structural validator for P3 Standard/Track evaluation.
+
+    ``mode`` is ``"standard"`` (low-level VisionEncoder + Actor77 only) or
+    ``"track"`` (low-level + NavigationEncoder + three-axis Actor +
+    ResponseAdapter).  The P3 package is the authoritative module source for
+    both entries; neither may fall back to an old P2/LBC payload.
+
+    Platform model ID, filename label and lineage are *not* structural
+    compatibility inputs -- the caller reports them as warning-only identity
+    metadata.  Format, stage, phase label, model_spec, module class/spec, state
+    dict shape and finite values are the correctness basis.
+
+    Returns an eval disposition dict with the selected ``phase_label`` and the
+    modules that must be loaded.
+    """
+    if not is_kaiwu_train_bundle(bundle):
+        raise ValueError(
+            "P3 evaluation requires a kaiwu_train_v1 checkpoint, got "
+            f"format={bundle.get('format')!r}, "
+            f"schema={bundle.get('schema_version')!r}"
+        )
+    if bundle.get("stage_type") != "p3_standard_joint":
+        raise ValueError(
+            "P3 evaluation requires stage_type='p3_standard_joint', got "
+            f"{bundle.get('stage_type')!r}"
+        )
+    phase_label = bundle.get("phase_label")
+    if not isinstance(phase_label, str) or phase_label not in P3_STANDARD_JOINT_PHASE_LABELS:
+        raise ValueError(
+            "P3 evaluation requires a valid phase_label, got "
+            f"{phase_label!r}"
+        )
+    validate_low_level_spec(
+        bundle,
+        {
+            "proprio_dim": 45,
+            "scan_dim": 256,
+            "latent_dim": 32,
+            "action_dim": 12,
+            "goal_dim": 0,
+        },
+    )
+    modules = bundle.get("modules")
+    if not isinstance(modules, dict):
+        raise KeyError("modules missing from P3 checkpoint")
+    low = modules.get("low_level")
+    if not isinstance(low, dict) or low.get("contract_version") != "low_level_v2":
+        raise ValueError("P3 evaluation low-level contract mismatch")
+
+    expected_low = P3_EVAL_LOW_LEVEL_SPEC
+    loaded: list[str] = []
+    for name, expected in expected_low.items():
+        leaf = low.get(name)
+        _validate_p3_eval_leaf(leaf, name, expected, context="P3 eval low_level")
+        loaded.append(f"low_level.{name}")
+    for name, state_key in (
+        ("locomotion_encoder", "state_dict"),
+        ("actor", "state_dict"),
+    ):
+        validate_state_dict_finite(low[name][state_key], f"P3 eval low_level.{name}")
+
+    if mode == "track":
+        high = modules.get("high_level")
+        if (
+            not isinstance(high, dict)
+            or high.get("contract_version") != "high_level_continuous_v2"
+            or high.get("component_status") != "complete"
+        ):
+            raise ValueError("P3 track evaluation requires complete high-level contract")
+        from agent_ppo.model.p2_high_level import (
+            navigation_actor_spec,
+            navigation_encoder_spec,
+        )
+        from agent_ppo.model.response_adapter import response_adapter_spec
+
+        expected_high = {
+            "navigation_encoder": {
+                "class_name": "NavigationEncoder",
+                "spec": navigation_encoder_spec(),
+            },
+            "actor": {"class_name": "P2NavigationActor", "spec": navigation_actor_spec()},
+            "response_adapter": {
+                "class_name": "CommandResponseAdapter",
+                "spec": response_adapter_spec(),
+            },
+        }
+        for name, expected in expected_high.items():
+            leaf = high.get(name)
+            _validate_p3_eval_leaf(leaf, name, expected, context="P3 track eval high_level")
+            loaded.append(f"high_level.{name}")
+            validate_state_dict_finite(leaf["state_dict"], f"P3 track eval high_level.{name}")
+    elif mode != "standard":
+        raise ValueError(f"P3 eval mode must be 'standard' or 'track', got {mode!r}")
+
+    return {
+        "stage_type": "p3_standard_joint",
+        "phase_label": phase_label,
+        "mode": mode,
+        "loaded_modules": sorted(loaded),
+    }
+
+
+def _validate_p3_eval_leaf(leaf: Any, name: str, expected: dict[str, Any], *, context: str) -> None:
+    """Validate one P3 eval leaf (class_name / spec / state_dict presence)."""
+    if not isinstance(leaf, dict):
+        raise KeyError(f"{context} missing leaf {name}")
+    if leaf.get("class_name") != expected["class_name"]:
+        raise ValueError(
+            f"{context}.{name} class mismatch: {leaf.get('class_name')!r}"
+        )
+    if leaf.get("spec") != expected["spec"]:
+        raise ValueError(f"{context}.{name} spec mismatch: {leaf.get('spec')!r}")
+    if not isinstance(leaf.get("state_dict"), dict):
+        raise KeyError(f"{context}.{name} missing state_dict")
 
 
 def low_level_only_parent_candidates(path: str, model_id: str | int) -> list[str]:

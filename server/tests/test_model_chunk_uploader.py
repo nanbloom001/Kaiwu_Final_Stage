@@ -23,6 +23,25 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ModelChunkUploaderTests(unittest.TestCase):
+    def test_default_concurrency_is_two_by_two(self):
+        self.assertEqual(MODULE.DEFAULT_PART_BYTES, 1024 * 1024)
+        self.assertEqual(MODULE.DEFAULT_PART_WORKERS, 2)
+        self.assertEqual(MODULE.DEFAULT_CHUNK_WORKERS, 2)
+
+    def test_manifest_entry_accepts_scope_relative_paths(self):
+        digest = "abc123"
+        manifest = {
+            "files": {
+                "test_artifacts/model.pkl": {"sha256": digest},
+            }
+        }
+        self.assertEqual(
+            MODULE.manifest_file_entry(
+                manifest, "agent_ppo/test_artifacts/model.pkl"
+            )["sha256"],
+            digest,
+        )
+
     def test_remote_path_is_confined_to_test_artifacts(self):
         self.assertEqual(
             MODULE.validate_remote_path("agent_ppo/test_artifacts/model.pkl"),
@@ -95,6 +114,38 @@ class ModelChunkUploaderTests(unittest.TestCase):
         upload_part.assert_called_once()
         self.assertEqual(upload_part.call_args.args[1].index, 1)
         merge.assert_called_once()
+
+    def test_upload_model_skips_scope_relative_verified_target(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = Path(temp_dir) / "model.pkl"
+            payload = b"verified-model"
+            source.write_bytes(payload)
+            digest = hashlib.sha256(payload).hexdigest()
+            client = mock.Mock()
+            client.get.return_value = {
+                "files": {
+                    "test_artifacts/model.pkl": {"sha256": digest},
+                }
+            }
+            with (
+                mock.patch.object(MODULE, "upload_part") as upload_part,
+                mock.patch.object(MODULE, "run_remote_command") as merge,
+            ):
+                result = MODULE.upload_model(
+                    client,
+                    source,
+                    "agent_ppo/test_artifacts/model.pkl",
+                    64 * 1024,
+                    2,
+                    2,
+                    1,
+                    False,
+                    False,
+                    30,
+                )
+        self.assertEqual(result, (digest, len(payload)))
+        upload_part.assert_not_called()
+        merge.assert_not_called()
 
     def test_merge_command_contains_atomic_verification_contract(self):
         with tempfile.TemporaryDirectory() as temp_dir:

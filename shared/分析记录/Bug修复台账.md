@@ -1677,6 +1677,24 @@
   最终 `/workspace/code` 为 65 MB / 149 files，松散对象、`__pycache__`、pytest/ruff/mypy cache、
   `.ide-sync-*` 和 `*.sync-tmp` 均为 0。当前尚未取得用户重新创建任务成功的证据，因此这次
   复发只记录为“容器已清理待平台重试”，不能把旧平台已验证结论自动套到新任务上。
+- 2026-07-31 P3 复发补充：创建 `p3std8h-sim2real` 前再次出现“训练任务创建失败”。
+  首轮清理删除 `/tmp/IsaacLab`、smoke 日志、sync 归档、Python/pytest 缓存和用户明确
+  不再保留的 `agent_ppo/test_artifacts/p3_parent`；凭证与 `conf/.env` 保留。重试仍失败后
+  发现项目根目录的 `agent_ppo/conf` 是指向 `/workspace/code` 的符号链接，根目录表面仅
+  103 MB/625 files，但真实用户代码挂载仍包含 72 MB Git object database、测试和 smoke 工具。
+  按用户授权删除容器内 `/workspace/code/.git`、`.vscode`、`agent_ppo/tests`、
+  `agent_ppo/tools` 及所有生成缓存；本地 Git 仓库与正式训练源码不受影响。清理后
+  `/workspace/code` 为约 2.2 MB/113 files，P3 `agent.py`、128-env TOML 和 `conf/.env` 均存在。
+  项目根剩余约 103 MB 主要是平台自带 `kaiwudrl/tools`，不再删除，避免破坏任务启动。
+  当前状态仍为“容器已清理待平台重试”；只有用户成功创建任务后才能升级验证状态。
+- 2026-07-31 P3 平台验证与防复发：用户确认上述清理后训练任务已经创建成功，因此本次
+  P3 复发由“待平台重试”升级为“平台已验证”。新增可复用
+  `server/conf/container_training_cleanup.py`：默认 dry-run，`--apply` 清理测试制品、同步归档、
+  缓存和 P3 临时文件；仅在全部容器测试完成后显式使用 `--remove-dev-files` 删除容器副本中的
+  `.git`、`.vscode`、`agent_ppo/tests` 和 `agent_ppo/tools`。脚本校验 Kaiwu 根目录、限制删除范围，
+  并保护 `conf/`、`conf/.env`、平台 `kaiwudrl/tools`、正式模型和训练日志。宿主安全回归覆盖
+  dry-run、普通/彻底清理边界、凭证保留与错误根目录拒绝；容器 dry-run/实际执行结果见本轮
+  后续验证记录。关联分支 `codex/p3-standard-joint-recovery`，commit/PR 尚未建立。
 
 ## BUG-20260729-004：P2 指令联合域 line 面板超过平台 20 指标上限
 
@@ -2122,6 +2140,22 @@
   遇到失败先看远端 part manifest 和每片 SHA，再看最终 merge SHA，不能仅凭 HTTP 200 判断成功。
   回滚只需删除本地工具和容器 `agent_ppo/test_artifacts/` 临时文件，不触碰训练代码与已发布模型。
   关联 commit/PR、平台任务 ID和新 checkpoint：尚未生成。
+- 2026-07-31 更正：在 P3 父包 `p2nav2h-r2_648278.zip` 实测中，`scope=agent_ppo`
+  manifest 返回的 key 可为 `test_artifacts/...` 相对路径，旧客户端只查询
+  `agent_ppo/test_artifacts/...` 完整路径，因此已经原子合并且 SHA256 正确的文件
+  仍会被误判为缺失并重复上传；中断后项目根目录留下 `.ide-sync-*.tar.gz`
+  bundle。已将 manifest 查询统一为兼容 rooted/scope-relative key，最终文件与分片均
+  使用同一规则；默认并发从 `2×4` 收紧为 `2×2`。后续发现 4 MiB 单片在
+  `2×2` 下仍包含约 1024 个 GET chunk，首片长时间无进度，因此默认单片进一步收紧为
+  1 MiB，降低单片重试成本并提高进度可见性。实测父包大小
+  `24,694,018` bytes，容器 SHA256
+  `cd82e6d98e32dc6c09a9341138d84d19cfd190ee1ef0c565a25a7bfd9e5bf784`，ZIP 全量校验通过。
+  修复后以默认 `2×2` 参数复验，客户端在约 1.5 秒内输出
+  `remote file already verified`，没有再生成分片或 bundle。随后已删除本次测试产生的
+  父包 ZIP、`extracted/`、`.parts/` 和项目根目录 `.ide-sync-*.tar.gz`，未删除代码、
+  凭证或平台缓存。上传器离线回归 `7 passed, 4 subtests passed`，该更正已完成开发容器验证。
+  后续用 1 MiB/`2×2` 完整上传同一 24 MB 父包，24/24 分片均输出独立校验进度，
+  最终原子合并 SHA256 一致；本次测试为后续 P3 smoke 保留父包，未提前删除。
 
 ## BUG-20260730-013：中央深度风险误罚坡面且 terminal 诊断混入 reset 后数据
 
@@ -2269,6 +2303,376 @@
   Adapter 更新、保存和 `exact_resume_history_reset`。真实 Isaac Track+Camera terminal smoke 进入 headless Kit 后场景
   初始化超过 4 分钟未返回首次 reset，已只终止本轮 smoke 进程；不得因此标记
   真实 Isaac、128 环境或平台行为已验证。
+
+## BUG-20260731-001：P3 复合训练入口缺少 lifecycle 接线且 worker transport 被禁用
+
+- 日期：2026-07-31；状态：本地已验证，开发容器真实 checkpoint 继续训练与
+  Standard+Camera reset/step 已验证，完整 P3 workflow rollout 与平台 smoke 待验证。
+- 影响：分支 `codex/p3-standard-joint-recovery`，任务 `p3std8h-sim2real`，父包
+  `p2nav2h-r2_648278`。P3 目标是在同一个 Standard+Camera 任务中依次恢复低层、校准
+  ResponseAdapter、适配高层并做低频联合微调；包保持 `deployable=false`。
+- 用户可见症状与审查证据：初版只有 P3 模块装配，通用 `workflow()` 会落入单算法 PPO 路径；
+  `Agent.learn/predict/exploit/save_model/load_model` 没有完整 P3 分支，复合 coordinator 也没有
+  独立 low/high rollout 与 exact resume。后续补上 observation 复用后又发现
+  `P2WorkerBridge._resolve_config()` 只允许 `p2_nav_ppo/p2_nav_eval`，真实 P3 critic observation
+  会在 `p2_response_aux()` 直接报 `P2 response aux requested while bridge is disabled`。
+- 根因：P3 不是把现有 stage 名称换掉即可运行；它需要 50Hz 低层与 5Hz 高层两条独立 recurrent
+  时间轴、各自 storage/optimizer/update 计数和阶段边界 reset。共享 response transport 的启用条件
+  仍把 stage 写死为 P2，且 P3 dashboard 直接复用 Track curriculum/segment 面板，导致 Standard
+  任务出现空面板或错误语义。
+- 修复：新增 `p3_standard_joint_workflow.py`，分别收集 80 帧低层 rollout 与 32 tick 高层
+  rollout；阶段只在完整 rollout 边界切换并 reset 环境、高低层 hidden、slew 和 future history。
+  Agent 新增 P3 专用训练 no-op 回调、推理、候选加载、阶段保存和 SIGTERM/final save。
+  `AlgorithmP3StandardJoint` 保存/恢复低层 critic、动作方差、optimizer、RNG、低/高层更新计数、
+  session/lifetime 时钟，并区分 P2→P3 warm start 与 P3 exact resume。checkpoint 标签加入
+  `lowbase/lowmild/lowmedium/lowfull/adaptercalib/highadapt/jointslow`；模型 ID/lineage 不一致
+  只告警，选中文件的结构或有限值错误仍硬失败。P3 共享 worker feedback/gait transport，但禁用
+  不适用的 Track curriculum worker probe。监控改为 P3 专用阶段、局部目标、三轴命令链、步态、
+  Adapter 和资源面板。
+- 目标与成功契约：完整 policy observation 保持 57905，高层 Actor85 不变；低层输入适配器只
+  删除 goal4 得到 57901，不改变低层网络结构。私有目标从当前位置采样 1.5-2.8m，并限制在
+  8m 地块的 1m 内边界；进入 0.6m 只结算一次高层奖励并在下一 observation 重采样，不终止
+  Standard episode。平台 Standard scorer 仍是正式完成口径，joint success 只允许监控。
+- 本地验证：`PY311test` 下 P3/P2/P1.5 定向回归 `142 passed`；修复 worker stage gate 后
+  P3/P2 核心回归 `105 passed`，最终定向与邻近回归为 `171 passed`。广域测试为
+  `386 passed, 31 subtests passed, 4 failed`；四个失败分别是已有 P2 smoke 工具被通用 import
+  规则扫描、sandbox 禁止本地 HTTP bind、旧 LBC 配置仍为 50 iterations、nav smoke 对 cwd 的
+  历史假设，均不涉及本轮 P3 文件。Python 编译、全部 server TOML 解析与 `git diff --check` 通过。
+  使用真实归档 `archive/代码存档/p2nav2h-r2_648278.zip` 中
+  `model.ckpt-safestable-648278.pkl` 完成 P2→P3 结构 warm start、P3 保存和 exact resume smoke；
+  session 秒数从 123.0 恢复，live hidden/future history 按合同清空。尚未在 Isaac 开发容器完成
+  env.reset、首个 50Hz/5Hz rollout/backward 或平台 checkpoint 注册，因此状态不能升级为平台已验证。
+  2026-07-31 尝试通过现有 RPC dry-run 连接开发容器，腾讯代理返回
+  `WEBIDE_RECORD_NOT_FOUND`；这是 IDE 容器记录失效，不是模型 ID、checkpoint 门禁或 P3 代码
+  报错，待用户重新打开容器后继续在线 smoke。
+  2026-07-31 容器重开后完成代码 bundle 同步，二次 dry-run 为
+  `files to overwrite: 0`；P3 contract/schedule/worker 定向测试 `37 passed`，Python compileall 和
+  10 份 TOML 解析通过。真实父包经分片上传、SHA256 和 ZIP 校验后，运行
+  `p3_parent_smoke.py` 在 import 阶段报
+  `ModuleNotFoundError: No module named 'torch'`；当时该失败尚未取得真实 checkpoint tensor
+  加载、rollout/backward 或 Isaac reset 证据。
+  同一 smoke 在本地 `PY311test` 使用同一父 checkpoint 通过，输出
+  `p3_joint_warm_start:p2_safe_direction_continue_warm_start` 和
+  `p3_exact_resume:exact_resume_history_reset`。
+- 2026-07-31 容器验证更正：上述“容器不含 PyTorch”判断错误。PyTorch
+  `2.7.0+cu128` 位于 Isaac Sim 的
+  `omni.isaac.ml_archive/pip_prebundle`，必须通过 `/workspace/isaaclab/isaaclab.sh -p`
+  注入依赖路径。首次包装器 smoke 仍失败，是因为命令前人为设置 `PYTHONPATH=.`
+  覆盖了包装器路径；移除该覆盖后，容器使用真实
+  `model.ckpt-safestable-648278.pkl` 完成 P2→P3 warm start、P3 save 和 exact resume，
+  输出与本地一致，`parent_loaded=true`、low-level digest 存在、session 恢复为
+  `123.0s`。该证据验证了真实 checkpoint tensor 加载与 save/resume，仍不等价于
+  Isaac `env.reset()` 或 rollout/backward 已验证。
+- 2026-07-31 开发容器最终 smoke：扩展 `p3_parent_smoke.py` 后，真实 648278 父包
+  在 `lowbase` 阶段填充一个完整低层 recurrent rollout，执行 1 次 PPO
+  backward/optimizer step，`applied_updates=1`，Actor 和 Critic 参数均发生有限更新，随后
+  P3 save/exact resume 通过。独立 `p3_env_smoke.py` 通过 Isaac Lab 包装器创建 1 个
+  Standard+Camera 环境；reset 返回 policy `[1,57905]`、worker wire `[1,385]`，policy、
+  critic core 和 worker aux 有限值比例均为 1.0，连续 3 次 `env.step()` 成功，第 3 帧
+  reward `-0.0194000751`、`terminated=false`、`truncated=false`，输出 `status=PASS`。
+  工具一度因对整个 worker wire 做过严有限值断言而在 reset 后退出，已改为只对
+  policy/critic core 做硬断言并单独报告 aux；同时修正了 vGPU `env.close()` 使用
+  `os._exit()` 导致外层 timeout 残留的测试编排，最终只保留一个 smoke 实例。当前
+  容器仍保留父包 ZIP、解压 checkpoint 和 `/data/pre_model/ckpt` 副本，待全部后续测试
+  完成后再清理。本证据尚未覆盖正式 P3 workflow 的 80 帧低层 rollout、高层
+  32 tick rollout 或平台 checkpoint 注册。
+- 2026-07-31 平台 15 分钟回归与更正：任务 `p3nav8h-r1`（task `235452`）从
+  `09:01:33` 运行至约 `09:15:41`，训练持续到 `iter=105`、`session_h=0.224`、
+  `low_updates=105`，没有数值异常或主动达到 8 小时目标。`09:07:36` 已成功写出合法的
+  `model.ckpt-lowbase-648278.pkl`，证明 checkpoint 标签正则和业务写盘正常；但 learner proxy
+  全程报告 `succ_cnt is 0`，平台模型 ID 未离开父 ID `648278`，随后 aisrv/learner 同时收到
+  外部 SIGTERM。根因是 P3 workflow 虽然让 `Agent.learn()` 对 P3 返回 lifecycle no-op，却从未
+  在任何低层或高层环境帧调用它；5 分钟墙钟 `save_model()` 不能代替平台 train step、
+  `dump_model_freq` 和健康看门狗。修复为每个成功 `env.step()` 完成全部帧处理后恰调用一次
+  `agent.learn(None)`，低层 80 帧与高层 32×10 帧均覆盖；普通 callback 失败计数并继续，
+  `CheckpointSaveError` 保持硬失败。新增 `platform_lifecycle_callbacks/failures` P3 面板与定向
+  回归。状态：代码已修复待本地、开发容器和新平台任务验证；旧任务已失败，不能热修复。
+- 2026-07-31 lifecycle 修复验证补充：本地从 `server/` 运行 P3 schedule 与相邻监控定向测试
+  `47 passed`，Python 编译、全部 server TOML 解析和定向 `git diff --check` 通过。随后只将
+  `agent_ppo/workflow/p3_standard_joint_workflow.py` 与 `agent_ppo/conf/monitor_builder.py`
+  同步到开发容器，二次 dry-run 为 `files to overwrite: 0`；容器使用 PyTorch
+  `2.7.0+cu128` 完成 Python 编译，并确认 lifecycle helper 连续两次调用均成功、attempt/success
+  计数均为 2、failure 为 0，低层和高层 rollout 的两个调用点均存在。状态更新为“本地已验证、
+  开发容器静态与 helper 行为已验证，新平台任务跨 20 分钟待验证”；该证据仍不能替代平台
+  learner wrapper 的 global-step、模型登记和 watchdog 行为验证。
+- 2026-07-31 P3 阶段交接补充验证：新增 `p3_joint_rollout_smoke.py`，使用真实 648278 父包在
+  5h/6h/6.5h rollout 边界分别覆盖 `adaptercalib/highadapt/jointslow`，并断言 target/exec、
+  pending tick、高低层 recurrent hidden 和未完成 Adapter future history 在边界 reset 后清空。
+  `adaptercalib` 完成 80 个真实 Standard 低层帧和 4 次 Adapter update，只有 Adapter 参数变化；
+  `highadapt` 完成 32 个高层 tick × 10 个低层帧、高层 PPO、Adapter update、save/exact resume，
+  低层 Actor forward hook 记录的注入命令绝对值均值为 `0.29683`，证明高层命令实际控制了
+  Standard 低层动作路径。
+- 该 smoke 同时发现两个训练语义 Bug。第一，P3 调用了 Adapter update，但旧阶段调度在低层恢复
+  和 `adaptercalib` 将 response optimizer LR 置零；现按阶段使用 `3e-5/2e-4/1e-5`，并用参数
+  实际变化而非计数验证。第二，高层推理将共享低层模型留在 `eval`，导致 `jointslow` 低层 CUDA
+  recurrent PPO 报 `cudnn RNN backward can only be called in training mode`。现规定 rollout 收集
+  显式 `eval`，低层 replay 恢复 Actor/Critic/LSTM `train`，冻结 CNN 和 anchor 保持 `eval`。
+  修复后 4 环境 `jointslow` 明确 PASS：高层 PPO 20 个 minibatch update、Adapter update、80 帧
+  低层 recurrent PPO、save/exact resume 全部完成；低层 Actor/Critic 变化，低层 CNN/LSTM 不变，
+  NavigationEncoder/高层 Actor/Critic/Adapter 均变化，所有关键 loss 有限。本地和容器 P3
+  contract/schedule 回归均为 `12 passed`。
+- 正式规格边界：开发 IDE vGPU 只暴露 5 GiB。64 环境 full-terrain 在模型 forward 前由 PhysX
+  尝试分配 `671088640` 字节 `mGpuContactPairsDev` 时 OOM，32 环境同样在 Articulation reset 阶段
+  OOM；随后 16 环境 full-terrain 在 height-scanner RayCaster 初始化触发 CUDA illegal-memory。
+  这些失败均发生于 `env.reset()`，不涉及 checkpoint 门禁、PPO 或 Adapter。compact-terrain 的
+  完整算法链已验证，但 64 环境正式 full-terrain 必须在训练规格 GPU 或重启后的更大显存容器做
+  平台 smoke，当前不得标记该规格已验证。
+- 已知边界：worker 已计算 `local_abs>3.2m` 诊断，但 2026-07-29 平台镜像显示现有 terrain-bound
+  termination 只在 eval 模式启用；训练态强制 partial reset 尚未取得可靠公开 API，当前不得宣称
+  已生效。原计划的分阶段质量/COM/电机/PD/action-delay/push 表目前只有配置记录，除顶层 TOML
+  静态摩擦外尚无经过 runtime 证明的执行器；正式长训前必须在开发容器补实现或明确缩减合同。
+- 防复发、回滚和最短检查路径：回归测试必须覆盖 P3 stage 能启用共享 worker transport、57905→
+  57901 只删除 goal4、局部目标事件保留一帧、P3 标签优先级、低高 optimizer 无交集、阶段 LR 和
+  P3 save/resume。启动时最短检查为：`Stage=p3_standard_joint` → worker 日志
+  `runtime_stage=p3_standard_joint` → P3 parent load mode → 首个 low/high update → 同 ID P3 阶段包
+  save/load。回滚只需切回 P2 `policy_entry` 与 648278 父包，不得把 P3 包交给旧二维/单层 loader。
+- 关联 commit/PR/checkpoint：P2 父提交 `b7519e6`；P3 尚未提交/未创建 PR；父 checkpoint ID
+  `648278`，新 P3 checkpoint 尚未生成。
+
+### 2026-07-31 更正：P3 正式训练阻断闭环与 compact storage
+
+- 状态：代码已修复待开发容器复核。关联分支 `codex/p3-standard-joint-recovery`，任务
+  `p3std8h-sim2real`，父包 `p2nav2h-r2_648278`；新 checkpoint 尚未生成，commit/PR 尚未创建。
+- 新审查证据：旧实现的 P3 低层阶段仍沿用 300 秒原生命令，worker RewardManager 不读取高层注入
+  command；`jointslow` 又在高层 rollout 后采集另一段原生命令低层数据。目标采样使用 clamp，边界
+  附近会缩短到 1.5m 以下；`local_out_of_bounds` 只有诊断，没有 termination。P3 高层继续结算 P2
+  Track SafetyHead、predictive collision、missed-safe、gait、body collision、tracking、stagnation 和
+  Track timeout impulse。低层 storage 保存 `80×64×57901 float32`，仅 observation 即约 1.10GiB。
+  分阶段 DR 表大多未被 worker 消费，exact resume 也没有不可变 anchor leaf。
+- 根因：P3 最初只完成模块装配，没有把 command、reward、环境随机化、rollout ownership 和
+  checkpoint lineage 视为同一个原子训练合同；旧 smoke 工具仍发送 12 维 action，并在 jointslow
+  额外采样低层 rollout，反而会把错误路径验证为通过。
+- 修复：新增 `P3RecoveryCommandSampler`，按 55/15/15/5/5/5 比例生成 2-8 秒三轴命令，核心/扩展
+  80/20，全程启用。P3-only 17 维 envelope 携带 `joint12+exec_cmd3+epoch+valid`，BaseEnv 写入并
+  readback `base_velocity` 后只把 joint12 送入 Isaac；原生命令 resampling 延长到 40000 秒。
+  `jointslow` 只使用同一 32×10 高层 rollout 的前 80 帧，更新顺序固定为 high→low→版本边界→
+  Adapter。低层更新后立即更新 digest/version 并清除 unfinished future history。
+- 目标/奖励：局部目标使用最多 64 次 rejection sampling，严格保持 1.5-2.8m 与地块 1m 内边界；
+  失败采样直接触发 reset，不伪造近距离成功。动态注册 `p3_local_out_of_bounds` hard termination，
+  threshold、timeout、success distance 与 seed 均从 P3 TOML 读取。P3 高层只保留 frontier/progress、
+  local +8/-1、time、crawl、command-rate 与 hard failure；local timeout 回收 frontier potential。
+  Track safety teacher/head loss、predictive/missed-safe、gait/body collision、tracking、stagnation 以及
+  Track success/timeout impulse 在 P3 中归零，SafetyHead 权重保留且冻结。
+- Sim2Real/DR：四阶段环境配置展开摩擦、全 link mass、COM、PD、action gain、0-2 帧 delay、push 与
+  observation noise；startup 随机化在 0.5h/2h/3.5h 边界通过环境重建生效。低层增加 torque 0.2s
+  EMA excess、instant peak、normalized action rate/jerk 的合并有界代价，单帧 raw cost 不超过 0.12；
+  joint/torque mapping 无效时归零并只报警一次。
+- 显存/checkpoint：低层在线输入和导出仍为 57901，但 recurrent PPO storage 只保存
+  `proprio45+frozen CNN feature32=77`；CNN collection 无梯度，replay 仍训练 LSTM/Actor/Critic。
+  P3 checkpoint 新增 immutable anchor leaf/digest、command sampler RNG、low version 与实际 DR phase；
+  exact resume 校验 anchor 和 Adapter completed records 的 low digest/version。显式 requested P3、配置
+  parent P3、显式 P2 648278 依次选择；仅在三者都不存在时允许唯一 discovery，多候选明确报歧义。
+- 额外回归：低层 timeout 过去把 pre-step value 当 terminal bootstrap，现因平台不提供 reset 前
+  terminal critic observation而采用零 bootstrap，避免把旧状态或新 episode 污染 Critic。P3 eval
+  与 `p3_env_smoke.py` 同步改为 17 维 envelope；joint smoke 改为验证同 rollout 80 帧路径。
+- 本地验证：当前阶段 P3/P2/Nav 定向回归 `140 passed`；新增严格目标距离、17 维 transport、sampler
+  对称/RNG、DR phase、77 维 compact replay 数值一致和 P3 reward profile 测试。最终测试、Python
+  编译、TOML、monitor schema 与 diff check 将在本轮代码审查结束后补录。开发容器真实 648278、
+  64 环境 full rollout/backward/save/resume、平台 15 分钟 smoke 尚未执行，不能升级为平台已验证。
+- 回滚和最短检查：回滚必须同时恢复 17 维 envelope、P3 workflow、compact storage、P3 reward
+  profile、DR materialization 与 checkpoint contract，不能只改 TOML。再次遇到时依次核对启动日志
+  sampler→BaseEnv command readback→worker tracking command→同 rollout low storage 77→low version reset→
+  anchor exact resume；任何一步缺失都不得启动正式 8 小时训练。
+
+### 2026-07-31 更正：平台覆盖 BaseEnv，撤回 17 维 transport 与伪随机化能力
+
+- 状态：本地已验证，开发容器待重新同步复核。用户明确确认正式平台会覆盖
+  `server/isaac_env/base_env.py`；该文件现已完整恢复到分支基线，`git diff` 为空。
+- 被证伪的旧方案：上一条记录中的 P3-only 17 维 envelope、worker command readback、动态
+  out-of-bounds termination、全 link mass、COM、PD、action gain/delay 与按环境 push 都依赖本地
+  BaseEnv 修改，正式任务不会执行。旧记录保留作为历史，不得再引用为已实现能力。
+- 替代闭环：0-5h 低层恢复直接使用平台原生 2-8 秒三轴命令，PPO observation、worker
+  RewardManager、实际动作与 Adapter records 使用同一命令。6h 后高层接管低层 observation，低层
+  全程冻结，只更新高层 PPO 与 Adapter；最后阶段从 `jointslow` 更名为 `highslow`。这主动放弃了
+  无法在公开接口下保证语义正确的同步高低层更新，避免用原生命令 reward 训练高层命令下的低层。
+- 随机化实际边界：只保留镜像确认平台支持的 friction、base added mass 和显式 observation noise，
+  在 0.5h/2h/3.5h 通过完整环境重建生效。push 保持关闭；COM、PD、action gain/delay 均从配置、
+  checkpoint contract 和面板删除。`local_abs>3.2m` 仅作诊断，真实 reset 仍由平台 Standard
+  termination/timeout 负责。
+- 契约：环境 action 恢复为固定 12 维；contract 升级为 `p3_standard_joint_v3`；checkpoint 不再保存
+  P3 command sampler，阶段标签固定为 `lowbase/lowmild/lowmedium/lowfull/adaptercalib/highadapt/highslow`。
+  模型 ID 仍只用于候选选择和告警，不形成单点硬门禁。
+- 本地证据：P3 contract/schedule 定向测试 `20 passed`；真实
+  `model.ckpt-safestable-648278.pkl` warm start、一次完整低层 PPO update、save/exact resume 通过，
+  输出确认父动作方差精确恢复、Actor/Critic 均有限更新。开发容器的真实 12 维 step、原生命令
+  2-8 秒保持、friction/base mass/noise 实际装配、高层阶段低层 digest 不变仍待复核。
+- 回滚与最短检查：正式任务不得同步或依赖本地 BaseEnv。启动后依次检查低层阶段 worker 原生命令
+  与 policy command 一致、高层阶段 low update counter 不再增长、低层 digest 不变、Adapter records
+  使用高层 owned command。若任何一项不成立，停止 P3 而不是恢复 17 维 transport。
+
+#### 2026-07-31 审查补充：阶段 reset 与采集同步开销
+
+- 状态：本地已验证，开发容器待验证。
+- 审查发现：早期替代实现只在 DR 变化的 0.5h/2h/3.5h 重建环境，5h/6h/6.5h 仅清理网络
+  hidden，导致旧 episode、局部目标和 worker 状态可能跨职责边界延续；`adaptercalib` 在低层冻结时
+  仍计算 critic/log-prob/anchor 并写满 80 帧 PPO storage。P3 统计还在每帧执行地形 `any()`，并在
+  每个高层 tick 对奖励项 `.item()`，造成大量 CUDA host synchronization。
+- 修复：所有阶段边界统一在 checkpoint 后调用公开 `env.reset(config)`，仅 DR 参数是否改变作为
+  诊断；校准阶段改为纯低层 actor 推理、environment step 与 Adapter record；高层 Adapter 按每两次
+  PPO update 更新一次。命令、地形、奖励与事件统计均在 GPU 累积，rollout 末批量搬到 CPU。
+
+#### 2026-07-31 审查补充：高层 terminal 后命令污染与监控同步
+
+- 状态：代码已修复待开发容器验证。
+- 症状与根因：P3 高层一个 5Hz transition 包含 10 个低层 frame。单个环境提前 termination 后，
+  `active` mask 虽已清零，但余下 frame 仍可能由 `frame_begin()` 沿用或重新采样非零命令，使自动
+  reset 后的新 episode 接收到旧 transition 的命令。另 Standard/joint-success 监控在每个 50Hz
+  frame 对两个 CUDA 标量调用 `.item()`，形成不必要的 host synchronization。
+- 修复：每个后续 frame 在 `frame_begin()` 前后都按 `active` mask 原地清零 `active_target` 与
+  `exec_cmd`；这只操作 agent-owned command，不修改平台 `BaseEnv`。成功计数保持为设备 tensor，
+  合并进 rollout accumulator 后才统一搬到 CPU。新增 inactive/live 两环境回归测试。
+- 回归边界：terminal-safe aux/exec 快照仍取首次 done 前状态；inactive env 的后续 frame 不进入旧
+  transition 的 duration/reward，下一导航 tick由正常 reset 状态重新开始。若容器 smoke 发现平台
+  reset 帧无法接受零命令，应停止 P3，而不是恢复 17 维 transport 或修改 `base_env.py`。
+
+#### 2026-07-31 审查补充：空 optimizer update 错误推进低层版本
+
+- 状态：代码已修复待开发容器验证。
+- 症状与根因：`AlgorithmVisualPPO.learn()` 在全部 minibatch 因非有限 loss/gradient 被跳过时返回
+  `applied_updates=0`，P3 workflow 过去仍无条件增加 `low_updates` 并调用版本切换。这会让
+  checkpoint 虚报低层更新、刷新 digest/version，并无必要地清空 Adapter 未完成 future history。
+- 修复：新增 `_finalize_low_level_update()`，只有 `applied_updates>0` 才递增低层 rollout 版本并调用
+  `note_low_level_update()`；零更新保持模型、版本和 Adapter history 不变。回归测试覆盖零更新与
+  多 minibatch 成功更新两条路径。
+- 最短检查路径：同时核对 `applied_updates`、`p3_low_updates` 与
+  `response_buffer.version_reset_count`；前者为零时后两者不得增加。
+- 开发容器证据：同步后 P3/P2 定向测试 `125 passed`；使用容器内真实
+  `model.ckpt-safestable-648278.pkl` 完成 P2→P3 warm start、一次低层 PPO update、保存与 exact
+  resume，确认 `applied_updates=1`、Actor/Critic 变化和动作方差恢复。随后 1 环境真实 Isaac
+  `p3_env_smoke.py` 在 180 秒内未完成启动且未输出 PASS，wrapper 超时后残留的两个父子进程已
+  `kill -9` 回收。因此状态仍为“代码已修复待真实环境验证”，不得据此创建正式训练任务。
+  2026-07-31 更正：重启容器后以独立日志重跑同一 1-env smoke，约 13 秒完成 reset 和
+  3 个 step，明确输出 `status=PASS`。Policy observation 为 `[1,57905]`，critic wire 为
+  `[1,385]`，policy/critic/worker aux 有限值比例均为 `1.0`；末帧 reward
+  `-0.01940007507801056`，无 termination/truncation，EnvMonitor 最终上报 237 个指标，
+  `abnormal=0, timeout=0`。功能验证已通过，但 vGPU workaround 输出调用 `os._exit(0)`
+  后父子进程未自动退出，已定向 `SIGKILL` 回收并确认无 `p3_env_smoke.py` 残留。
+  该退出异常是 smoke/Isaac 关闭路径问题，不影响上述 reset/step 证据；当前仍未覆盖
+  64-env、80 帧低层 update 或 32-tick 高层 PPO/Adapter 联合更新。
+  2026-07-31 追加验证：将 `p3_joint_rollout_smoke.py` 扩展为单进程 `integrated`
+  场景，修复阶段 reset 返回未定义 `obs/critic_wire` 和 Adapter cadence 校验缺少
+  `_high_adapter_update_due` 导入两个仅影响 smoke 工具的错误。开发容器使用真实
+  `648278` 父 checkpoint、`64 env`、完整 Standard terrain 在同一 Isaac 进程中完成：
+  80 帧低层 rollout 与 PPO update、32-tick/320-frame 高层 rollout 与 PPO update、一次
+  Adapter update、P3 save 和 exact resume。最终 `status=PASS`，`low_updates=1`、
+  `high_updates=1`，低层实际应用 20 个 minibatch update，高层 Actor/Critic/NavigationEncoder
+  与 Adapter 均按职责变化，冻结低层 CNN 和高层阶段的低层模块均未变化。
+  checkpoint 恢复模式为 `p3_exact_resume:exact_resume_history_reset`，完成 response records
+  为 32。CUDA 峰值 `max_memory_allocated=857867776`、`max_memory_reserved=954204160`，
+  pinned depth `235929600` bytes，无 OOM、无 non-finite skip。高层窗口内 2 个 failure 被
+  EnvMonitor 记为 `abnormal=2`，是环境 episode outcome，不是训练进程异常。进程仍受
+  vGPU 关闭路径影响未自动退出，已定向回收并确认无残留。
+  同日进一步以 `128 env` 重跑相同 integrated/full-terrain 规格，再次
+  `status=PASS`：80 帧低层 PPO、32-tick/320-frame 高层 PPO、Adapter update 和
+  save/exact-resume 均完成，无 OOM、CUDA illegal access 或 non-finite skip。峰值
+  `max_memory_allocated=1687526400`、`max_memory_reserved=1725956096`，约占 GPU
+  `32.92%`；pinned depth 为 `471859200` bytes。从首次 reset 到 PASS 约 90 秒，
+  端到端覆盖 400 个 vector step，约 `4.4 vector steps/s` 或 `568 env-frames/s`；
+  高层 update 本身约 13.6 秒。低层收集中出现一次 warning-only
+  `action_amplitude=6.5912>6.0000`，环境执行前仍裁剪到 `[-6,6]`；正式训练应继续
+  监控 action saturation，但本次未造成更新跳过或有限值错误。
+  根据该对照结果，用户选择将 P3 正式 TOML 的 `num_envs` 从 64 调整为 128；
+  这是经实测的训练配置变更，不改变 observation、storage、PPO 或 checkpoint 合同。
+  `commands.worker_progressive.enabled=false`，避免配置继续暗示存在 worker command override。
+- 回归：新增校准推理不访问 critic 的测试、高层 Adapter 两轮一次的 cadence 测试；P3 定向回归
+  当前 `50 passed`。容器中的原生命令 readback、阶段 reset、吞吐和真实 64 环境仍待在线验证。
+
+#### 2026-07-31 审查补充：原生命令 epoch、死分支与恢复完整性
+
+- 状态：本地已验证，开发容器待验证。
+- 审查发现：P3 低层阶段虽然已改用平台原生命令，但写入 ResponseAdapter buffer 时仍把所有环境、
+  所有帧的 `command_epoch` 固定为 0。平台命令按环境异步重采样时，0.2 秒 future label 可能跨越
+  target 变化却仍被视为有效。高层 workflow 还保留 `capture_low` 分支，但低层与高层 phase 判定
+  互斥，生产路径永远无法进入；这会继续暗示高层命令下仍可能更新低层。资源面板也只统计
+  observation tensor，漏掉 critic/action/return/anchor/recurrent hidden 等 storage。容器 smoke
+  则在正式 `high_update_interval=2` 下要求首个 high rollout 必须更新 Adapter，测试合同自身矛盾。
+- 根因：撤回 BaseEnv command override 后，部分旧 joint-rollout 元数据和测试假设没有同步删除；
+  平台原生命令又没有公开 epoch，因此不能直接复用 P2 单一 command controller 的标量 epoch。
+- 修复：workflow 根据 observation 中的三轴平台命令为每个环境独立维护 epoch，只有该环境 target
+  实际变化时递增；reset/resume/阶段环境 reset 清空 live tracker。`patch_owned_commands()` 同时支持
+  标量和逐环境 epoch。高层执行器改为纯冻结低层 inference，删除不可达的低层 metadata、storage、
+  return 和 optimizer 分支，并移除每个环境帧无副作用的 `agent.learn(None)` 调用。新增统一
+  storage tensor byte 统计；smoke 明确临时使用 interval=1 以在一次昂贵 Isaac rollout 中覆盖
+  high-policy→Adapter 边界，生产 TOML 仍为 interval=2。P3 exact resume 现在要求顶层
+  `phase_label`、global `compound_schedule_phase` 与 `session_effective_seconds` 推导阶段三者一致。
+- 本地验证：P3 contract/schedule 与 P2 邻近定向测试 `123 passed`；Python 编译与
+  `git diff --check` 通过，`server/isaac_env/base_env.py` 仍与 HEAD 完全一致。开发容器尚未同步本次
+  epoch/dead-branch/smoke 修复，不能升级为平台已验证。
+- 防复发：回归固定覆盖逐环境 epoch 独立递增、tensor epoch shape 拒绝、完整 storage bytes 去重、
+  Adapter 两轮生产 cadence、exact-resume 阶段/时钟不一致拒绝。正式训练仍不得恢复 17 维 action、
+  worker command override 或高层阶段低层 PPO 更新。
+
+## BUG-20260731-002：P3 评估被路由到 lbc_loco 且旧 loader 不搜 highslow 标签
+
+- 日期：2026-07-31；状态：本地已验证，开发容器与平台双评估待验证。
+- 影响：P3 `highslow` 等阶段包的 Standard+Camera 与 Track+Camera 平台评估；不影响训练、
+  checkpoint 参数或部署契约。
+- 首次发现：评估日志
+  `/Users/nanbloom001/Downloads/log-599578-18560427.zip`，任务 `599578` / 运行 `18560427`，
+  请求模型 ID `852198`，包内 `eval_model_id=884257`；模型包
+  `archive/代码存档/p3nav8h-r1_884257.zip`。
+- 用户可见症状与原始证据：aisrv 依次打印
+  `[eval] Override Config.CURRENT: p3_standard_joint -> lbc_loco (inferred from TOML task_name)`、
+  `Stage: lbc_loco, task_type: standard`，随后旧 LBC loader 构建 VisionEncoder/DmEncoder/Teacher
+  Actor，`load_model_by_source() Exception [LBC-Loco eval] No same-ID visual checkpoint found ...
+  candidate_order=[...model.ckpt-responsecalib-852198.pkl', ...]`，候选不含任何
+  `highslow/highadapt/...` P3 标签；`exploit() RuntimeError Exception` 后
+  `'NoneType' object is not subscriptable`。模型参数有限且完整（checkpoint SHA256
+  `8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23`），失败在装配与
+  发现，不在权重。
+- 根因：`_infer_stage_from_task_name` 在 eval TOML 没有显式 `policy_entry` 时对
+  Standard+Camera 无条件返回 `LBCLocoConfig`（第 743 行），P3 血缘在此分支被
+  `Config.CURRENT=P3StandardJointConfig` 掩盖；旧 LBC loader 的
+  `visual_eval_checkpoint_candidates`/`vision_checkpoint_candidates` 只搜
+  `responsecalib/command/anchor/rl/vision` 等视觉标签，从不搜 P3 的
+  `lowbase...highslow` 标签。两者叠加导致请求 ID 下无候选、checkpoint 未加载后仍尝试
+  `exploit()` 并用 None 模型触发二次异常。
+- 排除项：不是 checkpoint 完整性门禁"过严"；失败前的 LBC loader 拒绝未知模型是正确防线。
+  也不是模型损坏——真实 `highslow-884257.pkl` 反序列化、模块/spec/shape、有限值全部通过。
+  不修改平台托管的 `server/isaac_env/base_env.py`。
+- 修复：新增两个显式评估入口 `p3_standard_eval` 与 `p3_track_eval`（`P3StandardEvalConfig`/
+  `P3TrackEvalConfig`），在 `_valid_explicit_policy_stage` 注册并在 eval 下把显式
+  `p3_standard_joint` 按地形模式重映射到对应入口；无显式入口时按 `Config.CURRENT` 血缘选择
+  （Track+Camera→`p3_track_eval`、Standard+Camera→`p3_standard_eval`，历史 P2/Nav/视觉血缘
+  行为不变）。两个入口共用 `p3_standard_joint_eval_candidates`（P3 标签优先级
+  `highslow>highadapt>adaptercalib>lowfull>lowmedium>lowmild>lowbase`，无同 ID 时唯一
+  discovery，多候选明确报歧义）与 `validate_p3_eval_bundle`（format/stage/phase/model_spec/
+  模块 class/spec/有限值；请求 ID 与 payload ID 不一致只告警）。Standard 只装低层
+  VisionEncoder+Actor77（obs 57901），Track 只装低层+NavigationEncoder+三轴 Actor+
+  ResponseAdapter（obs 57905），两者都不创建 Critic/SafetyHead/optimizer/scheduler/训练
+  buffer；Track 复用 P2 `AlgorithmP2NavPPO(training=False)` 的 5Hz/50Hz 机器与
+  terminal-return bridge，`goal_reached` 继续进入平台 scorer。选中文件缺失/损坏/结构不兼容
+  一律硬失败，不落到 P2/LBC/随机权重。`feature/__init__.py` 把 `p3_standard_eval` 映射到
+  `LBCObservationProcess`（57901，无 P3 goal provider）、`p3_track_eval` 映射到
+  `P2PolicyObservationProcess/P2CriticObservationProcess`（57905 + eval transport）。
+- 修改文件：`server/agent_ppo/checkpoint_io.py`、`conf/conf.py`、`agent.py`、
+  `algorithm/algorithm_p2_nav_ppo.py`、`feature/__init__.py`、
+  `tests/test_nav_stage_and_metrics.py`、`tests/test_p3_eval.py`（新增）、
+  `server/CHANGELOG.md`、`shared/interfaces/server-deploy-contract.md` 与本台账。
+- 验证：`PY311test`（Python 3.11.13、PyTorch 2.11.0）新增 P3 eval 专项
+  `25 passed`，覆盖候选优先级/唯一 discovery/歧义/不落 P2/LBC 标签、validator 六类拒绝、
+  路由显式/血缘/重映射、真实 `highslow-884257` Standard 低层抽取与有限 12 维前向、
+  Track 完整层级装配且 optimizer/scheduler/rollout/ResponseBuffer 全为 None、12 帧跨
+  5Hz tick 边界动作有限、同一 checkpoint 顺序加载进两个独立装配、损坏 checkpoint 硬失败。
+  排除两个已知失效旧模块后的训练端回归 `336 passed, 3 subtests passed`。随后同步修正
+  `test_p3_contract.py::test_p3_production_config_and_monitor_are_standard_specific` 中遗留的
+  `num_envs=64` 期望，使其与已完成 128-env integrated smoke 的正式配置一致；P3、P2 邻近、
+  cleanup 与 uploader 定向回归为 `186 passed, 5 skipped, 4 subtests passed`。Python 编译、
+  TOML 解析、`git diff --check` 通过；开发容器与平台双评估未执行，状态不得提升为
+  "评估已验证"。
+- 防复发：任何新阶段标签（含 P3）必须同时补 candidate-order 测试；Camera eval 不得在
+  未加载 checkpoint 时推理；评估入口必须显式或按血缘选择，禁止 Standard+Camera 静默回退
+  `lbc_loco`。评估验收依次确认 `Stage: p3_standard_eval/p3_track_eval` → selected 为
+  highslow → `eval_disposition` → loaded modules → 无 lbc_loco/nav_eval 回退 →
+  Standard scorer 正常统计、Track 完成数非恒 0。
+- 血缘：分支 `codex/p3-dual-eval`（自 `codex/p3-standard-joint-recovery` 创建）；当前工作树
+  未提交（沿用 P2 eval 热修复先例）；父 checkpoint `highslow-884257`，SHA256
+  `8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23`；P3 父模型
+  `p2nav2h-r2_648278`。
+- 回滚：恢复 eval 路由到旧 `lbc_loco`/`nav_eval` 映射即复现本 Bug；仅需回滚评估装配代码，
+  不修改 checkpoint 或训练。再次遇到的最短检查路径：最早 `Stage:` → 是否 `p3_standard_eval`
+  或 `p3_track_eval` → 同 ID P3 candidate（highslow...lowbase）→ `eval_disposition`/
+  loaded modules → 有限前向；禁止从末尾 `NoneType` 反推模型损坏。
 
 ## 3. 已知高频误判
 

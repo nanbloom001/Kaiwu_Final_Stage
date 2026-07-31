@@ -261,6 +261,13 @@ class P2WorkerBridge:
     def __init__(self, env, *, config: dict[str, Any], seed: int = 0):
         self.env = env
         self.config = dict(config)
+        self.runtime_stage_type = str(
+            self.config.pop("_worker_stage_type", "p2_nav_ppo")
+        )
+        self.track_diagnostics_enabled = self.runtime_stage_type in {
+            "p2_nav_ppo",
+            "p2_nav_eval",
+        }
         robot = self._robot()
         self.num_envs = int(robot.data.root_lin_vel_b.shape[0])
         self.device = robot.data.root_lin_vel_b.device
@@ -277,7 +284,11 @@ class P2WorkerBridge:
             seed=seed,
             profile=self.config.get("feedback_profile"),
         )
-        self.curriculum_probe = P2TrackCurriculumProbe(self.num_envs)
+        self.curriculum_probe = (
+            P2TrackCurriculumProbe(self.num_envs)
+            if self.track_diagnostics_enabled
+            else None
+        )
         self._gait_window = P2GaitWindowProbe(
             env,
             robot,
@@ -305,6 +316,7 @@ class P2WorkerBridge:
             "[P2WorkerBridge] active owner=environment_worker "
             f"num_envs={self.num_envs} wire={p2_contract.PRIVILEGED_WIRE_DIM} "
             "command_owner=aisrv feedback_profile=p15_shared "
+            f"runtime_stage={self.runtime_stage_type} "
             f"live_segment_status={segment_status} "
             "initial_segment_histogram="
             f"{torch.bincount(initial_segment[initial_segment >= 0], minlength=3).tolist() if bool((initial_segment >= 0).any()) else []}"
@@ -335,7 +347,9 @@ class P2WorkerBridge:
         return family, level
 
     def _goal_distance(self, robot) -> torch.Tensor:
-        goal = getattr(self.env, "goal_positions", None)
+        goal = getattr(self.env, "_p3_goal_positions", None)
+        if goal is None:
+            goal = getattr(self.env, "goal_positions", None)
         if not torch.is_tensor(goal) or goal.shape[0] != self.num_envs:
             return torch.zeros(self.num_envs, device=self.device)
         return torch.linalg.vector_norm(
@@ -466,7 +480,8 @@ class P2WorkerBridge:
             self._gait_window.collision_valid
         )
         self.last_aux = aux
-        self.curriculum_probe.observe(self.env)
+        if self.curriculum_probe is not None:
+            self.curriculum_probe.observe(self.env)
         gait_metrics = {}
         if bool((gait[:, 24] > 0.5).any()):
             for index, name in enumerate(("fl", "fr", "rl", "rr")):
@@ -510,11 +525,17 @@ def _resolve_config() -> tuple[bool, dict[str, Any], int]:
         error = info
 
     usr_conf, _, is_eval, stage = Config.load_conf(_Logger())
-    enabled = getattr(stage, "algorithm", "") in {"p2_nav_ppo", "p2_nav_eval"}
-    enabled = enabled and (not is_eval or getattr(stage, "algorithm", "") == "p2_nav_eval")
-    stage_conf = usr_conf.get("p2_nav_ppo", {}) if isinstance(usr_conf, dict) else {}
+    algorithm = getattr(stage, "algorithm", "")
+    enabled = algorithm in {"p2_nav_ppo", "p2_nav_eval", "p3_standard_joint"}
+    enabled = enabled and (
+        not is_eval or algorithm in {"p2_nav_eval", "p3_standard_joint"}
+    )
+    config_key = "p3_standard_joint" if algorithm == "p3_standard_joint" else "p2_nav_ppo"
+    stage_conf = usr_conf.get(config_key, {}) if isinstance(usr_conf, dict) else {}
+    stage_conf = dict(stage_conf or {})
+    stage_conf["_worker_stage_type"] = algorithm
     seed = int(usr_conf.get("env_conf", {}).get("seed", 0))
-    return enabled, dict(stage_conf or {}), seed
+    return enabled, stage_conf, seed
 
 
 def get_p2_worker_bridge(env) -> P2WorkerBridge | None:

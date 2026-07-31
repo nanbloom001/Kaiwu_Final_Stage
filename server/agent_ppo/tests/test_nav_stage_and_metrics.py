@@ -22,6 +22,10 @@ from agent_ppo.conf.conf import (
     P15ResponseConfig,
     P2NavEvalConfig,
     P2NavPPOConfig,
+    P3StandardEvalConfig,
+    P3StandardJointConfig,
+    P3TrackEvalConfig,
+    StandardVisualPPOConfig,
     _configured_training_stage,
     _infer_stage_from_task_name,
 )
@@ -55,6 +59,7 @@ class TestNavStageSelection(unittest.TestCase):
             "nav_dagger": NavDaggerConfig,
             "p15_response": P15ResponseConfig,
             "p2_nav_ppo": P2NavPPOConfig,
+            "p3_standard_joint": P3StandardJointConfig,
         }[policy_entry]
         self.assertIs(Config.CURRENT, expected)
 
@@ -82,6 +87,7 @@ class TestNavStageSelection(unittest.TestCase):
             "nav_dagger": "NavDaggerConfig",
             "p15_response": "P15ResponseConfig",
             "p2_nav_ppo": "P2NavPPOConfig",
+            "p3_standard_joint": "P3StandardJointConfig",
         }[policy_entry]
         self.assertEqual(current_assignment.value.id, expected_name)
 
@@ -121,14 +127,29 @@ class TestNavStageSelection(unittest.TestCase):
                 _infer_stage_from_task_name(usr_conf, _Logger()), NavEvalConfig
             )
 
-    def test_standard_camera_still_selects_lbc(self):
+    def test_standard_camera_without_forwarded_entry_keeps_p3_lineage(self):
         usr_conf = {
             "env_conf": {"task_name": "Unitree-Go2-Velocity-Camera"},
             "terrain": {"mode": "standard"},
         }
-        self.assertIs(
-            _infer_stage_from_task_name(usr_conf, _Logger()), LBCLocoConfig
-        )
+        # 当前分支 bootstrap 为 P3 血缘：Standard+Camera 不能回退到 lbc_loco，
+        # 必须保持 p3_standard_eval（否则 P3 包找不到 highslow 候选）。
+        with mock.patch.object(Config, "CURRENT", P3StandardJointConfig):
+            self.assertIs(
+                _infer_stage_from_task_name(usr_conf, _Logger()),
+                P3StandardEvalConfig,
+            )
+
+    def test_standard_camera_without_forwarded_entry_keeps_legacy_lbc(self):
+        usr_conf = {
+            "env_conf": {"task_name": "Unitree-Go2-Velocity-Camera"},
+            "terrain": {"mode": "standard"},
+        }
+        # 非 P3 血缘（历史 StandardVisualPPO 基线）仍保持历史 lbc_loco 回退。
+        with mock.patch.object(Config, "CURRENT", StandardVisualPPOConfig):
+            self.assertIs(
+                _infer_stage_from_task_name(usr_conf, _Logger()), LBCLocoConfig
+            )
 
     def test_explicit_nav_dagger_is_eval_only_during_eval_inference(self):
         usr_conf = {

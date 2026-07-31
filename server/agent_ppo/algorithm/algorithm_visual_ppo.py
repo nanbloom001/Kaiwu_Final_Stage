@@ -40,6 +40,7 @@ SUPPORTED_SCHEDULE_MODES = (
     "visual_anchor_anneal_v2",
     "visual_command_generalization_v1",
     "p15_response_adapter_v1",
+    "p3_low_recovery_v1",
 )
 
 # Fixed load_mode values used in the startup log (§6). Returned by
@@ -148,6 +149,8 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         self.skipped_nonfinite_updates = 0
         if self.schedule_mode == "p15_response_adapter_v1":
             self.current_phase = "responsebase"
+        elif self.schedule_mode == "p3_low_recovery_v1":
+            self.current_phase = "lowbase"
         elif self.schedule_mode == "visual_command_generalization_v1":
             self.current_phase = "commandbase"
         else:
@@ -238,6 +241,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         if self.schedule_mode in {
             "visual_command_generalization_v1",
             "p15_response_adapter_v1",
+            "p3_low_recovery_v1",
         }:
             self.anchor_schedule_hours = None
             self.action_anchor_schedule = [self.command_anchor_action]
@@ -377,6 +381,14 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             if elapsed_h < 7.0:
                 return "responsefull"
             return "responsecalib"
+        if self.schedule_mode == "p3_low_recovery_v1":
+            if elapsed_h < 0.5: return "lowbase"
+            if elapsed_h < 2.0: return "lowmild"
+            if elapsed_h < 3.5: return "lowmedium"
+            if elapsed_h < 5.0: return "lowfull"
+            if elapsed_h < 6.0: return "adaptercalib"
+            if elapsed_h < 6.5: return "highadapt"
+            return "highslow"
         if self.schedule_mode == "visual_anchor_anneal_v2":
             ends = self.anchor_phase_end_hours
             if elapsed_h < ends[0]:
@@ -403,6 +415,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         if self.schedule_mode in {
             "visual_command_generalization_v1",
             "p15_response_adapter_v1",
+            "p3_low_recovery_v1",
         }:
             return (
                 self.command_anchor_action
@@ -461,12 +474,17 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         if self.schedule_mode in {
             "visual_command_generalization_v1",
             "p15_response_adapter_v1",
+            "p3_low_recovery_v1",
         }:
-            enabled = not (
-                self.schedule_mode == "p15_response_adapter_v1"
-                and phase == "responsecalib"
-            )
-            actor_enabled, recurrent_enabled = enabled, enabled
+            if self.schedule_mode == "p3_low_recovery_v1":
+                actor_enabled = phase in {"lowbase", "lowmild", "lowmedium", "lowfull"}
+                recurrent_enabled = phase in {"lowbase", "lowmild", "lowmedium", "lowfull"}
+            else:
+                enabled = not (
+                    self.schedule_mode == "p15_response_adapter_v1"
+                    and phase == "responsecalib"
+                )
+                actor_enabled, recurrent_enabled = enabled, enabled
         elif self.schedule_mode == "visual_anchor_anneal_v2":
             table = {
                 "anchorcritic": (False, False),
@@ -489,8 +507,11 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         for parameter in self.actor_critic.actor.parameters():
             parameter.requires_grad_(actor_enabled)
         critic_enabled = not (
-            self.schedule_mode == "p15_response_adapter_v1"
-            and phase == "responsecalib"
+            (self.schedule_mode == "p15_response_adapter_v1" and phase == "responsecalib")
+            or (
+                self.schedule_mode == "p3_low_recovery_v1"
+                and phase in {"adaptercalib", "highadapt", "highslow"}
+            )
         )
         for parameter in self.actor_critic.critic.parameters():
             parameter.requires_grad_(critic_enabled)
@@ -587,6 +608,21 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         action = self.anchor_actor(torch.cat((proprio, latent), dim=-1))
         return action, latent
 
+    def anchor_inference_from_cnn_features(
+        self,
+        proprio: torch.Tensor,
+        cnn_features: torch.Tensor,
+    ):
+        """Reuse the live frozen CNN output for the immutable anchor replay."""
+        latent = self.anchor_encoder.forward_from_cnn_features(
+            cnn_features,
+            proprio,
+            masks=None,
+            detach_hidden=True,
+        )
+        action = self.anchor_actor(torch.cat((proprio, latent), dim=-1))
+        return action, latent
+
     def reset_recurrent_states(self, dones: torch.Tensor) -> None:
         self.actor_critic.reset(dones)
         done_ids = torch.nonzero(dones.reshape(-1).bool(), as_tuple=False).flatten()
@@ -672,6 +708,16 @@ class AlgorithmVisualPPO(AlgorithmPPO):
     # Learn
     # ------------------------------------------------------------------
 
+    def _prepare_training_modules(self) -> None:
+        """Set recurrent PPO modules to modes compatible with CUDA backward."""
+        self.actor_critic.train()
+        # The visual CNN is permanently frozen.  Keep its BatchNorm statistics
+        # fixed while allowing the recurrent encoder and policy heads to run in
+        # training mode, including phases where their parameters are frozen.
+        self.actor_critic.vision_encoder.cnn.eval()
+        self.anchor_encoder.eval()
+        self.anchor_actor.eval()
+
     def learn(self, elapsed_h: float | None = None) -> dict[str, float]:
         elapsed_h = (
             self.anchor_session_elapsed_hours if elapsed_h is None else float(elapsed_h)
@@ -689,6 +735,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         hard_rate = self._update_safety_state(elapsed_h)
         self._set_trainable_phase(self.current_phase)
         self._set_phase_learning_rates(self.current_phase)
+        self._prepare_training_modules()
 
         totals = {
             "policy_loss": 0.0,

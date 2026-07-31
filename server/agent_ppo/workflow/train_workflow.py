@@ -128,6 +128,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
 
         return lbc_workflow(envs, agents, logger=logger, monitor=monitor, *args, **kwargs)
 
+    if getattr(agent, "is_p3_joint", False):
+        from agent_ppo.workflow.p3_standard_joint_workflow import (
+            workflow as p3_standard_joint_workflow,
+        )
+
+        return p3_standard_joint_workflow(
+            envs, agents, logger=logger, monitor=monitor, *args, **kwargs
+        )
+
     if getattr(agent, "is_p2_nav", False):
         from agent_ppo.workflow.p2_nav_ppo_workflow import (
             workflow as p2_nav_ppo_workflow,

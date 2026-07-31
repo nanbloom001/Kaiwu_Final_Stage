@@ -26,12 +26,21 @@ def patch_owned_commands(
     aux: torch.Tensor,
     active_target_cmd3: torch.Tensor,
     exec_cmd3: torch.Tensor,
-    command_epoch: int,
+    command_epoch: int | torch.Tensor,
 ) -> torch.Tensor:
     result = aux.clone()
     result[:, 0:3] = active_target_cmd3.to(result)
     result[:, 3:6] = exec_cmd3.to(result)
-    result[:, 26] = float(command_epoch)
+    epoch = torch.as_tensor(command_epoch, device=result.device, dtype=result.dtype)
+    if epoch.ndim == 0:
+        result[:, 26] = epoch
+    elif epoch.numel() == result.shape[0]:
+        result[:, 26] = epoch.reshape(-1)
+    else:
+        raise ValueError(
+            "command_epoch must be scalar or one value per environment, "
+            f"got {tuple(epoch.shape)} for {result.shape[0]} environments"
+        )
     return result
 
 

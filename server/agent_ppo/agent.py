@@ -45,6 +45,9 @@ from agent_ppo.checkpoint_io import (
     p15_response_parent_candidates,
     p2_nav_evaluation_candidates,
     p2_nav_training_candidates,
+    p3_standard_joint_candidates,
+    p3_standard_joint_eval_candidates,
+    validate_p3_eval_bundle,
     visual_command_parent_candidates,
     visual_eval_checkpoint_diagnostics,
     visual_eval_checkpoint_candidates,
@@ -76,6 +79,9 @@ class Agent(BaseAgent):
         self._eval_requested_model_id = None
         self._p2_eval_checkpoint_path = None
         self._p2_eval_requested_model_id = None
+        self._p3_eval_checkpoint_path = None
+        self._p3_eval_requested_model_id = None
+        self._p3_eval_phase_label = None
         self._lifecycle_probe_exploit_logged = False
         self._lifecycle_probe_predict_logged = False
         self._lifecycle_probe_learn_logged = False
@@ -138,11 +144,21 @@ class Agent(BaseAgent):
         self.is_p15_response = self.algorithm_name == "p15_response"
         self.is_p2_nav = self.algorithm_name in {"p2_nav_ppo", "p2_nav_eval"}
         self.is_p2_nav_eval = self.algorithm_name == "p2_nav_eval"
+        self.is_p3_joint = self.algorithm_name == "p3_standard_joint"
+        self.is_p3_standard_eval = self.algorithm_name == "p3_standard_eval"
+        self.is_p3_track_eval = self.algorithm_name == "p3_track_eval"
+        self.is_p3_eval = self.is_p3_standard_eval or self.is_p3_track_eval
         self.is_visual_ppo = self.algorithm_name in {"visual_ppo", "p15_response"}
         self.is_nav_dagger = self.algorithm_name == "nav_dagger"
         self.is_nav_eval = self.algorithm_name == "nav_eval"
 
-        if self.is_p2_nav:
+        if self.is_p3_standard_eval:
+            self._init_p3_standard_eval(stage, usr_conf)
+        elif self.is_p3_track_eval:
+            self._init_p3_track_eval(stage, usr_conf)
+        elif self.is_p3_joint:
+            self._init_p3_standard_joint(stage, usr_conf)
+        elif self.is_p2_nav:
             self._init_p2_nav(stage, usr_conf)
         elif self.is_lbc:
             # LBC 阶段：创建学生 + 教师；不初始化 PPO storage
@@ -181,6 +197,8 @@ class Agent(BaseAgent):
             or self.is_nav_dagger
             or self.is_nav_eval
             or self.is_p2_nav
+            or self.is_p3_joint
+            or self.is_p3_eval
         ):
             # Initialize storage
             # 初始化存储
@@ -214,6 +232,130 @@ class Agent(BaseAgent):
             algorithm=self.algorithm_name,
             num_envs=self.num_envs,
         )
+
+    def _init_p3_standard_joint(self, stage, usr_conf):
+        """Build independent low/high optimizers around shared low weights."""
+        import torch.nn as _nn
+        from agent_ppo.algorithm.algorithm_visual_ppo import AlgorithmVisualPPO
+        from agent_ppo.algorithm.algorithm_p3_standard_joint import (
+            AlgorithmP3HighPPO,
+            AlgorithmP3StandardJoint,
+        )
+        from agent_ppo.feature.p2_response_buffer import P2ResponseAuxBuffer
+        from agent_ppo.model.p2_high_level import (
+            NavigationEncoder,
+            NavigationSafetyHead,
+            P2NavigationActor,
+            P2NavigationCritic,
+        )
+        from agent_ppo.model.response_adapter import CommandResponseAdapter
+        from agent_ppo.model.visual_actor_critic import VisualActorCritic
+
+        conf = usr_conf.get("p3_standard_joint", {})
+        if not isinstance(conf, dict):
+            conf = {}
+        self.num_obs = stage.num_actor_observations
+        self.num_critic_obs = stage.num_critic_observations
+        self.low_level_model = VisualActorCritic(
+            num_proprio=45,
+            num_scan=256,
+            depth_shape=(180, 320, 1),
+            latent_dim=32,
+            cnn_output_dim=32,
+            lstm_hidden_size=64,
+            lstm_num_layers=2,
+            num_critic_obs=self.num_critic_obs,
+            num_actions=12,
+            actor_hidden_dims=stage.actor_hidden_dims,
+            critic_hidden_dims=stage.critic_hidden_dims,
+            activation=stage.activation,
+            init_noise_std=float(conf.get("init_noise_std", 0.15)),
+        ).to(self.device)
+        self.anchor_encoder = copy.deepcopy(self.low_level_model.vision_encoder).to(self.device)
+        self.anchor_actor = copy.deepcopy(self.low_level_model.actor).to(self.device)
+        for parameter in self.low_level_model.vision_encoder.cnn.parameters():
+            parameter.requires_grad_(False)
+        self.low_level_optimizer = optim.Adam(
+            [
+                {"params": [*self.low_level_model.actor.parameters()], "lr": float(conf.get("actor_learning_rate", 1e-5)), "name": "actor"},
+                {"params": [*self.low_level_model.vision_encoder.rnn.parameters(), *self.low_level_model.vision_encoder.rnn_output_layer.parameters()], "lr": float(conf.get("lstm_learning_rate", 5e-6)), "name": "lstm"},
+                {"params": self.low_level_model.critic.parameters(), "lr": float(conf.get("critic_learning_rate", 1e-4)), "name": "critic"},
+            ]
+        )
+        self.low_level_algorithm = AlgorithmVisualPPO(
+            model=self.low_level_model,
+            anchor_encoder=self.anchor_encoder,
+            anchor_actor=self.anchor_actor,
+            optimizer=self.low_level_optimizer,
+            sequence_length=int(conf.get("tbptt_sequence_length", 16)),
+            schedule_mode="p3_low_recovery_v1",
+            run_name=str(conf.get("run_name", "p3std8h-sim2real")),
+            source_parent_model_id=conf.get("parent_model_id"),
+            anchor_schedule_hours=[], action_anchor_schedule=None,
+            latent_anchor_schedule=None, anchor_phase_labels=None,
+            anchor_phase_end_hours=[], critic_warmup_learning_rate=None,
+            task_end_hours=8.0, warning_only_safety=True,
+            max_anchor_action_mse=0.10, max_hard_termination_delta=0.05,
+            max_action_amplitude=6.0, command_anchor_action=0.20,
+            command_anchor_latent=0.05, device=self.device,
+            logger=self.logger, monitor=self.monitor, clip_param=0.2,
+            gamma=0.99, lam=0.95, value_loss_coef=1.0, entropy_coef=0.01,
+            learning_rate=1e-5, max_grad_norm=float(conf.get("max_grad_norm", 1.0)),
+            num_mini_batches=int(conf.get("num_mini_batches", 4)),
+            num_learning_epochs=int(conf.get("num_learning_epochs", 5)),
+            desired_kl=None,
+        )
+        self.low_level_algorithm.init_storage(
+            self.num_envs, int(conf.get("num_steps_per_env", 80)),
+            actor_obs_shape=(77,), critic_obs_shape=(323,),
+            action_shape=(12,), device=self.device,
+        )
+        self.low_level_algorithm.initialize_recurrent_states(self.num_envs)
+
+        self.navigation_encoder = NavigationEncoder().to(self.device)
+        self.navigation_safety_head = NavigationSafetyHead().to(self.device)
+        self.p2_actor = P2NavigationActor().to(self.device)
+        self.p2_critic = P2NavigationCritic().to(self.device)
+        self.response_adapter = CommandResponseAdapter().to(self.device)
+        response_conf = conf.get("response_adapter", {})
+        self.response_aux_buffer = P2ResponseAuxBuffer(
+            self.num_envs, "cpu",
+            capacity_steps=int(response_conf.get("capacity_steps", 4096)),
+            sequence_length=int(response_conf.get("sequence_length", 16)),
+            burn_in_steps=int(response_conf.get("burn_in_steps", 8)),
+        )
+        self.high_level_algorithm = AlgorithmP3HighPPO(
+            low_level_encoder=self.low_level_model.vision_encoder,
+            low_level_actor=self.low_level_model.actor,
+            navigation_encoder=self.navigation_encoder,
+            safety_head=self.navigation_safety_head,
+            actor=self.p2_actor, critic=self.p2_critic,
+            response_adapter=self.response_adapter,
+            response_buffer=self.response_aux_buffer,
+            num_envs=self.num_envs, device=self.device, config=conf,
+            logger=self.logger, monitor=self.monitor,
+        )
+        self.high_level_algorithm.attach_low_algorithm(self.low_level_algorithm)
+        self.algorithm = AlgorithmP3StandardJoint(
+            low_algorithm=self.low_level_algorithm,
+            high_algorithm=self.high_level_algorithm,
+            config=conf, logger=self.logger,
+        )
+        low_ids = {id(p) for group in self.low_level_optimizer.param_groups for p in group["params"]}
+        high_ids = {id(p) for opt in (self.high_level_algorithm.actor_optimizer, self.high_level_algorithm.critic_optimizer, self.high_level_algorithm.response_optimizer) for group in opt.param_groups for p in group["params"]}
+        if low_ids & high_ids:
+            raise ValueError("P3 low/high optimizer parameter sets overlap")
+        self.model = _nn.ModuleDict({
+            "low_level": self.low_level_model,
+            "navigation_encoder": self.navigation_encoder,
+            "navigation_safety_head": self.navigation_safety_head,
+            "high_actor": self.p2_actor,
+            "high_critic": self.p2_critic,
+            "response_adapter": self.response_adapter,
+        })
+        self.training_elapsed_h = 0.0
+        self._p3_parent_model_id = str(conf.get("parent_model_id", 648278))
+        self.logger.info("[P3] joint assembly initialized; low/high optimizers isolated")
 
     def _init_flat(self, num_proprio, num_scan, stage):
         """
@@ -534,6 +676,112 @@ class Agent(BaseAgent):
             "[P2NavPPO] eval-only assembly initialized; modules="
             "low_level/navigation_encoder/actor/response_adapter "
             "critic=absent optimizers=absent response_buffer=absent"
+        )
+
+    def _init_p3_standard_eval(self, stage, usr_conf):
+        """P3 Standard+Camera 低层-only 评估装配（obs 57901）。
+
+        只构建冻结低层 VisionEncoder + Actor77，从一个 P3 包加载
+        ``modules.low_level.locomotion_encoder`` 与 ``modules.low_level.actor``。
+        不创建高层 Actor/NavigationEncoder/ResponseAdapter/SafetyHead/Critic、
+        optimizer 或训练 buffer，也不使用 P3 局部目标/goal4/命令覆盖。
+        """
+        from agent_ppo.model.vision_encoder import VisionEncoder
+
+        self.num_obs = stage.num_actor_observations
+        self.num_critic_obs = stage.num_critic_observations
+        self.vision_encoder = VisionEncoder(
+            image_shape=(stage.depth_height, stage.depth_width, stage.depth_channels),
+            proprio_dim=stage.proprio_dim,
+            cnn_output_dim=stage.cnn_output_dim,
+            rnn_hidden_dim=stage.lstm_hidden_size,
+            rnn_num_layers=stage.lstm_num_layers,
+            rnn_output_dim=stage.latent_dim,
+            use_lstm=True,
+        ).to(self.device)
+        self.teacher_actor = self._build_nav_low_level_actor(stage)
+        for module in (self.vision_encoder, self.teacher_actor):
+            module.eval()
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+        self.algorithm = None
+        self.model = self.vision_encoder
+        self._p3_eval_checkpoint_path = None
+        self._p3_eval_requested_model_id = None
+        self.training_elapsed_h = 0.0
+        self.logger.info(
+            "[P3] Standard eval-only assembly initialized; modules="
+            "low_level.locomotion_encoder/low_level.actor "
+            "high_level=absent optimizers=absent training_buffer=absent"
+        )
+
+    def _init_p3_track_eval(self, stage, usr_conf):
+        """P3 Track+Camera 完整高低层评估装配（obs 57905）。
+
+        复用 P2 ``AlgorithmP2NavPPO(training=False)`` 的 5Hz 高层 / 50Hz 低层
+        推理机器，从一个 P3 包加载低层 VisionEncoder/Actor 与
+        NavigationEncoder、三轴 Actor/LSTM、ResponseAdapter。SafetyHead/Critic、
+        optimizer、scheduler、PPO storage 与 ResponseBuffer 一律不创建。
+        """
+        import torch.nn as _nn
+
+        from agent_ppo.algorithm.algorithm_p2_nav_ppo import AlgorithmP2NavPPO
+        from agent_ppo.model.p2_high_level import NavigationEncoder, P2NavigationActor
+        from agent_ppo.model.response_adapter import CommandResponseAdapter
+        from agent_ppo.model.vision_encoder import VisionEncoder
+
+        self.num_obs = stage.num_actor_observations
+        self.num_critic_obs = stage.num_critic_observations
+        self.low_level_encoder = VisionEncoder(
+            image_shape=(stage.depth_height, stage.depth_width, stage.depth_channels),
+            proprio_dim=stage.proprio_dim,
+            cnn_output_dim=stage.cnn_output_dim,
+            rnn_hidden_dim=stage.lstm_hidden_size,
+            rnn_num_layers=stage.lstm_num_layers,
+            rnn_output_dim=stage.latent_dim,
+            use_lstm=True,
+        ).to(self.device)
+        self.low_level_actor = self._build_nav_low_level_actor(stage)
+        self.navigation_encoder = NavigationEncoder().to(self.device)
+        self.p2_actor = P2NavigationActor().to(self.device)
+        self.response_adapter = CommandResponseAdapter().to(self.device)
+        p3_conf = usr_conf.get("p3_standard_joint", {})
+        if not isinstance(p3_conf, dict):
+            p3_conf = {}
+        p2_conf = usr_conf.get("p2_nav_ppo", {})
+        if not isinstance(p2_conf, dict):
+            p2_conf = {}
+        self.model = _nn.ModuleDict(
+            {
+                "navigation_encoder": self.navigation_encoder,
+                "actor": self.p2_actor,
+                "response_adapter": self.response_adapter,
+            }
+        )
+        self.algorithm = AlgorithmP2NavPPO(
+            low_level_encoder=self.low_level_encoder,
+            low_level_actor=self.low_level_actor,
+            navigation_encoder=self.navigation_encoder,
+            safety_head=None,
+            actor=self.p2_actor,
+            critic=None,
+            response_adapter=self.response_adapter,
+            response_buffer=None,
+            num_envs=self.num_envs,
+            device=self.device,
+            config=p3_conf or p2_conf,
+            logger=self.logger,
+            monitor=self.monitor,
+            training=False,
+        )
+        self.training_elapsed_h = 0.0
+        self._p3_eval_checkpoint_path = None
+        self._p3_eval_requested_model_id = None
+        self.logger.info(
+            "[P3] Track eval-only assembly initialized; modules="
+            "low_level/navigation_encoder/actor/response_adapter "
+            "critic=absent safety_head=absent optimizers=absent "
+            "response_buffer=absent"
         )
 
     def _build_nav_low_level_actor(self, stage):
@@ -971,6 +1219,24 @@ class Agent(BaseAgent):
                 )
                 self.algorithm.eval_frame_advance()
                 return [ActData(action=result["actions"])]
+            if self.is_p3_standard_eval:
+                self._ensure_p3_eval_checkpoint_loaded()
+                return self._exploit_p3_standard_eval(list_obs_data)
+            if self.is_p3_track_eval:
+                self._ensure_p3_eval_checkpoint_loaded()
+                obs, critic_wire = self._p2_eval_inputs(list_obs_data)
+                result, _, _ = self.algorithm.frame_begin(
+                    obs, critic_wire, deterministic=True
+                )
+                self.algorithm.eval_frame_advance()
+                return [ActData(action=result["actions"])]
+            if self.is_p3_joint:
+                obs, critic_wire = self._p2_eval_inputs(list_obs_data)
+                result, _, _ = self.high_level_algorithm.frame_begin(
+                    obs, critic_wire, deterministic=True
+                )
+                self.high_level_algorithm.eval_frame_advance()
+                return [ActData(action=result["actions"])]
             if self.is_lbc:
                 return self._exploit_lbc_loco(obs)
             if self.is_nav_dagger or self.is_nav_eval:
@@ -1036,6 +1302,32 @@ class Agent(BaseAgent):
         if self._p2_eval_checkpoint_path is None:
             raise RuntimeError(
                 "P2 eval checkpoint was not loaded; refusing random inference"
+            )
+
+    def _ensure_p3_eval_checkpoint_loaded(self) -> None:
+        if not self.is_p3_eval or self._p3_eval_checkpoint_path is not None:
+            return
+        from common_python.config.config_control import CONFIG
+
+        model_dir = getattr(CONFIG, "eval_model_dir", None)
+        model_id = getattr(CONFIG, "eval_model_id", None)
+        if not model_dir or model_id in (None, ""):
+            import toml
+
+            configure_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "conf", "configure_app.toml")
+            )
+            app_conf = toml.load(configure_path).get("app", {})
+            model_dir = model_dir or app_conf.get("eval_model_dir")
+            model_id = model_id if model_id not in (None, "") else app_conf.get("eval_model_id")
+        if not model_dir or model_id in (None, ""):
+            raise RuntimeError(
+                "P3 eval checkpoint location is unavailable; refusing random inference"
+            )
+        self._load_p3_eval(str(model_dir), str(model_id))
+        if self._p3_eval_checkpoint_path is None:
+            raise RuntimeError(
+                "P3 eval checkpoint was not loaded; refusing random inference"
             )
 
     def _log_visual_eval_runtime_diagnostics(self, obs, actions) -> None:
@@ -1120,6 +1412,33 @@ class Agent(BaseAgent):
 
         return [ActData(action=joint_actions)]
 
+    def _exploit_p3_standard_eval(self, obs):
+        """P3 Standard 低层-only 推理：obs 57901 → 12 维关节动作。
+
+        只运行冻结低层 VisionEncoder + Actor77；不使用 goal4、P3 局部目标、
+        SafetyHead、Critic 或训练命令覆盖。未加载 checkpoint 时拒绝推理。
+        """
+        from agent_ppo.feature import p3_contract
+
+        if self._p3_eval_checkpoint_path is None:
+            raise RuntimeError(
+                "[P3 standard eval] checkpoint not loaded; refusing random inference"
+            )
+        obs = torch.as_tensor(obs, device=self.device)
+        if obs.ndim != 2 or obs.shape[1] != p3_contract.LOW_LEVEL_POLICY_OBS_DIM:
+            raise ValueError(
+                f"[P3 standard eval] obs must be [N,57901], got {tuple(obs.shape)}"
+            )
+        proprio = obs[:, :45]
+        depth = obs[:, p3_contract.PROPRIO_SCAN_DIM :].reshape(
+            obs.shape[0], 180, 320, 1
+        )
+        latent = self.vision_encoder(depth_image=depth, proprio=proprio, masks=None)
+        action = self.teacher_actor(
+            torch.cat([proprio, latent], dim=-1)
+        )
+        return [ActData(action=action)]
+
     def learn(self, list_sample_data=None):
         """
         Trigger learning process using sample data.
@@ -1140,6 +1459,11 @@ class Agent(BaseAgent):
         if self.is_behavior_distill:
             return None
         if self.is_p2_nav:
+            return None
+        if self.is_p3_joint:
+            return None
+        if self.is_p3_eval:
+            # P3 评估装配不含训练算法/optimizer，任何 learn 调用都是 no-op。
             return None
         if self.is_nav_dagger or self.is_nav_eval:
             # nav 训练在 nav_dagger_workflow 内直接调 algorithm；此处 no-op
@@ -1202,6 +1526,16 @@ class Agent(BaseAgent):
             raise RuntimeError(
                 "agent.predict() is not used in P2; p2_nav_ppo_workflow owns "
                 "semi-MDP collection and recurrent PPO updates."
+            )
+        if self.is_p3_joint:
+            raise RuntimeError(
+                "agent.predict() is not used in P3; p3_standard_joint_workflow "
+                "owns low/high recurrent collection and updates."
+            )
+        if self.is_p3_eval:
+            raise RuntimeError(
+                "agent.predict() is not used in P3 evaluation; the platform "
+                "calls exploit() for every frame."
             )
         if self.is_nav_dagger or self.is_nav_eval:
             raise RuntimeError(
@@ -1353,6 +1687,17 @@ class Agent(BaseAgent):
         id 由平台框架注入（调用 agent.save_model() 时不传 id）；不得用 iteration
         人工计算 id，否则平台模型池 ID / 文件名 / 任务页记录会不一致。
         """
+        if self.is_p3_eval:
+            # 评估装配不含训练状态，绝不允许写出 checkpoint。
+            if str(id) == "0":
+                self.logger.warning(
+                    "[P3 eval] skip framework bootstrap save id=0; "
+                    "evaluation never writes checkpoints"
+                )
+                return
+            raise RuntimeError(
+                "[P3 eval] evaluation assembly must not write training checkpoints"
+            )
         if (self.is_nav_dagger or self.is_nav_eval) and not self._lifecycle_probe_save_logged:
             self._lifecycle_probe_save_logged = True
             self.logger.info(
@@ -1379,7 +1724,28 @@ class Agent(BaseAgent):
         else:
             model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
 
-        if self.is_p2_nav:
+        if self.is_p3_joint:
+            if str(id) == "0" and not getattr(
+                self.algorithm, "parent_loaded", False
+            ):
+                self.logger.warning(
+                    "[P3] skip framework bootstrap save id=0 before parent preload"
+                )
+                return
+            phase_label = self.algorithm.current_phase
+            p3_path = f"{path}/model.ckpt-{phase_label}-{str(id)}.pkl"
+            if not validate_probe_filename(p3_path):
+                raise ValueError(
+                    f"P3 checkpoint filename not probe-compatible: {p3_path}"
+                )
+            checksum = self.algorithm.save_training_bundle(
+                p3_path, platform_model_id=id
+            )
+            self.logger.info(
+                f"[P3] save bundle={p3_path} phase={phase_label} "
+                f"platform_id={id} sha256={checksum} deployable=false"
+            )
+        elif self.is_p2_nav:
             if self.is_p2_nav_eval:
                 self.logger.info("[p2_nav_eval] save_model is a no-op")
                 return
@@ -1580,6 +1946,7 @@ class Agent(BaseAgent):
             or self.is_nav_dagger
             or self.is_nav_eval
             or self.is_p2_nav
+            or self.is_p3_joint
         ):
             self._save_side_locomotion(path, id)
 
@@ -1680,7 +2047,11 @@ class Agent(BaseAgent):
                 "[LifecycleProbe] nav_load_model inventory "
                 f"pid={os.getpid()} requested_id={id} same_id_files={same_id_files}"
             )
-        if self.is_p2_nav:
+        if self.is_p3_eval:
+            self._load_p3_eval(path, id)
+        elif self.is_p3_joint:
+            self._load_p3_standard_joint(path, id)
+        elif self.is_p2_nav:
             self._load_p2_nav(path, id)
         elif self.is_visual_ppo:
             self._load_visual_ppo(path, id)
@@ -1704,6 +2075,125 @@ class Agent(BaseAgent):
                 requested_id=str(id),
                 selected=self.cur_model_name,
             )
+
+    def _load_p3_standard_joint(self, path=None, id="1"):
+        if not path:
+            raise FileNotFoundError("[P3] preload path is empty")
+        requested = str(id)
+        candidates = p3_standard_joint_candidates(
+            path,
+            requested,
+            parent_model_id=self._p3_parent_model_id,
+        )
+        selected = next(
+            (candidate for candidate in candidates if os.path.isfile(candidate)), None
+        )
+        if selected is None:
+            raise FileNotFoundError(
+                "[P3] no compatible resume or configured P2 parent checkpoint; "
+                f"requested_id={requested} tried={candidates}"
+            )
+        selected_id = os.path.basename(selected).rsplit("-", 1)[-1].split(".", 1)[0]
+        if requested != "latest" and selected_id != requested:
+            self.logger.warning(
+                "[P3] requested model ID differs from selected file; continuing "
+                "with structural validation. "
+                f"requested={requested} selected_id={selected_id} selected={selected}"
+            )
+        load_mode = self.algorithm.load_checkpoint(
+            selected, platform_model_id=requested
+        )
+        self.training_elapsed_h = self.algorithm.session_effective_seconds / 3600.0
+        self.cur_model_name = selected
+        self.logger.info(
+            f"[P3] load complete mode={load_mode} requested_id={requested} "
+            f"selected={selected} session_h={self.training_elapsed_h:.3f}"
+        )
+
+    def _load_p3_eval(self, path=None, id="1"):
+        """P3 eval 加载分派：Standard 低层-only / Track 完整高低层。
+
+        两个入口共用同一个 P3 checkpoint 发现与结构验证规则。ID/标签/lineage
+        不一致只告警；候选只含 P3 阶段文件，绝不回退到 P2、LBC 或随机权重。
+        选中文件后反序列化、模块/spec/shape 或有限值错误必须硬失败。
+        """
+        if not path:
+            raise FileNotFoundError("[P3 eval] preload path is empty")
+        requested = str(id)
+        candidates = p3_standard_joint_eval_candidates(path, requested)
+        selected = next(
+            (candidate for candidate in candidates if os.path.isfile(candidate)),
+            None,
+        )
+        if selected is None:
+            raise FileNotFoundError(
+                f"[P3 eval] no P3 checkpoint for requested_id={requested}; "
+                f"tried={candidates}. Refusing to fall back to P2/LBC/random weights."
+            )
+        selected_id = os.path.basename(selected).rsplit("-", 1)[-1].split(".", 1)[0]
+        if requested != "latest" and selected_id != requested and self.logger:
+            self.logger.warning(
+                "[P3 eval] requested model ID differs from selected file; "
+                "continuing with structural validation (warning-only identity). "
+                f"requested={requested} selected_id={selected_id} selected={selected}"
+            )
+        self._eval_requested_model_id = requested
+        if self.is_p3_standard_eval:
+            self._load_p3_standard_eval_weights(selected, requested)
+        else:
+            self._load_p3_track_eval_weights(selected, requested)
+        self.cur_model_name = selected
+
+    def _load_p3_standard_eval_weights(self, selected, requested):
+        """Standard 低层-only：只加载 P3 包的 locomotion_encoder + actor。"""
+        raw = torch.load(selected, weights_only=False, map_location=self.device)
+        if not isinstance(raw, dict):
+            raise ValueError("[P3 standard eval] checkpoint payload is not a dict")
+        disposition = validate_p3_eval_bundle(raw, mode="standard")
+        low = (raw.get("modules") or {}).get("low_level") or {}
+        encoder_state = (low.get("locomotion_encoder") or {}).get("state_dict")
+        actor_state = (low.get("actor") or {}).get("state_dict")
+        if not isinstance(encoder_state, dict) or not isinstance(actor_state, dict):
+            raise KeyError(
+                "[P3 standard eval] low-level encoder/actor state missing"
+            )
+        validate_state_dict_finite(
+            encoder_state, "P3 standard eval low_level.locomotion_encoder"
+        )
+        validate_state_dict_finite(actor_state, "P3 standard eval low_level.actor")
+        self.vision_encoder.load_state_dict(encoder_state, strict=True)
+        self.vision_encoder.eval()
+        self.vision_encoder.reset_hidden_state(
+            batch_size=self.num_envs, device=self.device
+        )
+        self.teacher_actor.load_state_dict(actor_state, strict=True)
+        self.teacher_actor.eval()
+        checksum = self._checkpoint_sha256(selected)
+        self._p3_eval_checkpoint_path = selected
+        self._p3_eval_phase_label = disposition["phase_label"]
+        self.logger.info(
+            f"[P3] Standard eval checkpoint loaded selected={selected} "
+            f"phase_label={disposition['phase_label']} sha256={checksum} "
+            "eval_disposition=low_level_only "
+            "loaded_modules=low_level.locomotion_encoder/low_level.actor"
+        )
+
+    def _load_p3_track_eval_weights(self, selected, requested):
+        """Track 完整高低层：从同一 P3 包加载低层 + 完整高层推理模块。"""
+        load_mode = self.algorithm.load_p3_evaluation_bundle(
+            selected, platform_model_id=requested
+        )
+        checksum = self._checkpoint_sha256(selected)
+        self._p3_eval_checkpoint_path = selected
+        self._p3_eval_phase_label = getattr(
+            self.algorithm, "_p3_eval_phase_label", None
+        )
+        self.logger.info(
+            f"[P3] Track eval checkpoint loaded selected={selected} "
+            f"phase_label={self._p3_eval_phase_label} sha256={checksum} "
+            f"load_mode={load_mode} eval_disposition=full_hierarchy "
+            "loaded_modules=low_level/navigation_encoder/actor/response_adapter"
+        )
 
     def _load_p2_nav(self, path=None, id="1"):
         if not path:

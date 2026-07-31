@@ -123,7 +123,10 @@ class NavGoalChain:
                 self.dropout_remaining_s[starts] = duration
 
         true_xy = build_track_goal_raw(env)  # [N, 2]，真值缺席时为全零
-        goal_available = bool(getattr(env, "goal_positions", None) is not None)
+        goal_available = bool(
+            getattr(env, "_p3_goal_positions", None) is not None
+            or getattr(env, "goal_positions", None) is not None
+        )
 
         due = (self.age_s >= self.period_s) & (self.dropout_remaining_s <= 0.0)
         if goal_available and bool(due.any()):
