@@ -40,6 +40,10 @@ public:
             data.joint_vel[i] = motor.dq();
             data.joint_effort[i] = motor.tau_est();
         }
+        for(int i(0); i<4; i++) {
+            data.foot_force[i] = lowstate->msg_.foot_force()[i];
+            data.foot_force_est[i] = lowstate->msg_.foot_force_est()[i];
+        }
     }
 
     LowStatePtr lowstate;
