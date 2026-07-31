@@ -105,6 +105,18 @@ private:
     std::vector<float> buf_;
 };
 
+// Optional RealSense post-processing. Hole filling and decimation stay disabled
+// because they can erase thin obstacle boundaries seen by the policy.
+struct FilterConfig
+{
+    std::string mode = "none";
+    float spatial_smooth_alpha = 0.5f;
+    int spatial_magnitude = 2;
+    int spatial_smooth_delta = 20;
+    float temporal_alpha = 0.25f;
+    float temporal_delta = 20.0f;
+};
+
 #ifdef USE_REALSENSE
 } // namespace vision_nav
 #include <librealsense2/rs.hpp>
@@ -114,7 +126,9 @@ namespace vision_nav
 class RealSenseDepth : public DepthSource
 {
 public:
-    RealSenseDepth(int want_w = 424, int want_h = 240, int want_fps = 30)
+    RealSenseDepth(int want_w = 424, int want_h = 240, int want_fps = 30,
+                   const FilterConfig& filters = {})
+    : filt_(filters)
     {
         int cw, ch, cfps;
         _pick_profile(want_w, want_h, want_fps, cw, ch, cfps);
@@ -146,6 +160,26 @@ public:
             spdlog::warn("[depth] RealSense {}x{}@{}fps scale={:.5f}（无内参，最近邻缩放→320x180）",
                          cw, ch, cfps, units_);
         }
+
+        use_spatial_ = filt_.mode == "light_spatial" ||
+                       filt_.mode == "light_spatial_weak_temporal";
+        use_temporal_ = filt_.mode == "light_spatial_weak_temporal";
+        if (use_spatial_) {
+            spatial_.set_option(RS2_OPTION_FILTER_MAGNITUDE,
+                                static_cast<float>(filt_.spatial_magnitude));
+            spatial_.set_option(RS2_OPTION_FILTER_SMOOTH_ALPHA,
+                                filt_.spatial_smooth_alpha);
+            spatial_.set_option(RS2_OPTION_FILTER_SMOOTH_DELTA,
+                                static_cast<float>(filt_.spatial_smooth_delta));
+            spatial_.set_option(RS2_OPTION_HOLES_FILL, 0.0f);
+        }
+        if (use_temporal_) {
+            temporal_.set_option(RS2_OPTION_FILTER_SMOOTH_ALPHA, filt_.temporal_alpha);
+            temporal_.set_option(RS2_OPTION_FILTER_SMOOTH_DELTA, filt_.temporal_delta);
+            temporal_.set_option(RS2_OPTION_HOLES_FILL, 0.0f);
+        }
+        spdlog::info("[depth] filter={} spatial={} temporal={} hole_filling=OFF",
+                     filt_.mode, use_spatial_, use_temporal_);
 
         buf_.assign(DEPTH_H * DEPTH_W, 0.0f);
         running_ = true;
@@ -206,6 +240,8 @@ private:
             }
             auto depth = frames.get_depth_frame();
             if (!depth) continue;
+            if (use_spatial_) depth = spatial_.process(depth);
+            if (use_temporal_) depth = temporal_.process(depth);
             int W = depth.get_width(), H = depth.get_height();
             const uint16_t* raw = reinterpret_cast<const uint16_t*>(depth.get_data());
             meters.resize((size_t)W * H);
@@ -228,6 +264,11 @@ private:
     std::mutex mtx_;
     std::thread grab_;
     std::atomic<bool> running_{false};
+    FilterConfig filt_{};
+    bool use_spatial_ = false;
+    bool use_temporal_ = false;
+    rs2::spatial_filter spatial_;
+    rs2::temporal_filter temporal_;
 };
 #endif // USE_REALSENSE
 

@@ -182,7 +182,27 @@ State_VisionLoco::State_VisionLoco(int state_mode, std::string state_string)
     }
     if (dsrc == "realsense") {
 #ifdef USE_REALSENSE
-        depth_ = std::make_unique<vision_nav::RealSenseDepth>();
+        vision_nav::FilterConfig filters;
+        if (cfg["depth"]["filters"]) {
+            const auto f = cfg["depth"]["filters"];
+            filters.mode = yaml_get<std::string>(f, "mode", filters.mode);
+            filters.spatial_magnitude = std::clamp(
+                yaml_get<int>(f, "spatial_magnitude", filters.spatial_magnitude), 1, 5);
+            filters.spatial_smooth_alpha = std::clamp(
+                yaml_get<float>(f, "spatial_smooth_alpha", filters.spatial_smooth_alpha),
+                0.25f, 1.0f);
+            filters.spatial_smooth_delta = std::clamp(
+                yaml_get<int>(f, "spatial_smooth_delta", filters.spatial_smooth_delta), 1, 50);
+            filters.temporal_alpha = std::clamp(
+                yaml_get<float>(f, "temporal_alpha", filters.temporal_alpha), 0.0f, 1.0f);
+            filters.temporal_delta = std::clamp(
+                yaml_get<float>(f, "temporal_delta", filters.temporal_delta), 1.0f, 100.0f);
+        }
+        if (filters.mode != "none" && filters.mode != "light_spatial" &&
+            filters.mode != "light_spatial_weak_temporal") {
+            throw std::runtime_error("unknown RealSense filter mode: " + filters.mode);
+        }
+        depth_ = std::make_unique<vision_nav::RealSenseDepth>(424, 240, 30, filters);
 #else
         spdlog::error("[VisionLoco] 编译时未开 USE_REALSENSE，退回 ConstantDepth。"
                       "请在 CMake 打开 -DUSE_REALSENSE=ON 并装 librealsense2-dev。");
@@ -214,6 +234,12 @@ State_VisionLoco::State_VisionLoco(int state_mode, std::string state_string)
             std::max(1, yaml_get<int>(cfg["logging"], "max_consecutive_errors", 5));
         max_raw_action_abs_ =
             std::max(1.0f, yaml_get<float>(cfg["logging"], "max_raw_action_abs", 20.0f));
+        max_target_step_rad_ = std::max(
+            0.05f, yaml_get<float>(cfg["logging"], "max_target_step_rad", 0.35f));
+        max_tracking_error_rad_ = std::max(
+            0.10f, yaml_get<float>(cfg["logging"], "max_tracking_error_rad", 0.45f));
+        max_consecutive_motion_violations_ = std::max(
+            1, yaml_get<int>(cfg["logging"], "max_consecutive_motion_violations", 2));
     }
 
     // ---------- 安全转移：翻倒 → Passive ----------
@@ -499,6 +525,8 @@ void State_VisionLoco::enter()
                      "feedback_err_vx,feedback_err_vy,feedback_err_wz,"
                      "clr_L,clr_F,clr_R,"
                      "dep_inval,dep_meanv,front_inval,front_min,front_mean,"
+                     "action_step_max,target_step_max,tracking_error_max,"
+                     "motion_rejected,motion_violations,"
                      "avx,avy,avz,pgx,pgy,pgz";
             for (int i = 0; i < 12; ++i) diag_ << ",q" << i;
             for (int i = 0; i < 12; ++i) diag_ << ",dq" << i;
@@ -523,6 +551,9 @@ void State_VisionLoco::policy_loop()
         std::chrono::duration<double>(step_dt_));
     auto next_tick = clock::now() + dt;
     const auto t_start = clock::now();
+    std::vector<float> accepted_action(12, 0.0f);
+    std::vector<float> accepted_target = default_joint_pos_;
+    int motion_violations = 0;
 
     while (running_) {
         const auto loop_start = clock::now();
@@ -581,10 +612,39 @@ void State_VisionLoco::policy_loop()
             float v = act_offset_[i] + act_scale_ * out.joint[i];
             tgt[i] = std::clamp(v, act_clip_lo_, act_clip_hi_);
         }
-        {
+        float action_step_max = 0.0f;
+        float target_step_max = 0.0f;
+        float tracking_error_max = 0.0f;
+        const auto& policy_q = robot_->data.joint_pos;
+        for (int i = 0; i < 12; ++i) {
+            action_step_max = std::max(
+                action_step_max, std::fabs(out.joint[i] - accepted_action[i]));
+            target_step_max = std::max(
+                target_step_max, std::fabs(tgt[i] - accepted_target[i]));
+            tracking_error_max = std::max(
+                tracking_error_max, std::fabs(policy_q[i] - accepted_target[i]));
+        }
+        const bool motion_rejected = target_step_max > max_target_step_rad_ ||
+                                     tracking_error_max > max_tracking_error_rad_;
+        if (motion_rejected) {
+            ++motion_violations;
+            spdlog::warn(
+                "[VisionLoco] rejected motion frame: target_step={:.3f}rad "
+                "tracking_error={:.3f}rad ({}/{})",
+                target_step_max, tracking_error_max, motion_violations,
+                max_consecutive_motion_violations_);
+            if (motion_violations >= max_consecutive_motion_violations_) {
+                spdlog::critical("[VisionLoco] repeated unsafe motion; requesting Passive");
+                policy_fault_ = true;
+                running_ = false;
+            }
+        } else {
+            motion_violations = 0;
+            accepted_action = out.joint;
+            accepted_target = tgt;
             std::lock_guard<std::mutex> lk(tgt_mtx_);
             joint_target_    = tgt;
-            last_action_raw_ = out.joint;          // 回喂用原始动作
+            last_action_raw_ = out.joint;
             have_target_     = true;
         }
 
@@ -596,12 +656,14 @@ void State_VisionLoco::policy_loop()
         if ((frame_ % 50) == 0) {
             spdlog::info("[VisionLoco] source={} theory=[{:.3f},{:.3f},{:.3f}] "
                          "exec=[{:.3f},{:.3f},{:.3f}] uwb_ok={} goal=[{:.2f},{:.2f},{:.2f},{:.2f}] "
-                         "clr=[{:.2f},{:.2f},{:.2f}] infer={:.2f}ms loop={:.2f}ms miss={}",
+                         "clr=[{:.2f},{:.2f},{:.2f}] step(a/t/e)=[{:.2f},{:.2f},{:.2f}] "
+                         "reject={} infer={:.2f}ms loop={:.2f}ms miss={}",
                          command_source_, theory_cmd[0], theory_cmd[1], theory_cmd[2],
                          out.cmd[0], out.cmd[1], out.cmd[2],
                          uwb_valid, goal[0], goal[1], goal[2], goal[3],
                          out.clearance[0], out.clearance[1], out.clearance[2],
-                         out.inference_ms, loop_ms, deadline_misses_);
+                         action_step_max, target_step_max, tracking_error_max,
+                         motion_rejected, out.inference_ms, loop_ms, deadline_misses_);
         }
 
         // 逐帧 CSV：时延 / cmd / clearance / depth / IMU / q,dq / action,target。
@@ -674,6 +736,9 @@ void State_VisionLoco::policy_loop()
             write_values(diag_, out.clearance);
             diag_ << ',' << ds.invalid_frac << ',' << ds.mean_valid
                   << ',' << ds.front_invalid << ',' << ds.front_min << ',' << ds.front_mean
+                  << ',' << action_step_max << ',' << target_step_max
+                  << ',' << tracking_error_max << ',' << (motion_rejected ? 1 : 0)
+                  << ',' << motion_violations
                   << ',' << av[0] << ',' << av[1] << ',' << av[2]
                   << ',' << pg[0] << ',' << pg[1] << ',' << pg[2];
             for (int i = 0; i < q.size(); ++i) diag_ << ',' << q[i];
@@ -685,6 +750,7 @@ void State_VisionLoco::policy_loop()
         }
 
         ++frame_;
+        if (!running_) break;
         std::this_thread::sleep_until(next_tick);
         next_tick += dt;
         if (clock::now() > next_tick + dt) next_tick = clock::now() + dt;

@@ -98,6 +98,9 @@ private:
     int log_flush_every_ = 50;
     int max_consecutive_errors_ = 5;
     float max_raw_action_abs_ = 20.0f;
+    float max_target_step_rad_ = 0.35f;
+    float max_tracking_error_rad_ = 0.45f;
+    int max_consecutive_motion_violations_ = 2;
     std::string log_dir_;
     std::ofstream diag_;
     std::string   diag_path_;
