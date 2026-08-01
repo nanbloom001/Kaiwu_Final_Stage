@@ -29,6 +29,7 @@ from agent_ppo.workflow.p3_standard_joint_workflow import (
     _storage_bytes,
     _zero_inactive_high_commands,
 )
+from agent_ppo.tools.p3_joint_rollout_smoke import _smoke_num_mini_batches
 
 
 def _module():
@@ -47,6 +48,13 @@ def test_p35_integrated_smoke_uses_current_repair_phase():
     ).read_text(encoding="utf-8")
     assert 'PHASE_BOUNDARIES["repair"]' in source
     assert 'PHASE_BOUNDARIES["stairrobust"]' not in source
+
+
+@pytest.mark.parametrize(
+    ("num_envs", "expected"), ((1, 1), (2, 2), (3, 3), (4, 4), (6, 3))
+)
+def test_p35_smoke_uses_a_divisible_minibatch_count(num_envs, expected):
+    assert _smoke_num_mini_batches(num_envs, 4) == expected
 
 
 def test_p3_visual_schedule_enables_expected_low_modules():

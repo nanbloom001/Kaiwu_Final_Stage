@@ -76,6 +76,14 @@ def _assert_finite_metrics(metrics: dict, names: tuple[str, ...]) -> None:
         raise AssertionError(f"non-finite P3 smoke metrics: {invalid}")
 
 
+def _smoke_num_mini_batches(num_envs: int, requested_batches: int) -> int:
+    return max(
+        batch_count
+        for batch_count in range(1, min(requested_batches, num_envs) + 1)
+        if num_envs % batch_count == 0
+    )
+
+
 def _load_config(path: Path, num_envs: int, compact_terrain: bool) -> dict:
     config = toml.load(path)
     config["game_id"] = "p3-joint-rollout-smoke"
@@ -85,6 +93,11 @@ def _load_config(path: Path, num_envs: int, compact_terrain: bool) -> dict:
     # Exercise the high-policy -> Adapter update boundary in a single expensive
     # Isaac rollout. Unit tests separately cover the production interval of 2.
     config["p3_standard_joint"]["response_adapter"]["high_update_interval"] = 1
+    p3_conf = config["p3_standard_joint"]
+    requested_batches = int(p3_conf.get("num_mini_batches", 4))
+    p3_conf["num_mini_batches"] = _smoke_num_mini_batches(
+        num_envs, requested_batches
+    )
     if compact_terrain:
         config["terrain"]["num_rows"] = 2
         config["terrain"]["num_cols"] = 4

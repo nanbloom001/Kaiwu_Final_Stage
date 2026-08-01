@@ -3352,3 +3352,13 @@
   1-env、128 帧 integrated Isaac smoke 启动后显存峰值约 `2.78 GiB`、运行期约 `1.09 GiB`，无
   OOM；约 4 分钟时平台先返回 `WEBIDE_RECORD_NOT_FOUND`，随后 VSCode Remote WebSocket 也断开，
   未取得最终结果，因此 Isaac Camera、真实 Push EventManager 与完整 rollout 仍标记待验证。
+- 2026-08-02 容器重启后复测更正（状态：代码已修复待容器完整复测）：1-env smoke 实际只有
+  1 条 `TBPTT=128` recurrent sequence，但工具仍沿用生产 `num_mini_batches=4`，因而在 Isaac、相机、
+  128 帧 rollout 和模型加载均成功后报 `1 recurrent sequences are not divisible by num_mini_batches=4`。
+  smoke 工具现根据 env 数选择不超过生产值的最大可整除 minibatch 数，1-env 固定为 1，
+  不改正式 128-env 配置。限时复测已进入第 75 帧并观察到单进程运行显存约 `1.47 GiB`；
+  旧 smoke 在 IDE 断开后的孤儿 Isaac 子进程与新 smoke 重叠，导致合并显存最高 `3.85 GiB`，
+  该值不是单任务峰值，不用作容量结论。受五分钟预算限制未取得最终 PASS；已精确停止所有本次
+  smoke 派生进程，删除上传 ZIP、解压 checkpoint、`.uploading`/SHA 临时件、smoke 日志与
+  临时 checkpoint，复核 GPU 回到 `0/5000 MiB`。完整 Isaac Camera、Push EventManager 和 save/resume 仍待
+  下次使用进程组可控的 smoke runner 验证，不得将本次限时运行记为平台已验证。
