@@ -317,7 +317,10 @@ class P3StandardJointConfig(P2NavPPOConfig):
     ckpt_name = "model.ckpt-lowrecover"
     num_actor_observations = 57905
     num_critic_observations = 323
-    num_steps_per_env = 80
+    num_steps_per_env = 128
+    tbptt_sequence_length = 128
+    num_learning_epochs = 4
+    num_mini_batches = 4
     model_save_interval = 500
 
 

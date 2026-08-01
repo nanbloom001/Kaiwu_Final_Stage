@@ -19,44 +19,49 @@
 
 ## 活动基线
 
-- **当前 P3 功能分支入口**：`P3StandardJointConfig`（`p3_standard_joint`），任务名
-  `p3std2h30-gait-radial`，父包为 `p3nav8h-r1_884257`。P3 在一个 Standard+Camera 任务中按
-  rollout 边界执行 90 分钟低层恢复、10 分钟高层 Critic/Adapter 校准和 50 分钟高层适应；低层 CNN 始终冻结，
-  高低层 optimizer 参数不重叠。完整 policy observation 仍为 57905，高层 Actor85 不变；
-  低层在线输入适配器只删除 goal4，得到原有 57901 低层输入，不改变低层网络结构；PPO storage
-  只保存 `proprio45 + frozen_cnn_feat32 = 77`，避免 128 环境完整深度 rollout 常驻 GPU。
-- P3 私有目标改为相对真实出生点的径向里程碑：M1 `1.3-1.6m`、M2 `2.5-2.9m`，M3 使用
-  Standard 平台公式 `terrain_width/2-0.1m`。默认 8m 地块的 proxy 阈值为 `3.90m`，控制目标为
-  `3.93m`，并在最后 `0.20m/0.04m` 对向外线速度软制动；达到阈值后命令归零等待 scorer。
-  正常晋级保持方向，timeout 只允许相对原方向左右 `30/60` 度重规划。局部里程碑不触发环境 reset；
-  Standard 正式成功仍由平台 scorer 判定，并单独统计 proxy/platform 一致率。
-  平台会覆盖 `isaac_env/base_env.py`，因此 P3 不依赖任何 BaseEnv 补丁：低层恢复阶段由 worker
-  专用采样器通过公开 `base_velocity` tensor 写入并 readback 2-8 秒三轴命令，使 observation、
-  worker reward 与实际执行一致；高层接管命令后低层全程冻结，
-  只训练高层 PPO 与 Adapter。checkpoint 标签为
-  `lowbase/lowmild/lowmedium/lowfull/adaptercalib/highadapt/highslow`，保存 immutable low-level anchor、
-  低层和高层模块、optimizer、RNG、独立更新计数、DR phase 及 session/lifetime 时钟，保持
-  `deployable=false`。训练入口的 privileged wire 为 420 维，其中末 35 维只携带运行时地块尺寸、
-  contact onset/impact/touchdown/stance、joint torque/power 与映射有效位；评估入口不消费这些
-  training-only 字段。同阶段包 exact resume；P2 父包走显式 warm start。模型 ID 或 lineage
-  不一致只告警，选中文件的反序列化、必需模块、spec/shape 或有限值错误仍会停止。
+- **当前 P3 功能分支入口**：`P3StandardJointConfig`（`p3_standard_joint`），分支
+  `codex/p35-gaitfix2h`，任务 `p35gaitfix2h`。128 env、25 秒 episode、课程关闭，总计
+  7200 秒；父包固定为上一轮任务 235689 的最终 `stairfinal` checkpoint，模型 ID `1013548`。
+  父包下载加载后必须补录文件 SHA256 和模块 digest。完整 policy observation 仍为 57905，低层输入 57901、
+  Actor77、动作 12、高层输入 85 均不变。
+- 仅低层 LSTM、RNN output、最终 action head、Critic 与 ResponseAdapter 更新。低层 CNN、
+  Actor body/std、高层 NavigationEncoder/Actor/Critic/SafetyHead 及其 optimizer state 全程冻结，
+  `high_updates=0`。阶段为 `gaitfixcalib(0-15m)`、`repair(15-75m)`、`pushwarm(75-90m)`、
+  `pushfull(90-105m)`、`stable(105-120m)`；最后 15 分钟低层完全冻结、Adapter 使用 `1e-5`。
+- training-only worker wire 为 `critic323 | response+diagnostic62 | p3_extra108 = 493`。新增
+  joint-acc12、14 槽 contact force/onset/over-threshold duration、映射有效位和 Push
+  event/delta/age/active/telemetry；这些字段不进入 policy、eval、ONNX 或部署。worker wire 拆分后
+  立即回填 target/exec command，供 gait baseline、reward、Adapter 与监控使用。
+- 相机训练使用冻结 CNN feature32 的每环境随机 phase 30Hz capture、50Hz hold 和 10 帧 FP16
+  队列。前 15 分钟主动延迟关闭；15-75 分钟为 70% nominal、30% 40-100ms；75 分钟后为
+  50% nominal、35% 40-100ms、15% 100-150ms。150-250ms 只作 shadow；像素故障维持父包末段
+  50% 强度，不继续增加。eval/deploy 不启用人工增强。
+- DR 固定为 friction `[0.65,1.25]`、base mass `+-0.4kg`、restitution `[0,0.05]`、noise
+  `0.35`。EventManager `push_robot` 在进程创建时保留但速度为零；75 分钟后通过公开
+  `get_term_cfg/set_term_cfg/reset` 切到 `+-0.05m/s`，90 分钟后切到 `+-0.08m/s`，间隔
+  12-18 秒。透明 wrapper 调用 Isaac 原 `push_by_setting_velocity` 并记录真实 delta；断点 session
+  时间通过 `env.usr_conf` 传给 worker，75 分钟后的 resume 不重新等待。未修改平台覆盖的
+  `isaac_env/base_env.py`。
+- 前 15 分钟从父策略采集 joint/posture/gait envelope，之后使用正常区间严格为零且有 cap 的真实
+  推进、默认姿态、joint acceleration、undesired contact、gait responsibility 与合并姿态项。
+  Push 后 0.4 秒只减半 joint-acc/gait/非关键姿态。Hip/Thigh `17.6/22Nm`、Calf
+  `34.4/43Nm` 保留低权重平方软约束，不改变仿真 effort limit；强 contact quality/crossing/
+  starvation、deterministic smoothing 和 action-range auxiliary 保持 shadow-only。anchor、memory、
+  mirror 梯度目标为 3%/1.5%/0.5%，合计硬上限 5%。
 - P3 评估使用两个显式入口：`p3_standard_eval`（Standard+Camera，低层-only，obs 57901，
   只加载 `modules.low_level.locomotion_encoder/actor`）与 `p3_track_eval`（Track+Camera，
   完整低层+NavigationEncoder+三轴 Actor+ResponseAdapter，obs 57905）。二者共用
-  `p3_standard_joint_eval_candidates` 与 `validate_p3_eval_bundle`，标签优先级
-  `highslow>highadapt>adaptercalib>lowfull>lowmedium>lowmild>lowbase`，绝不回退 P2/LBC/随机权重；
+  `p3_standard_joint_eval_candidates` 与 `validate_p3_eval_bundle`，新标签优先级
+  `stable>pushfull>pushwarm>repair>gaitfixcalib`，并兼容 stair-memory/旧 P3 标签；绝不回退
+  P2/LBC/随机权重；
   SafetyHead/Critic/optimizer/训练 buffer 均不创建。
-- `local_abs>3.2m` 仅作诊断，不能宣称触发平台 reset。分阶段环境重建只使用平台公开支持的摩擦、
-  base added mass 与显式 observation noise；COM、PD、action gain/delay 和按环境 push 已删除。
-  所有职责边界均在保存后调用平台公开 `env.reset()`；本轮只有 0.5h 边界增强 DR 参数。
-  低层 optimizer 成功后立即推进版本并更新 Adapter，60-90 分钟每轮更新两次；集中校准阶段每轮
-  四次，高层后段每两次 PPO rollout 更新一次。真实 Isaac runtime 分布与 128 环境资源占用仍必须
-  以开发容器 smoke 为准。
-- 低层步态专项不奖励固定 trot、高步频或固定抬腿高度。前 15 分钟按正/逆坡、正/逆楼梯 ×
-  低速、前进、后退、转向/横移采集健康父策略 P95/P05 基线；样本不足按同地形、全局逐级回退，
-  全局仍不足则禁用对应奖励。15-60 分钟渐进启用接触质量、交叉落脚、步态饥饿和 25% TBPTT
-  sequence 镜像 loss。镜像 loss 只更新低层 LSTM、RNN 输出层和最终 action head，目标梯度约占
-  PPO Actor 梯度 3.5%、硬上限 10%；足端/关节映射异常时全部归零并告警。
+- 低层恢复命令域与可部署高层保持一致，`vx=[0,1.0]`，不训练高层无法发布的负 `vx`。七桶 wire
+  继续保留 reverse 槽位以兼容 checkpoint，但其采样权重固定为 0；运动类型为直行 25%、
+  `vx+wz` 35%、`vx+vy` 10%、pure-yaw 8%、brake/restart 15% 和 zero 7%。所有包含 `vx` 的
+  样本共用低/中/高 `0.10-0.35/0.35-0.70/0.70-1.00m/s` 与 55/30/15 分布。
+- 低层步态诊断仍按正/逆坡、正/逆楼梯和运动桶报告接触、滑移、触地、交叉与饥饿，但后三项
+  本轮不进入 PPO。mirror 前 45 分钟仅 shadow，之后目标梯度最多 1%；足端、关节、PD、effort
+  或 action-scale 映射异常时 mirror 与步态训练项自动归零并告警，主训练不因模型 ID 停止。
 
 - **当前功能分支入口**：`P2NavPPOConfig`（`p2_nav_ppo`），任务名 `p2nav2hsafedir`。
   它显式从最新验证通过的完整三轴 `p2nav10hvyavoid2` 包做
@@ -151,6 +156,41 @@
 ```bash
 python local_sync_client.py --check-local
 ```
+
+如果容器已经启动、但 `8765` 同步服务尚未确认，可在 Codex Chrome browser
+client 的 Node 会话中复用仓库自举 API。调用方必须传入已经登录腾讯开悟 IDE 的
+受控 `tab`；这不是普通 shell CLI：
+
+```js
+const { startKaiwuSyncService } = await import(
+  "../shared/tools/tencent_kaiwu_webide_upload.mjs"
+);
+
+const bootstrap = await startKaiwuSyncService({ tab });
+if (!bootstrap.healthy) throw new Error("Kaiwu sync service is unavailable");
+```
+
+该入口只负责确保容器内固定脚本
+`/data/projects/legged_robot_competition_26/conf/start_tongbu.sh` 已在
+`127.0.0.1:8765` 提供 HTTP 响应：已有服务不会重复启动；没有响应时才通过
+WebIDE PTY 后台启动。未携带 Token 的 `/health` 返回 `401` 仍表示服务存活，
+但不证明本地同步鉴权已经通过。自举使用的临时 WebSocket token 也不是
+`IDE_SYNC_TOKEN`。已有服务分支已在真实容器验证；冷启动分支仍须在端口自然空闲的
+新容器中复核，不能为了测试主动停止健康服务。完整证据和限制见
+[`shared/分析记录/2026-07-31_腾讯开悟WebIDE远程文件系统协议探查.md`](../shared/分析记录/2026-07-31_腾讯开悟WebIDE远程文件系统协议探查.md)。
+
+自举成功后仍从 `server/` 执行标准同步流程：
+
+```bash
+python3 local_sync_client.py --check-local
+python3 local_sync_client.py --dry-run --skip-unchanged
+python3 local_sync_client.py --skip-unchanged
+python3 container_rpc_client.py --cwd . "pwd"
+```
+
+前三条依次是离线范围检查、联网预览和正式同步；最后一条只验证 RPC 命令链。
+正式同步需要与容器一致的 `IDE_SYNC_TOKEN`，腾讯代理 Cookie 缺失或失效时按客户端
+提示使用 `--refresh-cookie`，不得把“自举成功”当作 Token/Cookie 已验证。
 
 Cookie 失效时用 `--refresh-cookie` 强制跳过缓存和旧兼容值重新录入；
 `--dry-run` 仍会连接腾讯代理并读取 `/health`、`/manifest`，但不写远程。

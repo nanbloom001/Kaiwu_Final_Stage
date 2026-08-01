@@ -4,6 +4,118 @@
 
 ## [未发布]
 
+- **[P3.5 两小时低速楼梯、相机时序与后期 Push]** 新分支
+  `codex/p35-gaitfix2h`、任务 `p35gaitfix2h` 将 P3 训练收敛为 7200 秒低层专项修复。
+  保持 policy `57905`、低层 `57901/Actor77/action12` 和高层 85 维合同不变；只训练低层
+  LSTM、RNN output、最终动作 head、Critic 与 ResponseAdapter，低层 CNN、Actor body/std 和
+  全部高层模块冻结，`high_updates=0`。地形调整为正逆楼梯各 35%、正逆坡各 15%，命令改为
+  直行 25%、`vx+wz` 35%、`vx+vy` 10%、pure-yaw 8%、brake/restart 15%、zero 7%，不采样
+  负 `vx`；worker wire 拆分后立即回填 target/exec command，避免 gait/Adapter/监控误归低速桶。
+  training-only P3 extra 从 46 扩为 108，完整 wire 从 431 扩为 493，新增 joint-acc12、14 槽
+  contact force/onset/duration、映射有效位和真实 Push event/delta/age/active/telemetry；字段不进入
+  policy、eval、ONNX 或部署。前 15 分钟采集父策略 joint/posture/gait envelope，之后启用有
+  deadzone 与 frame cap 的真实推进、默认姿态、joint acceleration、undesired contact、gait
+  responsibility 和合并姿态项；Push 后 0.4 秒只减半可恢复项。原生重复 posture/joint-acc/contact
+  权重置零，力矩仍使用 Hip/Thigh `17.6/22Nm`、Calf `34.4/43Nm` 的低权重平方软约束。
+  冻结 CNN feature32 新增每环境随机 phase 的 30Hz capture、50Hz hold 和 10 帧 FP16 队列；
+  15-75 分钟主动延迟为 70% nominal/30% 40-100ms，75 分钟后加入 15% 100-150ms，150-250ms
+  只作 shadow。EventManager `push_robot` 从进程创建保留为零速度，75 分钟通过公开
+  `get_term_cfg/set_term_cfg/reset` 切到 `+-0.05m/s`，90 分钟切到 `+-0.08m/s`，间隔 12-18 秒；
+  包装器透明调用 Isaac 原 `push_by_setting_velocity` 并记录真实 delta。checkpoint session 时间经
+  `env.usr_conf` 传给 worker，断点恢复不会重新等待 75 分钟。新增监控合同健康度、相机 age/hold、
+  Push 装配/事件/幅度/恢复/条件分桶，以及 P3.5 奖励和 3% anchor、1.5% memory、0.5% mirror
+  梯度比例。未修改平台覆盖的 `server/isaac_env/base_env.py`。
+  独立审查后进一步统一所有运动类型的 `vx` 三档范围与 restart 采样，使用普通足端 contact onset
+  放宽对应腿的 joint-acc 阈值，修正 roll/pitch 轴语义与 15/15/35/35 地形列边界。纯相机延迟帧
+  现在也进入 clean-teacher memory auxiliary，并分别监控 fault-only、delay-only 与交集占比。
+  Adapter 在最后低层冻结阶段仍按每 rollout 一次更新，replay 比例随阶段切换为
+  `50/25/25 -> 60/25/15 -> 75/15/10`；监控合同健康度改为按真实注册、有限数据和最后更新时间计算。
+  父包固定为任务 235689 的最终 `stairfinal-1013548`，SHA256 在真实制品加载后记录。
+
+- **[P3 楼梯半盲记忆与域随机化八小时恢复]** 新任务
+  `p3std8h-stairmem-dr` 从 `p3nav8h-r1_884257-F2` 显式 warm start，保持 57901 低层输入、
+  12 维动作和部署接口不变。低层 rollout/TBPTT 扩为 `128/128`，低层 CNN、高层
+  NavigationEncoder/Actor/Critic/SafetyHead 全程冻结且高层 PPO 不执行；仅更新低层
+  LSTM/Actor/Critic 与 ResponseAdapter。训练观测链新增每环境 `0.10-0.25m` Beta(1,4)
+  近裁剪和 rollout-persistent 稀疏/块状/严重孔洞与短时黑屏，使用冻结 F2 clean 教师对 fault
+  recurrent action 施加最多 3% 的 memory auxiliary，并提供 full-hidden/zero-hidden 消融指标。
+  平台 `BaseEnv` 只创建一次 Isaac 环境，因此首次 reset 即使用 friction `[0.55,1.35]`、base
+  mass `+-0.85kg`、restitution `[0,0.10]`、noise `0.55`，不再伪装 0.5 小时动态重建；通过
+  EventManager 从进程启动启用 `0.15m/s`、`8-15s` push，确保 25 秒 episode 内能够触发。
+  sparse/severe/blackout 使用 rollout 级固定空间随机秩图；severe/blackout 根据原始孔洞率只补足
+  到目标无效率，避免实测 80% 原始孔洞被重复叠加成近乎全黑。
+  Sim2Real 力矩项改为相对 Hip/Thigh `22Nm`、Calf `43Nm` 硬线的 80% 平方软约束，
+  不硬裁剪楼梯短时发力；强 contact/crossing/starvation、deterministic smoothing 与 range
+  auxiliary 均只作 shadow，PPO 仅保留低权重 prolonged-air/contact-participation 防线。
+  checkpoint 合同升级为 `p3_low_stair_memory_dr_v1`，保存故障 RNG、DR/push 配置合同、
+  memory state 与冻结高层 digest；恢复故障 RNG 后仅由进程首次环境 reset 采样一次 live near-clip，
+  避免 exact resume 额外消耗随机数。低层吞吐指标读取实际 128 帧 storage，并继续支持
+  Standard 低层-only和 Track 完整双评估。
+  阶段边界 episode reset 不再重采样 near-clip；监控新增 near-clip 桶楼梯完成率和 severe/blackout
+  事件数/持续时间。Push/DR 面板明确标记为配置合同，并用 telemetry-available=0 表示平台当前未
+  回传实际事件和逐环境物理采样，禁止将配置上下限解释为运行实测值。删除已取消高层训练后残留的
+  `short_high_adaptation_preserves` 等合同元数据。
+  监控复核后进一步补齐 near-clip 完成率的逐桶 attempt 分母、12 个地形/运动 gait 样本占比、
+  rollout 径向事件与 M3 边界面板；worker reset 结果明确标为 rollout 口径，不再与平台 scorer
+  lifetime `completed_count` 直接比较。禁用阶段仍会预采样的故障时长改名为
+  `depth_fault_planned_duration_s`，避免误解为已发生故障；P3 面板移除当前低层-only训练中不会
+  产生的 `adapter_confidence`、高层 update time 和 CPU-pinned depth H2D 空指标。
+
+- **[P3 stance 滑移单次结算与辅助训练 fail-safe]** 修复步态专项审查发现的两处训练语义问题：
+  P2 共享 gait aux 的 `GAIT_SLIP_SPEED_SLICE` 恢复为接触帧平均世界 XY 足端速度（m/s），不再
+  被 P3 的累计 stance 距离覆盖；P3 training-only tail 新增 completed-stance distance/event，
+  接触质量基线、奖励和分桶面板只在 stance 结束帧结算一次，避免同一异常在后续 1.5 秒窗口内
+  被 50Hz 重复扣分。P3 extra/wire 因此从 `42/427` 扩为 `46/431`，policy observation、评估、
+  导出和部署接口不变。gait baseline 合同升级为 v3，旧错误语义状态不能 exact resume；结构
+  兼容父包仍可 warm start。关节/PD/action-scale/contact 映射无效时，mirror、gait reward 与
+  deterministic-mean smoothing/range auxiliary 现在统一归零，不再只关闭前两项。
+
+- **[P3 25 分钟数据驱动的命令域、步态基线和监控修复]** 根据训练捕获
+  `20260801-030946`，以 `p3nav8h-r1_884257-F2` 为父包的 P3 低层恢复不再采样高层契约无法
+  发布的负 `vx`：保持七桶 checkpoint
+  布局，但 reverse 权重固定为 0，并将有效样本重新分配到低速前进、前进和 brake/restart。
+  步态基线升级为 v2，删除 reverse 运动桶，brake/zero 不进入健康基线；同地形回退只以 0.5
+  权重训练，全局回退仅作诊断，避免 75% fallback 用跨地形阈值错误塑形。监控改用独立
+  `p3_low_*`/`p3_high_*` PPO 指标，新增 KL、clip fraction、更新职责/耗时、命令桶覆盖、基线
+  回退层级、机械功率分位和四项 Sim2Real 原始分量。训练专用 worker tail 从 37 扩为 42，wire
+  从 422 扩为 427；新增字段不进入 policy observation、评估、导出或部署接口。奖励权重和网络
+  结构保持不变。课程重新分配为 120 分钟低层、10 分钟 Critic/Adapter 校准、10 分钟 Actor
+  warm-up 和 10 分钟完整高层收尾；P3 radial warm start 显式保留父包高层 Critic、Critic Adam
+  moments、return statistics 和高层梯度步数，避免 30 分钟高层阶段从零重学价值函数。
+
+- **[P3 训练侧防震荡与命令 anchor 修复]** 任务更新为
+  `p3std2h30-gait-smooth-radial`，保持父包 `p3nav8h-r1_884257`、57901 低层输入和 12 维动作接口。
+  修复 P3 sampler 继承旧 bucket-0 zero hold、使用全局 RNG 以及低层 transition 无条件
+  `anchor_weights=1` 的训练语义错误；P3 worker tail 新增 committed command bucket/anchor 两列，
+  wire 从 420 扩为 422，仅训练入口消费。低层 PPO 新增 deterministic action mean rate/jerk
+  超限辅助和 `|mean|>5` 软范围约束，梯度只连接 LSTM、RNN output 与最终 action head，并和 mirror
+  共用 10% PPO Actor 梯度上限。新增 raw/exec clip、关节目标 rate/jerk、15-25Hz 功率及分命令桶
+  clip/anchor 面板。`push_robots` 保持关闭，不把尚未隔离的外扰混入前 15 分钟 gait baseline。
+  审查后进一步修正：每个 minibatch 都重新标定 mirror/smooth/range 梯度，并按三者实际合成
+  梯度向量统一裁到 PPO policy gradient 的 10%，面板不再显示过期估算；worker command 状态
+  缺失或 wire 值非法时 anchor fail-safe 改为 0，禁止静默回退为全锚定。镜像装配的静态
+  joint/PD/effort/action-scale 核验缓存到 worker bridge 生命周期，不再在 50Hz 每帧同步 GPU。
+  P3 全 target sampler 在概率为 1 时不再调用全局 Torch RNG，保持专用 RNG 与主训练 RNG 隔离。
+  最终审查补齐四项可信度修复：镜像 preflight 精确定位平台 `JointPositionAction` 并校验实际
+  `0.25` scale 合同，避免多 action term 时误验无关项；axis-major 动作的逐腿 mirror error 改为
+  `FL[0,4,8]/FR[1,5,9]/RL[2,6,10]/RR[3,7,11]`；步态分桶只统计有效 gait 帧，impact 改按各腿
+  contact-onset 事件作分母；P3 低层 update 显式传入 coordinator 阶段，gaitcalib 不再被旧 8 小时
+  schedule 重映射为 lowbase，真实冻结策略权重及 Adam moments。
+
+- **[P3 真实父包 smoke 合同修复]** 将开发容器父包测试工具对齐当前 2.5 小时课程：分别验证
+  gaitcalib 的低层 Actor 冻结与 lowbase 的低层 Actor 更新，阶段边界使用
+  `5400/6000/7200s`，并允许低层恢复 rollout 按计划更新 Adapter。真实 `884257` 父包现可完成
+  低层 PPO、高层 PPO、Adapter update 和 save/exact-resume 联合 smoke。
+
+- **[P3 步态专项审查漂移修复]** 镜像/步态训练的 worker preflight 不再只检查关节名称顺序，
+  现在同时核验左右 action scale、PD stiffness/damping、effort limit 和 `contact_forces` 足端映射；
+  任一项不可证明对称时只关闭 training-only mirror/gait 奖励并告警，不阻断主训练。交叉落脚的
+  touchdown-y 改为完整 root quaternion 逆变换后的机体系横向坐标，避免坡面/楼梯 roll/pitch
+  造成误罚；滑移统计改为每次 stance 累计世界 XY 距离，并在 1.5 秒窗口取 stance 最大预算，
+  不再用接触帧平均速度稀释短时严重滑移。checkpoint 补齐实际运行时 M3 半径合同的保存/恢复，
+  明确 worker command sampler 因跨进程边界在环境 reset 后 fresh 初始化。面板增加正/负 `vy/wz`
+  条件响应、M3 边界差和 lifetime 时钟，并将四足滑移单位改为 stance distance。
+
 - **[P3 Standard 双评估、径向完成与步态专项 2.5 小时课程]** 新任务
   `p3std2h30-gait-radial` 从
   `p3nav8h-r1_884257` warm start。局部目标改为相对真实出生点的 M1 `1.3-1.6m`、M2
@@ -15,7 +127,7 @@
   继续归零；raw frontier clawback 改为有效 timeout 的加权均值。低层成功更新后立即推进 Adapter
   version/history 边界并执行 1/2 次 Adapter update，集中校准阶段每轮 4 次，高层后段每两轮 1 次。
   监控拆分 M1/M2、proxy/platform/joint、一致率、径向距离/历史最佳/M3 hold、低高层 reward mean
-  和 Adapter attempts/applied/skipped。低层新增 4 类地形 × 4 类运动的健康父策略基线、25% 完整
+  和 Adapter attempts/applied/skipped。低层新增 4 类地形 × 3 类运动的健康父策略基线、25% 完整
   TBPTT sequence 镜像一致性，以及只在超出基线时生效的接触滑移/冲击、交叉落脚和步态饥饿
   惩罚；旧 air-time/duty/participation shaping 权重归零。镜像梯度只进入低层 LSTM、RNN 输出层
   与最终 action head，首 15 分钟 shadow/baseline 阶段冻结 Actor，CNN 始终冻结。P3 worker wire

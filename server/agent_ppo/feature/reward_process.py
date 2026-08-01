@@ -23,6 +23,18 @@ import torch
 from tools.base_env.base_reward import RewardProcessBase
 
 
+def p3_normalized_torque_excess(
+    absolute_torque: torch.Tensor,
+    soft_limit: torch.Tensor,
+    hard_limit: torch.Tensor,
+) -> torch.Tensor:
+    """Squared soft constraint: zero at soft limit and one at hard limit."""
+    scale = (hard_limit - soft_limit).clamp_min(1.0e-6)
+    return torch.square(
+        torch.clamp((absolute_torque - soft_limit) / scale, 0.0, 1.5)
+    )
+
+
 class RewardProcess(RewardProcessBase):
     def _p2_goal_geometry(self):
         goal = getattr(self.env, "goal_positions", None)
@@ -389,11 +401,11 @@ class RewardProcess(RewardProcessBase):
             for name in joint_names:
                 lower = str(name).lower()
                 if "hip" in lower:
-                    groups.append((15.5, 20.0))
+                    groups.append((17.6, 22.0))
                 elif "thigh" in lower:
-                    groups.append((15.5, 20.0))
+                    groups.append((17.6, 22.0))
                 elif "calf" in lower:
-                    groups.append((21.0, 30.0))
+                    groups.append((34.4, 43.0))
                 else:
                     valid_mapping = False
                     break
@@ -415,7 +427,7 @@ class RewardProcess(RewardProcessBase):
         previous_action = getattr(action_manager, "prev_action", None)
         if not isinstance(state, dict) or state.get("torque_ema") is None:
             state = {
-                "torque_ema": absolute_torque.detach().clone(),
+                "torque_ema": torch.zeros_like(absolute_torque),
                 "previous_action": (
                     previous_action.detach().clone()
                     if torch.is_tensor(previous_action)
@@ -427,10 +439,13 @@ class RewardProcess(RewardProcessBase):
         alpha = 1.0 - math.exp(-max(dt_s, 0.0) / max(float(ema_window_s), 1.0e-3))
         state["torque_ema"].mul_(1.0 - alpha).add_(absolute_torque * alpha)
         soft = torch.tensor([item[0] for item in groups], device=torque.device, dtype=torque.dtype)
-        strong = torch.tensor([item[1] for item in groups], device=torque.device, dtype=torque.dtype)
-        scale = (strong - soft).clamp_min(1.0e-6)
-        sustained = torch.clamp((state["torque_ema"] - soft) / scale, 0.0, 1.0).mean(dim=1)
-        peak = torch.clamp((absolute_torque - strong) / strong, 0.0, 1.0).mean(dim=1)
+        hard = torch.tensor([item[1] for item in groups], device=torque.device, dtype=torque.dtype)
+        sustained = p3_normalized_torque_excess(
+            state["torque_ema"], soft, hard
+        ).mean(dim=1)
+        peak = p3_normalized_torque_excess(
+            absolute_torque, soft, hard
+        ).mean(dim=1)
 
         if (
             torch.is_tensor(current_action)
@@ -456,7 +471,7 @@ class RewardProcess(RewardProcessBase):
         reset = getattr(self.env, "episode_length_buf", None)
         if torch.is_tensor(reset):
             reset = reset.reshape(-1) == 0
-            state["torque_ema"][reset] = absolute_torque[reset]
+            state["torque_ema"][reset] = 0.0
             if torch.is_tensor(state.get("previous_action")) and torch.is_tensor(previous_action):
                 state["previous_action"][reset] = previous_action[reset]
         self.env._p3_torque_mapping_valid = torch.ones(

@@ -27,6 +27,13 @@ def test_low_level_adapter_removes_only_goal4():
     assert torch.equal(depth, obs[:, 305:])
 
 
+def test_p35_adapter_replay_schedule_and_stable_updates():
+    assert p3.adapter_replay_ratios(0.0) == (0.50, 0.25, 0.25)
+    assert p3.adapter_replay_ratios(4500.0) == (0.60, 0.25, 0.15)
+    assert p3.adapter_replay_ratios(6300.0) == (0.75, 0.15, 0.10)
+    assert p3.adapter_updates_per_low_rollout(7000.0) == 1
+
+
 def test_subgoals_stay_inside_tile_inner_boundary():
     root = torch.tensor([[2.9, 2.9], [-2.9, -2.9], [0.0, 0.0]])
     origin = torch.zeros_like(root)
@@ -36,25 +43,59 @@ def test_subgoals_stay_inside_tile_inner_boundary():
     assert bool(((distances >= 1.5) & (distances <= 2.8)).all())
 
 
-def test_materialized_domain_randomization_uses_phase_values():
+def test_materialized_domain_randomization_uses_static_startup_values():
     config = {
         "p3_standard_joint": {
             "domain_randomization": {
-                "friction_ranges": [[0.6, 1.3], [0.55, 1.35]],
-                "base_added_mass_kg": [0.75, 0.85],
-                "noise_levels": [0.50, 0.55],
+                "friction_range": [0.55, 1.35],
+                "base_added_mass_kg": 0.85,
+                "noise_level": 0.55,
+                "restitution_range": [0.0, 0.10],
+                "push_robots": True,
+                "min_push_interval_s": 8.0,
+                "push_interval_s": 15.0,
             }
         }
     }
     realized = p3.materialize_environment_config(config, 1800.0)
     assert realized["domain_rand"]["friction_range"] == [0.55, 1.35]
     assert realized["domain_rand"]["added_mass_range"] == [-0.85, 0.85]
-    assert realized["domain_rand"]["push_robots"] is False
+    assert realized["domain_rand"]["push_robots"] is True
+    assert realized["domain_rand"]["restitution_range"] == [0.0, 0.10]
     assert realized["p3_runtime"]["worker_command_override"] is True
     assert realized["p3_runtime"]["low_phase_command_owner"] == (
         "p3_worker_recovery_sampler_2_to_8_seconds"
     )
     assert realized["noise"]["noise_level"] == 0.55
+
+
+def test_environment_config_is_identical_across_training_phases():
+    config = {
+        "p3_standard_joint": {
+            "domain_randomization": {
+                "friction_range": [0.55, 1.35],
+                "base_added_mass_kg": 0.85,
+                "noise_level": 0.55,
+                "restitution_range": [0.0, 0.10],
+                "push_robots": True,
+                "min_push_interval_s": 8.0,
+                "push_interval_s": 15.0,
+            }
+        }
+    }
+    startup = p3.materialize_environment_config(config, 0.0)
+    late = p3.materialize_environment_config(config, 5400.0)
+    assert startup["domain_rand"] == late["domain_rand"]
+    assert startup["noise"] == late["noise"]
+    assert startup["p3_standard_joint"]["push_schedule"]["resume_offset_s"] == 0.0
+    assert late["p3_standard_joint"]["push_schedule"]["resume_offset_s"] == 5400.0
+    assert startup["domain_rand"]["push_robots"] is True
+    assert startup["domain_rand"]["min_push_interval_s"] == 8.0
+    assert startup["domain_rand"]["push_interval_s"] == 15.0
+    assert startup["domain_rand"]["max_push_vel_xy"] == 0.0
+    assert startup["p3_runtime"]["environment_contract"] == (
+        "p35_static_dr_dynamic_push_v1"
+    )
 
 
 def test_success_contracts_are_independent():
@@ -75,13 +116,17 @@ def test_local_bounds_and_phase_boundaries():
     origin = torch.tensor([[10.0, -5.0], [10.0, -5.0]])
     root = torch.tensor([[13.2, -5.0], [13.2001, -5.0]])
     assert p3.local_out_of_bounds(root, origin).tolist() == [False, True]
-    assert p3.phase_for_elapsed(0).name == "gaitcalib"
-    assert p3.phase_for_elapsed(900).name == "lowbase"
-    assert p3.phase_for_elapsed(1800).name == "lowmild"
-    assert p3.phase_for_elapsed(3600).name == "lowmedium"
-    assert p3.phase_for_elapsed(5400).name == "adaptercalib"
-    assert p3.phase_for_elapsed(6000).name == "highadapt"
-    assert p3.phase_for_elapsed(7200).name == "highslow"
+    assert p3.phase_for_elapsed(0).name == "gaitfixcalib"
+    assert p3.phase_for_elapsed(900).name == "repair"
+    assert p3.phase_for_elapsed(4500).name == "pushwarm"
+    assert p3.phase_for_elapsed(5400).name == "pushfull"
+    assert p3.phase_for_elapsed(6300).name == "stable"
+    assert p3.action_smooth_training_fraction(899.0) == 0.0
+    assert p3.action_smooth_training_fraction(1800.0) == 0.0
+    assert p3.action_smooth_training_fraction(3600.0) == 0.0
+    assert p3.action_smooth_training_fraction(7199.0) == 0.0
+    assert p3.action_smooth_training_fraction(7200.0) == 0.0
+    assert p3.action_smooth_training_fraction(3600.0, mapping_valid=False) == 0.0
 
 
 class _Scene:
@@ -273,8 +318,16 @@ def test_p3_production_config_and_monitor_are_standard_specific():
     }
     assert config["terrain"]["mode"] == "standard"
     assert config["terrain"]["curriculum"] is False
-    assert config["p3_standard_joint"]["run_name"] == "p3std2h30-gait-radial"
-    assert config["p3_standard_joint"]["target_effective_seconds"] == 9000
+    assert config["p3_standard_joint"]["run_name"] == "p35gaitfix2h"
+    assert config["domain_rand"]["push_robots"] is True
+    assert config["domain_rand"]["min_push_interval_s"] == 12.0
+    assert config["domain_rand"]["push_interval_s"] == 18.0
+    assert config["p3_standard_joint"]["command_schedule"]["seed"] == p3.P3_COMMAND_SEED
+    assert p3.P3_WORKER_EXTRA_DIM == 108
+    assert p3.P3_PRIVILEGED_WIRE_DIM == 493
+    assert config["p3_standard_joint"]["target_effective_seconds"] == 7200
+    assert config["p3_standard_joint"]["num_steps_per_env"] == 128
+    assert config["p3_standard_joint"]["tbptt_sequence_length"] == 128
     monitor_source = (root / "conf/monitor_builder.py").read_text()
     p3_builder = monitor_source.split("def _build_p3_monitor():", 1)[1].split(
         "def build_monitor():", 1
@@ -282,8 +335,27 @@ def test_p3_production_config_and_monitor_are_standard_specific():
     assert "p2_curriculum" not in p3_builder
     assert "p2_track_segments" not in p3_builder
     assert "p3_command_feedback" in p3_builder
+    assert "p3_stair_memory" in p3_builder
     assert "p3_radial_milestones" in p3_builder
+    assert "p3_near_clip_stair_attempts" in p3_builder
+    assert "p3_gait_condition_coverage" in p3_builder
+    assert "p35_push_assembly" in p3_builder
+    assert "p35_monitor_contract" in p3_builder
+    assert "adapter_confidence" not in p3_builder
+    assert "p3_high_update_time_s" not in p3_builder
+    assert "h2d_time_s" not in p3_builder
     assert "p3_frontier_clawback" not in p3_builder
+
+
+def test_p35_training_wire_is_493_with_contiguous_training_only_extra():
+    assert p3.P3_PRIVILEGED_WIRE_DIM == 385 + 108
+    assert p3.JOINT_ACCELERATION_SLICE == slice(46, 58)
+    assert p3.CONTACT_FORCE_SLICE == slice(58, 72)
+    assert p3.CONTACT_ONSET_SLICE == slice(72, 86)
+    assert p3.CONTACT_OVER_THRESHOLD_DURATION_SLICE == slice(86, 100)
+    assert p3.PUSH_DELTA_VELOCITY_SLICE == slice(103, 105)
+    assert p3.PUSH_TELEMETRY_VALID_INDEX == 107
+    assert p3.contract()["step_transport"]["privileged_wire_dim"] == 493
 
 
 def test_platform_completion_radii_keep_a_boundary_margin():

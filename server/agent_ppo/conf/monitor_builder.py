@@ -1228,22 +1228,21 @@ def _build_p2_monitor():
 
 def _build_p3_monitor():
     monitor = MonitorConfigBuilder()
-    monitor.title("P3 Standard分阶段恢复")
+    monitor.title("P3.5 低速楼梯与后期Push")
     groups = (
         (
             "P3分阶段训练",
             "p3_joint_training",
             (
-                ("阶段与时钟", "p3_phase_clock", ("p3_phase", "p3_session_effective_seconds")),
+                ("阶段与时钟", "p3_phase_clock", ("p3_phase", "p3_session_effective_seconds", "p3_lifetime_effective_seconds")),
+                ("监控合同健康度", "p35_monitor_contract", ("p35_monitor_expected_metric_count", "p35_monitor_registered_metric_count", "p35_monitor_metric_with_data_count", "p35_monitor_empty_metric_count", "p35_monitor_longest_data_age_s")),
                 ("高低层更新", "p3_update_counts", ("p3_low_updates", "p3_high_updates", "adapter_update_attempts", "adapter_updates", "adapter_skipped_updates")),
                 ("平台生命周期", "p3_lifecycle", ("platform_lifecycle_callbacks", "platform_lifecycle_failures")),
-                ("低层收敛", "p3_low_losses", ("policy_loss", "value_loss", "low_reward_mean", "low_done_rate")),
-                ("高层收敛", "p3_high_losses", ("actor_loss", "critic_loss", "entropy", "approx_kl", "clip_fraction", "high_reward_mean")),
-                ("径向里程碑", "p3_radial_milestones", ("p3_m1_success_count", "p3_m2_success_count", "p3_standard_success_count", "p3_platform_success_count", "p3_joint_success_count", "p3_proxy_platform_agreement_count")),
-                ("径向进展与保持", "p3_radial_progress", ("p3_radial_distance_mean", "p3_best_radial_distance_mean", "p3_m3_hold_share", "reward_radial_new_best")),
-                ("局部目标事件", "p3_subgoal_events", ("subgoal_success_count", "subgoal_timeout_count")),
-                ("高层奖励分解", "p3_high_reward", ("reward_local_positive_progress", "reward_local_negative_progress", "reward_radial_new_best", "reward_failure", "reward_timeout", "reward_time", "reward_crawl", "reward_command_rate", "reward_decomposed_total")),
-                ("窗口终止结果", "p3_window_outcomes", ("p3_window_completed_count", "p3_window_failure_count", "p3_window_timeout_count")),
+                ("低层收敛", "p3_low_losses", ("p3_low_policy_loss", "p3_low_value_loss", "p3_low_entropy", "p3_low_approx_kl", "p3_low_clip_fraction", "low_reward_mean", "low_done_rate")),
+                ("低层更新职责", "p3_low_update_scope", ("p3_low_actor_update_active", "p3_low_critic_update_active", "p3_low_update_time_s")),
+                ("Rollout reset终止结果", "p3_window_outcomes", ("p3_window_completed_count", "p3_window_failure_count", "p3_window_timeout_count")),
+                ("Rollout径向事件", "p3_radial_milestones", ("p3_m1_success_count", "p3_m2_success_count", "p3_standard_success_count", "p3_platform_success_count", "p3_joint_success_count", "p3_proxy_platform_agreement_count")),
+                ("径向进展与M3边界", "p3_radial_progress", ("p3_radial_distance_mean", "p3_best_radial_distance_mean", "p3_m3_hold_share", "p3_m3_target_boundary_gap_m", "p3_m3_proxy_target_gap_m")),
             ),
         ),
         (
@@ -1263,8 +1262,11 @@ def _build_p3_monitor():
                 ("横向速度链", "p3_vy_response", ("target_vy", "exec_vy", "measured_vy", "true_vy")),
                 ("转向速度链", "p3_wz_response", ("target_wz", "exec_wz", "measured_wz", "true_wz")),
                 ("执行跟踪误差", "p3_tracking_error", ("vx_tracking_abs_error", "vy_tracking_abs_error", "wz_tracking_abs_error")),
-                ("指令正负覆盖", "p3_command_sign_share", ("target_vx_positive_share", "target_vy_positive_share", "target_vy_negative_share", "target_wz_positive_share", "target_wz_negative_share")),
-                ("反馈质量", "p3_feedback_quality", ("feedback_valid", "feedback_age_s", "feedback_true_velocity_error", "adapter_confidence")),
+                ("指令正负覆盖", "p3_command_sign_share", ("target_vx_positive_share", "target_vx_negative_share", "target_vy_positive_share", "target_vy_negative_share", "target_wz_positive_share", "target_wz_negative_share")),
+                ("低层命令桶覆盖", "p3_command_bucket_share", ("command_bucket_straight_share", "command_bucket_reserved_reverse_share", "command_bucket_vx_vy_share", "command_bucket_vx_wz_share", "command_bucket_pure_yaw_share", "command_bucket_brake_restart_share", "command_bucket_zero_share")),
+                ("横向正负条件响应", "p3_vy_signed_response", ("target_vy_positive_mean", "exec_vy_positive_mean", "true_vy_positive_mean", "vy_positive_tracking_abs_error", "target_vy_negative_mean", "exec_vy_negative_mean", "true_vy_negative_mean", "vy_negative_tracking_abs_error")),
+                ("转向正负条件响应", "p3_wz_signed_response", ("target_wz_positive_mean", "exec_wz_positive_mean", "true_wz_positive_mean", "wz_positive_tracking_abs_error", "target_wz_negative_mean", "exec_wz_negative_mean", "true_wz_negative_mean", "wz_negative_tracking_abs_error")),
+                ("反馈质量", "p3_feedback_quality", ("feedback_valid", "feedback_age_s", "feedback_true_velocity_error")),
             ),
         ),
         (
@@ -1274,23 +1276,50 @@ def _build_p3_monitor():
                 ("四足接触占空比", "p3_gait_duty", ("fl_duty_factor", "fr_duty_factor", "rl_duty_factor", "rr_duty_factor")),
                 ("四足最长悬空", "p3_gait_max_air", ("fl_max_air_time", "fr_max_air_time", "rl_max_air_time", "rr_max_air_time")),
                 ("四足步频", "p3_gait_frequency", ("fl_step_frequency", "fr_step_frequency", "rl_step_frequency", "rr_step_frequency")),
-                ("四足滑移", "p3_gait_slip", ("fl_slip_speed", "fr_slip_speed", "rl_slip_speed", "rr_slip_speed")),
+                ("四足单次支撑滑移", "p3_gait_slip", ("fl_slip_distance", "fr_slip_distance", "rl_slip_distance", "rr_slip_distance")),
                 ("触地冲击", "p3_gait_impact", ("fl_impact_speed", "fr_impact_speed", "rl_impact_speed", "rr_impact_speed")),
                 ("触地点横向边界", "p3_gait_touchdown_y", ("fl_touchdown_y", "fr_touchdown_y", "rl_touchdown_y", "rr_touchdown_y")),
                 ("连续支撑时间", "p3_gait_stance", ("fl_continuous_stance", "fr_continuous_stance", "rl_continuous_stance", "rr_continuous_stance")),
                 ("镜像一致性", "p3_mirror", ("mirror_loss", "mirror_sequence_share", "mirror_gradient_ratio", "mirror_gradient_cosine", "mirror_error_fl", "mirror_error_fr", "mirror_error_rl", "mirror_error_rr")),
-                ("步态基线", "p3_gait_baseline", ("p3_gait_baseline_finalized", "p3_gait_baseline_fallback_share", "gait_baseline_samples")),
-                ("映射有效性", "p3_gait_mapping", ("gait_window_valid", "gait_sensor_mapping_valid", "body_collision_mapping_valid")),
+                ("辅助梯度比例", "p35_aux_gradients", ("anchor_gradient_ratio", "anchor_gradient_cosine", "memory_gradient_ratio", "memory_gradient_cosine", "mirror_gradient_ratio", "mirror_gradient_cosine", "action_aux_combined_gradient_ratio")),
+                ("动作幅度与裁剪", "p3_action_amplitude", ("action_mean_abs_p50", "action_mean_abs_p95", "action_mean_abs_max", "action_raw_abs_p50", "action_raw_abs_p95", "action_raw_abs_max", "action_exec_abs_p95", "action_exec_abs_max", "action_clip_rate", "action_clip_rate_hip", "action_clip_rate_thigh", "action_clip_rate_calf")),
+                ("关节目标动态", "p3_joint_target_dynamics", ("joint_target_rate_abs_p50", "joint_target_rate_abs_p95", "joint_target_rate_abs_max", "joint_target_jerk_abs_p50", "joint_target_jerk_abs_p95", "joint_target_jerk_abs_max")),
+                ("高频动作功率", "p3_action_spectrum", ("action_15_25hz_power_ratio_hip", "action_15_25hz_power_ratio_thigh", "action_15_25hz_power_ratio_calf", "action_spectrum_valid_env_share")),
+                ("步态基线", "p3_gait_baseline", ("p3_gait_baseline_finalized", "p3_gait_baseline_exact_share", "p3_gait_baseline_terrain_share", "p3_gait_baseline_global_share", "p3_gait_baseline_disabled_share", "gait_baseline_samples")),
+                ("映射有效性", "p3_gait_mapping", ("gait_window_valid", "gait_sensor_mapping_valid", "body_collision_mapping_valid", "mirror_mapping_valid")),
             ),
         ),
         (
             "低层奖励与Sim2Real",
             "p3_low_reward",
             (
-                ("低层奖励分解", "p3_low_reward_terms", ("reward_track_lin_vel_xy", "reward_track_ang_vel_z", "reward_p3_sim2real_cost", "reward_energy", "reward_undesired_contacts", "reward_feet_air_time", "reward_joint_position_penalty")),
-                ("步态专项奖励", "p3_gait_reward_terms", ("reward_p3_contact_quality", "reward_p3_crossing", "reward_p3_starvation")),
+                ("低层奖励分解", "p3_low_reward_terms", ("reward_track_lin_vel_xy", "reward_track_ang_vel_z", "reward_p3_sim2real_cost", "reward_energy", "reward_undesired_contacts", "reward_joint_acc", "reward_joint_position_penalty")),
+                ("P3.5训练侧奖励", "p35_low_reward_terms", ("p35_reward_progress", "p35_reward_default_posture", "p35_reward_joint_acc", "p35_reward_contact", "p35_reward_gait", "p35_reward_posture", "p35_reward_baseline_valid")),
+                ("步态Shadow诊断", "p3_gait_shadow_terms", ("shadow_p3_contact_quality", "shadow_p3_crossing", "shadow_p3_starvation")),
+                ("Sim2Real约束原始分量", "p3_sim2real_components", ("p3_sim2real_component_valid_share", "p3_sim2real_sustained_torque_raw", "p3_sim2real_torque_peak_raw", "p3_sim2real_action_rate_raw", "p3_sim2real_action_jerk_raw")),
                 ("关节力矩分位", "p3_torque_quantiles", ("hip_torque_p50", "hip_torque_p95", "hip_torque_max", "thigh_torque_p50", "thigh_torque_p95", "thigh_torque_max", "calf_torque_p50", "calf_torque_p95", "calf_torque_max")),
-                ("机械功率", "p3_mechanical_power", ("mechanical_power_mean",)),
+                ("力矩硬线余量", "p3_torque_margin", ("torque_margin_p50", "torque_margin_p05", "torque_margin_min", "torque_near_hard_rate", "torque_hard_violation_rate", "torque_near_hard_max_duration_s")),
+                ("机械功率", "p3_mechanical_power", ("mechanical_power_mean", "mechanical_power_p50", "mechanical_power_p95", "mechanical_power_max")),
+                ("命令桶裁剪率", "p3_command_bucket_clip", ("command_bucket_straight_clip_rate", "command_bucket_reserved_reverse_clip_rate", "command_bucket_vx_vy_clip_rate", "command_bucket_vx_wz_clip_rate", "command_bucket_pure_yaw_clip_rate", "command_bucket_brake_restart_clip_rate", "command_bucket_zero_clip_rate")),
+                ("命令桶锚点", "p3_command_bucket_anchor", ("command_bucket_straight_anchor_mean", "command_bucket_reserved_reverse_anchor_mean", "command_bucket_vx_vy_anchor_mean", "command_bucket_vx_wz_anchor_mean", "command_bucket_pure_yaw_anchor_mean", "command_bucket_brake_restart_anchor_mean", "command_bucket_zero_anchor_mean")),
+            ),
+        ),
+        (
+            "楼梯视觉记忆",
+            "p3_stair_memory",
+            (
+                ("近裁剪分位", "p3_near_clip_quantiles", ("near_clip_mean_m", "near_clip_p50_m", "near_clip_p90_m", "near_clip_p99_m")),
+                ("近裁剪分布", "p3_near_clip_histogram", tuple(f"near_clip_bin_{i}_share" for i in range(10))),
+                ("原始深度孔洞", "p3_raw_depth_holes", ("depth_raw_hole_full", "depth_raw_hole_center", "depth_raw_hole_lower")),
+                ("增强深度孔洞", "p3_aug_depth_holes", ("depth_aug_hole_full", "depth_aug_hole_center", "depth_aug_hole_lower", "depth_fault_active_share", "depth_fault_enabled_share", "depth_fault_strength")),
+                ("故障类型与计划时长", "p3_depth_fault_types", ("depth_fault_near_only_share", "depth_fault_sparse_share", "depth_fault_block_share", "depth_fault_severe_share", "depth_fault_blackout_share", "depth_fault_planned_duration_s")),
+                ("严重故障事件", "p3_depth_fault_events", ("depth_fault_severe_event_count", "depth_fault_severe_duration_s", "depth_fault_blackout_event_count", "depth_fault_blackout_duration_s", "depth_fault_recovery_telemetry_available")),
+                ("近裁剪桶楼梯完成率", "p3_near_clip_stair_completion", tuple(f"near_clip_bin_{i}_stair_completion_rate" for i in range(10))),
+                ("近裁剪桶楼梯样本数", "p3_near_clip_stair_attempts", tuple(f"near_clip_bin_{i}_stair_attempt_count" for i in range(10))),
+                ("记忆监督", "p3_memory_aux", ("memory_loss", "memory_action_mae", "memory_latent_cosine", "memory_gradient_ratio", "memory_gradient_cosine")),
+                ("记忆样本来源", "p35_memory_selection", ("memory_fault_frame_share", "memory_timing_frame_share", "memory_fault_only_frame_share", "memory_timing_only_frame_share", "memory_fault_timing_overlap_share", "memory_selected_frame_share")),
+                ("相机采集与保持", "p35_camera_timing", ("camera_capture_count", "camera_hold_ratio", "camera_feature_age_mean_ms", "camera_feature_age_p95_ms", "camera_active_delay_p95_ms", "camera_shadow_delay_p95_ms")),
+                ("Hidden消融", "p3_memory_hidden_ablation", ("memory_hidden_advantage",)),
             ),
         ),
         (
@@ -1307,12 +1336,20 @@ def _build_p3_monitor():
             "性能资源",
             "p3_runtime",
             (
-                ("阶段耗时", "p3_stage_timing", ("p3_rollout_time_s", "update_time_s", "env_step_time_s")),
+                ("阶段耗时", "p3_stage_timing", ("p3_rollout_time_s", "env_step_time_s", "p3_low_update_time_s")),
                 ("采样吞吐", "p3_throughput", ("samples_per_s",)),
-                ("随机化阶段", "p3_domain_randomization", ("p3_dr_phase", "p3_friction_min", "p3_friction_max", "p3_base_added_mass_kg", "p3_noise_level")),
+                ("随机化配置合同", "p3_domain_randomization", ("p3_friction_min", "p3_friction_max", "p3_base_added_mass_kg", "p3_restitution_max", "p3_noise_level", "p3_dr_runtime_telemetry_available")),
+                ("Push装配", "p35_push_assembly", ("p35_push_term_exists", "p35_push_mode_correct", "p35_push_wrapper_installed", "p35_push_runtime_api_available", "p3_push_enabled", "p3_push_velocity_m_s", "p3_push_runtime_telemetry_available", "p35_push_runtime_active_share", "p35_push_telemetry_valid_share")),
+                ("Push事件", "p35_push_events", ("p35_push_event_count", "p35_push_events_per_min_per_env", "p35_push_env_coverage", "p35_seconds_since_push_min")),
+                ("Push实际幅度", "p35_push_delta", ("p35_push_delta_vx_p50", "p35_push_delta_vx_p95", "p35_push_delta_vx_max", "p35_push_delta_vx_positive_share", "p35_push_delta_vy_p50", "p35_push_delta_vy_p95", "p35_push_delta_vy_max", "p35_push_delta_vy_positive_share", "p35_push_config_violation_count")),
+                ("Push后姿态恢复", "p35_push_posture_recovery", ("p35_push_post_roll_peak", "p35_push_post_pitch_peak", "p35_push_post_fall_rate", "p35_push_post_timeout_rate", "p35_push_recovery_time_p50_s", "p35_push_recovery_time_p95_s")),
+                ("Push后运动恢复", "p35_push_motion_recovery", ("p35_push_post_speed_mae_peak", "p35_push_post_timeout_rate", "p35_push_recovery_time_p50_s", "p35_push_recovery_time_p95_s")),
+                ("Push地形分桶", "p35_push_terrain", ("p35_push_terrain_slope_count", "p35_push_terrain_slope_inv_count", "p35_push_terrain_stairs_count", "p35_push_terrain_stairs_inv_count")),
+                ("Push难度分桶", "p35_push_level", tuple(f"p35_push_level_{i}_count" for i in range(10))),
+                ("Push命令分桶", "p35_push_command", ("p35_push_command_straight_count", "p35_push_command_reserved_reverse_count", "p35_push_command_vx_vy_count", "p35_push_command_vx_wz_count", "p35_push_command_pure_yaw_count", "p35_push_command_brake_restart_count", "p35_push_command_zero_count")),
+                ("Push速度与方向", "p35_push_speed_direction", ("p35_push_speed_low_count", "p35_push_speed_medium_count", "p35_push_speed_high_count", "p35_push_direction_vx_positive_count", "p35_push_direction_vx_negative_count", "p35_push_direction_vy_positive_count", "p35_push_direction_vy_negative_count")),
                 ("显存当前值", "p3_memory_current", ("memory_allocated", "memory_reserved")),
                 ("显存峰值", "p3_memory_peak", ("max_memory_allocated", "max_memory_reserved")),
-                ("深度缓存", "p3_depth_storage", ("pinned_depth_bytes", "h2d_time_s")),
                 ("低层紧凑缓存", "p3_low_compact_storage", ("p3_low_storage_bytes",)),
             ),
         ),
@@ -1322,6 +1359,35 @@ def _build_p3_monitor():
         for name, name_en, metrics in panels:
             _add_multi_line_panel(monitor, name, name_en, metrics)
         monitor.end_group()
+    monitor.add_group(group_name="步态条件分组", group_name_en="p3_gait_conditioned")
+    _add_multi_line_panel(
+        monitor,
+        "步态条件样本覆盖",
+        "p3_gait_condition_coverage",
+        tuple(
+            f"p3_{terrain}_{motion}_sample_share"
+            for terrain in ("slope", "slope_inv", "stairs", "stairs_inv")
+            for motion in ("low_speed", "forward", "turn_lateral")
+        ),
+    )
+    for terrain in ("slope", "slope_inv", "stairs", "stairs_inv"):
+        for metric, label in (
+            ("slip_distance", "滑移距离"),
+            ("impact_speed", "触地速度"),
+            ("stance_s", "连续支撑"),
+        ):
+            names = tuple(
+                f"p3_{terrain}_{motion}_{leg}_{metric}"
+                for motion in ("low_speed", "forward", "turn_lateral")
+                for leg in ("fl", "fr", "rl", "rr")
+            )
+            _add_multi_line_panel(
+                monitor,
+                f"{terrain} {label}",
+                f"p3_{terrain}_{metric}",
+                names,
+            )
+    monitor.end_group()
     return monitor.build()
 
 

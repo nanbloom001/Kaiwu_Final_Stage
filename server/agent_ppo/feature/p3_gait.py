@@ -12,26 +12,402 @@ from agent_ppo.feature import p2_contract, p3_contract
 
 
 LEG_SWAP = torch.tensor([1, 0, 3, 2], dtype=torch.long)
-JOINT_SWAP = torch.tensor([3, 4, 5, 0, 1, 2, 9, 10, 11, 6, 7, 8], dtype=torch.long)
-JOINT_SIGN = torch.tensor([-1, 1, 1, -1, 1, 1, -1, 1, 1, -1, 1, 1], dtype=torch.float32)
+# The platform exposes joints axis-major: FL/FR/RL/RR hip, then thigh, then calf.
+JOINT_SWAP = torch.tensor([1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10], dtype=torch.long)
+JOINT_SIGN = torch.tensor([-1, -1, -1, -1, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.float32)
+
+
+class P35LowRewardShaper:
+    """Parent-envelope P3.5 shaping with fail-closed training signals."""
+
+    CONTRACT = "p35_low_reward_baseline_v2"
+    MAX_SAMPLES = 65536
+
+    def __init__(self, num_envs: int, device):
+        self.num_envs = int(num_envs)
+        self.device = torch.device(device)
+        self.samples = {
+            name: []
+            for name in ("joint_pos", "joint_acc_noncontact", "joint_acc_onset", "posture", "frequency")
+        }
+        self.sample_count = {name: 0 for name in self.samples}
+        self.thresholds: dict[str, torch.Tensor] = {}
+        self.finalized = False
+        self.valid = False
+        self.frames_since_onset = torch.zeros(
+            self.num_envs, 4, device=self.device
+        )
+        self.onset_ema = torch.zeros_like(self.frames_since_onset)
+
+    def _append(self, name: str, values: torch.Tensor) -> None:
+        remaining = self.MAX_SAMPLES - self.sample_count[name]
+        if remaining <= 0 or values.numel() == 0:
+            return
+        selected = values.detach()[:remaining].to(self.device)
+        self.samples[name].append(selected)
+        self.sample_count[name] += selected.shape[0]
+
+    def observe(
+        self,
+        proprio: torch.Tensor,
+        aux: torch.Tensor,
+        extra: torch.Tensor,
+        healthy: torch.Tensor,
+    ) -> None:
+        if self.finalized or not bool(healthy.any()):
+            return
+        valid_joint = extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] > 0.5
+        valid_contact = extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] > 0.5
+        selected = healthy & valid_joint & valid_contact
+        if not bool(selected.any()):
+            return
+        joint_acc = extra[:, p3_contract.JOINT_ACCELERATION_SLICE].abs()
+        foot_onset = extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE] > 0.5
+        joint_onset = foot_onset.repeat(1, 3)
+        noncontact_rows = selected & ~joint_onset.any(dim=-1)
+        onset_rows = selected & joint_onset.any(dim=-1)
+        self._append("joint_pos", proprio[selected, 9:21].abs())
+        self._append("joint_acc_noncontact", joint_acc[noncontact_rows])
+        onset_acc = joint_acc.masked_fill(~joint_onset, float("nan"))
+        self._append("joint_acc_onset", onset_acc[onset_rows])
+        posture = torch.stack(
+            (
+                aux[:, 22].abs(),
+                aux[:, 18].abs(),
+                aux[:, 19].abs(),
+                aux[:, 21].abs(),
+            ),
+            dim=-1,
+        )
+        self._append("posture", posture[selected])
+        self._append("frequency", aux[selected, p2_contract.GAIT_STEP_FREQUENCY_SLICE])
+
+    def finalize(self) -> None:
+        if self.finalized:
+            return
+        required = ("joint_pos", "joint_acc_noncontact", "posture", "frequency")
+        self.valid = all(self.sample_count[name] >= 128 for name in required)
+        if self.valid:
+            for name in required:
+                values = torch.cat(self.samples[name], dim=0).float()
+                quantile = 0.99 if name == "joint_pos" else (0.05 if name == "frequency" else 0.95)
+                self.thresholds[name] = torch.quantile(values, quantile, dim=0)
+            if self.sample_count["joint_acc_onset"] >= 128:
+                onset = torch.cat(self.samples["joint_acc_onset"], dim=0).float()
+                fallback = 1.5 * self.thresholds["joint_acc_noncontact"]
+                values = []
+                for joint_index in range(onset.shape[-1]):
+                    joint_values = onset[:, joint_index]
+                    joint_values = joint_values[torch.isfinite(joint_values)]
+                    values.append(
+                        torch.quantile(joint_values, 0.99)
+                        if joint_values.numel() >= 32
+                        else fallback[joint_index]
+                    )
+                self.thresholds["joint_acc_onset"] = torch.stack(values)
+            else:
+                self.thresholds["joint_acc_onset"] = 1.5 * self.thresholds[
+                    "joint_acc_noncontact"
+                ]
+        self.samples = {name: [] for name in self.samples}
+        self.finalized = True
+
+    @staticmethod
+    def _huber_excess(excess: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
+        absolute = excess.abs()
+        return torch.where(
+            absolute <= delta,
+            0.5 * absolute.square(),
+            delta * (absolute - 0.5 * delta),
+        )
+
+    def rewards(
+        self,
+        *,
+        proprio: torch.Tensor,
+        aux: torch.Tensor,
+        next_aux: torch.Tensor,
+        extra: torch.Tensor,
+        command: torch.Tensor,
+        dones: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        zero = command.new_zeros(command.shape[0])
+        if not self.finalized or not self.valid:
+            return zero, {
+                name: zero.clone()
+                for name in ("progress", "default_posture", "joint_acc", "contact", "gait", "posture")
+            }
+        joint_valid = extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] > 0.5
+        contact_valid = extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] > 0.5
+        finite = (
+            torch.isfinite(extra).all(dim=-1)
+            & torch.isfinite(aux).all(dim=-1)
+            & torch.isfinite(next_aux).all(dim=-1)
+            & torch.isfinite(proprio).all(dim=-1)
+            & torch.isfinite(command).all(dim=-1)
+        )
+        valid = joint_valid & contact_valid & finite
+        moving = command[:, :2].norm(dim=-1) > 0.05
+        yaw = aux[:, 17]
+        world_command = torch.stack(
+            (
+                torch.cos(yaw) * command[:, 0] - torch.sin(yaw) * command[:, 1],
+                torch.sin(yaw) * command[:, 0] + torch.cos(yaw) * command[:, 1],
+            ),
+            dim=-1,
+        )
+        direction = F.normalize(world_command, dim=-1, eps=1.0e-6)
+        velocity = (next_aux[:, 15:17] - aux[:, 15:17]) / p2_contract.CONTROL_DT_S
+        posture_ok = aux[:, 21:23].abs().amax(dim=-1) < 0.50
+        progress = 0.15 * (velocity * direction).sum(dim=-1)
+        progress = torch.clamp(progress, -0.15, 0.15)
+        progress = torch.where(valid & moving & posture_ok & ~dones, progress, zero)
+
+        joint_limit = 1.10 * self.thresholds["joint_pos"].clamp_min(1.0e-4)
+        joint_excess = torch.relu(proprio[:, 9:21].abs() - joint_limit) / joint_limit
+        default_posture = -self._huber_excess(joint_excess).mean(dim=-1)
+        default_posture *= torch.where(moving, 0.60, 1.0)
+        default_posture = default_posture.clamp(-0.04, 0.0)
+
+        joint_acc = extra[:, p3_contract.JOINT_ACCELERATION_SLICE].abs()
+        foot_onset = extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE] > 0.5
+        joint_onset = foot_onset.repeat(1, 3)
+        noncontact_limit = 1.10 * self.thresholds["joint_acc_noncontact"].clamp_min(1.0)
+        onset_limit = torch.maximum(
+            self.thresholds["joint_acc_onset"], 1.5 * self.thresholds["joint_acc_noncontact"]
+        )
+        onset_limit = onset_limit.clone()
+        onset_limit[8:12] *= 1.20
+        acceleration_limit = torch.where(joint_onset, onset_limit, noncontact_limit)
+        acceleration_excess = torch.relu(joint_acc - acceleration_limit) / acceleration_limit
+        joint_acc_reward = -acceleration_excess.square().mean(dim=-1).clamp(max=0.08)
+
+        force = extra[:, p3_contract.CONTACT_FORCE_SLICE]
+        onset = extra[:, p3_contract.CONTACT_ONSET_SLICE] > 0.5
+        duration = extra[:, p3_contract.CONTACT_OVER_THRESHOLD_DURATION_SLICE]
+        contact_event = torch.zeros_like(onset)
+        contact_event[:, :2] = onset[:, :2]
+        contact_event[:, 2:] = (
+            ((duration[:, 2:] >= 0.060) & (duration[:, 2:] < 0.080))
+        )
+        calf_slots = torch.tensor([4, 7, 10, 13], device=extra.device)
+        contact_event[:, calf_slots] = (
+            (duration[:, calf_slots] >= 0.100)
+            & (duration[:, calf_slots] < 0.120)
+        )
+        thresholds = force.new_tensor(
+            [10.0, 10.0, 25.0, 25.0, 35.0, 25.0, 25.0, 35.0,
+             25.0, 25.0, 35.0, 25.0, 25.0, 35.0]
+        )
+        contact_excess = torch.relu(force - thresholds) / thresholds
+        contact_reward = -(
+            contact_excess.square() * contact_event.to(force)
+        ).sum(dim=-1).clamp(max=0.06)
+
+        foot_onset = extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE] > 0.5
+        self.frames_since_onset = torch.where(
+            foot_onset,
+            torch.zeros_like(self.frames_since_onset),
+            self.frames_since_onset + 1.0,
+        )
+        alpha = p2_contract.CONTROL_DT_S / 1.5
+        self.onset_ema.mul_(1.0 - alpha).add_(foot_onset.to(command) * alpha)
+        frequency_floor = self.thresholds["frequency"].clamp_min(0.05)
+        observed_frequency = aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE]
+        frequency_deficit = torch.relu(frequency_floor - observed_frequency) / frequency_floor
+        prolonged = torch.relu(self.frames_since_onset * p2_contract.CONTROL_DT_S - 1.0) / 0.5
+        diagonal = (self.onset_ema[:, [0, 3]] - self.onset_ema[:, [1, 2]]).abs().mean(dim=-1)
+        turn_scale = (1.0 - 0.5 * (command[:, 1].abs() + command[:, 2].abs()).clamp(0.0, 1.0))
+        gait_reward = -0.035 * torch.maximum(
+            torch.maximum(frequency_deficit.amax(dim=-1), prolonged.amax(dim=-1).clamp(max=1.0)),
+            diagonal.clamp(max=1.0),
+        ) * turn_scale
+
+        posture_values = torch.stack(
+            (
+                aux[:, 22].abs(),
+                aux[:, 18].abs(),
+                aux[:, 19].abs(),
+                aux[:, 21].abs(),
+            ),
+            dim=-1,
+        )
+        posture_limit = self.thresholds["posture"].clamp_min(1.0e-3)
+        posture_excess = torch.relu(posture_values - posture_limit) / posture_limit
+        posture_weights = posture_excess.new_tensor((1.0, 1.0, 0.65, 0.30))
+        posture_reward = -(
+            self._huber_excess(posture_excess) * posture_weights
+        ).sum(dim=-1).div(posture_weights.sum()).clamp(max=0.08)
+
+        grace = extra[:, p3_contract.SECONDS_SINCE_PUSH_INDEX] <= 0.40
+        grace_scale = torch.where(grace, 0.5, 1.0)
+        joint_acc_reward *= grace_scale
+        gait_reward *= grace_scale
+        posture_reward *= grace_scale
+        components = {
+            "progress": progress,
+            "default_posture": default_posture,
+            "joint_acc": joint_acc_reward,
+            "contact": contact_reward,
+            "gait": gait_reward,
+            "posture": posture_reward,
+        }
+        for name in components:
+            components[name] = torch.where(valid, components[name], zero)
+        self.frames_since_onset[dones] = 0.0
+        self.onset_ema[dones] = 0.0
+        return sum(components.values(), zero.clone()), components
+
+    def state_dict(self) -> dict:
+        return {
+            "contract": self.CONTRACT,
+            "finalized": self.finalized,
+            "valid": self.valid,
+            "sample_count": dict(self.sample_count),
+            "thresholds": {name: value.detach().cpu() for name, value in self.thresholds.items()},
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        if state.get("contract") != self.CONTRACT:
+            raise ValueError("P3.5 reward baseline checkpoint contract mismatch")
+        self.finalized = bool(state.get("finalized", False))
+        self.valid = bool(state.get("valid", False))
+        self.sample_count.update(state.get("sample_count") or {})
+        self.thresholds = {
+            name: value.to(self.device) for name, value in (state.get("thresholds") or {}).items()
+        }
 
 
 def validate_joint_order(names) -> bool:
     names = [str(name).lower() for name in names]
     if len(names) != 12:
         return False
-    expected = ("fl", "fr", "rl", "rr")
-    axes = ("hip", "thigh", "calf")
+    mirror_leg = {"fl": "fr", "fr": "fl", "rl": "rr", "rr": "rl"}
+    parsed = []
+    for name in names:
+        leg = next((item for item in mirror_leg if item in name), None)
+        axis = next((item for item in ("hip", "thigh", "calf") if item in name), None)
+        if leg is None or axis is None:
+            return False
+        parsed.append((leg, axis))
+    permutation = JOINT_SWAP.tolist()
     return all(
-        expected[index // 3] in name and axes[index % 3] in name
-        for index, name in enumerate(names)
+        parsed[permutation[index]] == (mirror_leg[leg], axis)
+        for index, (leg, axis) in enumerate(parsed)
     )
+
+
+def _mirrored_parameter_is_symmetric(value, *, permutation=JOINT_SWAP) -> bool:
+    if value is None:
+        return False
+    try:
+        tensor = torch.as_tensor(value).detach().float()
+    except (TypeError, ValueError):
+        return False
+    if tensor.numel() == 1:
+        return bool(torch.isfinite(tensor).all())
+    if tensor.shape[-1] != 12 or not bool(torch.isfinite(tensor).all()):
+        return False
+    tensor = tensor.reshape(-1, 12)
+    mirrored = tensor.index_select(-1, permutation.to(tensor.device))
+    return bool(torch.allclose(tensor.abs(), mirrored.abs(), rtol=1.0e-4, atol=1.0e-6))
+
+
+def _joint_position_action_term(action_manager):
+    """Resolve the joint-position term without accepting an unrelated action term."""
+    terms = getattr(action_manager, "_terms", None)
+    if not terms:
+        return None
+    if hasattr(terms, "items"):
+        exact = [
+            term
+            for name, term in terms.items()
+            if str(name).lower() == "jointpositionaction"
+        ]
+        exact = [term for term in exact if getattr(term, "action_dim", 12) == 12]
+        if len(exact) == 1:
+            return exact[0]
+        candidates = [
+            term
+            for name, term in terms.items()
+            if "jointpositionaction" in str(name).lower()
+            or "jointpositionaction" in type(term).__name__.lower()
+        ]
+    else:
+        candidates = [
+            term
+            for term in terms
+            if "jointpositionaction" in type(term).__name__.lower()
+        ]
+    candidates = [
+        term
+        for term in candidates
+        if getattr(term, "action_dim", 12) == 12
+    ]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _joint_action_scale_matches_contract(term) -> bool:
+    if term is None:
+        return False
+    cfg = getattr(term, "cfg", None)
+    value = getattr(term, "_scale", None)
+    if value is None:
+        value = getattr(cfg, "scale", getattr(term, "scale", None))
+    if not _mirrored_parameter_is_symmetric(value):
+        return False
+    try:
+        scale = torch.as_tensor(value).detach().float().abs()
+    except (TypeError, ValueError):
+        return False
+    expected = torch.full_like(scale, p3_contract.ACTION_TO_JOINT_SCALE)
+    return bool(torch.allclose(scale, expected, rtol=1.0e-4, atol=1.0e-6))
+
+
+def validate_mirror_assembly(robot, env=None) -> tuple[bool, dict[str, bool]]:
+    """Fail-safe validation for every physical quantity used by mirror training."""
+    data = getattr(robot, "data", None)
+    names = getattr(data, "joint_names", None)
+    if not names:
+        names = getattr(robot, "joint_names", ())
+    checks = {"joint_order": validate_joint_order(names)}
+    aliases = {
+        "stiffness": ("joint_stiffness", "default_joint_stiffness"),
+        "damping": ("joint_damping", "default_joint_damping"),
+        "effort_limit": ("joint_effort_limits", "soft_joint_effort_limits"),
+    }
+    for label, candidates in aliases.items():
+        value = next(
+            (getattr(data, name) for name in candidates if getattr(data, name, None) is not None),
+            None,
+        )
+        checks[label] = _mirrored_parameter_is_symmetric(value)
+
+    action_manager = getattr(env, "action_manager", None)
+    joint_action = _joint_position_action_term(action_manager)
+    checks["action_scale"] = _joint_action_scale_matches_contract(joint_action)
+    return all(checks.values()), checks
 
 
 def mirror_action(action: torch.Tensor) -> torch.Tensor:
     permutation = JOINT_SWAP.to(action.device)
     signs = JOINT_SIGN.to(action)
     return action.index_select(-1, permutation) * signs
+
+
+def per_leg_action_mse(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+    if prediction.shape != target.shape or prediction.shape[-1] != 12:
+        raise ValueError("P3 per-leg action error requires matching 12-column tensors")
+    error = (prediction - target).square()
+    return {
+        leg: error[..., indices].mean()
+        for leg, indices in {
+            "fl": (0, 4, 8),
+            "fr": (1, 5, 9),
+            "rl": (2, 6, 10),
+            "rr": (3, 7, 11),
+        }.items()
+    }
 
 
 def mirror_proprio(proprio: torch.Tensor) -> torch.Tensor:
@@ -61,9 +437,10 @@ def mirror_scan_from_coordinates(scan: torch.Tensor, lateral_coordinates: torch.
 class P3GaitBaseline:
     """Collect terrain/motion envelopes, then freeze event-only rewards."""
 
+    CONTRACT_VERSION = p3_contract.GAIT_BASELINE_VERSION
     NAMES = ("slip", "impact", "margin", "stance", "frequency", "duty")
     TERRAIN_BUCKETS = ("slope", "slope_inv", "stairs", "stairs_inv")
-    MOTION_BUCKETS = ("low_speed", "forward", "reverse", "turn_lateral")
+    MOTION_BUCKETS = ("low_speed", "forward", "turn_lateral")
     MIN_SAMPLES = 128
     MAX_SAMPLES_PER_BUCKET = 65536
 
@@ -87,23 +464,29 @@ class P3GaitBaseline:
     def _terrain_bucket(aux: torch.Tensor) -> torch.Tensor:
         column = aux[:, p2_contract.PRE_STEP_TERRAIN_TYPE_INDEX].round().long()
         result = torch.full_like(column, -1)
-        result[(column >= 0) & (column < 4)] = 0
-        result[(column >= 4) & (column < 8)] = 1
-        result[(column >= 8) & (column < 14)] = 2
-        result[(column >= 14) & (column < 20)] = 3
+        first, second, third, fourth = p3_contract.TERRAIN_COLUMN_BUCKET_BOUNDARIES
+        result[(column >= 0) & (column < first)] = 0
+        result[(column >= first) & (column < second)] = 1
+        result[(column >= second) & (column < third)] = 2
+        result[(column >= third) & (column < fourth)] = 3
         return result
 
     @staticmethod
-    def _motion_bucket(aux: torch.Tensor) -> torch.Tensor:
+    def _motion_bucket(
+        aux: torch.Tensor, extra: torch.Tensor | None = None
+    ) -> torch.Tensor:
         command = aux[:, 3:6]
         vx, vy, wz = command.unbind(-1)
         result = torch.full_like(vx, 1, dtype=torch.long)
-        reverse = vx < -0.05
-        turn_lateral = (~reverse) & ((vy.abs() > 0.05) | (wz.abs() > 0.10))
-        low_speed = (~reverse) & (~turn_lateral) & (vx.abs() < 0.20)
-        result[reverse] = 2
-        result[turn_lateral] = 3
+        invalid = vx < -1.0e-6
+        turn_lateral = (~invalid) & ((vy.abs() > 0.05) | (wz.abs() > 0.10))
+        low_speed = (~invalid) & (~turn_lateral) & (vx < 0.20)
+        result[turn_lateral] = 2
         result[low_speed] = 0
+        result[invalid] = -1
+        if torch.is_tensor(extra) and extra.shape[1] > p3_contract.COMMAND_BUCKET_INDEX:
+            command_bucket = extra[:, p3_contract.COMMAND_BUCKET_INDEX].round().long()
+            result[(command_bucket == 5) | (command_bucket == 6)] = -1
         return result
 
     def _append(self, key, value: torch.Tensor) -> None:
@@ -127,20 +510,23 @@ class P3GaitBaseline:
         if self.finalized or not bool(healthy.any()):
             return
         terrain = self._terrain_bucket(aux)
-        motion = self._motion_bucket(aux)
+        motion = self._motion_bucket(aux, extra)
         onset = extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE] > 0.5
+        slip_event = extra[:, p3_contract.GAIT_COMPLETED_SLIP_EVENT_SLICE] > 0.5
         for terrain_index in range(len(self.TERRAIN_BUCKETS)):
             for motion_index in range(len(self.MOTION_BUCKETS)):
                 selected = healthy & (terrain == terrain_index) & (motion == motion_index)
                 if not bool(selected.any()):
                     continue
                 fields = {
+                    "slip": extra[selected, p3_contract.GAIT_COMPLETED_SLIP_SLICE][
+                        slip_event[selected]
+                    ],
                     "impact": extra[selected, p3_contract.GAIT_IMPACT_SPEED_SLICE][onset[selected]],
                     "margin": extra[selected, p3_contract.GAIT_TOUCHDOWN_Y_SLICE][onset[selected]],
                 }
                 if collect_continuous:
                     fields.update(
-                        slip=aux[selected, p2_contract.GAIT_SLIP_SPEED_SLICE],
                         stance=extra[selected, p3_contract.GAIT_CONTINUOUS_STANCE_SLICE],
                         frequency=aux[selected, p2_contract.GAIT_STEP_FREQUENCY_SLICE],
                         duty=aux[selected, p2_contract.GAIT_DUTY_SLICE],
@@ -213,11 +599,27 @@ class P3GaitBaseline:
         self.samples = {}
         self.finalized = True
 
-    def _thresholds(self, aux: torch.Tensor, name: str) -> tuple[torch.Tensor, torch.Tensor]:
+    def fallback_level_shares(self) -> dict[str, float]:
+        total = max(len(self.fallback_levels), 1)
+        counts = {
+            level: sum(value == level for value in self.fallback_levels.values())
+            for level in range(4)
+        }
+        return {
+            "exact": counts[0] / total,
+            "terrain": counts[1] / total,
+            "global": counts[2] / total,
+            "disabled": counts[3] / total,
+        }
+
+    def _thresholds(
+        self, aux: torch.Tensor, extra: torch.Tensor, name: str
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         terrain = self._terrain_bucket(aux)
-        motion = self._motion_bucket(aux)
+        motion = self._motion_bucket(aux, extra)
         threshold = torch.zeros(aux.shape[0], device=aux.device, dtype=aux.dtype)
         valid = torch.zeros(aux.shape[0], device=aux.device, dtype=torch.bool)
+        confidence = torch.zeros(aux.shape[0], device=aux.device, dtype=aux.dtype)
         for terrain_index in range(len(self.TERRAIN_BUCKETS)):
             for motion_index in range(len(self.MOTION_BUCKETS)):
                 selected = (terrain == terrain_index) & (motion == motion_index)
@@ -225,7 +627,13 @@ class P3GaitBaseline:
                 if bool(selected.any()) and self.valid.get(key, False):
                     threshold[selected] = self.values[key]
                     valid[selected] = True
-        return threshold.unsqueeze(-1), valid.unsqueeze(-1)
+                    level = self.fallback_levels.get(key, 3)
+                    confidence[selected] = 1.0 if level == 0 else 0.5 if level == 1 else 0.0
+        return (
+            threshold.unsqueeze(-1),
+            valid.unsqueeze(-1),
+            confidence.unsqueeze(-1),
+        )
 
     def rewards(self, aux: torch.Tensor, extra: torch.Tensor, scale: float):
         zeros = torch.zeros(aux.shape[0], device=aux.device)
@@ -233,17 +641,23 @@ class P3GaitBaseline:
             return zeros, zeros, zeros
         sensor_valid = (aux[:, p2_contract.GAIT_VALID_INDEX] > 0.5).float()
         onset = (extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE] > 0.5).float()
-        slip_threshold, slip_valid = self._thresholds(aux, "slip")
-        impact_threshold, impact_valid = self._thresholds(aux, "impact")
-        margin_threshold, margin_valid = self._thresholds(aux, "margin")
-        stance_threshold, stance_valid = self._thresholds(aux, "stance")
-        frequency_threshold, frequency_valid = self._thresholds(aux, "frequency")
-        duty_threshold, duty_valid = self._thresholds(aux, "duty")
-        slip = F.relu(aux[:, p2_contract.GAIT_SLIP_SPEED_SLICE] - slip_threshold)
+        slip_event = (
+            extra[:, p3_contract.GAIT_COMPLETED_SLIP_EVENT_SLICE] > 0.5
+        ).float()
+        slip_threshold, slip_valid, slip_conf = self._thresholds(aux, extra, "slip")
+        impact_threshold, impact_valid, impact_conf = self._thresholds(aux, extra, "impact")
+        margin_threshold, margin_valid, margin_conf = self._thresholds(aux, extra, "margin")
+        stance_threshold, stance_valid, stance_conf = self._thresholds(aux, extra, "stance")
+        frequency_threshold, frequency_valid, frequency_conf = self._thresholds(aux, extra, "frequency")
+        duty_threshold, duty_valid, duty_conf = self._thresholds(aux, extra, "duty")
+        slip = F.relu(
+            extra[:, p3_contract.GAIT_COMPLETED_SLIP_SLICE] - slip_threshold
+        )
         impact = F.relu(extra[:, p3_contract.GAIT_IMPACT_SPEED_SLICE] - impact_threshold)
         contact = -(
-            0.45 * (slip.square() * slip_valid).mean(-1)
-            + 0.45 * (impact.square() * onset * impact_valid).mean(-1)
+            0.45
+            * (slip.square() * slip_event * slip_valid * slip_conf).mean(-1)
+            + 0.45 * (impact.square() * onset * impact_valid * impact_conf).mean(-1)
         )
         contact = contact.clamp(min=-p3_contract.GAIT_CONTACT_REWARD_CAP)
         margin = extra[:, p3_contract.GAIT_TOUCHDOWN_Y_SLICE]
@@ -251,11 +665,24 @@ class P3GaitBaseline:
             F.relu(margin_threshold - margin).square()
             * onset
             * margin_valid
+            * margin_conf
         ).mean(-1)
         crossing = crossing.clamp(min=-p3_contract.GAIT_CROSS_REWARD_CAP)
-        stance = F.relu(extra[:, p3_contract.GAIT_CONTINUOUS_STANCE_SLICE] - stance_threshold) * stance_valid
-        freq = F.relu(frequency_threshold - aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE]) * frequency_valid
-        duty = F.relu(aux[:, p2_contract.GAIT_DUTY_SLICE] - duty_threshold) * duty_valid
+        stance = (
+            F.relu(extra[:, p3_contract.GAIT_CONTINUOUS_STANCE_SLICE] - stance_threshold)
+            * stance_valid
+            * stance_conf
+        )
+        freq = (
+            F.relu(frequency_threshold - aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE])
+            * frequency_valid
+            * frequency_conf
+        )
+        duty = (
+            F.relu(aux[:, p2_contract.GAIT_DUTY_SLICE] - duty_threshold)
+            * duty_valid
+            * duty_conf
+        )
         starvation = -(0.4 * stance + 0.35 * freq + 0.25 * duty).amax(-1)
         starvation = starvation.clamp(min=-p3_contract.GAIT_STARVATION_REWARD_CAP)
         total = torch.stack((contact, crossing, starvation), -1)
@@ -270,6 +697,7 @@ class P3GaitBaseline:
         encoded_valid = {"|".join(map(str, key)): value for key, value in self.valid.items()}
         encoded_fallback = {"|".join(map(str, key)): value for key, value in self.fallback_levels.items()}
         metadata = {
+            "contract_version": self.CONTRACT_VERSION,
             "finalized": self.finalized,
             "values": encoded_values,
             "valid": encoded_valid,
@@ -293,6 +721,8 @@ class P3GaitBaseline:
         return payload
 
     def load_state_dict(self, state):
+        if int(state.get("contract_version", 0)) != self.CONTRACT_VERSION:
+            raise ValueError("incompatible P3 gait baseline contract version")
         self.finalized = bool(state.get("finalized", False))
         def decode(values, cast):
             return {
@@ -321,6 +751,13 @@ class P3GaitBaseline:
                 key: int(counts.get(key, sum(item.numel() for item in parts)))
                 for key, parts in self.samples.items()
             }
+
+
+def gait_bucket_indices(
+    aux: torch.Tensor, extra: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expose the versioned baseline grouping to monitoring without duplicating it."""
+    return P3GaitBaseline._terrain_bucket(aux), P3GaitBaseline._motion_bucket(aux, extra)
 
 
 class P3MirrorAuxiliary:
@@ -391,11 +828,160 @@ class P3MirrorAuxiliary:
         features = torch.cat((mirrored_seq[..., :45], mirrored_latent), -1)
         prediction = self._actor_with_detached_body(model.actor, features)
         loss = F.mse_loss(prediction, target) * self.scale
-        return loss, {
+        leg_errors = per_leg_action_mse(prediction, target)
+        metrics = {
             "mirror_loss": float(loss.detach()),
             "mirror_sequence_share": float(self.selected.float().mean()),
-            "mirror_error_fl": float((prediction[..., 0:3] - target[..., 0:3]).square().mean().detach()),
-            "mirror_error_fr": float((prediction[..., 3:6] - target[..., 3:6]).square().mean().detach()),
-            "mirror_error_rl": float((prediction[..., 6:9] - target[..., 6:9]).square().mean().detach()),
-            "mirror_error_rr": float((prediction[..., 9:12] - target[..., 9:12]).square().mean().detach()),
         }
+        for leg, value in leg_errors.items():
+            metrics[f"mirror_error_{leg}"] = float(value.detach())
+        return loss, metrics
+
+
+class P3ActionSmoothAuxiliary:
+    """Bound recurrent policy-mean rate, jerk and extreme action means."""
+
+    def __init__(self):
+        self.scale = 0.0
+        self.multipliers = {"smooth": None, "range": None}
+        self.gradient_ratios = {"smooth": 0.0, "range": 0.0}
+        self.gradient_cosines = {"smooth": 0.0, "range": 0.0}
+
+    def begin_rollout(self, fraction: float):
+        self.scale = max(0.0, min(1.0, float(fraction)))
+        self.multipliers = {"smooth": None, "range": None}
+        self.gradient_ratios = {"smooth": 0.0, "range": 0.0}
+        self.gradient_cosines = {"smooth": 0.0, "range": 0.0}
+
+    @staticmethod
+    def action_mean_with_detached_body(actor, features: torch.Tensor) -> torch.Tensor:
+        value = features
+        modules = list(actor)
+        for module in modules[:-1]:
+            if isinstance(module, torch.nn.Linear):
+                value = F.linear(
+                    value,
+                    module.weight.detach(),
+                    None if module.bias is None else module.bias.detach(),
+                )
+            else:
+                value = module(value)
+        return modules[-1](value)
+
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        mask = mask.to(device=values.device, dtype=values.dtype)
+        while mask.ndim < values.ndim:
+            mask = mask.unsqueeze(-1)
+        denominator = (mask.sum() * values.shape[-1]).clamp_min(1.0)
+        return (values * mask).sum() / denominator
+
+    def loss(self, action_mean: torch.Tensor, continuation: torch.Tensor):
+        zero = action_mean.new_zeros(())
+        if self.scale <= 0.0 or action_mean.ndim != 3 or action_mean.shape[0] < 2:
+            return zero, zero, {
+                "action_smooth_scale": self.scale,
+                "action_mean_rate_loss": 0.0,
+                "action_mean_jerk_loss": 0.0,
+                "action_mean_range_loss": 0.0,
+            }
+
+        q_mean = action_mean * p3_contract.ACTION_TO_JOINT_SCALE
+        rate = q_mean[1:] - q_mean[:-1]
+        rate_threshold = action_mean.new_tensor(
+            [0.20] * 8 + [0.25] * 4
+        ).reshape(1, 1, -1)
+        rate_excess = torch.relu(rate.abs() - rate_threshold)
+        rate_terms = F.smooth_l1_loss(
+            rate_excess, torch.zeros_like(rate_excess), reduction="none"
+        )
+        rate_mask = continuation[:-1].bool()
+        rate_loss = self._masked_mean(rate_terms, rate_mask)
+
+        jerk_loss = zero
+        if rate.shape[0] >= 2:
+            jerk = rate[1:] - rate[:-1]
+            jerk_threshold = action_mean.new_tensor(
+                [0.15] * 8 + [0.20] * 4
+            ).reshape(1, 1, -1)
+            jerk_excess = torch.relu(jerk.abs() - jerk_threshold)
+            jerk_terms = F.smooth_l1_loss(
+                jerk_excess, torch.zeros_like(jerk_excess), reduction="none"
+            )
+            jerk_mask = continuation[:-2].bool() & continuation[1:-1].bool()
+            jerk_loss = self._masked_mean(jerk_terms, jerk_mask)
+
+        smooth_loss = (rate_loss + jerk_loss) * self.scale
+        range_excess = torch.relu(
+            action_mean.abs() - p3_contract.ACTION_MEAN_SOFT_LIMIT
+        )
+        range_loss = F.smooth_l1_loss(
+            range_excess, torch.zeros_like(range_excess), reduction="mean"
+        ) * self.scale
+        return smooth_loss, range_loss, {
+            "action_smooth_scale": self.scale,
+            "action_mean_rate_loss": float(rate_loss.detach()),
+            "action_mean_jerk_loss": float(jerk_loss.detach()),
+            "action_mean_range_loss": float(range_loss.detach()),
+        }
+
+    @staticmethod
+    @torch.no_grad()
+    def diagnostics(
+        action_mean: torch.Tensor,
+        sampled_action: torch.Tensor,
+        dones: torch.Tensor,
+        *,
+        control_dt_s: float = 0.02,
+    ) -> dict[str, float]:
+        means = action_mean.detach().float()
+        sampled = sampled_action.detach().float()
+        done = dones.detach().bool().squeeze(-1)
+        result = {}
+
+        def quantiles(prefix: str, values: torch.Tensor):
+            flat = values.abs().reshape(-1)
+            result[f"{prefix}_abs_p50"] = float(torch.quantile(flat, 0.50))
+            result[f"{prefix}_abs_p95"] = float(torch.quantile(flat, 0.95))
+            result[f"{prefix}_abs_max"] = float(flat.max())
+
+        quantiles("action_mean", means)
+        quantiles("action_raw", sampled)
+        quantiles("action_exec", sampled.clamp(-6.0, 6.0))
+        clipped = sampled.abs() > 6.0
+        result["action_clip_rate"] = float(clipped.float().mean())
+        for name, values in (("hip", clipped[..., :4]), ("thigh", clipped[..., 4:8]), ("calf", clipped[..., 8:12])):
+            result[f"action_clip_rate_{name}"] = float(values.float().mean())
+
+        if means.shape[0] > 1:
+            continuation = ~done[:-1]
+            q_mean = means * p3_contract.ACTION_TO_JOINT_SCALE
+            rate = q_mean[1:] - q_mean[:-1]
+            valid_rate = rate[continuation]
+            if valid_rate.numel():
+                quantiles("joint_target_rate", valid_rate)
+            if means.shape[0] > 2:
+                valid_jerk_mask = continuation[:-1] & continuation[1:]
+                jerk = rate[1:] - rate[:-1]
+                valid_jerk = jerk[valid_jerk_mask]
+                if valid_jerk.numel():
+                    quantiles("joint_target_jerk", valid_jerk)
+
+        valid_env = ~done[:-1].any(dim=0) if means.shape[0] > 1 else torch.zeros(
+            means.shape[1], dtype=torch.bool, device=means.device
+        )
+        result["action_spectrum_valid_env_share"] = float(valid_env.float().mean())
+        if means.shape[0] >= 32 and bool(valid_env.any()):
+            series = means[:, valid_env]
+            window = torch.hann_window(series.shape[0], device=series.device).reshape(-1, 1, 1)
+            power = torch.fft.rfft(series * window, dim=0).abs().square()
+            frequency = torch.fft.rfftfreq(
+                series.shape[0], d=float(control_dt_s), device=series.device
+            )
+            total_mask = (frequency >= 1.0) & (frequency <= 25.0)
+            high_mask = (frequency >= 15.0) & (frequency <= 25.0)
+            for name, slc in (("hip", slice(0, 4)), ("thigh", slice(4, 8)), ("calf", slice(8, 12))):
+                total = power[total_mask, :, slc].sum().clamp_min(1.0e-12)
+                high = power[high_mask, :, slc].sum()
+                result[f"action_15_25hz_power_ratio_{name}"] = float(high / total)
+        return result

@@ -14,7 +14,7 @@ import torch
 from agent_ppo.checkpoint_io import CheckpointSaveError
 from agent_ppo.conf.conf import Config
 from agent_ppo.feature import nav_contract, p2_contract, p3_contract
-from agent_ppo.feature.p3_gait import mirror_proprio
+from agent_ppo.feature.p3_gait import P3GaitBaseline, gait_bucket_indices, mirror_proprio
 from agent_ppo.feature.definition import RolloutStorage
 from agent_ppo.feature.p2_response_buffer import (
     patch_owned_commands,
@@ -29,6 +29,28 @@ from agent_ppo.workflow.p2_nav_ppo_workflow import (
 
 def _as_device(value, device):
     return torch.as_tensor(value, device=device)
+
+
+P35_REQUIRED_MONITOR_METRICS = (
+    "p35_push_telemetry_valid_share",
+    "p35_push_runtime_active_share",
+    "p35_push_event_count",
+    "p35_push_delta_vx_p95",
+    "p35_push_delta_vy_p95",
+    "p35_push_post_roll_peak",
+    "p35_push_post_speed_mae_peak",
+    "camera_hold_ratio",
+    "camera_feature_age_p95_ms",
+    "camera_active_delay_p95_ms",
+    "p35_reward_progress",
+    "p35_reward_joint_acc",
+    "p35_reward_contact",
+    "p35_reward_gait",
+    "p35_reward_posture",
+    "p35_reward_baseline_valid",
+    "p3_low_updates",
+    "p3_high_updates",
+)
 
 
 def _reset_env(env, agent, usr_conf):
@@ -52,6 +74,7 @@ def _reset_env(env, agent, usr_conf):
     )
     critic_wire = critic_wire[:, : p2_contract.PRIVILEGED_WIRE_DIM]
     agent.algorithm.reset_live_state()
+    agent.algorithm.depth_fault.ensure_environment_initialized()
     agent._p3_native_target_cmd = None
     agent._p3_native_command_epoch = None
     return obs, critic_wire
@@ -68,18 +91,17 @@ def _consume_p3_wire(agent, wire: torch.Tensor) -> torch.Tensor:
     return wire[:, : p2_contract.PRIVILEGED_WIRE_DIM]
 
 
-def _requires_environment_rebuild(before_s: float, after_s: float) -> bool:
-    return p3_contract.domain_randomization_index(
-        before_s
-    ) != p3_contract.domain_randomization_index(after_s)
-
-
 def _high_adapter_update_due(high_updates: int, response_config: dict) -> bool:
     interval = max(1, int(response_config.get("high_update_interval", 2)))
     return int(high_updates) % interval == 0
 
 
 def _run_adapter_updates(agent, count: int) -> dict[str, float]:
+    agent.response_aux_buffer.set_p3_replay_ratios(
+        *p3_contract.adapter_replay_ratios(
+            agent.algorithm.session_effective_seconds
+        )
+    )
     attempts = max(0, int(count))
     latest: dict[str, float] = {}
     applied = 0.0
@@ -188,13 +210,23 @@ def _advance_platform_lifecycle(agent) -> bool:
     return True
 
 
-def _low_policy_step(agent, proprio, depth, critic_obs):
+def _low_policy_step(
+    agent, proprio, depth, critic_obs, *, clean_depth=None, cnn_features=None
+):
     algorithm = agent.low_level_algorithm
     hidden = algorithm.rollout_hidden_state()
-    actions = algorithm.actor_critic.act_from_proprio_depth(proprio, depth)
+    actions = (
+        algorithm.actor_critic.act_from_proprio_depth(proprio, depth)
+        if cnn_features is None
+        else algorithm.actor_critic.act_from_proprio_cnn_features(
+            proprio, cnn_features
+        )
+    )
+    clean_features = algorithm.actor_critic.last_cnn_features
+    if clean_depth is not None:
+        clean_features = algorithm.anchor_encoder.cnn(clean_depth)
     anchor_action, anchor_latent = algorithm.anchor_inference_from_cnn_features(
-        proprio,
-        algorithm.actor_critic.last_cnn_features,
+        proprio, clean_features
     )
     compact_obs = torch.cat(
         (
@@ -207,6 +239,7 @@ def _low_policy_step(agent, proprio, depth, critic_obs):
     log_prob = algorithm.actor_critic.get_actions_log_prob(actions)
     return {
         "obs": compact_obs,
+        "clean_obs": torch.cat((proprio, clean_features), dim=-1),
         "actions": actions,
         "values": values,
         "log_prob": log_prob,
@@ -218,10 +251,14 @@ def _low_policy_step(agent, proprio, depth, critic_obs):
     }
 
 
-def _low_policy_action(agent, proprio, depth):
+def _low_policy_action(agent, proprio, depth, *, cnn_features=None):
     """Run the frozen low-level executor without constructing PPO metadata."""
-    return agent.low_level_algorithm.actor_critic.act_from_proprio_depth(
-        proprio, depth
+    if cnn_features is None:
+        return agent.low_level_algorithm.actor_critic.act_from_proprio_depth(
+            proprio, depth
+        )
+    return agent.low_level_algorithm.actor_critic.act_from_proprio_cnn_features(
+        proprio, cnn_features
     )
 
 
@@ -247,7 +284,10 @@ def _record_adapter_frame(
     )
 
 
-def _command_accumulator(device):
+def _command_accumulator(device, *, push_limit_m_s: float = 0.0):
+    gait_bucket_count = len(P3GaitBaseline.TERRAIN_BUCKETS) * len(
+        P3GaitBaseline.MOTION_BUCKETS
+    )
     return {
         "count": torch.zeros((), device=device),
         "target": torch.zeros(3, device=device),
@@ -257,18 +297,27 @@ def _command_accumulator(device):
         "tracking": torch.zeros(3, device=device),
         "positive": torch.zeros(3, device=device),
         "negative": torch.zeros(3, device=device),
+        "signed_count": torch.zeros(3, 2, device=device),
+        "signed_target": torch.zeros(3, 2, device=device),
+        "signed_exec": torch.zeros(3, 2, device=device),
+        "signed_true": torch.zeros(3, 2, device=device),
+        "signed_tracking": torch.zeros(3, 2, device=device),
         "gait_duty": torch.zeros(4, device=device),
         "gait_air": torch.zeros(4, device=device),
         "gait_frequency": torch.zeros(4, device=device),
-        "gait_slip": torch.zeros(4, device=device),
+        "gait_slip_speed": torch.zeros(4, device=device),
+        "gait_completed_slip": torch.zeros(4, device=device),
+        "gait_completed_slip_count": torch.zeros(4, device=device),
         "gait_valid": torch.zeros((), device=device),
         "body_collision_mapping_valid": torch.zeros((), device=device),
+        "mirror_mapping_valid": torch.zeros((), device=device),
         "feedback_valid": torch.zeros((), device=device),
         "feedback_age_s": torch.zeros((), device=device),
         "feedback_true_error": torch.zeros((), device=device),
         "terrain_columns": torch.zeros(20, device=device),
         "terrain_levels": torch.zeros(10, device=device),
         "outcomes": torch.zeros(3, device=device),
+        "near_clip_stair_outcomes": torch.zeros(10, 3, device=device),
         "standard_successes": torch.zeros((), device=device),
         "platform_successes": torch.zeros((), device=device),
         "joint_successes": torch.zeros((), device=device),
@@ -279,11 +328,47 @@ def _command_accumulator(device):
         "best_radial_distance": torch.zeros((), device=device),
         "m3_hold": torch.zeros((), device=device),
         "torque_samples": [],
+        "torque_near_hard_frames": None,
+        "torque_near_hard_max_frames": None,
+        "torque_near_hard_count": torch.zeros((), device=device),
         "mechanical_power": torch.zeros((), device=device),
+        "mechanical_power_samples": [],
         "gait_contact_onset": torch.zeros(4, device=device),
         "gait_impact": torch.zeros(4, device=device),
         "gait_touchdown_y": torch.zeros(4, device=device),
         "gait_stance": torch.zeros(4, device=device),
+        "gait_bucket_count": torch.zeros(gait_bucket_count, device=device),
+        "gait_bucket_impact_count": torch.zeros(gait_bucket_count, 4, device=device),
+        "gait_bucket_slip_count": torch.zeros(gait_bucket_count, 4, device=device),
+        "gait_bucket_slip": torch.zeros(gait_bucket_count, 4, device=device),
+        "gait_bucket_impact": torch.zeros(gait_bucket_count, 4, device=device),
+        "gait_bucket_stance": torch.zeros(gait_bucket_count, 4, device=device),
+        "command_bucket_count": torch.zeros(7, device=device),
+        "command_bucket_clipped": torch.zeros(7, device=device),
+        "command_anchor_sum": torch.zeros(7, device=device),
+        "sim2real_component_sum": torch.zeros(4, device=device),
+        "sim2real_component_valid": torch.zeros((), device=device),
+        "push_event_count": torch.zeros((), device=device),
+        "push_delta_samples": [],
+        "push_env_seen": None,
+        "push_runtime_active": torch.zeros((), device=device),
+        "push_telemetry_valid": torch.zeros((), device=device),
+        "push_seconds_since_min": torch.full((), 1.0e6, device=device),
+        "push_post_count": torch.zeros((), device=device),
+        "push_post_roll_peak": torch.zeros((), device=device),
+        "push_post_pitch_peak": torch.zeros((), device=device),
+        "push_post_speed_mae_peak": torch.zeros((), device=device),
+        "push_post_fall_count": torch.zeros((), device=device),
+        "push_recovered": None,
+        "push_recovery_time_samples": [],
+        "push_terrain_count": torch.zeros(4, device=device),
+        "push_level_count": torch.zeros(10, device=device),
+        "push_command_count": torch.zeros(7, device=device),
+        "push_speed_count": torch.zeros(3, device=device),
+        "push_direction_count": torch.zeros(4, device=device),
+        "push_config_limit_m_s": float(push_limit_m_s),
+        "push_config_violation_count": torch.zeros((), device=device),
+        "push_post_timeout_count": torch.zeros((), device=device),
     }
 
 
@@ -299,13 +384,31 @@ def _accumulate_command(accumulator, target, exec_command, aux, extra=None):
     accumulator["tracking"] += torch.abs(exec_command - true).sum(dim=0)
     accumulator["positive"] += (target > 0.05).float().sum(dim=0)
     accumulator["negative"] += (target < -0.05).float().sum(dim=0)
-    accumulator["gait_duty"] += aux[:, p2_contract.GAIT_DUTY_SLICE].sum(dim=0)
-    accumulator["gait_air"] += aux[:, p2_contract.GAIT_MAX_AIR_SLICE].sum(dim=0)
-    accumulator["gait_frequency"] += aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE].sum(dim=0)
-    accumulator["gait_slip"] += aux[:, p2_contract.GAIT_SLIP_SPEED_SLICE].sum(dim=0)
-    accumulator["gait_valid"] += (
-        aux[:, p2_contract.GAIT_VALID_INDEX] > 0.5
-    ).float().sum()
+    for axis in range(3):
+        for sign_index, selected in enumerate((target[:, axis] > 0.05, target[:, axis] < -0.05)):
+            selected_f = selected.float()
+            accumulator["signed_count"][axis, sign_index] += selected_f.sum()
+            accumulator["signed_target"][axis, sign_index] += (target[:, axis] * selected_f).sum()
+            accumulator["signed_exec"][axis, sign_index] += (exec_command[:, axis] * selected_f).sum()
+            accumulator["signed_true"][axis, sign_index] += (true[:, axis] * selected_f).sum()
+            accumulator["signed_tracking"][axis, sign_index] += (
+                torch.abs(exec_command[:, axis] - true[:, axis]) * selected_f
+            ).sum()
+    gait_valid = aux[:, p2_contract.GAIT_VALID_INDEX] > 0.5
+    gait_valid_f = gait_valid.to(aux).unsqueeze(-1)
+    accumulator["gait_duty"] += (
+        aux[:, p2_contract.GAIT_DUTY_SLICE] * gait_valid_f
+    ).sum(dim=0)
+    accumulator["gait_air"] += (
+        aux[:, p2_contract.GAIT_MAX_AIR_SLICE] * gait_valid_f
+    ).sum(dim=0)
+    accumulator["gait_frequency"] += (
+        aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE] * gait_valid_f
+    ).sum(dim=0)
+    accumulator["gait_slip_speed"] += (
+        aux[:, p2_contract.GAIT_SLIP_SPEED_SLICE] * gait_valid_f
+    ).sum(dim=0)
+    accumulator["gait_valid"] += gait_valid_f.sum()
     accumulator["body_collision_mapping_valid"] += (
         aux[:, p2_contract.BODY_COLLISION_MAPPING_VALID_INDEX] > 0.5
     ).float().sum()
@@ -320,11 +423,186 @@ def _accumulate_command(accumulator, target, exec_command, aux, extra=None):
         accumulator["torque_samples"].append(
             extra[:, p3_contract.JOINT_TORQUE_SLICE].abs()
         )
-        accumulator["mechanical_power"] += extra[:, p3_contract.MECHANICAL_POWER_INDEX].sum()
-        accumulator["gait_contact_onset"] += extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE].sum(0)
-        accumulator["gait_impact"] += extra[:, p3_contract.GAIT_IMPACT_SPEED_SLICE].sum(0)
-        accumulator["gait_touchdown_y"] += extra[:, p3_contract.GAIT_TOUCHDOWN_Y_SLICE].sum(0)
-        accumulator["gait_stance"] += extra[:, p3_contract.GAIT_CONTINUOUS_STANCE_SLICE].sum(0)
+        absolute_torque = extra[:, p3_contract.JOINT_TORQUE_SLICE].abs()
+        hard = absolute_torque.new_tensor([22.0] * 8 + [43.0] * 4)
+        near_hard = (absolute_torque >= 0.95 * hard).any(dim=-1)
+        if accumulator["torque_near_hard_frames"] is None:
+            accumulator["torque_near_hard_frames"] = torch.zeros_like(
+                near_hard, dtype=torch.float32
+            )
+            accumulator["torque_near_hard_max_frames"] = torch.zeros_like(
+                near_hard, dtype=torch.float32
+            )
+        accumulator["torque_near_hard_frames"] = (
+            accumulator["torque_near_hard_frames"] + 1.0
+        ) * near_hard.float()
+        accumulator["torque_near_hard_max_frames"] = torch.maximum(
+            accumulator["torque_near_hard_max_frames"],
+            accumulator["torque_near_hard_frames"],
+        )
+        accumulator["torque_near_hard_count"] += near_hard.float().sum()
+        mechanical_power = extra[:, p3_contract.MECHANICAL_POWER_INDEX]
+        accumulator["mechanical_power"] += mechanical_power.sum()
+        accumulator["mechanical_power_samples"].append(mechanical_power.detach())
+        onset = (extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE] > 0.5) & gait_valid.unsqueeze(-1)
+        onset_f = onset.to(extra)
+        slip_event = (
+            extra[:, p3_contract.GAIT_COMPLETED_SLIP_EVENT_SLICE] > 0.5
+        ) & gait_valid.unsqueeze(-1)
+        slip_event_f = slip_event.to(extra)
+        accumulator["gait_contact_onset"] += onset_f.sum(0)
+        accumulator["gait_impact"] += (
+            extra[:, p3_contract.GAIT_IMPACT_SPEED_SLICE] * onset_f
+        ).sum(0)
+        accumulator["gait_touchdown_y"] += (
+            extra[:, p3_contract.GAIT_TOUCHDOWN_Y_SLICE] * onset_f
+        ).sum(0)
+        accumulator["gait_stance"] += (
+            extra[:, p3_contract.GAIT_CONTINUOUS_STANCE_SLICE] * gait_valid_f
+        ).sum(0)
+        accumulator["gait_completed_slip"] += (
+            extra[:, p3_contract.GAIT_COMPLETED_SLIP_SLICE] * slip_event_f
+        ).sum(0)
+        accumulator["gait_completed_slip_count"] += slip_event_f.sum(0)
+        accumulator["mirror_mapping_valid"] += (
+            extra[:, p3_contract.JOINT_MAPPING_VALID_INDEX] > 0.5
+        ).float().sum()
+        sim2real_valid = (
+            extra[:, p3_contract.SIM2REAL_COMPONENT_VALID_INDEX] > 0.5
+        )
+        accumulator["sim2real_component_valid"] += sim2real_valid.float().sum()
+        accumulator["sim2real_component_sum"] += (
+            extra[:, p3_contract.SIM2REAL_COMPONENT_SLICE]
+            * sim2real_valid.to(extra).unsqueeze(-1)
+        ).sum(dim=0)
+        push_valid = extra[:, p3_contract.PUSH_TELEMETRY_VALID_INDEX] > 0.5
+        push_active = extra[:, p3_contract.PUSH_RUNTIME_ACTIVE_INDEX] > 0.5
+        push_event = (extra[:, p3_contract.PUSH_EVENT_FLAG_INDEX] > 0.5) & push_valid
+        accumulator["push_runtime_active"] += push_active.float().sum()
+        accumulator["push_telemetry_valid"] += push_valid.float().sum()
+        if bool(push_event.any()):
+            accumulator["push_event_count"] += push_event.float().sum()
+            accumulator["push_delta_samples"].append(
+                extra[push_event, p3_contract.PUSH_DELTA_VELOCITY_SLICE].detach()
+            )
+            limit = float(accumulator["push_config_limit_m_s"])
+            if limit > 0.0:
+                accumulator["push_config_violation_count"] += (
+                    extra[push_event, p3_contract.PUSH_DELTA_VELOCITY_SLICE].abs()
+                    > limit + 1.0e-5
+                ).any(dim=-1).float().sum()
+            ids = push_event.nonzero(as_tuple=False).flatten()
+            if accumulator["push_env_seen"] is None:
+                accumulator["push_env_seen"] = torch.zeros(
+                    extra.shape[0], dtype=torch.bool, device=extra.device
+                )
+            accumulator["push_env_seen"][ids] = True
+            if accumulator["push_recovered"] is None:
+                accumulator["push_recovered"] = torch.zeros(
+                    extra.shape[0], dtype=torch.bool, device=extra.device
+                )
+            accumulator["push_recovered"][ids] = False
+            terrain_columns = aux[push_event, p2_contract.PRE_STEP_TERRAIN_TYPE_INDEX].round().long()
+            terrain_groups = torch.full_like(terrain_columns, -1)
+            first, second, third, fourth = p3_contract.TERRAIN_COLUMN_BUCKET_BOUNDARIES
+            terrain_groups[(terrain_columns >= 0) & (terrain_columns < first)] = 0
+            terrain_groups[(terrain_columns >= first) & (terrain_columns < second)] = 1
+            terrain_groups[(terrain_columns >= second) & (terrain_columns < third)] = 2
+            terrain_groups[(terrain_columns >= third) & (terrain_columns < fourth)] = 3
+            valid_terrain = terrain_groups >= 0
+            accumulator["push_terrain_count"] += torch.bincount(
+                terrain_groups[valid_terrain], minlength=4
+            ).to(accumulator["push_terrain_count"])
+            levels = aux[push_event, p2_contract.PRE_STEP_TERRAIN_LEVEL_INDEX].round().long()
+            valid_level = (levels >= 0) & (levels < 10)
+            accumulator["push_level_count"] += torch.bincount(
+                levels[valid_level], minlength=10
+            ).to(accumulator["push_level_count"])
+            buckets = extra[push_event, p3_contract.COMMAND_BUCKET_INDEX].round().long()
+            valid_bucket = (buckets >= 0) & (buckets < 7)
+            accumulator["push_command_count"] += torch.bincount(
+                buckets[valid_bucket], minlength=7
+            ).to(accumulator["push_command_count"])
+            vx = exec_command[push_event, 0]
+            speed_bucket = torch.where(vx < 0.35, 0, torch.where(vx < 0.70, 1, 2)).long()
+            accumulator["push_speed_count"] += torch.bincount(
+                speed_bucket, minlength=3
+            ).to(accumulator["push_speed_count"])
+            delta = extra[push_event, p3_contract.PUSH_DELTA_VELOCITY_SLICE]
+            accumulator["push_direction_count"] += torch.stack(
+                ((delta[:, 0] > 0).sum(), (delta[:, 0] < 0).sum(),
+                 (delta[:, 1] > 0).sum(), (delta[:, 1] < 0).sum())
+            ).to(accumulator["push_direction_count"])
+        seconds_since = extra[:, p3_contract.SECONDS_SINCE_PUSH_INDEX]
+        finite_age = seconds_since[torch.isfinite(seconds_since)]
+        if finite_age.numel():
+            accumulator["push_seconds_since_min"] = torch.minimum(
+                accumulator["push_seconds_since_min"], finite_age.min()
+            )
+        post = push_valid & (seconds_since >= 0.0) & (seconds_since <= 2.0)
+        if bool(post.any()):
+            accumulator["push_post_count"] += post.float().sum()
+            accumulator["push_post_roll_peak"] = torch.maximum(
+                accumulator["push_post_roll_peak"], aux[post, 21].abs().max()
+            )
+            accumulator["push_post_pitch_peak"] = torch.maximum(
+                accumulator["push_post_pitch_peak"], aux[post, 22].abs().max()
+            )
+            accumulator["push_post_speed_mae_peak"] = torch.maximum(
+                accumulator["push_post_speed_mae_peak"],
+                (true[post] - exec_command[post]).abs().amax(dim=-1).max(),
+            )
+            accumulator["push_post_fall_count"] += (
+                (aux[post, 24] > 0.5) & (aux[post, 25].round() == 2)
+            ).float().sum()
+            accumulator["push_post_timeout_count"] += (
+                (aux[post, 24] > 0.5) & (aux[post, 25].round() == 3)
+            ).float().sum()
+            if accumulator["push_recovered"] is None:
+                accumulator["push_recovered"] = torch.zeros(
+                    extra.shape[0], dtype=torch.bool, device=extra.device
+                )
+            speed_error = (true - exec_command).abs().amax(dim=-1)
+            posture_error = aux[:, 21:23].abs().amax(dim=-1)
+            recovered = post & ~accumulator["push_recovered"] & (speed_error < 0.10) & (posture_error < 0.12)
+            if bool(recovered.any()):
+                accumulator["push_recovery_time_samples"].append(
+                    seconds_since[recovered].detach()
+                )
+                accumulator["push_recovered"][recovered] = True
+        terrain_bucket, motion_bucket = gait_bucket_indices(aux, extra)
+        valid_bucket = (terrain_bucket >= 0) & (motion_bucket >= 0) & gait_valid
+        flat_bucket = terrain_bucket * len(P3GaitBaseline.MOTION_BUCKETS) + motion_bucket
+        ids = flat_bucket[valid_bucket]
+        accumulator["gait_bucket_count"].scatter_add_(
+            0, ids, torch.ones_like(ids, dtype=accumulator["gait_bucket_count"].dtype)
+        )
+        accumulator["gait_bucket_impact_count"].scatter_add_(
+            0,
+            ids.unsqueeze(-1).expand(-1, 4),
+            onset[valid_bucket].to(accumulator["gait_bucket_impact_count"]),
+        )
+        accumulator["gait_bucket_slip_count"].scatter_add_(
+            0,
+            ids.unsqueeze(-1).expand(-1, 4),
+            slip_event[valid_bucket].to(accumulator["gait_bucket_slip_count"]),
+        )
+        for name, values in (
+            (
+                "gait_bucket_slip",
+                extra[:, p3_contract.GAIT_COMPLETED_SLIP_SLICE] * slip_event_f,
+            ),
+            (
+                "gait_bucket_impact",
+                extra[:, p3_contract.GAIT_IMPACT_SPEED_SLICE] * onset_f,
+            ),
+            ("gait_bucket_stance", extra[:, p3_contract.GAIT_CONTINUOUS_STANCE_SLICE]),
+        ):
+            accumulator[name].scatter_add_(
+                0,
+                ids.unsqueeze(-1).expand(-1, 4),
+                values[valid_bucket],
+            )
     columns = aux[:, p2_contract.PRE_STEP_TERRAIN_TYPE_INDEX].round().long()
     levels = aux[:, p2_contract.PRE_STEP_TERRAIN_LEVEL_INDEX].round().long()
     valid_columns = (columns >= 0) & (columns < accumulator["terrain_columns"].numel())
@@ -337,11 +615,42 @@ def _accumulate_command(accumulator, target, exec_command, aux, extra=None):
     ).to(accumulator["terrain_levels"])
 
 
-def _accumulate_outcomes(accumulator, aux):
+def _accumulate_outcomes(accumulator, aux, near_clip_m=None):
     reset = aux[:, 24] > 0.5
     reason = aux[:, 25].round().long()
     for index, code in enumerate((1, 2, 3)):
         accumulator["outcomes"][index] += (reset & (reason == code)).float().sum()
+    if torch.is_tensor(near_clip_m) and near_clip_m.shape == reset.shape:
+        columns = aux[:, p2_contract.PRE_STEP_TERRAIN_TYPE_INDEX].round().long()
+        stairs = (columns >= 8) & (columns < 20)
+        bins = torch.floor((near_clip_m.to(aux) - 0.10) / 0.015).long().clamp(0, 9)
+        for index, code in enumerate((1, 2, 3)):
+            selected = reset & stairs & (reason == code)
+            accumulator["near_clip_stair_outcomes"][:, index].scatter_add_(
+                0,
+                bins[selected],
+                torch.ones_like(
+                    bins[selected],
+                    dtype=accumulator["near_clip_stair_outcomes"].dtype,
+                ),
+            )
+
+
+def _accumulate_action_bucket(accumulator, extra, actions):
+    if not torch.is_tensor(extra) or extra.shape[1] != p3_contract.P3_WORKER_EXTRA_DIM:
+        return
+    bucket = extra[:, p3_contract.COMMAND_BUCKET_INDEX].round().long()
+    valid = (bucket >= 0) & (bucket < accumulator["command_bucket_count"].numel())
+    if not bool(valid.any()):
+        return
+    ids = bucket[valid]
+    ones = torch.ones_like(ids, dtype=accumulator["command_bucket_count"].dtype)
+    accumulator["command_bucket_count"].scatter_add_(0, ids, ones)
+    clipped = (actions.detach().abs() > 6.0).any(dim=-1).float()[valid]
+    accumulator["command_bucket_clipped"].scatter_add_(0, ids, clipped)
+    anchor = extra[:, p3_contract.COMMAND_ANCHOR_WEIGHT_INDEX][valid].float()
+    anchor = torch.nan_to_num(anchor, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+    accumulator["command_anchor_sum"].scatter_add_(0, ids, anchor)
 
 
 def _accumulate_joint_success(agent, accumulator, aux):
@@ -380,16 +689,40 @@ def _command_metrics(accumulator):
         result[f"{axis}_tracking_abs_error"] = accumulator["tracking"][index] / count
         result[f"target_{axis}_positive_share"] = accumulator["positive"][index] / count
         result[f"target_{axis}_negative_share"] = accumulator["negative"][index] / count
+        for sign_index, sign in enumerate(("positive", "negative")):
+            signed_count = accumulator["signed_count"][index, sign_index].clamp_min(1.0)
+            result[f"target_{axis}_{sign}_mean"] = accumulator["signed_target"][index, sign_index] / signed_count
+            result[f"exec_{axis}_{sign}_mean"] = accumulator["signed_exec"][index, sign_index] / signed_count
+            result[f"true_{axis}_{sign}_mean"] = accumulator["signed_true"][index, sign_index] / signed_count
+            result[f"{axis}_{sign}_tracking_abs_error"] = accumulator["signed_tracking"][index, sign_index] / signed_count
+    gait_count = accumulator["gait_valid"].clamp_min(1.0)
     for index, leg in enumerate(("fl", "fr", "rl", "rr")):
-        result[f"{leg}_duty_factor"] = accumulator["gait_duty"][index] / count
-        result[f"{leg}_max_air_time"] = accumulator["gait_air"][index] / count
-        result[f"{leg}_step_frequency"] = accumulator["gait_frequency"][index] / count
-        result[f"{leg}_slip_speed"] = accumulator["gait_slip"][index] / count
+        result[f"{leg}_duty_factor"] = accumulator["gait_duty"][index] / gait_count
+        result[f"{leg}_max_air_time"] = accumulator["gait_air"][index] / gait_count
+        result[f"{leg}_step_frequency"] = accumulator["gait_frequency"][index] / gait_count
+        result[f"{leg}_slip_speed"] = (
+            accumulator["gait_slip_speed"][index] / gait_count
+        )
+        result[f"{leg}_slip_distance"] = (
+            accumulator["gait_completed_slip"][index]
+            / accumulator["gait_completed_slip_count"][index].clamp_min(1.0)
+        )
     result["gait_window_valid"] = accumulator["gait_valid"] / count
     result["gait_sensor_mapping_valid"] = result["gait_window_valid"]
     result["body_collision_mapping_valid"] = (
         accumulator["body_collision_mapping_valid"] / count
     )
+    result["mirror_mapping_valid"] = accumulator["mirror_mapping_valid"] / count
+    sim2real_count = accumulator["sim2real_component_valid"].clamp_min(1.0)
+    result["p3_sim2real_component_valid_share"] = (
+        accumulator["sim2real_component_valid"] / count
+    )
+    for index, name in enumerate(
+        ("sustained_torque", "torque_peak", "action_rate", "action_jerk")
+    ):
+        result[f"p3_sim2real_{name}_raw"] = (
+            accumulator["sim2real_component_sum"][index] / sim2real_count
+        )
     result["feedback_valid"] = accumulator["feedback_valid"] / count
     result["feedback_age_s"] = accumulator["feedback_age_s"] / count
     result["feedback_true_velocity_error"] = accumulator["feedback_true_error"] / count
@@ -414,6 +747,13 @@ def _command_metrics(accumulator):
         )
     for index, label in enumerate(("completed", "failure", "timeout")):
         result[f"p3_window_{label}_count"] = accumulator["outcomes"][index]
+    for index in range(10):
+        attempts = accumulator["near_clip_stair_outcomes"][index].sum()
+        result[f"near_clip_bin_{index}_stair_attempt_count"] = attempts
+        result[f"near_clip_bin_{index}_stair_completion_rate"] = (
+            accumulator["near_clip_stair_outcomes"][index, 0]
+            / attempts.clamp_min(1.0)
+        )
     result["p3_standard_success_count"] = accumulator["standard_successes"]
     result["p3_platform_success_count"] = accumulator["platform_successes"]
     result["p3_joint_success_count"] = accumulator["joint_successes"]
@@ -428,22 +768,121 @@ def _command_metrics(accumulator):
     )
     result["p3_m3_hold_share"] = accumulator["m3_hold"] / count
     result["mechanical_power_mean"] = accumulator["mechanical_power"] / count
+    if accumulator["mechanical_power_samples"]:
+        power = torch.cat(accumulator["mechanical_power_samples"]).float()
+        result["mechanical_power_p50"] = torch.quantile(power, 0.50)
+        result["mechanical_power_p95"] = torch.quantile(power, 0.95)
+        result["mechanical_power_max"] = power.max()
+    bucket_total = accumulator["command_bucket_count"].sum().clamp_min(1.0)
+    for index, name in enumerate(
+        (
+            "straight", "reserved_reverse", "vx_vy", "vx_wz", "pure_yaw",
+            "brake_restart", "zero",
+        )
+    ):
+        bucket_count = accumulator["command_bucket_count"][index].clamp_min(1.0)
+        result[f"command_bucket_{name}_share"] = (
+            accumulator["command_bucket_count"][index] / bucket_total
+        )
+        result[f"command_bucket_{name}_clip_rate"] = (
+            accumulator["command_bucket_clipped"][index] / bucket_count
+        )
+        result[f"command_bucket_{name}_anchor_mean"] = (
+            accumulator["command_anchor_sum"][index] / bucket_count
+        )
     if accumulator["torque_samples"]:
         torque = torch.cat(accumulator["torque_samples"], dim=0)
         for label, ids in (
-            ("hip", (0, 3, 6, 9)),
-            ("thigh", (1, 4, 7, 10)),
-            ("calf", (2, 5, 8, 11)),
+            ("hip", (0, 1, 2, 3)),
+            ("thigh", (4, 5, 6, 7)),
+            ("calf", (8, 9, 10, 11)),
         ):
             values = torque[:, ids].reshape(-1)
             result[f"{label}_torque_p50"] = torch.quantile(values, 0.50)
             result[f"{label}_torque_p95"] = torch.quantile(values, 0.95)
             result[f"{label}_torque_max"] = values.max()
+        hard = torque.new_tensor([22.0] * 8 + [43.0] * 4)
+        margin = hard - torque
+        result["torque_margin_p50"] = torch.quantile(margin, 0.50)
+        result["torque_margin_p05"] = torch.quantile(margin, 0.05)
+        result["torque_margin_min"] = margin.min()
+        result["torque_hard_violation_rate"] = (torque > hard).float().mean()
+        result["torque_near_hard_rate"] = accumulator["torque_near_hard_count"] / count
+        near_max = accumulator["torque_near_hard_max_frames"]
+        result["torque_near_hard_max_duration_s"] = (
+            near_max.max() * 0.02 if torch.is_tensor(near_max) else torque.new_zeros(())
+        )
+    result["p35_push_event_count"] = accumulator["push_event_count"]
+    result["p35_push_events_per_min_per_env"] = (
+        accumulator["push_event_count"] / count
+    ) * (60.0 / p2_contract.CONTROL_DT_S)
+    result["p35_push_env_coverage"] = (
+        accumulator["push_env_seen"].float().mean()
+        if torch.is_tensor(accumulator["push_env_seen"])
+        else count.new_zeros(())
+    )
+    result["p35_push_runtime_active_share"] = accumulator["push_runtime_active"] / count
+    result["p35_push_telemetry_valid_share"] = accumulator["push_telemetry_valid"] / count
+    result["p35_seconds_since_push_min"] = torch.where(
+        accumulator["push_seconds_since_min"] < 1.0e5,
+        accumulator["push_seconds_since_min"],
+        count.new_full((), -1.0),
+    )
+    post_count = accumulator["push_post_count"].clamp_min(1.0)
+    result["p35_push_post_roll_peak"] = accumulator["push_post_roll_peak"]
+    result["p35_push_post_pitch_peak"] = accumulator["push_post_pitch_peak"]
+    result["p35_push_post_speed_mae_peak"] = accumulator["push_post_speed_mae_peak"]
+    result["p35_push_post_fall_rate"] = accumulator["push_post_fall_count"] / post_count
+    result["p35_push_post_timeout_rate"] = accumulator["push_post_timeout_count"] / post_count
+    result["p35_push_config_violation_count"] = accumulator["push_config_violation_count"]
+    if accumulator["push_delta_samples"]:
+        delta = torch.cat(accumulator["push_delta_samples"], dim=0)
+        for index, axis in enumerate(("vx", "vy")):
+            values = delta[:, index].abs()
+            result[f"p35_push_delta_{axis}_p50"] = torch.quantile(values, 0.50)
+            result[f"p35_push_delta_{axis}_p95"] = torch.quantile(values, 0.95)
+            result[f"p35_push_delta_{axis}_max"] = values.max()
+            result[f"p35_push_delta_{axis}_positive_share"] = (delta[:, index] > 0).float().mean()
+    if accumulator["push_recovery_time_samples"]:
+        recovery = torch.cat(accumulator["push_recovery_time_samples"])
+        result["p35_push_recovery_time_p50_s"] = torch.quantile(recovery, 0.50)
+        result["p35_push_recovery_time_p95_s"] = torch.quantile(recovery, 0.95)
+    for index, name in enumerate(("slope", "slope_inv", "stairs", "stairs_inv")):
+        result[f"p35_push_terrain_{name}_count"] = accumulator["push_terrain_count"][index]
+    for index in range(10):
+        result[f"p35_push_level_{index}_count"] = accumulator["push_level_count"][index]
+    for index, name in enumerate(("straight", "reserved_reverse", "vx_vy", "vx_wz", "pure_yaw", "brake_restart", "zero")):
+        result[f"p35_push_command_{name}_count"] = accumulator["push_command_count"][index]
+    for index, name in enumerate(("low", "medium", "high")):
+        result[f"p35_push_speed_{name}_count"] = accumulator["push_speed_count"][index]
+    for index, name in enumerate(("vx_positive", "vx_negative", "vy_positive", "vy_negative")):
+        result[f"p35_push_direction_{name}_count"] = accumulator["push_direction_count"][index]
     for index, leg in enumerate(("fl", "fr", "rl", "rr")):
+        onset_count = accumulator["gait_contact_onset"][index].clamp_min(1.0)
         result[f"{leg}_contact_onset_rate"] = accumulator["gait_contact_onset"][index] / count
-        result[f"{leg}_impact_speed"] = accumulator["gait_impact"][index] / count
-        result[f"{leg}_touchdown_y"] = accumulator["gait_touchdown_y"][index] / count
-        result[f"{leg}_continuous_stance"] = accumulator["gait_stance"][index] / count
+        result[f"{leg}_impact_speed"] = accumulator["gait_impact"][index] / onset_count
+        result[f"{leg}_touchdown_y"] = accumulator["gait_touchdown_y"][index] / onset_count
+        result[f"{leg}_continuous_stance"] = accumulator["gait_stance"][index] / gait_count
+    gait_bucket_total = accumulator["gait_bucket_count"].sum().clamp_min(1.0)
+    for terrain_index, terrain in enumerate(P3GaitBaseline.TERRAIN_BUCKETS):
+        for motion_index, motion in enumerate(P3GaitBaseline.MOTION_BUCKETS):
+            bucket = terrain_index * len(P3GaitBaseline.MOTION_BUCKETS) + motion_index
+            bucket_count = accumulator["gait_bucket_count"][bucket].clamp_min(1.0)
+            result[f"p3_{terrain}_{motion}_sample_share"] = (
+                accumulator["gait_bucket_count"][bucket] / gait_bucket_total
+            )
+            for leg_index, leg in enumerate(("fl", "fr", "rl", "rr")):
+                result[f"p3_{terrain}_{motion}_{leg}_slip_distance"] = (
+                    accumulator["gait_bucket_slip"][bucket, leg_index]
+                    / accumulator["gait_bucket_slip_count"][bucket, leg_index].clamp_min(1.0)
+                )
+                result[f"p3_{terrain}_{motion}_{leg}_impact_speed"] = (
+                    accumulator["gait_bucket_impact"][bucket, leg_index]
+                    / accumulator["gait_bucket_impact_count"][bucket, leg_index].clamp_min(1.0)
+                )
+                result[f"p3_{terrain}_{motion}_{leg}_stance_s"] = (
+                    accumulator["gait_bucket_stance"][bucket, leg_index] / bucket_count
+                )
     keys = tuple(result)
     values = torch.stack([result[key].reshape(()) for key in keys]).detach().cpu().tolist()
     return dict(zip(keys, values))
@@ -458,22 +897,55 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
     storage.clear()
     reward_sum = torch.zeros((), device=agent.device)
     done_sum = torch.zeros((), device=agent.device)
-    command_accumulator = _command_accumulator(agent.device)
-    gait_fraction = p3_contract.gait_training_fraction(
+    command_accumulator = _command_accumulator(
+        agent.device,
+        push_limit_m_s=float(
+            p3_contract.push_phase_config(
+                agent.algorithm.session_effective_seconds
+            )["max_velocity_xy_m_s"]
+        ),
+    )
+    env_step_elapsed = 0.0
+    if agent.algorithm.session_effective_seconds >= 900.0:
+        agent.algorithm.gait_baseline.finalize()
+        agent.algorithm.low_reward_shaper.finalize()
+    mirror_fraction = p3_contract.mirror_training_fraction(
         agent.algorithm.session_effective_seconds
     )
     if not agent.algorithm.mirror_mapping_valid:
-        gait_fraction = 0.0
-    if agent.algorithm.session_effective_seconds >= 900.0:
-        agent.algorithm.gait_baseline.finalize()
-    agent.algorithm.mirror_aux.begin_rollout(gait_fraction)
+        mirror_fraction = 0.0
+    agent.algorithm.mirror_aux.begin_rollout(mirror_fraction)
+    agent.algorithm.depth_fault.begin_rollout(
+        p3_contract.depth_fault_strength(agent.algorithm.session_effective_seconds)
+    )
+    agent.algorithm.memory_aux.begin_rollout(
+        p3_contract.memory_training_fraction(agent.algorithm.session_effective_seconds)
+    )
+    agent.algorithm.camera_timing.begin_rollout(
+        agent.algorithm.session_effective_seconds
+    )
+    agent.algorithm.action_smooth_aux.begin_rollout(
+        p3_contract.action_smooth_training_fraction(
+            agent.algorithm.session_effective_seconds,
+            mapping_valid=agent.algorithm.mirror_mapping_valid,
+        )
+    )
     gait_reward_sums = torch.zeros(3, device=agent.device)
+    p35_reward_sums = {
+        name: torch.zeros((), device=agent.device)
+        for name in (
+            "progress", "default_posture", "joint_acc", "contact", "gait", "posture"
+        )
+    }
     for _ in range(storage.num_transitions_per_env):
         critic_obs, aux = split_p2_transport(critic_wire)
         p0, p1 = nav_contract.POLICY_CMD_SLICE
         target_command = obs[:, p0:p1].clone()
         exec_command = target_command.clone()
         command_epoch = _native_command_epoch(agent, target_command)
+        aux = patch_owned_commands(
+            aux, target_command, exec_command, command_epoch
+        )
         _accumulate_command(
             command_accumulator, target_command, exec_command, aux, agent._p3_extra
         )
@@ -487,18 +959,38 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
                 :,
                 nav_contract.POLICY_CMD_SLICE[0] : nav_contract.POLICY_CMD_SLICE[1],
             ] = exec_command.to(proprio)
-        depth = obs[:, p3_contract.DEPTH_SLICE].reshape(
+        clean_depth = obs[:, p3_contract.DEPTH_SLICE].reshape(
             obs.shape[0], p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH, p2_contract.DEPTH_CHANNELS
         )
+        depth, fault_changed = agent.algorithm.depth_fault.apply(
+            clean_depth, storage.step
+        )
         with torch.no_grad():
+            fault_features = algorithm.actor_critic.vision_encoder.cnn(depth)
+            timed_features, _ = agent.algorithm.camera_timing.step(
+                fault_features
+            )
             if train_low:
                 critic_obs = critic_obs.clone()
                 critic_obs[
                     :,
                     nav_contract.CRITIC_CMD_SLICE[0] : nav_contract.CRITIC_CMD_SLICE[1],
                 ] = exec_command.to(critic_obs)
-                step = _low_policy_step(agent, proprio, depth, critic_obs)
+                step = _low_policy_step(
+                    agent,
+                    proprio,
+                    depth,
+                    critic_obs,
+                    clean_depth=clean_depth,
+                    cnn_features=timed_features,
+                )
                 actions = step["actions"]
+                agent.algorithm.memory_aux.store(
+                    storage.step,
+                    step["clean_obs"],
+                    fault_changed,
+                    agent.algorithm.camera_timing.last_timing_changed,
+                )
                 mirror_mask = agent.algorithm.mirror_aux.select_block(
                     storage.step, agent.num_envs
                 )
@@ -515,7 +1007,11 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
                     )
             else:
                 step = None
-                actions = _low_policy_action(agent, proprio, depth)
+                actions = _low_policy_action(
+                    agent, proprio, depth, cnn_features=timed_features
+                )
+
+        _accumulate_action_bucket(command_accumulator, agent._p3_extra, actions)
 
         transition = None
         if train_low:
@@ -530,11 +1026,21 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
             transition.hidden_states = step["hidden"]
             transition.anchor_actions = step["anchor_action"].detach()
             transition.anchor_latents = step["anchor_latent"].detach()
-            transition.anchor_weights = torch.ones(
-                agent.num_envs, 1, device=agent.device
+            anchor_weights = agent._p3_extra[
+                :, p3_contract.COMMAND_ANCHOR_WEIGHT_INDEX
+            ].reshape(-1, 1)
+            valid_anchor = torch.isfinite(anchor_weights) & (
+                (anchor_weights >= 0.0) & (anchor_weights <= 1.0)
+            )
+            transition.anchor_weights = torch.where(
+                valid_anchor,
+                anchor_weights,
+                torch.zeros_like(anchor_weights),
             )
 
+        env_step_started = time.perf_counter()
         step_data = env.step(torch.clamp(actions, -6.0, 6.0))
+        env_step_elapsed += time.perf_counter() - env_step_started
         _, next_obs, rewards, terminated, truncated, infos, next_wire = _extract_step(
             step_data
         )
@@ -542,6 +1048,9 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
         next_wire = _consume_p3_wire(agent, _as_device(next_wire, agent.device))
         rewards = _as_device(rewards, agent.device).reshape(-1)
         next_aux = next_wire[:, p2_contract.CRITIC_OBS_DIM :]
+        next_aux = patch_owned_commands(
+            next_aux, target_command, exec_command, command_epoch
+        )
         dones, timeouts = _frame_done_masks(
             terminated,
             truncated,
@@ -552,6 +1061,7 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
         _accumulate_outcomes(
             command_accumulator,
             next_aux,
+            agent.algorithm.depth_fault.near_clip_m,
         )
         _accumulate_joint_success(
             agent,
@@ -576,16 +1086,33 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
                     storage.step % p3_contract.GAIT_BASELINE_CONTINUOUS_STRIDE == 0
                 ),
             )
+            if storage.step % p3_contract.GAIT_BASELINE_CONTINUOUS_STRIDE == 0:
+                agent.algorithm.low_reward_shaper.observe(
+                    proprio, next_aux, extra, healthy
+                )
         contact_reward, cross_reward, starvation_reward = (
-            agent.algorithm.gait_baseline.rewards(next_aux, extra, gait_fraction)
+            agent.algorithm.gait_baseline.rewards(
+                next_aux,
+                extra,
+                1.0 if agent.algorithm.gait_baseline.finalized else 0.0,
+            )
         )
         if storage.step % p2_contract.NAV_PERIOD_FRAMES != p2_contract.NAV_PERIOD_FRAMES - 1:
             starvation_reward.zero_()
-        gait_rewards = contact_reward + cross_reward + starvation_reward
-        rewards = rewards + gait_rewards
         gait_reward_sums += torch.stack(
             (contact_reward.mean(), cross_reward.mean(), starvation_reward.mean())
         )
+        p35_reward, p35_components = agent.algorithm.low_reward_shaper.rewards(
+            proprio=proprio,
+            aux=aux,
+            next_aux=next_aux,
+            extra=extra,
+            command=exec_command,
+            dones=dones,
+        )
+        for name, values in p35_components.items():
+            p35_reward_sums[name] += values.mean()
+        rewards = rewards + p35_reward
         if train_low:
             transition.rewards = rewards.clone()
             transition.dones = dones
@@ -603,6 +1130,7 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
             dones,
         )
         algorithm.reset_recurrent_states(dones)
+        agent.algorithm.camera_timing.reset(dones)
         obs, critic_wire = next_obs, next_wire
         reward_sum += rewards.mean()
         done_sum += dones.float().mean()
@@ -613,28 +1141,75 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
             next_critic, _ = split_p2_transport(critic_wire)
             last_values = algorithm.actor_critic.evaluate(next_critic).detach()
         storage.compute_returns(last_values, algorithm.gamma, algorithm.lam)
-        metrics = algorithm.learn(agent.training_elapsed_h)
+        metrics = algorithm.learn(
+            agent.training_elapsed_h,
+            phase_override=agent.algorithm.current_phase,
+        )
         low_updated = _finalize_low_level_update(agent, metrics)
         if low_updated:
-            update_count = 2 if agent.algorithm.current_phase == "lowmedium" else 1
-            metrics.update(_run_adapter_updates(agent, update_count))
+            metrics.update(_run_adapter_updates(agent, 1))
         else:
             metrics.update(_run_adapter_updates(agent, 0))
     else:
-        metrics = {"applied_updates": 0.0, "policy_loss": 0.0, "value_loss": 0.0}
+        metrics = {
+            "applied_updates": 0.0,
+            "policy_loss": 0.0,
+            "value_loss": 0.0,
+            "entropy_loss": 0.0,
+            "approx_kl": 0.0,
+            "clip_fraction": 0.0,
+            "low_update_time_s": 0.0,
+            "low_actor_update_active": 0.0,
+            "low_critic_update_active": 0.0,
+        }
+        metrics.update(
+            _run_adapter_updates(
+                agent,
+                p3_contract.adapter_updates_per_low_rollout(
+                    agent.algorithm.session_effective_seconds
+                ),
+            )
+        )
     storage_bytes = _storage_bytes(storage)
     storage.clear()
+    fallback_shares = agent.algorithm.gait_baseline.fallback_level_shares()
     metrics.update(
         {
+            "p3_low_policy_loss": float(metrics.get("policy_loss", 0.0)),
+            "p3_low_value_loss": float(metrics.get("value_loss", 0.0)),
+            "p3_low_entropy": float(metrics.get("entropy_loss", 0.0)),
+            "p3_low_approx_kl": float(metrics.get("approx_kl", 0.0)),
+            "p3_low_clip_fraction": float(metrics.get("clip_fraction", 0.0)),
+            "p3_low_update_time_s": float(metrics.get("low_update_time_s", 0.0)),
+            "p3_low_actor_update_active": float(
+                metrics.get("low_actor_update_active", 0.0)
+            ),
+            "p3_low_critic_update_active": float(
+                metrics.get("low_critic_update_active", 0.0)
+            ),
             "low_reward_mean": float(reward_sum / storage.num_transitions_per_env),
             "low_done_rate": float(done_sum / storage.num_transitions_per_env),
-            "reward_p3_contact_quality": float(gait_reward_sums[0] / storage.num_transitions_per_env),
-            "reward_p3_crossing": float(gait_reward_sums[1] / storage.num_transitions_per_env),
-            "reward_p3_starvation": float(gait_reward_sums[2] / storage.num_transitions_per_env),
+            "shadow_p3_contact_quality": float(gait_reward_sums[0] / storage.num_transitions_per_env),
+            "shadow_p3_crossing": float(gait_reward_sums[1] / storage.num_transitions_per_env),
+            "shadow_p3_starvation": float(gait_reward_sums[2] / storage.num_transitions_per_env),
             "p3_gait_baseline_finalized": float(agent.algorithm.gait_baseline.finalized),
             "p3_gait_baseline_fallback_share": float(agent.algorithm.gait_baseline.fallback_share),
+            **{
+                f"p3_gait_baseline_{name}_share": float(value)
+                for name, value in fallback_shares.items()
+            },
             "gait_baseline_samples": float(agent.algorithm.gait_baseline.total_samples),
+            "p35_reward_baseline_valid": float(agent.algorithm.low_reward_shaper.valid),
+            **{
+                f"p35_reward_{name}": float(
+                    value / storage.num_transitions_per_env
+                )
+                for name, value in p35_reward_sums.items()
+            },
             "p3_low_storage_bytes": float(storage_bytes),
+            "env_step_time_s": env_step_elapsed,
+            **agent.algorithm.depth_fault.diagnostics(),
+            **agent.algorithm.camera_timing.diagnostics(),
             **_command_metrics(command_accumulator),
         }
     )
@@ -648,7 +1223,15 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
     agent.low_level_algorithm.actor_critic.eval()
     local_successes = torch.zeros((), device=agent.device)
     local_timeouts = torch.zeros((), device=agent.device)
-    command_accumulator = _command_accumulator(agent.device)
+    command_accumulator = _command_accumulator(
+        agent.device,
+        push_limit_m_s=float(
+            p3_contract.push_phase_config(
+                agent.algorithm.session_effective_seconds
+            )["max_velocity_xy_m_s"]
+        ),
+    )
+    env_step_elapsed = 0.0
     reward_component_sum = {}
     reward_component_ticks = 0
     frontier_clawback = torch.zeros((), device=agent.device)
@@ -700,7 +1283,9 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
                 aux,
                 agent._p3_extra,
             )
+            env_step_started = time.perf_counter()
             step_data = env.step(torch.clamp(result["actions"], -6.0, 6.0))
+            env_step_elapsed += time.perf_counter() - env_step_started
             _, next_obs, _, terminated, truncated, infos, next_wire = _extract_step(
                 step_data
             )
@@ -714,7 +1299,11 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
                 agent.device,
                 worker_aux=next_aux,
             )
-            _accumulate_outcomes(command_accumulator, next_aux)
+            _accumulate_outcomes(
+                command_accumulator,
+                next_aux,
+                agent.algorithm.depth_fault.near_clip_m,
+            )
             p3_events = _accumulate_joint_success(
                 agent, command_accumulator, next_aux
             )
@@ -822,6 +1411,21 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
         raise RuntimeError("P3 high rollout did not fill at 32 ticks")
     metrics = algorithm.update()
     metrics["high_reward_mean"] = float(metrics.get("rollout_reward_mean", 0.0))
+    metrics.update(
+        {
+            "p3_high_actor_loss": float(metrics.get("actor_loss", 0.0)),
+            "p3_high_critic_loss": float(metrics.get("critic_loss", 0.0)),
+            "p3_high_entropy": float(metrics.get("entropy", 0.0)),
+            "p3_high_approx_kl": float(metrics.get("approx_kl", 0.0)),
+            "p3_high_clip_fraction": float(metrics.get("clip_fraction", 0.0)),
+            "p3_high_reward_mean": float(metrics.get("rollout_reward_mean", 0.0)),
+            "p3_high_update_time_s": float(
+                metrics.get("actor_update_time_s", 0.0)
+                + metrics.get("critic_update_time_s", 0.0)
+            ),
+            "p3_high_actor_update_active": float(algorithm._actor_update_enabled()),
+        }
+    )
     agent.algorithm.high_updates += 1
     response_config = agent.algorithm.config.get("response_adapter", {})
     if agent.algorithm.current_phase == "adaptercalib":
@@ -857,6 +1461,7 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
             "p3_low_storage_bytes": float(
                 _storage_bytes(agent.low_level_algorithm.storage)
             ),
+            "env_step_time_s": env_step_elapsed,
             **_command_metrics(command_accumulator),
             **{
                 f"reward_{name}": value
@@ -880,6 +1485,40 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
 def _monitor_put(monitor, metrics):
     if monitor is not None:
         monitor.put_data({os.getpid(): metrics})
+
+
+def _monitor_contract_metrics(agent, metrics: dict, elapsed_s: float) -> dict[str, float]:
+    last_finite = getattr(agent, "_p35_monitor_last_finite_s", None)
+    if not isinstance(last_finite, dict):
+        last_finite = {}
+        agent._p35_monitor_last_finite_s = last_finite
+    registered = 0
+    with_data = 0
+    ages = []
+    for name in P35_REQUIRED_MONITOR_METRICS:
+        if name in metrics:
+            registered += 1
+        value = metrics.get(name)
+        finite = False
+        try:
+            finite = math.isfinite(float(value))
+        except (TypeError, ValueError):
+            pass
+        if finite:
+            with_data += 1
+            last_finite[name] = float(elapsed_s)
+        last_seen = last_finite.get(name)
+        ages.append(
+            float(elapsed_s) if last_seen is None else max(0.0, float(elapsed_s) - last_seen)
+        )
+    expected = len(P35_REQUIRED_MONITOR_METRICS)
+    return {
+        "p35_monitor_expected_metric_count": float(expected),
+        "p35_monitor_registered_metric_count": float(registered),
+        "p35_monitor_metric_with_data_count": float(with_data),
+        "p35_monitor_empty_metric_count": float(expected - with_data),
+        "p35_monitor_longest_data_age_s": max(ages, default=0.0),
+    }
 
 
 def _install_sigterm_handler():
@@ -941,11 +1580,23 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             changed = agent.algorithm.update_clock(elapsed)
             if elapsed >= 900.0 and not agent.algorithm.gait_baseline.finalized:
                 agent.algorithm.gait_baseline.finalize()
+                agent.algorithm.low_reward_shaper.finalize()
+                logger.info(
+                    "[P35Baseline] "
+                    f"valid={int(agent.algorithm.low_reward_shaper.valid)} "
+                    f"samples={agent.algorithm.low_reward_shaper.sample_count} "
+                    "threshold_ranges="
+                    f"{ {name: [float(value.min()), float(value.max())] for name, value in agent.algorithm.low_reward_shaper.thresholds.items()} } "
+                    f"disabled_rewards={[] if agent.algorithm.low_reward_shaper.valid else ['progress','posture','joint_acc','contact','gait']}"
+                )
             agent.training_elapsed_h = elapsed / 3600.0
             agent.algorithm.current_iteration += 1
             metrics.update(
                 {
                     "p3_session_effective_seconds": elapsed,
+                    "p3_lifetime_effective_seconds": (
+                        agent.algorithm.lifetime_base_seconds + elapsed
+                    ),
                     "p3_phase": float(
                         tuple(item.name for item in p3_contract.PHASES).index(
                             agent.algorithm.current_phase
@@ -960,13 +1611,28 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         agent._p3_lifecycle_failure_callbacks
                     ),
                     "p3_rollout_time_s": now - loop_started,
+                    "p3_m3_target_boundary_gap_m": (
+                        agent.algorithm.platform_boundary_radius_m
+                        - agent.algorithm.m3_target_radius_m
+                    ),
+                    "p3_m3_proxy_target_gap_m": (
+                        agent.algorithm.m3_target_radius_m
+                        - agent.algorithm.platform_complete_radius_m
+                    ),
                     **agent.algorithm.memory_metrics(),
                 }
             )
+            metrics.update(_monitor_contract_metrics(agent, metrics, elapsed))
             rollout_frames = (
                 p2_contract.NAV_ROLLOUT_TICKS * p2_contract.NAV_PERIOD_FRAMES
                 if collect_high
-                else int(conf.get("num_steps_per_env", 80))
+                else int(
+                    getattr(
+                        agent.low_level_algorithm.storage,
+                        "num_transitions_per_env",
+                        conf.get("num_steps_per_env", 128),
+                    )
+                )
             )
             metrics["samples_per_s"] = (
                 float(agent.num_envs * rollout_frames)
@@ -975,6 +1641,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             realized = p3_contract.materialize_environment_config(usr_conf, elapsed)
             domain_rand = realized.get("domain_rand", {})
             runtime = realized.get("p3_runtime", {})
+            push_phase = p3_contract.push_phase_config(elapsed)
             metrics.update(
                 {
                     "p3_dr_phase": float(runtime.get("phase_index", 0)),
@@ -982,22 +1649,35 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     "p3_friction_max": float(domain_rand.get("friction_range", [1, 1])[1]),
                     "p3_base_added_mass_kg": float(runtime.get("base_added_mass_kg", 0.0)),
                     "p3_noise_level": float((realized.get("noise", {}) or {}).get("noise_level", 0.0)),
+                    "p3_restitution_max": float(domain_rand.get("restitution_range", [0, 0])[1]),
+                    "p3_push_enabled": float(push_phase["active"]),
+                    "p3_push_velocity_m_s": float(push_phase["max_velocity_xy_m_s"]),
+                    "p3_push_runtime_telemetry_available": float(
+                        metrics.get("p35_push_telemetry_valid_share", 0.0) > 0.99
+                    ),
+                    "p3_dr_runtime_telemetry_available": 0.0,
+                }
+            )
+            push_preflight_valid = float(
+                metrics.get("p35_push_telemetry_valid_share", 0.0) > 0.99
+            )
+            metrics.update(
+                {
+                    "p35_push_term_exists": push_preflight_valid,
+                    "p35_push_mode_correct": push_preflight_valid,
+                    "p35_push_wrapper_installed": push_preflight_valid,
+                    "p35_push_runtime_api_available": push_preflight_valid,
                 }
             )
             if changed:
                 agent.save_model()
-                domain_randomization_changed = _requires_environment_rebuild(
-                    elapsed_before, elapsed
-                )
                 logger.info(
                     f"[P3] rollout-boundary phase change {phase_before} -> "
                     f"{agent.algorithm.current_phase}; "
-                    "environment_reset=True; "
-                    f"domain_randomization_changed={domain_randomization_changed}"
+                    "episode_reset=True; environment_contract=p35_static_dr_dynamic_push_v1"
                 )
-                # Every responsibility boundary starts from a fresh episode.
-                # This uses the public platform reset API and does not depend on
-                # patching the platform-owned BaseEnv implementation.
+                # Phase boundaries clear recurrent/live state, but platform-owned
+                # physics and EventManager objects remain the startup instances.
                 obs, critic_wire = _reset_env(env, agent, usr_conf)
             if elapsed >= next_save:
                 agent.save_model()
@@ -1005,11 +1685,27 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     next_save += save_interval
             if now - last_log >= 60.0 or agent.algorithm.current_iteration == 1:
                 logger.info(
-                    f"[P3] iter={agent.algorithm.current_iteration} "
+                    f"[P35TrainState] iter={agent.algorithm.current_iteration} "
                     f"session_h={elapsed / 3600.0:.3f} "
                     f"phase={agent.algorithm.current_phase} "
                     f"low_updates={agent.algorithm.low_updates} "
                     f"high_updates={agent.algorithm.high_updates}"
+                )
+                logger.info(
+                    "[P35PushSummary] "
+                    f"events={metrics.get('p35_push_event_count', 0.0)} "
+                    f"telemetry={metrics.get('p35_push_telemetry_valid_share', 0.0)} "
+                    f"delta_vx_p95={metrics.get('p35_push_delta_vx_p95', 0.0)} "
+                    f"delta_vy_p95={metrics.get('p35_push_delta_vy_p95', 0.0)} "
+                    f"post_fall_rate={metrics.get('p35_push_post_fall_rate', 0.0)}"
+                )
+                logger.info(
+                    "[P35MonitorContract] "
+                    f"registered={int(metrics['p35_monitor_registered_metric_count'])} "
+                    f"expected={int(metrics['p35_monitor_expected_metric_count'])} "
+                    f"with_data={int(metrics['p35_monitor_metric_with_data_count'])} "
+                    f"empty={int(metrics['p35_monitor_empty_metric_count'])} "
+                    f"max_age_s={metrics['p35_monitor_longest_data_age_s']:.1f}"
                 )
                 _monitor_put(monitor, metrics)
                 last_log = now

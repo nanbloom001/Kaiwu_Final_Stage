@@ -15,19 +15,18 @@ import toml
 import torch
 
 from agent_ppo.conf.conf import Config, P3StandardJointConfig
-from agent_ppo.feature import nav_contract, p2_contract, p3_contract
+from agent_ppo.feature import p3_contract
 from agent_ppo.workflow.p3_standard_joint_workflow import (
-    _collect_high_rollout,
     _collect_low_rollout,
-    _high_adapter_update_due,
     _reset_env,
 )
 
 
 PHASE_BOUNDARIES = {
-    "adaptercalib": 5.0 * 3600.0,
-    "highadapt": 6.0 * 3600.0,
-    "highslow": 6.5 * 3600.0,
+    "repair": 900.0,
+    "pushwarm": 4500.0,
+    "pushfull": 5400.0,
+    "stable": 6300.0,
 }
 SCENARIOS = (*PHASE_BOUNDARIES, "integrated")
 
@@ -152,131 +151,10 @@ def _module_changes(agent, before) -> dict[str, bool]:
     }
 
 
-def _run_adaptercalib(env, agent, obs, critic_wire):
-    before = _snapshot_modules(agent)
-    adapter_steps = agent.high_level_algorithm.adapter_gradient_steps
-    obs, critic_wire, metrics = _collect_low_rollout(
-        env, agent, obs, critic_wire, train_low=False
-    )
-    updates = []
-    for _ in range(4):
-        update = agent.high_level_algorithm._adapter_update()
-        updates.append(update)
-    changes = _module_changes(agent, before)
-    applied = sum(float(item.get("adapter_updates", 0.0)) for item in updates)
-    if applied <= 0.0:
-        raise AssertionError(f"adapter calibration produced no update: {updates}")
-    if agent.high_level_algorithm.adapter_gradient_steps <= adapter_steps:
-        raise AssertionError("Adapter gradient-step counter did not advance")
-    if not changes["adapter"]:
-        raise AssertionError("Adapter update counter advanced without changing parameters")
-    forbidden = (
-        "low_cnn",
-        "low_lstm",
-        "low_actor",
-        "low_critic",
-        "nav_encoder",
-        "high_actor",
-        "high_critic",
-    )
-    if any(changes[name] for name in forbidden):
-        raise AssertionError(f"adaptercalib changed frozen modules: {changes}")
-    metrics.update(updates[-1])
-    metrics["adapter_updates_total"] = applied
-    return obs, critic_wire, metrics, changes
-
-
-def _run_high(env, agent, obs, critic_wire):
-    high = agent.high_level_algorithm
-    joint = agent.algorithm
-    before = _snapshot_modules(agent)
-    steps_before = {
-        "actor": high.actor_gradient_steps,
-        "critic": high.critic_gradient_steps,
-        "adapter": high.adapter_gradient_steps,
-        "high_updates": joint.high_updates,
-        "low_updates": joint.low_updates,
-    }
-    injected_commands = []
-
-    def _record_low_actor_input(_module, inputs, _output):
-        actor_input = inputs[0]
-        injected_commands.append(
-            actor_input[:, nav_contract.POLICY_CMD_SLICE[0] : nav_contract.POLICY_CMD_SLICE[1]]
-            .detach()
-            .abs()
-            .mean()
-        )
-
-    hook = agent.low_level_model.actor.register_forward_hook(_record_low_actor_input)
-    try:
-        obs, critic_wire, metrics = _collect_high_rollout(env, agent, obs, critic_wire)
-    finally:
-        hook.remove()
-
-    changes = _module_changes(agent, before)
-    _assert_finite_metrics(
-        metrics,
-        (
-            "actor_loss",
-            "critic_loss",
-            "adapter_loss",
-            "update_time_s",
-        ),
-    )
-    if float(metrics.get("updates", 0.0)) <= 0.0:
-        raise AssertionError(f"high PPO update was skipped: {metrics}")
-    adapter_due = _high_adapter_update_due(
-        joint.high_updates,
-        joint.config.get("response_adapter", {}),
-    )
-    if adapter_due != (float(metrics.get("adapter_updates", 0.0)) > 0.0):
-        raise AssertionError(
-            "high rollout Adapter cadence mismatch: "
-            f"due={adapter_due} metrics={metrics}"
-        )
-    if joint.high_updates != steps_before["high_updates"] + 1:
-        raise AssertionError("high update counter did not advance exactly once")
-    if high.actor_gradient_steps <= steps_before["actor"]:
-        raise AssertionError("high Actor gradient steps did not advance")
-    if high.critic_gradient_steps <= steps_before["critic"]:
-        raise AssertionError("high Critic gradient steps did not advance")
-    if adapter_due and high.adapter_gradient_steps <= steps_before["adapter"]:
-        raise AssertionError("Adapter gradient steps did not advance when due")
-    if not adapter_due and high.adapter_gradient_steps != steps_before["adapter"]:
-        raise AssertionError("Adapter gradient steps advanced before cadence boundary")
-    expected_changed = ["nav_encoder", "high_actor", "high_critic"]
-    if adapter_due:
-        expected_changed.append("adapter")
-    for name in expected_changed:
-        if not changes[name]:
-            raise AssertionError(f"expected trainable module did not change: {name}")
-    if not adapter_due and changes["adapter"]:
-        raise AssertionError("Adapter changed before its configured cadence boundary")
-    if changes["low_cnn"] or changes["low_lstm"]:
-        raise AssertionError(f"frozen low visual module changed: {changes}")
-    if changes["low_actor"] or changes["low_critic"]:
-        raise AssertionError(f"high-level phase changed frozen low modules: {changes}")
-    if joint.low_updates != steps_before["low_updates"]:
-        raise AssertionError("high-level phase advanced the frozen low update counter")
-
-    if not injected_commands:
-        raise AssertionError("low Actor was not invoked by the high-level rollout")
-    injected_mean = float(torch.stack(injected_commands).mean())
-    target_mean = float(high.command.active_target.abs().mean())
-    if injected_mean <= 0.0 or target_mean <= 0.0:
-        raise AssertionError(
-            "high-level commands were not injected into the Standard low-level policy"
-        )
-    metrics["injected_low_command_abs_mean"] = injected_mean
-    metrics["high_target_abs_mean"] = target_mean
-    return obs, critic_wire, metrics, changes
-
-
 def _run_integrated(env, agent, config):
-    """Exercise one full low update followed by one high+Adapter update."""
+    """Exercise one full 128-frame low PPO + Adapter + memory update."""
     joint = agent.algorithm
-    joint.update_clock(0.0)
+    joint.update_clock(PHASE_BOUNDARIES["stairrobust"])
     obs, critic_wire = _reset_env(env, agent, config)
 
     low_before = _snapshot_modules(agent)
@@ -286,27 +164,22 @@ def _run_integrated(env, agent, config):
     low_changes = _module_changes(agent, low_before)
     if float(low_metrics.get("applied_updates", 0.0)) <= 0.0:
         raise AssertionError(f"low PPO update was skipped: {low_metrics}")
-    for name in ("low_lstm", "low_actor", "low_critic"):
+    _assert_finite_metrics(
+        low_metrics,
+        ("p3_low_policy_loss", "p3_low_value_loss", "adapter_loss", "memory_loss"),
+    )
+    for name in ("low_lstm", "low_actor", "low_critic", "adapter"):
         if not low_changes[name]:
             raise AssertionError(f"expected low module did not change: {name}")
-    for name in ("low_cnn", "nav_encoder", "high_actor", "high_critic", "adapter"):
+    for name in ("low_cnn", "nav_encoder", "high_actor", "high_critic"):
         if low_changes[name]:
             raise AssertionError(f"low phase changed a frozen module: {name}")
 
-    obs, critic_wire = _assert_boundary_reset(
-        agent, env, config, PHASE_BOUNDARIES["highadapt"]
-    )
-    obs, critic_wire, high_metrics, high_changes = _run_high(
-        env, agent, obs, critic_wire
-    )
-    metrics = {
-        **{f"low_{name}": value for name, value in low_metrics.items()},
-        **{f"high_{name}": value for name, value in high_metrics.items()},
-    }
-    return obs, critic_wire, metrics, {
-        "low_phase": low_changes,
-        "high_phase": high_changes,
-    }
+    if joint.high_updates != 0:
+        raise AssertionError("stair-memory smoke unexpectedly advanced high_updates")
+    if float(low_metrics.get("memory_loss", 0.0)) <= 0.0:
+        raise AssertionError(f"memory auxiliary did not run: {low_metrics}")
+    return obs, critic_wire, low_metrics, low_changes
 
 
 def _round_trip(agent, output: Path) -> str:
@@ -373,7 +246,10 @@ def main() -> int:
     logger = _Logger()
     agent = Agent(agent_type="learner", device="cuda", logger=logger, monitor=None)
     load_mode = agent.algorithm.load_checkpoint(
-        checkpoint, platform_model_id="648278"
+        checkpoint,
+        platform_model_id=str(
+            config["p3_standard_joint"].get("parent_model_id", "")
+        ) or None,
     )
     env = Robot()
     try:
@@ -392,17 +268,17 @@ def main() -> int:
                 raise AssertionError(
                     f"expected {args.scenario}, got {agent.algorithm.current_phase}"
                 )
-        if args.scenario == "adaptercalib":
-            obs, critic_wire, metrics, changes = _run_adaptercalib(
-                env, agent, obs, critic_wire
+        if args.scenario != "integrated":
+            before = _snapshot_modules(agent)
+            obs, critic_wire, metrics = _collect_low_rollout(
+                env, agent, obs, critic_wire, train_low=True
             )
-        elif args.scenario != "integrated":
-            obs, critic_wire, metrics, changes = _run_high(
-                env,
-                agent,
-                obs,
-                critic_wire,
-            )
+            changes = _module_changes(agent, before)
+            if agent.algorithm.high_updates != 0:
+                raise AssertionError("phase smoke unexpectedly advanced high_updates")
+            for name in ("low_cnn", "nav_encoder", "high_actor", "high_critic"):
+                if changes[name]:
+                    raise AssertionError(f"phase smoke changed frozen module {name}")
 
         output = args.output
         remove_output = False

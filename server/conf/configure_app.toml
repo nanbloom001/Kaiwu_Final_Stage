@@ -3,7 +3,7 @@
 # Replay buffer configurations
 # 样本池容量
 preload_model_dir = "/data/pre_model/ckpt"
-preload_model_id = 884257
+preload_model_id = 1013548
 preload_model = true
 # Repository-side stage bootstrap. This is read before the stage-specific
 # training TOML path is constructed; the same TOML cannot select itself.

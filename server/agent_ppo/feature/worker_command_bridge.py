@@ -69,6 +69,8 @@ def _resolve_config() -> tuple[bool, dict[str, Any], int]:
         and schedule_mode in {
             "visual_command_generalization_v1",
             "p3_low_recovery_v1",
+            "p3_stair_memory_v1",
+            "p35_gaitfix_v1",
         }
     )
     schedule_conf = stage_conf.get("command_schedule", {})
@@ -289,3 +291,14 @@ def apply_worker_command(env) -> None:
 
 def record_worker_command_observation(env, group: str, obs: torch.Tensor) -> None:
     worker_command_bridge(env).record_observation(group, obs)
+
+
+def worker_command_training_state(env) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return committed P3 bucket/anchor state without creating a bridge."""
+    bridge = getattr(env, _STATE_ATTR, None)
+    scheduler = getattr(bridge, "scheduler", None)
+    bucket = getattr(scheduler, "bucket", None)
+    anchor = getattr(scheduler, "anchor_weights", None)
+    if not torch.is_tensor(bucket) or not torch.is_tensor(anchor):
+        return None, None
+    return bucket.detach(), anchor.detach()

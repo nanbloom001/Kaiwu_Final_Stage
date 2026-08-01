@@ -57,6 +57,15 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
         )
         self.resized_completed_records = 0
         self.replay_policy = "track_parent_75_25"
+        self.p3_replay_ratios = (0.50, 0.25, 0.25)
+
+    def set_p3_replay_ratios(
+        self, latest: float, recent: float, parent: float
+    ) -> None:
+        values = tuple(float(value) for value in (latest, recent, parent))
+        if any(value < 0.0 for value in values) or abs(sum(values) - 1.0) > 1.0e-6:
+            raise ValueError("P3 replay ratios must be nonnegative and sum to one")
+        self.p3_replay_ratios = values
 
     def clear_unfinished_history(self) -> None:
         super().clear_unfinished_history()
@@ -202,7 +211,7 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
         return ResponseBatch(**values)
 
     def sample(self, *, batch_envs: int, generator=None) -> ResponseBatch | None:
-        if self.replay_policy == "p3_versioned_50_25_25":
+        if self.replay_policy.startswith("p3_versioned"):
             return self._sample_p3_versioned(batch_envs=batch_envs, generator=generator)
         requested = max(1, int(batch_envs))
         parent_count = int(round(requested * p2_contract.PARENT_RESPONSE_REPLAY_RATIO))
@@ -272,8 +281,9 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
             (record for record in current if int(record.get("low_level_iteration", -1)) < latest_iteration),
             maxlen=self.capacity_steps,
         )
-        latest_count = int(round(requested * 0.50))
-        recent_count = int(round(requested * 0.25))
+        latest_ratio, recent_ratio, _ = self.p3_replay_ratios
+        latest_count = int(round(requested * latest_ratio))
+        recent_count = int(round(requested * recent_ratio))
         parent_count = max(0, requested - latest_count - recent_count)
         batches = [
             self._sample_pool(latest, latest_count, generator),
@@ -307,6 +317,7 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
             self._cpu_record(record) for record in self._parent_records
         ]
         state["replay_policy"] = self.replay_policy
+        state["p3_replay_ratios"] = list(self.p3_replay_ratios)
         return state
 
     def _resize_completed_records(self, state: dict[str, object]) -> dict[str, object]:
@@ -366,6 +377,8 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
         self._parent_records.clear()
         if isinstance(state, dict):
             self.replay_policy = str(state.get("replay_policy", self.replay_policy))
+            ratios = state.get("p3_replay_ratios", self.p3_replay_ratios)
+            self.set_p3_replay_ratios(*ratios)
             for record in state.get("parent_records", []):
                 if not isinstance(record, dict):
                     continue

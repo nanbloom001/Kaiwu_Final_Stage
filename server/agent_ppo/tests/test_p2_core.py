@@ -510,6 +510,71 @@ def test_gait_probe_maps_articulation_ids_to_permuted_contact_sensor_columns():
     assert result[0, 20:24].tolist() == pytest.approx((0.7, 0.0, 0.0, 0.0))
 
 
+def test_gait_probe_uses_full_root_rotation_for_touchdown_lateral_margin():
+    sensor = SimpleNamespace(
+        body_names=("trunk", "FL_foot", "FR_foot", "RL_foot", "RR_foot"),
+        data=SimpleNamespace(
+            current_air_time=torch.ones(1, 5),
+            last_air_time=torch.ones(1, 5),
+            net_forces_w=torch.zeros(1, 5, 3),
+        ),
+    )
+    body_pos = torch.zeros(1, 4, 3)
+    robot = SimpleNamespace(
+        find_bodies=lambda _pattern: (
+            torch.tensor((0, 1, 2, 3)),
+            ("FL_foot", "FR_foot", "RL_foot", "RR_foot"),
+        ),
+        data=SimpleNamespace(
+            body_lin_vel_w=torch.zeros(1, 4, 3),
+            body_pos_w=body_pos,
+            root_pos_w=torch.zeros(1, 3),
+            root_quat_w=torch.tensor(((2**-0.5, 2**-0.5, 0.0, 0.0),)),
+        ),
+    )
+    env = SimpleNamespace(scene=SimpleNamespace(sensors={"contact_forces": sensor}))
+    probe = P2GaitWindowProbe(env, robot, num_envs=1, device="cpu")
+    probe.step(torch.tensor((False,)))
+    body_pos[0, 0, 2] = 0.2
+    sensor.data.current_air_time.zero_()
+    probe.step(torch.tensor((False,)))
+    assert probe.last_p3_detail[0, 8].item() == pytest.approx(0.2)
+
+
+def test_gait_probe_keeps_per_stance_slip_budget():
+    sensor = SimpleNamespace(
+        body_names=("trunk", "FL_foot", "FR_foot", "RL_foot", "RR_foot"),
+        data=SimpleNamespace(
+            current_air_time=torch.zeros(1, 5),
+            last_air_time=torch.zeros(1, 5),
+            net_forces_w=torch.zeros(1, 5, 3),
+        ),
+    )
+    velocity = torch.zeros(1, 4, 3)
+    velocity[0, 0, 0] = 1.0
+    robot = SimpleNamespace(
+        find_bodies=lambda _pattern: (torch.arange(4), ("FL_foot", "FR_foot", "RL_foot", "RR_foot")),
+        data=SimpleNamespace(body_lin_vel_w=velocity),
+    )
+    probe = P2GaitWindowProbe(
+        SimpleNamespace(scene=SimpleNamespace(sensors={"contact_forces": sensor})),
+        robot,
+        num_envs=1,
+        device="cpu",
+    )
+    assert probe.step(torch.tensor((False,)))[0, 20].item() == pytest.approx(1.0)
+    assert probe.step(torch.tensor((False,)))[0, 20].item() == pytest.approx(1.0)
+    sensor.data.current_air_time.zero_()
+    sensor.data.current_air_time[:, 1] = 1.0
+    # A completed stance is exported once through the P3-only detail tail.
+    result = probe.step(torch.tensor((False,)))
+    assert probe.last_p3_detail[0, 16].item() == pytest.approx(0.04)
+    assert probe.last_p3_detail[0, 20].item() == pytest.approx(1.0)
+    result = probe.step(torch.tensor((False,)))
+    assert probe.last_p3_detail[0, 16].item() == pytest.approx(0.0)
+    assert probe.last_p3_detail[0, 20].item() == pytest.approx(0.0)
+
+
 def test_gait_probe_excludes_reset_boundary_sample_from_window_count():
     sensor = SimpleNamespace(
         body_names=("trunk", "FL_foot", "FR_foot", "RL_foot", "RR_foot"),
@@ -1646,6 +1711,18 @@ def test_p2_response_buffer_is_cpu_backed_and_resume_clears_future_history():
     assert restored._records[0]["aux"].device.type == "cpu"
     assert len(restored._history_aux) == 0
     assert restored._next_episode_start.all()
+
+
+def test_p3_response_replay_ratios_validate_and_resume():
+    buffer = P2ResponseAuxBuffer(2, "cpu")
+    buffer.replay_policy = "p3_versioned_50_25_25"
+    buffer.set_p3_replay_ratios(0.75, 0.15, 0.10)
+    state = buffer.checkpoint_state()
+    restored = P2ResponseAuxBuffer(2, "cpu")
+    restored.load_checkpoint_state(state)
+    assert restored.p3_replay_ratios == pytest.approx((0.75, 0.15, 0.10))
+    with pytest.raises(ValueError, match="sum to one"):
+        restored.set_p3_replay_ratios(0.5, 0.5, 0.5)
 
 
 def test_p2_adapter_update_reports_row_domain_and_confidence_metrics():

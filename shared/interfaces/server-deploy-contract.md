@@ -423,7 +423,13 @@ high actor input   = nav_feat32 | nav_nonvisual36 | response16 | confidence1 = 8
 low action         = joint12 at 50Hz
 high action        = [vx,vy,wz] at 5Hz
 environment step   = joint12 (platform contract unchanged)
-training worker wire = critic323 | response+diagnostic62 | p3_runtime+gait35 = 420
+training worker wire = critic323 | response+diagnostic62 | p3_training_extra108 = 493
+
+The P3.5 training-only tail retains the original runtime/gait/command/Sim2Real
+fields and appends joint-acc12, contact force/onset/over-threshold-duration14,
+mapping-valid flags, and Push event/delta/age/active/telemetry fields.
+These fields are excluded from policy observations,
+evaluation inputs, exported models, and deployment interfaces.
 ```
 
 平台会覆盖 `isaac_env/base_env.py`，P3 不依赖该文件的本地补丁。低层恢复阶段由 P3 worker
@@ -449,18 +455,43 @@ modules.high_level.actor / critic / response_adapter
 optimizers.low_level / high_level_actor / high_level_critic / response_adapter
 training_states.low_level / high_level / response_adapter / global
 training_states.low_level.gait_baseline / mirror_rng_state / mirror_training_fraction (training_only)
+training_states.low_level.depth_fault / memory_auxiliary / camera_timing / memory_training_fraction (training_only)
+training_states.low_level.p35_reward_baseline (training_only)
 training_states.global.session_effective_seconds / lifetime_effective_seconds
 training_states.global.low_updates / high_updates / compound_schedule_phase
 training_states.global.p3_anchor_digest / low_level_version
 training_states.global.domain_randomization_phase / domain_randomization_realized
-contracts.p3_standard_joint.name = "p3_standard_gait_radial_v5"
+training_states.global.runtime_m3_contract
+contracts.p3_standard_joint.name = "p35_low_speed_gait_push_v1"
 ```
 
-阶段文件标签固定为 `gaitcalib`、`lowbase`、`lowmild`、`lowmedium`、`lowfull`、`adaptercalib`、
-`highadapt`、`highslow`。候选文件缺失时可继续查找配置父包；一旦选中文件，格式、模块、
+当前两小时 P3.5 session 的阶段标签固定为 `gaitfixcalib`、`repair`、`pushwarm`、
+`pushfull`、`stable`。候选文件缺失时可继续查找配置父包；一旦选中文件，格式、模块、
 spec/shape、optimizer exact-resume 状态或有限值不兼容必须停止。平台模型 ID、文件名 ID 和
 lineage 只用于选择、告警与追溯，不得形成单点硬门禁。live hidden、未完成 rollout、未完成
 future history和每环境局部目标状态不保存，resume 后统一 reset。
+
+本轮父包选择固定为任务 `235689` 的最终 `stairfinal` checkpoint（模型 ID `1013548`）；实际文件
+SHA256 与模块 digest 必须由加载器在下载并解析真实制品后记录。训练命令中所有含 `vx` 的类型
+共用 `0.10-0.35/0.35-0.70/0.70-1.00m/s` 三档和 `55/30/15` 概率。ResponseAdapter replay
+按 session 阶段使用 `50/25/25`、`60/25/15`、`75/15/10` 的最新/近期/父 records 比例；最后
+15 分钟低层冻结不代表 Adapter 冻结，仍每 rollout 更新一次。
+
+当前 7200 秒 session 只执行低层 recurrent PPO 和 ResponseAdapter：`0-900s gaitfixcalib`、
+`900-4500s repair`、`4500-5400s pushwarm`、`5400-6300s pushfull`、
+`6300-7200s stable`。低层 rollout 与 TBPTT 均为 128 帧；低层 CNN、高层
+NavigationEncoder/Actor/Critic/SafetyHead 全程冻结，高层 rollout、PPO 和 optimizer/scheduler
+step 均不执行，`high_updates` 必须保持 0。P3.5 另外冻结低层 Actor body/std，只允许 LSTM、
+RNN output、最终 action head 和 Critic 更新；`stable` 阶段低层全部冻结。从旧 P3 合同 warm
+start 时保留高层模块及 optimizer 状态，仅重置本轮 session clock、rollout 与 live hidden。
+
+训练期 depth contract 不改变模型输入布局。每环境 `near_clip` 保持父包合同；冻结 CNN feature32
+通过随机 phase 的 30Hz capture、50Hz hold 和 10 帧 FP16 队列模拟相机时序，主动延迟上限
+150ms，150-250ms 只作 shadow。完整 128 帧 sequence 继续使用父包末段 50% 深度故障强度。
+clean 路径使用冻结父模型 anchor，fault/delayed 路径只允许 memory auxiliary 更新低层 LSTM、
+RNN output 与最终 action head；eval/export/deploy 忽略这些 training-only state，且不运行人工增强。
+memory auxiliary 的选择 mask 是像素故障与实际交付 feature age 大于零的并集，必须分别报告
+fault-only、delay-only 与交集占比，不能把纯 sample-and-hold/延迟帧排除在教师监督之外。
 
 同一个 P3 包支持两种独立评估入口，二者共用同一份候选发现与结构验证器
 （`p3_standard_joint_eval_candidates` + `validate_p3_eval_bundle`），绝不回退
@@ -480,22 +511,34 @@ P2/LBC/随机权重：
   保留已验证的 Track goal-reached→scorer 链（完成数不再恒为 0）。
 SafetyHead/Critic/optimizer/scheduler/训练 buffer 一律不创建。
 
-P3 训练专属步态状态不改变 57901 低层输入、12 维动作或部署接口。镜像合同固定为
+P3 训练专属步态状态不改变 57901 低层输入、12 维动作或部署接口。镜像训练只在 joint order、
+action scale、PD stiffness/damping、effort limit 和 `contact_forces` 足端映射均明确左右一致时启用；
+异常只关闭 training-only mirror/gait 奖励并告警。交叉落脚使用完整 root quaternion 逆旋转后的
+body-y；P2 共享诊断继续报告接触帧平均滑移速度，P3 私有 tail 只在 stance 结束帧报告一次累计
+世界 XY 滑移距离，训练奖励不会在后续窗口重复扣分。镜像合同固定为
 `FL<->FR`、`RL<->RR`，`vy/wz` 与左右相关轴取反，Hip 按机械轴交换并取反、Thigh/Calf 仅交换；
-depth 水平翻转，scan 置换由真实 lateral ray 坐标生成。前 15 分钟采集 4 类地形 × 4 类运动健康
+depth 水平翻转，scan 置换由真实 lateral ray 坐标生成。前 15 分钟采集 4 类地形 × 3 类运动健康
 基线；样本不足按同地形、全局逐级回退，全局仍不足时对应接触/交叉/饥饿奖励归零。镜像和步态
 baseline/RNG 仅写入 training state，`p3_standard_eval` 与 `p3_track_eval` 必须忽略它们。
+worker command sampler 位于独立环境 worker，当前公开 transport 不回传其 live RNG/hold 状态；
+checkpoint 明确记录 `seeded_fresh_after_environment_reset`，不得宣称该部分 exact resume。
 
-P3 评估候选标签优先级为 `highslow > highadapt > adaptercalib > lowfull > lowmedium >
-lowmild > lowbase`；无同 ID P3 文件时只允许唯一 discovery，多个候选明确报歧义。请求 ID、
+P3 评估候选标签优先级为 `stable > pushfull > pushwarm > repair > gaitfixcalib`，随后兼容
+`stairfinal/stairrobust/stairadapt/stairwarm/staircalib` 及
+旧 `highslow/highadapt/adaptercalib/lowfull/lowmedium/lowmild/lowbase`；无同 ID P3 文件时只允许
+唯一 discovery，多个候选明确报歧义。请求 ID、
 文件名标签与 lineage 不一致只告警；选中文件的反序列化、必需模块、spec/shape 或非有限值
 错误必须硬失败，禁止继续用随机参数评分。
 
-每个阶段边界先保存 checkpoint，再通过平台公开 `env.reset(config)` 开始新 episode；不修改或
-依赖平台托管的 `BaseEnv`。本轮只在 0.5h 边界增强 friction/base-mass/noise，未验证的 COM、PD、
-action gain/delay 与按环境 push 不属于运行合同。低层 optimizer 成功后先推进 low-level digest/version
-并清除未完成 future history，再执行 Adapter update；0-60 分钟每轮 1 次、60-90 分钟每轮 2 次，
-`adaptercalib` 每轮 4 次，高层后段按 `high_update_interval=2` 更新。
+每个阶段边界先保存 checkpoint，再通过平台公开 `env.reset(config)` 开始新 episode并清理 live
+recurrent 状态；该调用不会重建平台 create-once 的 Isaac 环境。friction `[0.65,1.25]`、base mass
+`+-0.4kg`、restitution `[0,0.05]`、noise `0.35` 在首次 reset 装配。`push_robot` EventTerm 同时
+以零 XY 速度保留；75 分钟通过 EventManager `get_term_cfg/set_term_cfg/reset` 切到
+`+-0.05m/s`，90 分钟切到 `+-0.08m/s`，间隔 12-18 秒。wrapper 必须先调用 Isaac 原
+`push_by_setting_velocity`，再记录推前/推后的真实 root velocity delta；配置值不得冒充实测值。
+checkpoint session 时间经 reset `usr_conf` 传给 worker，断点恢复立即恢复对应 Push 阶段。
+未验证的 COM、PD、action gain/delay 不属于运行合同。低层 optimizer 成功后先推进 low-level
+digest/version 并清除未完成 future history，再执行一次 Adapter update。
 
 文件数字 ID 完全使用开悟框架传入值，不由业务代码从 iteration 或父模型 ID
 计算。R2 每次保存同一 payload 的阶段文件和评估兼容别名：

@@ -99,6 +99,16 @@ P3_STANDARD_JOINT_PHASE_LABELS = (
     "adaptercalib",
     "highadapt",
     "highslow",
+    "staircalib",
+    "stairwarm",
+    "stairadapt",
+    "stairrobust",
+    "stairfinal",
+    "gaitfixcalib",
+    "repair",
+    "pushwarm",
+    "pushfull",
+    "stable",
 )
 
 _PROBE_NAME = re.compile(r"^model\.ckpt-[a-z]*-*[0-9]+\.[^.]+$")

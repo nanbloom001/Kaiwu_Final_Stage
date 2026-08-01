@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import sys
+import time
 import types
 from typing import Any
 
@@ -14,7 +15,7 @@ from agent_ppo.feature.feedback_emulator import FeedbackEmulator
 from agent_ppo.feature.p2_gait import P2GaitWindowProbe
 from agent_ppo.feature.p2_curriculum_probe import P2TrackCurriculumProbe
 from agent_ppo.feature import p2_contract, p3_contract
-from agent_ppo.feature.p3_gait import validate_joint_order
+from agent_ppo.feature.p3_gait import validate_mirror_assembly
 
 
 _STATE_ATTR = "_agent_ppo_p2_worker_bridge"
@@ -274,6 +275,16 @@ class P2WorkerBridge:
     def __init__(self, env, *, config: dict[str, Any], seed: int = 0):
         self.env = env
         self.config = dict(config)
+        live_usr_conf = getattr(env, "usr_conf", None)
+        live_stage = (
+            live_usr_conf.get("p3_standard_joint")
+            if isinstance(live_usr_conf, dict)
+            else None
+        )
+        if isinstance(live_stage, dict):
+            stage_type = self.config.get("_worker_stage_type")
+            self.config.update(live_stage)
+            self.config["_worker_stage_type"] = stage_type
         self.runtime_stage_type = str(
             self.config.pop("_worker_stage_type", "p2_nav_ppo")
         )
@@ -317,6 +328,34 @@ class P2WorkerBridge:
             num_envs=self.num_envs,
             device=self.device,
         )
+        if self.runtime_stage_type.startswith("p3_"):
+            self._p3_mirror_assembly_valid, self._p3_mirror_assembly_checks = (
+                validate_mirror_assembly(robot, self.env)
+            )
+        self._p35_contact_slot_ids = None
+        self._p35_contact_mapping_valid = False
+        self._p35_contact_previous = torch.zeros(
+            self.num_envs, 14, dtype=torch.bool, device=self.device
+        )
+        self._p35_contact_duration = torch.zeros(
+            self.num_envs, 14, device=self.device
+        )
+        self._p35_push_event_flag = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._p35_push_delta = torch.zeros(self.num_envs, 2, device=self.device)
+        self._p35_seconds_since_push = torch.full(
+            (self.num_envs,), 1.0e6, device=self.device
+        )
+        self._p35_push_runtime_active = False
+        self._p35_push_telemetry_valid = False
+        self._p35_push_event_count = 0
+        self._p35_push_phase_name = None
+        self._p35_started_monotonic = time.monotonic()
+        push_config = self.config.get("push_schedule") or {}
+        self._p35_resume_offset_s = float(push_config.get("resume_offset_s", 0.0))
+        if self.runtime_stage_type == "p3_standard_joint":
+            self._p35_install_push_wrapper()
         self._collision_force_history = torch.zeros(
             p2_contract.NAV_PERIOD_FRAMES,
             self.num_envs,
@@ -387,17 +426,256 @@ class P2WorkerBridge:
             value = 2.0 * p3_contract.TILE_HALF_EXTENT_M
         return value
 
+    def _p35_contact_slots(self):
+        if getattr(self, "_p35_contact_slot_ids", None) is not None:
+            return self._p35_contact_slot_ids
+        names = [
+            name.lower()
+            for name in getattr(self._gait_window, "sensor_body_names", ())
+        ]
+        slots: list[list[int]] = []
+
+        def matches(*tokens):
+            return [
+                index
+                for index, name in enumerate(names)
+                if all(token in name for token in tokens)
+            ]
+
+        base = [index for index, name in enumerate(names) if name == "base"]
+        if not base:
+            base = matches("base")
+        slots.append(base[:1])
+        slots.append(matches("head"))
+        for leg in ("fl", "fr", "rl", "rr"):
+            for link in ("hip", "thigh", "calf"):
+                slots.append(matches(leg, link))
+        self._p35_contact_mapping_valid = (
+            len(slots) == 14
+            and all(len(slot) >= 1 for slot in slots)
+            and all(len(slot) == 1 for index, slot in enumerate(slots) if index != 1)
+        )
+        self._p35_contact_slot_ids = slots
+        _print(
+            "[P35Baseline] contact_mapping_valid="
+            f"{int(self._p35_contact_mapping_valid)} slots={slots} names={names}"
+        )
+        return slots
+
+    def _p35_contact_transport(self, reset: torch.Tensor):
+        force = torch.zeros(self.num_envs, 14, device=self.device)
+        onset = torch.zeros_like(force)
+        duration = torch.zeros_like(force)
+        sensor = getattr(self._gait_window, "sensor", None)
+        if not hasattr(self, "_p35_contact_previous"):
+            self._p35_contact_previous = torch.zeros(
+                self.num_envs, 14, dtype=torch.bool, device=self.device
+            )
+            self._p35_contact_duration = torch.zeros_like(force)
+        values = getattr(getattr(sensor, "data", None), "net_forces_w", None)
+        slots = self._p35_contact_slots()
+        valid = (
+            self._p35_contact_mapping_valid
+            and torch.is_tensor(values)
+            and values.ndim == 3
+            and values.shape[:2]
+            == (self.num_envs, len(self._gait_window.sensor_body_names))
+            and values.shape[2] == 3
+            and bool(torch.isfinite(values).all())
+        )
+        if not valid:
+            self._p35_contact_previous.zero_()
+            self._p35_contact_duration.zero_()
+            return force, onset, duration, False
+        magnitudes = values.norm(dim=-1)
+        for index, ids in enumerate(slots):
+            force[:, index] = magnitudes[:, ids].amax(dim=-1)
+        thresholds = force.new_tensor(
+            [10.0, 10.0, 25.0, 25.0, 35.0, 25.0, 25.0, 35.0,
+             25.0, 25.0, 35.0, 25.0, 25.0, 35.0]
+        )
+        above = force > thresholds
+        onset = (above & ~self._p35_contact_previous).to(force)
+        self._p35_contact_duration = torch.where(
+            above,
+            self._p35_contact_duration + p2_contract.CONTROL_DT_S,
+            torch.zeros_like(self._p35_contact_duration),
+        )
+        self._p35_contact_previous.copy_(above)
+        self._p35_contact_previous[reset] = False
+        self._p35_contact_duration[reset] = 0.0
+        duration.copy_(self._p35_contact_duration)
+        force[reset] = 0.0
+        onset[reset] = 0.0
+        duration[reset] = 0.0
+        return force, onset, duration, True
+
+    def _p35_push_elapsed_s(self) -> float:
+        return self._p35_resume_offset_s + max(
+            0.0, time.monotonic() - self._p35_started_monotonic
+        )
+
+    def _p35_install_push_wrapper(self) -> None:
+        manager = getattr(self.env, "event_manager", None)
+        getter = getattr(manager, "get_term_cfg", None)
+        setter = getattr(manager, "set_term_cfg", None)
+        if not callable(getter) or not callable(setter):
+            _print("[P35PushPreflight] valid=0 reason=runtime_api_unavailable")
+            return
+        term_name = str((self.config.get("push_schedule") or {}).get("term_name", "push_robot"))
+        try:
+            cfg = getter(term_name)
+        except Exception as exc:
+            _print(f"[P35PushPreflight] valid=0 reason=term_missing error={type(exc).__name__}")
+            return
+        mode_names = getattr(manager, "active_terms", None)
+        if mode_names is None:
+            mode_names = getattr(manager, "_mode_term_names", {})
+        interval_names = (
+            list(mode_names.get("interval", ()))
+            if isinstance(mode_names, dict)
+            else []
+        )
+        original = getattr(cfg, "func", None)
+        function_name = getattr(original, "__name__", "")
+        params = getattr(cfg, "params", None)
+        valid = (
+            term_name in interval_names
+            and callable(original)
+            and function_name == "push_by_setting_velocity"
+            and isinstance(params, dict)
+        )
+        if not valid:
+            _print(
+                "[P35PushPreflight] valid=0 "
+                f"term={term_name} mode_interval={term_name in interval_names} "
+                f"function={function_name}"
+            )
+            return
+        bridge = self
+
+        def _wrapped_push(env, env_ids, **kwargs):
+            robot = bridge._robot()
+            ids = env_ids
+            if ids is None:
+                ids = torch.arange(bridge.num_envs, device=bridge.device)
+            ids = torch.as_tensor(ids, device=bridge.device, dtype=torch.long)
+            before = robot.data.root_vel_w[ids, :2].detach().clone()
+            original(env, env_ids, **kwargs)
+            after = robot.data.root_vel_w[ids, :2].detach()
+            delta = torch.nan_to_num(after - before)
+            bridge._p35_push_event_flag[ids] = True
+            bridge._p35_push_delta[ids] = delta
+            bridge._p35_seconds_since_push[ids] = 0.0
+            bridge._p35_push_event_count += int(ids.numel())
+            if bridge._p35_push_event_count <= 5 or bridge._p35_push_event_count % 50 == 0:
+                _print(
+                    "[P35PushEvent] "
+                    f"count={bridge._p35_push_event_count} env_ids={ids[:8].tolist()} "
+                    f"delta_mean={delta.mean(dim=0).tolist()}"
+                )
+
+        cfg.func = _wrapped_push
+        params["velocity_range"] = {
+            "x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0),
+            "roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0),
+        }
+        cfg.interval_range_s = (12.0, 18.0)
+        try:
+            setter(term_name, cfg)
+            self._p35_push_telemetry_valid = True
+            _print(
+                "[P35PushPreflight] valid=1 term=push_robot mode=interval "
+                "interval=(12,18) initial_velocity=0 wrapper=installed"
+            )
+        except Exception as exc:
+            _print(f"[P35PushPreflight] valid=0 reason=set_failed error={type(exc).__name__}")
+
+    def _p35_update_push_phase(self) -> None:
+        if not self._p35_push_telemetry_valid:
+            return
+        phase = p3_contract.push_phase_config(self._p35_push_elapsed_s())
+        if phase["name"] == self._p35_push_phase_name:
+            return
+        manager = self.env.event_manager
+        term_name = str((self.config.get("push_schedule") or {}).get("term_name", "push_robot"))
+        try:
+            cfg = manager.get_term_cfg(term_name)
+            maximum = float(phase["max_velocity_xy_m_s"])
+            cfg.params["velocity_range"] = {
+                "x": (-maximum, maximum), "y": (-maximum, maximum),
+                "z": (0.0, 0.0), "roll": (0.0, 0.0),
+                "pitch": (0.0, 0.0), "yaw": (0.0, 0.0),
+            }
+            cfg.interval_range_s = (
+                float(phase["min_interval_s"]), float(phase["max_interval_s"])
+            )
+            manager.set_term_cfg(term_name, cfg)
+            manager.reset(None)
+            previous = self._p35_push_phase_name
+            self._p35_push_phase_name = str(phase["name"])
+            self._p35_push_runtime_active = bool(phase["active"])
+            _print(
+                "[P35PushPhase] "
+                f"before={previous} after={self._p35_push_phase_name} "
+                f"session_s={self._p35_push_elapsed_s():.1f} max_xy={maximum} timer_reset=1"
+            )
+        except Exception as exc:
+            self._p35_push_telemetry_valid = False
+            self._p35_push_runtime_active = False
+            _print(f"[P35PushPhase] valid=0 error={type(exc).__name__}:{exc}")
+
     def _p3_extra(self, robot, reset: torch.Tensor) -> torch.Tensor:
         extra = torch.zeros_like(self.last_p3_extra)
         extra[:, p3_contract.RUNTIME_TERRAIN_SIZE_INDEX] = self._runtime_terrain_size_x()
         if self._gait_window.valid:
-            extra[:, 1:21] = self._gait_window.last_p3_detail
+            extra[:, 1:25] = self._gait_window.last_p3_detail
         torque = getattr(robot.data, "applied_torque", None)
         velocity = getattr(robot.data, "joint_vel", None)
-        joint_names = getattr(robot.data, "joint_names", getattr(robot, "joint_names", ()))
-        extra[:, p3_contract.JOINT_MAPPING_VALID_INDEX] = float(
-            validate_joint_order(joint_names)
-        )
+        if not hasattr(self, "_p3_mirror_assembly_valid"):
+            self._p3_mirror_assembly_valid, self._p3_mirror_assembly_checks = (
+                validate_mirror_assembly(robot, self.env)
+            )
+        mirror_valid = self._p3_mirror_assembly_valid
+        mirror_checks = self._p3_mirror_assembly_checks
+        mirror_valid = mirror_valid and bool(self._gait_window.valid)
+        extra[:, p3_contract.JOINT_MAPPING_VALID_INDEX] = float(mirror_valid)
+        from agent_ppo.feature.worker_command_bridge import worker_command_training_state
+
+        command_bucket, anchor_weight = worker_command_training_state(self.env)
+        if (
+            torch.is_tensor(command_bucket)
+            and command_bucket.numel() == self.num_envs
+            and torch.is_tensor(anchor_weight)
+            and anchor_weight.numel() == self.num_envs
+        ):
+            extra[:, p3_contract.COMMAND_BUCKET_INDEX] = command_bucket.to(
+                self.device, dtype=extra.dtype
+            ).reshape(-1)
+            extra[:, p3_contract.COMMAND_ANCHOR_WEIGHT_INDEX] = anchor_weight.to(
+                self.device, dtype=extra.dtype
+            ).reshape(-1)
+        else:
+            extra[:, p3_contract.COMMAND_BUCKET_INDEX] = -1.0
+            extra[:, p3_contract.COMMAND_ANCHOR_WEIGHT_INDEX] = 0.0
+            if not getattr(self, "_p3_command_state_missing_warned", False):
+                _print(
+                    "[P3CommandTransport] warning=worker_command_state_missing "
+                    "fallback_anchor=0"
+                )
+                self._p3_command_state_missing_warned = True
+        previous_mirror_valid = getattr(self, "_p3_mirror_valid_last", None)
+        if previous_mirror_valid is None or previous_mirror_valid != mirror_valid:
+            joint_names = getattr(robot.data, "joint_names", None)
+            if not joint_names:
+                joint_names = getattr(robot, "joint_names", ())
+            _print(
+                "[P3MirrorPreflight] "
+                f"enabled={mirror_valid} checks={mirror_checks} "
+                f"contact_mapping={bool(self._gait_window.valid)} "
+                f"joint_names={list(joint_names) if joint_names else []}"
+            )
+        self._p3_mirror_valid_last = mirror_valid
         if (
             torch.is_tensor(torque)
             and torque.shape == (self.num_envs, 12)
@@ -411,11 +689,97 @@ class P2WorkerBridge:
             extra[:, p3_contract.MECHANICAL_POWER_INDEX] = (
                 safe_torque * safe_velocity
             ).abs().sum(dim=-1)
+        sim2real_components = getattr(self.env, "_p3_sim2real_components", None)
+        component_names = (
+            "sustained_torque",
+            "torque_peak",
+            "action_rate",
+            "action_jerk",
+        )
+        if isinstance(sim2real_components, dict):
+            values = [sim2real_components.get(name) for name in component_names]
+            if all(
+                torch.is_tensor(value)
+                and value.numel() == self.num_envs
+                for value in values
+            ):
+                component_values = torch.stack(
+                    [value.to(self.device, dtype=extra.dtype).reshape(-1) for value in values],
+                    dim=-1,
+                )
+                component_valid = torch.isfinite(component_values).all(dim=-1)
+                torque_mapping_valid = getattr(
+                    self.env, "_p3_torque_mapping_valid", None
+                )
+                if (
+                    torch.is_tensor(torque_mapping_valid)
+                    and torque_mapping_valid.numel() == self.num_envs
+                ):
+                    component_valid &= torque_mapping_valid.to(
+                        self.device
+                    ).reshape(-1).bool()
+                extra[:, p3_contract.SIM2REAL_COMPONENT_SLICE] = torch.where(
+                    component_valid.unsqueeze(-1), component_values, 0.0
+                )
+                extra[:, p3_contract.SIM2REAL_COMPONENT_VALID_INDEX] = (
+                    component_valid.to(extra)
+                )
+        joint_acc = getattr(robot.data, "joint_acc", None)
+        joint_acc_valid = (
+            bool(mirror_valid)
+            and torch.is_tensor(joint_acc)
+            and joint_acc.shape == (self.num_envs, 12)
+            and bool(torch.isfinite(joint_acc).all())
+        )
+        if joint_acc_valid:
+            extra[:, p3_contract.JOINT_ACCELERATION_SLICE] = joint_acc
+        extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] = float(
+            joint_acc_valid
+        )
+        contact_force, contact_onset, contact_duration, contact_valid = (
+            self._p35_contact_transport(reset)
+        )
+        extra[:, p3_contract.CONTACT_FORCE_SLICE] = contact_force
+        extra[:, p3_contract.CONTACT_ONSET_SLICE] = contact_onset
+        extra[:, p3_contract.CONTACT_OVER_THRESHOLD_DURATION_SLICE] = contact_duration
+        extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = float(contact_valid)
+        push_event_flag = getattr(
+            self, "_p35_push_event_flag", torch.zeros(self.num_envs, device=self.device)
+        )
+        push_delta = getattr(
+            self, "_p35_push_delta", torch.zeros(self.num_envs, 2, device=self.device)
+        )
+        seconds_since_push = getattr(
+            self,
+            "_p35_seconds_since_push",
+            torch.full((self.num_envs,), 1.0e6, device=self.device),
+        )
+        extra[:, p3_contract.PUSH_EVENT_FLAG_INDEX] = push_event_flag.to(extra)
+        extra[:, p3_contract.PUSH_DELTA_VELOCITY_SLICE] = push_delta
+        extra[:, p3_contract.SECONDS_SINCE_PUSH_INDEX] = seconds_since_push
+        extra[:, p3_contract.PUSH_RUNTIME_ACTIVE_INDEX] = float(
+            getattr(self, "_p35_push_runtime_active", False)
+        )
+        extra[:, p3_contract.PUSH_TELEMETRY_VALID_INDEX] = float(
+            getattr(self, "_p35_push_telemetry_valid", False)
+        )
         # Reset only episode-local measurements.  The joint-name mapping is a
         # static assembly invariant and must remain valid on reset rows;
         # clearing it would disable gait/mirror training for every rollout
         # containing any reset environment.
         extra[reset, 1 : p3_contract.JOINT_MAPPING_VALID_INDEX] = 0.0
+        extra[reset, p3_contract.SIM2REAL_COMPONENT_SLICE] = 0.0
+        extra[reset, p3_contract.SIM2REAL_COMPONENT_VALID_INDEX] = 0.0
+        extra[reset, p3_contract.JOINT_ACCELERATION_SLICE] = 0.0
+        extra[reset, p3_contract.CONTACT_FORCE_SLICE] = 0.0
+        extra[reset, p3_contract.CONTACT_ONSET_SLICE] = 0.0
+        extra[reset, p3_contract.CONTACT_OVER_THRESHOLD_DURATION_SLICE] = 0.0
+        extra[reset, p3_contract.PUSH_EVENT_FLAG_INDEX] = 0.0
+        extra[reset, p3_contract.PUSH_DELTA_VELOCITY_SLICE] = 0.0
+        if hasattr(self, "_p35_push_event_flag"):
+            self._p35_push_event_flag.zero_()
+        if hasattr(self, "_p35_push_delta"):
+            self._p35_push_delta.zero_()
         return extra
 
     def _goal_distance(self, robot) -> torch.Tensor:
@@ -479,6 +843,10 @@ class P2WorkerBridge:
         robot = self._robot()
         data = robot.data
         reset = _reset_mask(self.env, self.num_envs, self.device)
+        if self.runtime_stage_type == "p3_standard_joint":
+            self._p35_seconds_since_push.add_(p2_contract.CONTROL_DT_S)
+            self._p35_seconds_since_push[reset] = 1.0e6
+            self._p35_update_push_phase()
         true_velocity = torch.stack(
             (data.root_lin_vel_b[:, 0], data.root_lin_vel_b[:, 1], data.root_ang_vel_b[:, 2]),
             dim=-1,

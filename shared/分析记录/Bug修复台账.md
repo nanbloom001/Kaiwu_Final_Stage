@@ -1695,6 +1695,27 @@
   并保护 `conf/`、`conf/.env`、平台 `kaiwudrl/tools`、正式模型和训练日志。宿主安全回归覆盖
   dry-run、普通/彻底清理边界、凭证保留与错误根目录拒绝；容器 dry-run/实际执行结果见本轮
   后续验证记录。关联分支 `codex/p3-standard-joint-recovery`，commit/PR 尚未建立。
+- 2026-08-01 P3 再次复发更正：用户在创建 `p3gait2h30` 时仍看到“训练任务创建失败”。
+  先执行普通清理，再按已完成容器测试的边界执行 `--apply --remove-dev-files`，删除容器
+  副本中的 `.git`、`agent_ppo/tests` 和 `agent_ppo/tools`，共释放 `70,861,806` bytes；其中包含
+  `36,280,101` bytes 的测试父模型副本与约 `32.4 MB` Git object。`/workspace/code` 由约
+  `72 MB` 降至 `2.3 MB`，磁盘使用率 `18%`、inode 使用率 `3%`，凭证、`conf/.env`、P3 训练
+  TOML 和正式运行时源码均保留。项目根剩余约 `104 MB` 主要为平台固定提供的
+  `kaiwudrl` 约 `73 MB` 和 `tools` 约 `30 MB`，不得为减小快照删除。
+- 同次 Chrome 只读证据显示：清理后 `POST /api/v5/Competition/CreateTrainTask` 仍连续三次返回
+  HTTP `500`（响应体 `92` bytes）。页面控制台另有一条前端生成 TOML 的错误：第 37 行
+  `track_length =` 无值；但创建请求已实际发送至后端，因此它不能单独解释 HTTP 500。
+  本次复发状态修正为“调查中”：文件过多已被排除为当前唯一根因，后续必须在重试前启用
+  Network 事件捕获并读取 `CreateTrainTask` 响应正文，再区分平台快照、父模型、配置转换或
+  后端临时故障。禁止继续删除 `kaiwudrl/tools/isaac_env` 等平台运行框架来试错。
+- 2026-08-01 平台结果追记：用户确认 `p3gait2h30` 已成功创建并开始训练，父模型为
+  `p3nav8h-r1_884257-F2`。因此本次复发从“调查中”升级为“平台已验证”。成功前实际执行的
+  有效操作是删除容器副本中的 `.git`、`agent_ppo/tests`、`agent_ppo/tools` 及生成缓存；
+  `agent_ppo/tests/data/model.ckpt-highslow-884257.pkl` 作为已完成容器测试的父模型副本，随
+  `tests` 目录按用户授权删除。本地测试源码、本地模型归档、容器凭据、`conf/.env` 和正式运行时源码
+  均未删除。由于平台 HTTP 500 没有提供可区分单个文件的根因，仍只能证明“彻底清理后重试”与
+  恢复有因果关联，不把某一个 test 文件写成已被独立证明的唯一根因。平台 task ID、后续
+  checkpoint/model ID 与评估结果当前未知，不做虚假记录。
 
 ## BUG-20260729-004：P2 指令联合域 line 面板超过平台 20 指标上限
 
@@ -2845,3 +2866,470 @@
 - 关联：父 checkpoint `p3nav8h-r1_884257`；实现 commit `49b0cb5`，双评估 merge commit
   `0b03a8b`（含 `codex/p3-dual-eval` 的 `09889b1`）。PR、新 checkpoint、容器同步与平台任务
   均待产生，产生后追加，不得预填。
+
+- 2026-07-31 审查更正（状态：代码已修复待开发容器验证）：后续独立审查确认首版仍有三处
+  训练语义漂移。第一，`JOINT_MAPPING_VALID` 只证明 joint order，未证明 action scale、PD、
+  effort limit 左右镜像一致；第二，touchdown-y 只按 yaw 旋转，坡面和楼梯的 roll/pitch 会污染
+  body-frame 横向落点；第三，slip 使用 1.5 秒接触帧平均速度，并非计划中的 per-stance budget。
+  修复后 preflight 同时验证 joint order、action scale、stiffness、damping、effort limit 与明确的
+  `contact_forces` 映射，异常只关闭 mirror/gait 专项并输出检查明细；touchdown-y 使用完整四元数
+  逆旋转；slip 改为每个 stance 累计世界 XY 距离，窗口输出 stance 最大值。checkpoint 额外保存
+  并 exact-resume 恢复运行时 `terrain_size/platform_complete/m3_target/boundary`，同时明确记录
+  worker sampler 因 worker/aisrv 无公开反向状态通道，只能在环境 reset 后 fresh 初始化，不能
+  虚构 exact sampler resume。新增定向测试覆盖 roll=90° 的 body-y、stance 断开重启、PD 不对称
+  fail-safe 和正负速度条件统计；开发容器与平台 smoke 尚未执行。再次遇到时最短检查路径为
+  `P3MirrorPreflight checks -> contact mapping -> touchdown quaternion -> stance slip distance -> M3 runtime contract`。
+
+- 2026-07-31 开发容器验证补充（状态：开发容器 1-env 已验证，真实父包联合更新仍待验证）：
+  初次 1-env Isaac smoke 正确暴露平台实际 joint 顺序为 axis-major：`FL/FR/RL/RR hip`、
+  `FL/FR/RL/RR thigh`、`FL/FR/RL/RR calf`；首版镜像置换错误地按 leg-major 编排，导致
+  `P3MirrorPreflight joint_order=False` 并安全关闭 gait/mirror 训练。修复 `JOINT_SWAP` 为
+  `[1,0,3,2,5,4,7,6,9,8,11,10]`，hip 四轴取负、thigh/calf 保持符号，同时修复
+  `robot.data.joint_names=None` 时向 `robot.joint_names` 回退。容器定向测试 `11 passed`；复跑
+  1-env Camera smoke 得到 `P3MirrorPreflight enabled=True`，全部 joint/PD/effort/action-scale/contact
+  检查为真，policy shape `57905`、critic wire `420`、三帧 finite step 与最终 `status=PASS`。
+  容器未找到父 checkpoint `p3nav8h-r1_884257`，因此本轮未完成真实父包的低层 PPO、镜像
+  backward、Adapter、高层 update 与 save/resume，不能据此升级为平台训练已验证。
+
+- 2026-08-01 真实父包验证补充（状态：开发容器联合 smoke 已验证，平台任务待验证）：上传
+  `p3nav8h-r1_884257-evalfix-v2.zip`，容器端 zip SHA256
+  `7722cf9f919a08a2e5c7ec06839bc36d2da740f753ad1a947bb16ead452955ab`，只提取真实
+  `model.ckpt-highslow-884257.pkl`，未用包内旧源码覆盖当前分支。真实 checkpoint 双评估回归
+  `28 passed`；父包 smoke 验证 gaitcalib 阶段 Actor 不变/Critic 更新、lowbase 阶段 Actor/Critic
+  均更新、action std 恢复及 exact resume，退出码为 0。4-env Isaac integrated smoke 完成同一
+  环境中的 80 帧低层 rollout/PPO、32 tick 高层 PPO、Adapter update 和 save/exact-resume：低层
+  阶段仅 low LSTM/Actor/Critic 与 Adapter 变化，高层模块冻结；高层阶段仅 NavigationEncoder、
+  high Actor/Critic 与 Adapter 变化，低层全部冻结；生成 32 条 completed response records，
+  `status=PASS`。峰值 CUDA allocated/reserved 分别约 325/362 MiB（4-env smoke 口径）。测试过程
+  同时修复两个仅影响 smoke 的旧合同：阶段边界由旧 8 小时时钟改为当前
+  `5400/6000/7200s`，integrated 低层更新从 Actor 可训练的 `901s` 开始，并允许低层阶段按计划
+  更新 Adapter。1-env integrated 因 5 条 recurrent sequence 无法整除 4 minibatch 被明确拒绝，
+  改用合法 4-env 规格后通过；这不是正式训练路径故障。
+
+## BUG-20260801-001：P3 低速实机震荡缺少确定性均值约束且命令 anchor 桶语义错位
+
+- 日期：2026-08-01；状态：本地已验证，开发容器、平台 smoke 与实机复测待验证。
+- 影响：分支 `codex/p3-sim2real-radial-nav`，任务 `p3std2h30-gait-smooth-radial`，父包
+  `p3nav8h-r1_884257`。保持低层 57901 输入、12 维动作和部署接口不变；不修改平台覆盖的
+  `server/isaac_env/base_env.py`，本轮 `push_robots=false`。
+- 用户可见症状与证据：实机部署出现高频震荡。训练代码只对 sampled environment action 施加
+  饱和的 rate/jerk frame cost，而部署主要执行 deterministic policy mean；训练还保存 raw sampled
+  action/log-prob，却向环境执行 `clamp[-6,6]`。审查同时确认 P3 bucket 0 是 low-forward、bucket 6
+  才是 zero，但继承的 `_sample_hold()` 把 bucket 0 当 zero；worker 已持有准确 bucket/anchor，aisrv
+  低层 transition 却无条件写入 `anchor_weights=1`，会把父模型低速震荡过度锚定。
+- 根因：P3 sampler 复用了旧六桶的 zero/anchor 语义并使用全局 Torch RNG；worker-to-aisrv wire
+  没有传递 committed bucket/anchor。现有 frame reward无法区分策略均值的确定性高频变化和
+  Gaussian exploration noise，且超过归一化阈值后很快饱和。
+- 修复：P3 sampler 使用独立 seeded generator，bucket 6 使用 zero hold；anchor 映射固定为
+  low-forward 0.10、forward 0.50、joint-turn 0.25、lateral 0.05，其余为 0。P3 training-only
+  worker extra 增加 bucket/anchor 两列，wire `420->422`，评估和部署不消费。低层 TBPTT replay
+  对 deterministic mean 对应的关节目标计算 terminal-safe rate/jerk Huber 超限项，并增加
+  `|mean|>5` 软范围约束；辅助前向 detach Actor 中间 MLP，只更新 LSTM、RNN output 和最终 head。
+  smooth 目标梯度 3.5%、range 1%，与 mirror 合计硬上限 10%。增加 raw/exec action、clip rate、
+  joint-target rate/jerk、15-25Hz power 和命令桶 clip/anchor 面板。
+  同时将力矩 P50/P95/max 的 Hip/Thigh/Calf 索引改为平台 axis-major 的
+  `[0:4]/[4:8]/[8:12]`，避免旧 leg-major 索引混合三类关节。
+- 排除方向：本轮未加入部署端滤波、bounded/tanh Gaussian、command ramp、action/feedback delay、
+  PD/电机/传感器偏置或 depth temporal 随机化。外力 push 虽由平台公开事件支持，但当前无法表达
+  部分环境和 reset grace，且会污染前 15 分钟健康 gait baseline，因此继续关闭；后续应单独以
+  25-30 秒间隔、0.15-0.20m/s 小扰动做抗扰恢复实验。
+- 本地验证：P3 gait/radial/contract/eval 与 P2 core 邻近回归 `226 passed, 5 skipped`；排除既有
+  J9/ST9 失效测试后的广泛回归为 `360 passed, 5 skipped, 3 subtests passed`。新增测试覆盖固定
+  seed、zero bucket hold、七桶 anchor、reset 边界平滑屏蔽、正常范围零损失、极端 mean 软约束、
+  20Hz 频谱识别、Actor 中间层梯度隔离、worker bucket/anchor wire 和 axis-major 力矩分组。Python
+  编译、全部 TOML 解析和 `git diff --check` 均通过。使用真实父包
+  `p3nav8h-r1_884257-evalfix-v2` 完成 warm-start、gaitcalib update、lowbase update、保存和 fresh
+  exact-resume；平滑辅助梯度估计比例为 `0.0350000001`，未超过 10% 总上限。5 个 skip 为需要
+  特定平台装配的集成场景；上述结果仍不能替代开发容器 Isaac、平台 smoke 或实机验证。
+- 回滚与最短检查：将 smooth fraction 置 0、恢复 P3 extra 35/worker wire 420 和全 1 anchor 即可
+  回滚训练侧变化，不需要改 checkpoint module 或部署端。再次遇到时依次检查
+  `command bucket/anchor -> action_mean 15-25Hz -> raw clip rate -> joint target rate/jerk -> torque/roll`。
+  关联 commit/PR、新 checkpoint、平台任务和实机结果均尚未产生。
+
+- 2026-08-01 审查更正（状态：本地已验证，开发容器、平台 smoke 与实机复测待验证）：独立审查
+  发现首版仍有四处语义或性能缺口。辅助 multiplier 只在每个 epoch 的首 minibatch 标定，随后
+  沿用旧梯度范数；三项 ratio 又以标量相加近似合成范数，因此所谓 10% 上限和面板值都不一定
+  对应实际 optimizer step。现改为每个 minibatch 重新取得 mirror/smooth/range 梯度，先按目标
+  比例缩放，再对实际合成向量统一裁到 PPO policy gradient 的 10%；无 PPO 或无辅助梯度时该项
+  multiplier 为 0。worker command 状态缺失及 aisrv wire 非法值的 anchor 回退从 1 改为 0，并
+  输出一次 warning，避免 transport 故障时重新过度锚定。joint/PD/effort/action-scale 属于环境
+  装配期静态合同，现只在 `P2WorkerBridge` 初始化（或旧测试对象首次调用）核验一次，环境重建会
+  自然创建新 bridge 并重验，不再 50Hz 重复执行 GPU 同步。`target_probability=1` 的 P3 sampler
+  跳过无意义的全局 `torch.rand`，全部实际命令随机性继续由专用 generator 提供。新增回归覆盖
+  合成梯度实际范数、全局 RNG state、静态 preflight 缓存与 command-state 缺失回退；P2/P3
+  定向与邻近回归合计 `186 passed, 5 skipped`，5 项均为缺少指定真实 checkpoint 的既有集成
+  skip。Python 编译、9 份 TOML 解析和 `git diff --check` 通过。开发容器和平台验证将在后续
+  结果中追加；旧 checkpoint 不受影响，本轮训练必须生成新包后这些修复才进入模型。
+
+- 2026-08-01 第二次审查更正（状态：本地已验证，开发容器、平台 smoke 与实机复测待验证）：
+  审查确认首版 preflight 遍历 action terms 后取首个 scale，多 term 环境可能误验无关动作；逐腿
+  mirror error 仍按 leg-major 连续三列切片，与容器确认的 axis-major 动作布局冲突；地形/运动
+  步态桶把 gait-invalid 帧计入分母，并将稀疏 contact-onset impact 除以全部帧数；父包 smoke
+  只比较 Actor 权重，没有发现 LR=0 时 Adam moments 仍可漂移。进一步追踪发现 P3 coordinator
+  设置 `gaitcalib` 后，`AlgorithmVisualPPO.learn()` 又按旧 8 小时时钟把 0 分钟映射为 `lowbase`，
+  生产路径同样存在策略 optimizer state 漂移，而非仅测试缺口。修复后只接受明确的 12 维
+  `JointPositionAction`，并验证解析后的 scale 左右对称且等于训练合同 0.25；逐腿指标使用
+  `FL[0,4,8]/FR[1,5,9]/RL[2,6,10]/RR[3,7,11]`；全部 gait 汇总屏蔽无效帧，impact/touchdown
+  按各腿 onset 事件计数，分桶 impact 保存独立事件分母。P3 workflow 通过显式 `phase_override`
+  把 coordinator 的 2.5 小时阶段传入低层 PPO；真实父包 smoke 同时比较 Actor/LSTM optimizer
+  state digest，冻结阶段任何 Adam `step/exp_avg/exp_avg_sq` 变化都会失败。新增定向回归覆盖
+  多 action-term 误选、0.25 合同、axis-major 逐腿误差、无效帧屏蔽和 impact onset 分母；P3 与
+  P2 core 广泛回归 `182 passed, 5 skipped`，Python 编译、全部 TOML 解析和 `git diff --check`
+  通过。真实 `model.ckpt-highslow-884257.pkl` 父包 smoke 进一步确认：gaitcalib 阶段
+  Actor 权重不变、策略 optimizer state digest 不变且 Critic 更新；lowbase 阶段 Actor、策略
+  optimizer state 与 Critic 均更新，随后保存/exact-resume 通过。平台镜像证据为 Go2
+  `ActionsCfg.JointPositionAction scale=0.25`；镜像生成时间
+  `2026-07-29T10:15:44.395342+00:00`，当前容器动态装配仍须下一次 Isaac smoke 复核。
+
+- 2026-08-01 开发容器验证补充（状态：开发容器已验证，平台任务与实机复测待验证）：源码 bundle
+  同步 15 个 P3 文件后，容器定向回归 `22 passed`。1-env Isaac Camera smoke 读取到真实
+  `JointPositionAction` 12 维，`P3MirrorPreflight enabled=True`，joint order、stiffness、damping、
+  effort limit、action scale 与 `contact_forces` mapping 全部为真；policy/critic wire shape 分别为
+  `57905/422`，三帧 step 有限并输出 `status=PASS`。真实 `884257` 父包 smoke 再次确认 gaitcalib
+  阶段 Actor 权重及策略 optimizer state 均不变、Critic 更新，lowbase 阶段三者正常更新并完成
+  exact resume。4-env integrated smoke 完成 80 帧低层 PPO、32-tick 高层 PPO、Adapter update 和
+  save/exact-resume，低层阶段只更新 low LSTM/Actor/Critic 与 Adapter，高层阶段低层全冻结；
+  completed response records 为 32，峰值 CUDA allocated/reserved 约 `325/362 MiB`，最终
+  `status=PASS`。Isaac vGPU workaround 遗留的测试子进程和 `/tmp` 日志已清理，父模型保留。
+
+## BUG-20260801-002：WebIDE 上传器默认写入根目录过宽，可能覆盖源码或凭据
+
+- 日期：2026-08-01；状态：本地已验证。
+- 影响：未跟踪工具 `shared/tools/tencent_kaiwu_webide_upload.mjs`。用户可见风险是调用方省略
+  `remoteRoot` 时，任意项目内路径都可通过校验，误传文件可能覆盖训练源码、配置或
+  `conf/.env`；该工具不属于训练运行时。
+- 根因：路径规范化只验证目标位于
+  `/data/projects/legged_robot_competition_26/` 下，默认边界大于文档约定的
+  `agent_ppo/test_artifacts/`，也没有独立的凭据/仓库元数据拒绝规则。
+- 修复：默认 root 收窄到 `agent_ppo/test_artifacts/`。调用方即使显式扩大 root，仍拒绝 `.git`、
+  `.env*`、credential/secret 文件及 `.key/.pem/.p12/.pfx`。保留显式 root 参数供受控实验使用，
+  不把模型 ID、IDE ID 或路径标签作为单点门禁。
+- 验证：后续 Node 定向测试扩展为 `10 passed`，`node --check` 通过，覆盖默认白名单、目录穿越、
+  根目录目标、NUL 与扩大 root 后的凭据拒绝。已使用 31.46 MiB 真实 ZIP 完成容器上传、SHA256、
+  原子改名和自动清理，摘要匹配；该证据不等同于训练平台或模型能力验证。
+- 防复发与回滚：上传模型默认先落 `test_artifacts`，由容器内受控命令解压/移动；不得放宽默认
+  root。若确需其他临时目录，调用方显式传 root，受保护路径仍不可覆盖。关联 commit/PR 尚未
+  产生；该工具和调查文档目前仍为用户未跟踪文件，本任务未擅自暂存。
+
+## BUG-20260801-003：WebIDE 同步服务自举误判鉴权 health 并解析终端回显
+
+- 日期：2026-08-01；状态：本地已验证，开发容器 already-running 分支已验证，冷启动待验证。
+- 影响：未跟踪工具 `shared/tools/tencent_kaiwu_webide_upload.mjs` 新增的
+  `startKaiwuSyncService()`。首次真实测试中，已有 8765 服务被误判为未启动，工具额外尝试启动
+  PID 2652；该进程因端口占用立即以状态 1 退出，原同步服务未停止、Token 与源码未变更。
+- 症状与证据：首次返回对象同时出现互斥的 `alreadyRunning=true`、`started=true`、
+  `scriptMissing=true`、`healthy=true`；真实 PTY 输出则是 `CODEX_SYNC_STATE=started`、
+  `CODEX_SYNC_PID=2652`、`Done(1)` 和 `CODEX_SYNC_HEALTH=failed`。随后本地 `PY311test` 经
+  `container_rpc_client.py --cwd . "pwd"` 仍成功返回项目根，证明原服务始终健康。
+- 根因：容器 `/health` 需要 Token，未带认证访问返回 HTTP 401；探针使用 `curl -f`，把“服务有
+  HTTP 响应”错当成“连接失败”。解析器又用 `output.includes(marker)`，而交互 PTY 会回显整条
+  shell 命令，使四个 marker 即使没有作为独立结果输出也全部命中。
+- 修复：健康探针移除 `-f`，只把连接/超时失败视为服务不可达；结果解析先去除 ANSI CSI，再仅
+  接受独立整行 `CODEX_SYNC_STATE`、`CODEX_SYNC_PID` 和 `CODEX_SYNC_HEALTH`，取最后一个合法
+  state/health。解析逻辑提取为 `parseKaiwuSyncBootstrapOutput()`，不再依赖模糊子串。
+- 排除方向：不是 `start_tongbu.sh` 缺失或原进程退出。通过当前容器 RPC 读取脚本确认它加载
+  `conf/.env` 后 `exec` Python 服务；本轮没有读取或输出 Token 内容，也没有主动停止 8765。
+- 验证：Node 定向测试 `10 passed`、`node --check` 通过；新增回归包含命令回显中的伪 marker，
+  只接受后续独立结果行。真实容器复测返回 `alreadyRunning=true`、`started=false`、
+  `healthy=true`、`scriptMissing=false`、退出码 0；关闭 Chrome/PTY 后再次通过本地
+  `PY311test` RPC 执行 `pwd` 成功。因不应破坏当前健康服务，尚未人为关闭 8765 验证冷启动。
+- 防复发、回滚与血缘：任何 PTY 机器可读结果都必须使用独立整行解析；带鉴权 HTTP 端点的存活
+  检查不得把 401 等业务状态等同于 TCP 不可达。回滚可删除 `startKaiwuSyncService()`，不影响
+  上传、终端 SHA256 或现有 RPC。当前分支 `codex/p3-sim2real-radial-nav`；无 commit/PR、训练
+  task、模型或 checkpoint 变更，工具与协议文档仍未暂存。
+
+## BUG-20260801-004：P3 训练不可达负速度且稀疏步态基线跨地形误塑形
+
+- 日期：2026-08-01；状态：本地已验证，开发容器、平台 smoke 和新 checkpoint 待验证。
+- 影响：分支 `codex/p3-sim2real-radial-nav`，任务配置
+  `p3std2h30-gait-smooth-radial`，计划父包 `p3nav8h-r1_884257-F2`。不修改平台覆盖的
+  `server/isaac_env/base_env.py`，不改变 57901 低层输入、12 维动作、高层 Actor85 或部署接口。
+- 症状与证据：捕获 `20260801-030946` 覆盖约 25 分钟，低层 mirror error 已下降约
+  22%-40%，但 gait baseline
+  fallback share 约 0.75；原 sampler 仍把 15% 样本分配给 `vx<0`，而现有高层命令映射只允许
+  `vx>=0`，该恢复能力无法被高层调用。面板使用通用 `policy_loss/value_loss`，与高层同名指标
+  覆盖；P3 Sim2Real 只显示合计项，无法确认 sustained torque、peak、action rate 和 jerk
+  分别是否生效。
+- 根因：命令采样方案沿用了尚未进入高层动作合同的后退设想；健康基线按四地形乘四运动分桶，
+  15 分钟内 16 个桶大量不足，代码仍允许全局 fallback 直接产生训练惩罚。brake/zero 也会落入
+  low-speed 基线，混入静止与切换瞬态。P3 monitor 沿用跨算法通用指标名，且奖励函数内部四项
+  Sim2Real 原始分量未进入训练诊断 transport。
+- 修复：`vx` 范围统一为 `[0,1.0]`，七桶 wire/checkpoint 布局不变但 reverse 权重固定为 0，
+  任何自定义配置重新启用该桶均在启动时报错；有效分布改为低速前进 30%、前进 25%、联合
+  转向 15%、横移 10%、brake/restart 15%、zero 5%。gait baseline 升级为 contract v2，运动桶
+  改为低速/前进/转向横移，brake/zero 和意外负 `vx` 不采集也不受罚；exact threshold 权重 1，
+  same-terrain fallback 权重 0.5，global fallback 和缺失项权重 0。checkpoint contract 同步记录
+  新命令域、分布和 fallback 语义，旧状态只能显式 warm start。
+- 课程更正：按本轮低层专项目标改为 0-120 分钟低层、120-130 分钟 Critic/Adapter 校准、
+  130-140 分钟高层 Actor warm-up、140-150 分钟完整高层收尾。旧 P3 radial warm-start 会通过
+  P2 reward loader 重建高层 Critic 和 return statistics，与 30 分钟适配预算冲突；现在加载策略
+  和 Adapter 后，必须从父 P3 包恢复高层 Critic、Critic optimizer moments、return statistics、
+  Actor/Critic gradient steps。缺少这些训练状态按结构不兼容报错，不依赖模型 ID 或标签阻断。
+- 监控修复：低层/高层 PPO 分别输出独立 loss、entropy、KL、clip fraction、更新职责和耗时；
+  增加命令桶 share、负 `vx` share、基线 exact/terrain/global/disabled 比例、机械功率 P50/P95/max。
+  训练 worker tail 增加四项已有 Sim2Real 原始分量与 validity，extra `37->42`、privileged wire
+  `422->427`。字段只供训练诊断，不进入 observation、reward、eval/export/deploy；奖励权重未改。
+- 验证：本地 P3 gait/radial/schedule/eval/contract/monitor 与 P2 core 邻近回归
+  `215 passed, 5 skipped`；5 项为缺少指定真实 checkpoint 的既有集成场景。Python 编译、13 份
+  TOML 解析和 `git diff --check` 通过。新增测试覆盖负 `vx` 禁止、命令合同、全局 fallback
+  奖励为零、Sim2Real validity 屏蔽和机械功率分位。开发容器尚未同步，不能标为平台已验证；
+  当前进行中的旧任务不会因本地源码修改而改变。
+- 真实父包本地 smoke：使用
+  `archive/代码存档/p3nav8h-r1_884257-evalfix-v2/ckpt/model.ckpt-highslow-884257.pkl`
+  完成 warm start、冻结低层更新、可训练低层更新、保存和 exact resume；逐值确认高层 Critic、
+  Critic Adam moments 和 return statistics 均从父包恢复，输出
+  `high_critic_restored/high_critic_optimizer_restored/high_return_statistics_restored=true`。
+  这证明本地装配合同闭环，但不替代开发容器 Isaac 或平台 smoke。
+- 回滚与最短检查：可恢复旧 command weights 与 gait baseline v1，并将 P3 extra/wire 恢复
+  `37/422`；无需改变模型模块。再次遇到时依次检查 `target_vx_negative_share -> command bucket
+  share -> baseline fallback levels -> gait reward -> sim2real component validity -> low/high PPO panel`。
+  commit/PR、新 checkpoint、平台 task/model ID 均待产生；模型 ID 不作为单点硬门禁。
+
+## BUG-20260801-005：P3 stance 滑移被重复扣分且映射失效后平滑辅助仍训练
+
+- 日期：2026-08-01；状态：本地已验证，开发容器、平台 smoke、评估和真机均待验证。
+- 影响：分支 `codex/p3-sim2real-radial-nav`，任务
+  `p3std2h30-gait-smooth-radial`，父包 `p3nav8h-r1_884257-F2`。只影响训练专用 gait/aux
+  transport；57901 低层输入、12 维动作、高层 Actor85、Standard/Track eval 与部署接口不变。
+- 用户可见症状：P2 面板的 `*_slip_speed` 实际显示累计 stance distance，单位和历史口径漂移；
+  P3 接触质量奖励在 stance 结束前读取 1.5 秒 ring 最大值，同一滑移预算会在最多 75 个 50Hz
+  frame 中重复扣分。另有关节顺序、PD、effort、action scale 或 contact mapping preflight 失败时，
+  mirror/gait reward 会关闭，但 deterministic-mean smoothing/range auxiliary 仍继续更新低层输出。
+- 根因：P3 引入 per-stance slip budget 时直接复用了共享 `GAIT_SLIP_SPEED_SLICE`，并把 ring
+  maximum 当成逐帧 reward 输入，没有独立的 stance-completed event。action-smoothing 课程函数
+  也没有消费同一个 mapping-valid fail-safe。
+- 修复：共享 P2 aux 恢复为接触帧平均足端 XY 速度；P3 私有 tail 增加四腿 completed-slip 和
+  completed-event，baseline、reward 及地形/运动分桶只按事件样本累计。训练 extra/wire 从
+  `42/427` 扩为 `46/431`；gait baseline 合同升级为 v3，旧错误语义状态只允许重新 warm start，
+  不允许 exact resume。`action_smooth_training_fraction()` 新增 mapping-valid 输入，失效时返回 0，
+  与 mirror/gait fail-safe 保持一致。模型 ID、请求 ID 和 lineage 仍不作为单点硬门禁。
+- 本地验证：`PY311test` 定向执行 P2 core、P3 contract、P3 gait/radial、P3 schedule 和双评估，
+  结果 `187 passed, 5 skipped`；5 项为缺少指定真实 checkpoint 的既有集成场景。回归覆盖 P2
+  m/s 口径、stance completion 单帧事件、后续帧不重复奖励、P3
+  分桶事件分母、wire `431` 维和 mapping-invalid smoothing=0。改动模块 Python 编译、9 份活动
+  TOML 解析和 `git diff --check` 均通过。
+- 容器/平台/评估/真机：均未执行，不能升级为平台已验证。关联 commit/PR、新 checkpoint、
+  平台 task/model ID 与 SHA256：尚未产生。
+- 回滚与最短检查：可回滚本条目的 P3 tail 和 baseline v3，但不得恢复“ring maximum 每帧扣分”
+  逻辑。再次遇到时依次检查 `GAIT_SLIP_SPEED_SLICE` 单位、completed-event 单帧性、
+  `gait_completed_slip_count`、contact reward frame 数和 `mirror_mapping_valid/action_smooth_scale`。
+
+## BUG-20260801-006：P3 近场深度失效、短 TBPTT 与楼梯恢复过度塑形
+
+- 日期：2026-08-01；状态：本地已验证，开发容器、平台 smoke、评估和真机均待验证。
+- 影响：分支 `codex/p3-stairmem-dr`，任务 `p3std8h-stairmem-dr`，计划父包
+  `p3nav8h-r1_884257-F2`（本地制品目录为 `p3nav8h-r1_884257-evalfix-v2`）。不修改平台覆盖的
+  `server/isaac_env/base_env.py`，不改变 57901 低层输入、12 维动作、高层 Actor85、Standard/Track
+  双评估或部署接口。模型 ID 和标签只用于选择与 lineage，不作为单点阻断。
+- 用户可见症状：实机靠近楼梯时，小于约 0.25m 的深度回波不可靠，中央孔洞率会瞬时接近 80%；
+  原 80 帧 rollout 配合 16 帧 TBPTT 只向低层 LSTM 提供约 0.32 秒反传历史，无法针对“远处看见
+  楼梯、近处视觉退化后继续动作”建立连续记忆。上一轮同时启用较强动作平滑、接触/交叉/饥饿
+  shaping 与 Sim2Real 代价后，评估出现楼梯抬腿、触地和跟进能力回退；真机还记录到前腿
+  Hip/Thigh 力矩连续逼近 22Nm 硬线，但不能用硬裁剪牺牲楼梯短时发力。
+- 根因：训练观测没有覆盖每环境近裁剪、持续孔洞和黑屏，故障也没有按完整 recurrent sequence
+  固定；TBPTT 窗口不足以把故障前视觉与故障期动作建立梯度联系。旧平滑/强步态项又形成奖励
+  竞争，可能通过减少快速摆腿和触地事件降低惩罚。初版 stair-memory 实现另有课程 Bug：只要
+  `strength>0` 就对全部环境应用 near clip，并把未启用序列记成 `near_only`，实际不是 0->25%
+  渐进。高层虽然不 step，初版仍把其 optimizer LR 改为 0，导致保存状态无谓漂移；warm start
+  还可能优先读取 legacy `low_level.critic` 而不是 P3 的 `p3_critic`，并误用父包内更早的
+  `p3_anchor` 作为 memory 教师而不是选中的 F2 当前低层策略。
+- 修复：新增 `p3_depth_memory.py`，按独立 RNG 采样 Beta(1,4) `0.10-0.25m` 近裁剪，并对完整
+  128 帧 sequence 持续施加 near-only、3% sparse、1-3 block、60%-85% severe 或 95%-100%
+  blackout。启用掩码现在独立于 fault type，课程覆盖率和面板口径一致。clean compact feature
+  由冻结 F2 anchor 生成教师动作，fault compact feature 只让低层 LSTM/RNN output/最终 action
+  head接受 SmoothL1 memory 梯度；目标 1.5%、上限 3%，mirror 上限 1%，全部 auxiliary 上限 5%。
+  rollout/TBPTT 改为 `128/128`，低层 CNN及全部高层模块冻结，高层 rollout/PPO不执行。
+- 域随机化与抗扰：前 30 分钟为 friction `[0.60,1.30]`、base mass `+-0.75kg`、restitution
+  `[0,0.05]`、noise `0.50`，之后为 `[0.55,1.35]`、`+-0.85kg`、`[0,0.10]`、`0.55`；15 分钟
+  后通过平台已有 EventManager 打开 25-35 秒间隔、最大 `0.15m/s` XY push。不宣称 COM、PD、
+  action delay 等没有可靠消费链的随机化。
+- 力矩与步态边界：Hip/Thigh `17.6/22Nm`、Calf `34.4/43Nm` 采用相对 soft-hard 区间的平方
+  sustained/peak 软约束，权重 `0.004/0.001`、frame cap `0.015`，不改仿真 effort limit。
+  contact/crossing/starvation、deterministic smoothing 与 action-range auxiliary 保持 shadow-only；
+  仅保留 `-0.015` prolonged-air 与 `-0.015` participation 防止单腿长期悬空。
+- checkpoint 与恢复：合同升级为 `p3_low_stair_memory_dr_v1`，保存 depth/memory RNG、DR/push
+  实际配置、低层版本和冻结高层 digest；exact resume 要求 `high_updates=0`。高层 Actor/Critic
+  optimizer 和 scheduler 状态不再通过设置 LR=0 伪冻结，仅 Adapter LR 独立更新。P3 warm start
+  优先并严格加载 `low_level.p3_critic`，只为缺少该 leaf 的旧兼容包显式回退 legacy critic；
+  加载完成后从 F2 live encoder/actor 建立新的不可变 clean teacher，exact resume 保存并恢复该快照。
+  depth fault 恢复只还原 RNG，不再在 `load_state_dict()` 内提前采样 live near-clip；统一由环境
+  reset 路径采样一次，避免 resume 比连续训练多消耗一轮随机数。吞吐统计改为读取低层 storage
+  的实际 transition 数，128 帧训练不再被错误报告成 80 帧。
+- 本地验证：`PY311test` 已完成 P3 合同、调度、深度记忆、步态/径向、双评估、checkpoint、
+  lifecycle、P1.5/P2 邻近回归；排除历史失效的 ST9 导入文件与 J9 fixed-LR 文件后结果为
+  `378 passed, 5 skipped, 3 subtests passed`。新增 fixture 覆盖 near-clip 分布、故障覆盖率渐进、
+  严重孔洞范围、持续故障、memory 梯度隔离、力矩 soft/hard 平方曲线、push/DR阶段及高层
+  optimizer LR 不漂移；最终审查补充的 RNG 无额外消费回归与 P3/checkpoint 定向套件为
+  `115 passed, 5 skipped`。真实 F2 父包结构含 `p3_critic`、完整高层、四套 optimizer 和双评估 leaf；
+  本地 real-bundle smoke 进一步通过 warm start、冻结校准、低层 Actor/LSTM/Critic+memory 更新、
+  action smoothing=0、高层两个 optimizer 不变和 save/exact-resume。Python 编译、13 份 TOML、
+  `git diff --check`、`base_env.py` 零差异与 P3 monitor 实际构建（70 panels、440 metrics、单线最多
+  20）均通过。Isaac camera/push/DR 动态 smoke 尚未执行，不能标为平台已验证。
+- 回滚与最短检查：可把 schedule/load mode 回退到上一 P3 合同并移除 training-only
+  depth/memory state，无需修改模型 I/O。再次遇到时依次检查 `near_clip histogram -> raw/aug hole
+  rate -> fault_enabled_share/type -> memory hidden advantage -> high_updates/digest -> torque margin ->
+  prolonged-air/participation -> stairs clean/fault eval`。关联 commit/PR、新 checkpoint、平台 task/
+  model ID 与 SHA256：尚未产生。
+- 2026-08-01 审查更正：原条目关于“15/30 分钟通过 `env.reset(config)` 启用 push 并增强 DR”的
+  结论不成立。平台源码镜像 `kaiwu_runtime/base_env.py:1476-1480` 明确显示 `_create_env()` 在
+  `self.env is not None` 时直接返回，阶段 reset 只能开始新 episode，不能重新装配 friction、mass、
+  restitution、noise 或 EventManager。另据 Isaac EventManager 镜像 `event_manager.py:123-145`，Go2
+  push 是 episode reset 时重采样的非 global interval event；25 秒 episode 配置 25-35 秒 interval
+  几乎不会触发。本次改为首次 reset 即装配最终但保守的 `[0.55,1.35]`、`+-0.85kg`、
+  `[0,0.10]`、noise `0.55`，并从进程启动启用 `0.15m/s`、`8-15s` push。删除伪环境重建索引、
+  墙钟 DR 表和阶段切换日志中的 `environment_reset` 声明；阶段边界 reset 仅用于 episode/live
+  recurrent 状态清理。`server/isaac_env/base_env.py` 保持零修改。
+- 2026-08-01 深度故障更正：sparse/severe/blackout 原先在每帧重新采样空间掩码，无法形成连续
+  缺失，且 severe 在已有约 80% 原始孔洞上继续清零 60%-78% 像素，会把最终无效率推到约
+  92%-96%。现为每个 rollout 生成固定空间随机秩图，在故障持续期内复用；severe/blackout 按当前
+  有效像素数计算精确 dropout budget，并按固定空间优先级只补足到目标范围，中心/下方优先级也
+  计入同一总预算。新增 fixture 验证随机故障跨帧逐像素一致，以及均匀或集中分布的 80% 原始孔洞
+  都不会被 severe 叠加到 85% 以上。
+- 2026-08-01 更正验证：宿主 `PY311test` 禁用 bytecode/pytest cache 后，P3 contract、schedule、
+  stair-memory 定向套件为 `50 passed`，全部 `test_p3*.py` 为 `100 passed, 5 skipped`；Python 编译、
+  TOML 解析和 `git diff --check` 通过。尚未同步开发容器，也未取得真实 EventManager push、Isaac
+  DR 实配或平台 smoke 证据，状态保持“本地已验证”。回滚时恢复静态启动配置前必须先解决平台
+  create-once 边界，不能再次恢复阶段 `env.reset()` 伪重建路径。
+- 2026-08-01 开发容器快测补充：通过 `local_sync_client.py` bundle 同步 55 个 server 文件并完成
+  远端校验，没有同步或修改平台 `base_env.py`。父包
+  `p3nav8h-r1_884257-evalfix-v2.zip` 使用分片上传器写入
+  `agent_ppo/test_artifacts/`，远端大小 `32982918` bytes、SHA256
+  `7722cf9f919a08a2e5c7ec06839bc36d2da740f753ad1a947bb16ead452955ab`。真实父包 CPU smoke 通过
+  `p3_stair_memory_warm_start`、冻结阶段 Critic-only 更新、训练阶段 Actor/LSTM/Critic+memory 更新、
+  高层 optimizer 不漂移和 `p3_exact_resume`。随后启动 1-env integrated Isaac smoke，目标覆盖
+  camera、128 帧低层 PPO、Adapter 和 save/resume；进程持续运行至 RPC `260s` 超时后被终止，未
+  生成结果文件，内核日志无 OOM 记录。该结果只能标记为“Isaac integrated 待验证”，不能宣称
+  rollout/update、push 事件或 DR 实际采样已经通过；状态仍为“本地已验证”。
+- 2026-08-01 最小监控与生命周期修复：复核发现 `_reset_env()` 在每个训练阶段边界调用
+  `depth_fault.reset_environment()`，导致本应绑定环境进程的 near-clip 在八小时内重复采样。现改为
+  幂等 `ensure_environment_initialized()`：fresh/warm start 使用构造期唯一采样，exact resume 恢复
+  RNG 后只在首次 workflow reset 采样一次，后续 episode/阶段 reset 不再消费 RNG或改变阈值。
+  新增 near-clip 十桶楼梯 terminal 完成率，以及 severe/blackout 每 rollout 事件数和实际配置持续
+  时间。当前 worker wire 不包含 EventManager push 事件或 PhysX 逐环境 friction/mass/restitution
+  readback，因此 Push/DR 面板改名为“配置合同”并显式输出 `runtime_telemetry_available=0`，不再把
+  配置范围描述为实际采样；恢复时间仍明确不可用。删除 `short_high_adaptation_preserves`、
+  `high_phase_command_owner` 和 `low_level_frozen_while_high_level_owns_command`，合同只保留
+  `high_level_training=disabled_full_session` 及冻结模块清单。新增定向测试覆盖 near-clip 初始化幂等、
+  楼梯 terminal 与 clip 桶关联和 fault 事件口径；平台 Push/DR 实测仍待平台提供回传链后验证。
+- 2026-08-01 监控捕获 `20260801-100322` 更正：采集 866 项、851 项有点、15 项为空且无
+  NaN/Inf。该 capture 的 `p3_window_completed_count=0` 与平台 `completed_count>0` 不是完成
+  readback 回归：前者只统计当前 rollout 内 worker reset reason，后者来自平台 scorer lifetime
+  累计，原面板名称未说明口径。现将其明确命名为 rollout reset 终止结果，并恢复独立的 P3
+  M1/M2、standard/platform/joint、径向距离与 M3 边界面板。near-clip 楼梯完成率同步展示逐桶
+  attempt 数；四地形乘三运动 gait 指标新增样本占比，避免把无样本桶的 0 当作正常表现。
+  `depth_fault_duration_s` 改为 `depth_fault_planned_duration_s`，明确 shadow 阶段非零值只是预采样
+  课程参数。P3 低层-only面板移除未接线的 `adapter_confidence`、禁用高层的 update time 和未使用
+  CPU-pinned depth 路径的 H2D 指标。该修复只改变监控输出，不改 reward、optimizer、Push/DR、
+  checkpoint 或模型接口；当前已启动任务不会热加载新面板，需新任务/新进程后验证。宿主
+  `PY311test` 全部 `test_p3*.py` 回归为 `103 passed, 5 skipped`，Python 编译和
+  `git diff --check` 通过；使用本地 MonitorConfigBuilder stub 实际构建为 75 panels、486 metrics、
+  单 panel 最多 20 项。随后通过 `local_sync_client.py` bundle 定向同步 monitor builder、depth
+  memory、P3 workflow 和 3 个对应测试文件，共 6 files；远端校验为 `191.4 KiB`，二次 dry-run
+  显示 `files to overwrite: 0`、无删除候选。未同步或修改平台 `base_env.py`，未在容器重跑测试，
+  也未创建新平台任务；已运行进程不会热加载本次面板，状态保持“本地已验证/代码已同步待平台验证”。
+## BUG-20260801-007：前端监控工具未统一持久化浏览器登录状态
+
+- 日期：2026-08-01；状态：本地已验证。
+- 影响范围：`shared/arena_frontend_monitor` 本地人工监控采集工具；不影响 `server/`、`deploy/`、
+  训练/部署接口、checkpoint 或平台容器运行时。
+- 用户可见症状与证据：每次新开可视化 Chrome 测试窗口后都需要重新输入腾讯竞技平台账号密码。
+  原入口虽然设置了 `AGENT_BROWSER_SESSION_NAME=tencent-arena`，但没有统一配置持久化 Chrome
+  profile，也没有读取本工具目录的 `.env`；`manual_metric_recorder.sh` 直接执行
+  `agent-browser tab new`，各 Python 文件分别拼装浏览器子进程环境。
+- 根因与排除方向：采集逻辑只假设“已有登录会话”，没有为所有入口指定同一持久化 profile。
+  不采用把 Cookie 字符串或密码写入源码/`.env` 的方案，因为这会产生明文凭据泄露和过期同步
+  问题；使用 `agent-browser` 原生 Chrome profile 保存 Cookie、localStorage 和站点状态。
+- 核心修复：新增 `browser_auth.py`，统一加载本地 `.env`、保留显式进程环境变量优先级，并默认
+  使用 Git 忽略的 `runtime/browser_profile/`；profile 目录按 `0700` 创建。五个 Python 浏览器
+  入口和两个 shell 推荐入口均使用同一配置；新增 `.env.example`、局部忽略规则、README 首次
+  登录与失效重登说明，以及配置解析/profile 权限回归测试。
+- 验证：`py_compile` 覆盖本目录全部 Python 文件，两个 shell 入口通过 `bash -n`，全部 12 个
+  单元测试通过，`git diff --check` 通过；真实 `agent-browser 0.26.0 --version` 在统一环境下可执行，
+  默认 profile 已按 `0700` 创建且被 Git 忽略。未使用用户账号执行真实登录复用 E2E；平台会话
+  是否仍有效取决于腾讯服务端 Cookie 生命周期，服务端主动失效后仍需人工重新登录一次。
+- 防复发、回滚和最短检查路径：测试必须确认进程环境覆盖 `.env`、相对 profile 以工具目录解析、
+  profile 权限为 `0700`。再次出现重复登录时先检查 `.env` 的 `AGENT_BROWSER_PROFILE` 是否一致，
+  再检查平台是否主动使 Cookie 过期。回滚可删除本次工具文件改动；本地 profile 可保留或由用户
+  手动删除，禁止将其加入 Git。
+- 血缘：当前分支 `codex/p3-stairmem-dr`；本次不涉及模型 ID、checkpoint、制品 SHA256、容器
+  同步或真机验证；commit/PR 尚未创建。工作区中既有 P3 训练改动属于用户，未纳入本任务。
+
+## BUG-20260802-008：P3 低速楼梯训练缺少相机时序与可验证的后期 Push，旧奖励会扩大步态回退
+
+- 日期：2026-08-02；状态：本地已验证，待开发容器与平台 smoke。
+- 影响范围：分支 `codex/p35-gaitfix2h` 的 `p3_standard_joint` 训练入口、training-only worker
+  transport、低层 PPO/Adapter、checkpoint 与监控；不改变 Standard/Track eval、ONNX、部署 I/O，
+  不修改平台覆盖的 `server/isaac_env/base_env.py`。
+- 用户可见症状与证据：上一轮楼梯恢复同时施加强动作平滑、接触/步态代价和较强 DR，出现低速
+  上楼抬腿/触地退化；真实相机以约 30Hz 提供深度而低层以 50Hz 执行，旧训练每控制帧都按新图像
+  处理，未覆盖重复帧与 40-150ms 延迟。旧 Push 面板只有配置值，没有真实事件、delta 和恢复指标，
+  不能证明 EventManager 链实际生效。用户要求本轮只聚焦低速楼梯非劣化、相机时序和后期小 Push。
+- 根因与排除方向：P3 extra 46 列没有 joint acceleration、逐 link contact 持续时间或 Push 实测
+  transport，训练侧无法实现 fail-closed deadzone/cap，也无法区分“配置启用”和“真实发生”。
+  `BaseEnv` create-once 边界意味着阶段 reset 不能重建 EventTerm，但 Isaac EventManager 的公开
+  `get_term_cfg/set_term_cfg/reset` 可以修改既有 interval term；因此不采用 BaseEnv 补丁、自定义
+  外力函数、配置值伪装遥测或扩展部署 action/observation 的方案。
+- 核心修复：任务改为 `p35gaitfix2h`、7200 秒、128 env、25 秒 episode、课程关闭；阶段为
+  `gaitfixcalib/repair/pushwarm/pushfull/stable`。P3 extra/wire 扩为 `108/493`，新增 joint-acc12、
+  base/head 聚合与四腿 hip/thigh/calf 共 14 槽的 contact force/onset/over-threshold duration、
+  joint/contact mapping valid、Push event/delta/age/active/telemetry。拆分 worker wire 后立即把
+  target/exec command 回填本地 aux，修复 gait baseline、reward、Adapter 和面板全部误归低速桶。
+- 相机与 Push：冻结 CNN feature32 使用每环境随机 capture phase 的 30Hz capture、50Hz hold、
+  10 帧 FP16 FIFO；前 15 分钟主动延迟关闭，随后训练 40-100ms，75 分钟后加入 100-150ms，
+  150-250ms 只作 shadow。`push_robot` 启动速度固定为 0；worker preflight 核验 term、interval mode、
+  原函数和 public API 后安装透明 wrapper，75/90 分钟分别切到 `+-0.05/+-0.08m/s`、12-18 秒，
+  并记录真实 delta。checkpoint 的 session 时间通过 materialized reset `usr_conf` 写入 worker
+  `resume_offset_s`，75 分钟后的 exact resume 不重新等待。任一 preflight/shape/finite 失败时
+  telemetry 置无效且 Push 条件奖励归零。
+- 奖励与冻结：前 15 分钟采集父策略 joint position P99、joint-acc noncontact P95/onset P99、
+  posture P95 和 gait frequency P05；不足或映射无效时训练项为 0。之后启用有 deadzone/cap 的真实
+  推进、默认姿态、joint acceleration、undesired contact、gait responsibility 与合并姿态项，
+  Push 后 0.4 秒只减半 joint-acc/gait/非关键姿态。原生重复 posture/joint-acc/contact 权重置 0；
+  torque 继续使用 Hip/Thigh `17.6/22Nm`、Calf `34.4/43Nm` 的低权重平方软约束。只更新低层
+  LSTM/RNN output、最终 action head、Critic 与 Adapter；Actor body/std、CNN 和全部高层冻结，
+  `high_updates=0`。anchor/memory/mirror 梯度按 3%/1.5%/0.5% 标定，合计封顶 5%。
+- 监控与日志：新增监控合同注册/有数据/空项统计、相机 capture/hold/feature age、Push term/mode/
+  wrapper/API、事件数/环境覆盖、真实 delta 分位与方向、姿态/速度恢复、地形/难度/命令/速度分桶，
+  以及 P3.5 奖励分解和辅助梯度。日志前缀为 `[P35MonitorContract]`、`[P35PushPreflight]`、
+  `[P35PushPhase]`、`[P35PushEvent]`、`[P35PushSummary]`、`[P35Baseline]`、`[P35TrainState]`。
+- 验证：宿主 `PY311test` 的 P3/P2 worker、双评估、hard-start 与相邻回归为
+  `237 passed, 5 skipped, 3 subtests passed`；新增测试覆盖 493 维连续索引、30/50Hz feature FIFO、150ms 主动延迟
+  上限、相机 RNG round-trip、正常 envelope 奖励严格为 0、contact cap、Push grace、EventManager
+  原函数 wrapper、真实 delta 和公开 term 动态切换。Python 编译与 `git diff --check` 通过；
+  `server/isaac_env/base_env.py` 零差异。尚未同步/运行开发容器，尚未取得真实 Isaac camera、
+  ContactSensor 14 槽、EventManager delta、平台 15-30 分钟 smoke 或真机证据，状态不得升级。
+- 父包与血缘：计划从任务 `235689` 的 `stairrobust/stairfinal` 同 seed A/B 中选择唯一父包；本地
+  尚无这两个平台制品，因此最终 model ID、标签、SHA256 和模块 digest 待平台选择后补录。当前
+  TOML 保留 `p3nav8h-r1_884257-F2` 作为结构兼容 lineage，不作为模型 ID 硬门禁。commit/PR、
+  新 checkpoint 与平台 task ID 尚未产生。
+- 遗留风险、回滚与最短检查：正式任务前必须在开发容器 smoke 配置中 5 秒启用 `+-0.03m/s`、
+  2-4 秒 interval，确认 `push_telemetry_valid=1`、事件计数递增、delta 非零且不越界；再检查
+  `joint/contact mapping -> camera hold/age -> command aux readback -> reward baseline valid ->
+  high_updates/digest -> Push recovery`。失败时回滚到选中的父包并关闭 P3.5 training-only shaper、
+  camera timing 和动态 Push；网络/部署接口未变，无需修改部署端。
+
+- 2026-08-02 独立审查更正（状态：本地已验证，待开发容器与平台 smoke）：审查确认首版仍有
+  七处训练语义偏差。`vx` 三档曾误写为 `0.05-0.25/0.25-0.60/0.60-1.00m/s`，且 restart 绕过
+  公共采样器；joint-acc 放宽错误使用碰撞阈值 onset 而不是普通足端 contact onset；姿态包络遗漏
+  projected-gravity Y 的 roll-like 分量；15/15/35/35 地形桶仍沿用旧等宽列边界；纯延迟帧未进入
+  clean-teacher MemoryAux；最后 15 分钟低层冻结时 Adapter 未更新，且 replay 比例未按阶段切换；
+  监控健康度以 `len(metrics)+5` 和固定零年龄伪装真实注册与新鲜度。
+- 修复后所有含 `vx` 的运动类型统一使用 `0.10-0.35/0.35-0.70/0.70-1.00m/s`、55/30/15；
+  foot onset 按 axis-major `(hip,thigh,calf)` 映射到同一腿；姿态项使用强 roll/roll-rate、次级
+  pitch-rate 和弱 pitch；地形列边界统一为 `3/6/13/20`。MemoryAux 选择 mask 改为 pixel fault 与
+  实际 delivered feature age 的并集，并新增 fault-only、delay-only、overlap 面板。Adapter 在
+  stable 阶段每 rollout 更新一次，replay 依次为 `50/25/25 -> 60/25/15 -> 75/15/10`。监控合同
+  按 required key 实际存在、有限值及最后有限数据时间计算，缺项或陈旧项不再显示为健康。
+- 父包不再保留未消费的 A/B 元数据，按用户确认固定为上一轮任务 `235689` 的最终模型：平台模型
+  ID `1013548`、标签 `stairfinal`、文件 `model.ckpt-stairfinal-1013548.pkl`。平台列表未提供文件
+  SHA256；该值和模块 digest 必须在开发容器实际下载/加载后补录，当前不得编造。完整
+  `agent_ppo/tests` 回归为 `417 passed, 5 skipped, 3 subtests passed`，覆盖命令分布、普通触地
+  放宽、逐腿 onset 基线、姿态轴、地形桶、delay-only MemoryAux、Adapter 阶段 replay/冻结阶段
+  更新及监控陈旧度；Python 编译、TOML 解析、`git diff --check` 通过且 `BaseEnv` 零差异。
+  容器 Isaac/Push smoke 与平台训练仍待执行。
+- 同次核验修复了既有完整测试收集阻断：`test_st9_opt3_d2.py` 仍导入已删除的分段
+  `_student_drive_probability`，而当前 LBC 已使用线性 `_ramp_probability`。测试已迁移到当前线性
+  ramp、当前无 goal 的 locomotion teacher 和 three-way loss 接口，不恢复废弃生产 helper。
+  完整回归还发现通用 `AlgorithmPPO` 的 fixed schedule 守卫被删除，导致 optimizer LR 漂移静默
+  通过；现恢复初始化 LR 的前后 update 校验，并使用配置的 adaptive min/max。该通用修复不改变
+  P3.5 的显式分组 LR 调度，但防止旧 fixed PPO 入口静默漂移。

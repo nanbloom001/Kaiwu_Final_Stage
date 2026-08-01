@@ -13,18 +13,34 @@ LOW_LEVEL_POLICY_OBS_DIM = 57901
 PROPRIO_SCAN_DIM = 301
 GOAL4_SLICE = slice(301, 305)
 DEPTH_SLICE = slice(305, 57905)
-SESSION_TARGET_SECONDS = 9000.0
-P3_WORKER_EXTRA_DIM = 35
-P3_PRIVILEGED_WIRE_DIM = 420
+SESSION_TARGET_SECONDS = 7200.0
+P3_WORKER_EXTRA_DIM = 108
+P3_PRIVILEGED_WIRE_DIM = 493
 RUNTIME_TERRAIN_SIZE_INDEX = 0
 GAIT_CONTACT_ONSET_SLICE = slice(1, 5)
 GAIT_IMPACT_SPEED_SLICE = slice(5, 9)
 GAIT_TOUCHDOWN_Y_SLICE = slice(9, 13)
 GAIT_CONTINUOUS_STANCE_SLICE = slice(13, 17)
-GAIT_FORCE_IMPULSE_SLICE = slice(17, 21)
-JOINT_TORQUE_SLICE = slice(21, 33)
-MECHANICAL_POWER_INDEX = 33
-JOINT_MAPPING_VALID_INDEX = 34
+GAIT_COMPLETED_SLIP_SLICE = slice(17, 21)
+GAIT_COMPLETED_SLIP_EVENT_SLICE = slice(21, 25)
+JOINT_TORQUE_SLICE = slice(25, 37)
+MECHANICAL_POWER_INDEX = 37
+JOINT_MAPPING_VALID_INDEX = 38
+COMMAND_BUCKET_INDEX = 39
+COMMAND_ANCHOR_WEIGHT_INDEX = 40
+SIM2REAL_COMPONENT_SLICE = slice(41, 45)
+SIM2REAL_COMPONENT_VALID_INDEX = 45
+JOINT_ACCELERATION_SLICE = slice(46, 58)
+CONTACT_FORCE_SLICE = slice(58, 72)
+CONTACT_ONSET_SLICE = slice(72, 86)
+CONTACT_OVER_THRESHOLD_DURATION_SLICE = slice(86, 100)
+JOINT_ACCELERATION_MAPPING_VALID_INDEX = 100
+CONTACT_REWARD_MAPPING_VALID_INDEX = 101
+PUSH_EVENT_FLAG_INDEX = 102
+PUSH_DELTA_VELOCITY_SLICE = slice(103, 105)
+SECONDS_SINCE_PUSH_INDEX = 105
+PUSH_RUNTIME_ACTIVE_INDEX = 106
+PUSH_TELEMETRY_VALID_INDEX = 107
 SUBGOAL_SUCCESS_DISTANCE_M = 0.50
 SUBGOAL_MIN_DISTANCE_M = 1.30
 SUBGOAL_MAX_DISTANCE_M = 2.90
@@ -41,6 +57,7 @@ SOFT_BRAKE_FINAL_MARGIN_M = 0.04
 SOFT_BRAKE_MID_SPEED_M_S = 0.30
 SOFT_BRAKE_FINAL_SPEED_M_S = 0.12
 P3_ACTION_DIM = 12
+P3_COMMAND_SEED = 3187
 # M1 and M2 are local-goal events. Platform completion supplies M3.
 JOINT_SUCCESS_MIN_SUBGOALS = 2
 SUBGOAL_EVENT_NONE = 0
@@ -59,34 +76,107 @@ class P3Phase:
 
 
 PHASES = (
-    P3Phase("gaitcalib", 0.0, 900.0, True, True, False),
-    P3Phase("lowbase", 900.0, 1800.0, True, True, False),
-    P3Phase("lowmild", 1800.0, 3600.0, True, True, False),
-    P3Phase("lowmedium", 3600.0, 5400.0, True, True, False),
-    P3Phase("adaptercalib", 5400.0, 6000.0, False, True, True),
-    P3Phase("highadapt", 6000.0, 7200.0, False, True, True),
-    P3Phase("highslow", 7200.0, SESSION_TARGET_SECONDS, False, True, True),
+    P3Phase("gaitfixcalib", 0.0, 900.0, True, True, False),
+    P3Phase("repair", 900.0, 4500.0, True, True, False),
+    P3Phase("pushwarm", 4500.0, 5400.0, True, True, False),
+    P3Phase("pushfull", 5400.0, 6300.0, True, True, False),
+    P3Phase("stable", 6300.0, SESSION_TARGET_SECONDS, False, True, False),
 )
 
 MIRROR_SEQUENCE_SHARE = 0.25
-MIRROR_TARGET_GRADIENT_RATIO = 0.035
-MIRROR_MAX_GRADIENT_RATIO = 0.10
+MIRROR_TARGET_GRADIENT_RATIO = 0.005
+MIRROR_MAX_GRADIENT_RATIO = 0.05
+MEMORY_TARGET_GRADIENT_RATIO = 0.015
+MEMORY_MAX_GRADIENT_RATIO = 0.03
+ACTION_SMOOTH_TARGET_GRADIENT_RATIO = 0.0
+ACTION_RANGE_TARGET_GRADIENT_RATIO = 0.0
+AUXILIARY_MAX_GRADIENT_RATIO = 0.05
+ANCHOR_TARGET_GRADIENT_RATIO = 0.030
+ACTION_MEAN_SOFT_LIMIT = 5.0
+ACTION_TO_JOINT_SCALE = 0.25
 GAIT_CONTACT_REWARD_CAP = 0.18
 GAIT_CROSS_REWARD_CAP = 0.14
 GAIT_STARVATION_REWARD_CAP = 0.08
 GAIT_TOTAL_REWARD_CAP = 0.40
 GAIT_BASELINE_CONTINUOUS_STRIDE = 5
+GAIT_BASELINE_VERSION = 3
+TERRAIN_COLUMN_BUCKET_BOUNDARIES = (3, 6, 13, 20)
 
 
 def gait_training_fraction(elapsed_s: float) -> float:
+    del elapsed_s
+    # Event gait terms remain shadow diagnostics in the stair-memory run.
+    return 0.0
+
+
+def mirror_training_fraction(elapsed_s: float) -> float:
+    return 0.0 if float(elapsed_s) < 2700.0 else 1.0
+
+
+def depth_fault_strength(elapsed_s: float) -> float:
+    # P3.5 inherits the parent model's final 50% fault mixture. Camera timing,
+    # rather than stronger pixel corruption, is the active curriculum.
+    return 0.0 if float(elapsed_s) < 900.0 else 0.5
+
+
+def memory_training_fraction(elapsed_s: float) -> float:
+    return depth_fault_strength(elapsed_s)
+
+
+def adapter_replay_ratios(elapsed_s: float) -> tuple[float, float, float]:
+    """Return latest, recent and parent completed-record replay shares."""
     elapsed = max(0.0, float(elapsed_s))
-    if elapsed < 900.0:
-        return 0.0
-    if elapsed < 1800.0:
-        return 0.25 * (elapsed - 900.0) / 900.0
-    if elapsed < 3600.0:
-        return 0.25 + 0.75 * (elapsed - 1800.0) / 1800.0
-    return 1.0
+    if elapsed < 4500.0:
+        return 0.50, 0.25, 0.25
+    if elapsed < 6300.0:
+        return 0.60, 0.25, 0.15
+    return 0.75, 0.15, 0.10
+
+
+def adapter_updates_per_low_rollout(elapsed_s: float) -> int:
+    return int(phase_for_elapsed(elapsed_s).adapter_trainable)
+
+
+def camera_delay_probabilities(elapsed_s: float) -> tuple[float, float, float]:
+    """Return nominal, 40-100 ms and 100-150 ms active-delay shares."""
+    if float(elapsed_s) < 900.0:
+        return 1.0, 0.0, 0.0
+    if float(elapsed_s) < 4500.0:
+        return 0.70, 0.30, 0.0
+    return 0.50, 0.35, 0.15
+
+
+def push_phase_config(elapsed_s: float) -> dict[str, float | bool | str]:
+    elapsed = max(0.0, float(elapsed_s))
+    if elapsed < 4500.0:
+        return {
+            "name": "disabled",
+            "active": False,
+            "max_velocity_xy_m_s": 0.0,
+            "min_interval_s": 12.0,
+            "max_interval_s": 18.0,
+        }
+    if elapsed < 5400.0:
+        maximum = 0.05
+        name = "pushwarm"
+    else:
+        maximum = 0.08
+        name = "pushfull"
+    return {
+        "name": name,
+        "active": True,
+        "max_velocity_xy_m_s": maximum,
+        "min_interval_s": 12.0,
+        "max_interval_s": 18.0,
+    }
+
+
+def action_smooth_training_fraction(
+    elapsed_s: float, *, mapping_valid: bool = True
+) -> float:
+    del elapsed_s, mapping_valid
+    # Kept for diagnostics only; it must never enter the optimizer.
+    return 0.0
 
 
 def asymmetric_local_progress(
@@ -111,28 +201,26 @@ def phase_for_elapsed(elapsed_s: float) -> P3Phase:
 
 
 def domain_randomization_index(elapsed_s: float) -> int:
-    elapsed = max(0.0, float(elapsed_s))
-    if elapsed < 1800.0:
-        return 0
-    return 1
+    del elapsed_s
+    # Platform BaseEnv creates Isaac once per process, so P3 uses one startup
+    # randomization contract instead of advertising an unrealizable schedule.
+    return 0
 
 
 def materialize_environment_config(usr_conf: dict, elapsed_s: float) -> dict:
-    """Expand the P3 wall-clock DR table into worker-consumed configuration."""
+    """Materialize the process-start P3 environment configuration."""
     result = copy.deepcopy(usr_conf)
     p3 = result.get("p3_standard_joint", {})
-    table = p3.get("domain_randomization", {}) if isinstance(p3, dict) else {}
-    index = domain_randomization_index(elapsed_s)
-
-    def item(name, default):
-        values = table.get(name, default)
-        if not isinstance(values, (tuple, list)) or len(values) <= index:
-            raise ValueError(f"P3 domain randomization table {name} is incomplete")
-        return values[index]
-
-    friction = item("friction_ranges", [[0.6, 1.3], [0.55, 1.35]])
-    added_mass = float(item("base_added_mass_kg", [0.75, 0.85]))
-    noise_level = float(item("noise_levels", [0.5, 0.55]))
+    config = p3.get("domain_randomization", {}) if isinstance(p3, dict) else {}
+    friction = config.get("friction_range", [0.65, 1.25])
+    added_mass = float(config.get("base_added_mass_kg", 0.40))
+    noise_level = float(config.get("noise_level", 0.35))
+    restitution = config.get("restitution_range", [0.0, 0.05])
+    push_enabled = bool(config.get("push_robots", True))
+    min_push_interval = float(config.get("min_push_interval_s", 12.0))
+    max_push_interval = float(config.get("push_interval_s", 18.0))
+    if not 0.0 < min_push_interval <= max_push_interval:
+        raise ValueError("P3 push interval must be finite, positive, and ordered")
 
     result["domain_rand"] = {
         **dict(result.get("domain_rand", {})),
@@ -141,8 +229,11 @@ def materialize_environment_config(usr_conf: dict, elapsed_s: float) -> dict:
         "friction_range": list(friction),
         "randomize_base_mass": added_mass > 0.0,
         "added_mass_range": [-added_mass, added_mass],
-        # The platform API cannot express per-env share or reset grace.
-        "push_robots": False,
+        "restitution_range": list(restitution),
+        "push_robots": push_enabled,
+        "min_push_interval_s": min_push_interval,
+        "push_interval_s": max_push_interval,
+        "max_push_vel_xy": 0.0,
     }
     result["noise"] = {
         **dict(result.get("noise", {})),
@@ -154,11 +245,17 @@ def materialize_environment_config(usr_conf: dict, elapsed_s: float) -> dict:
         "gravity": 0.05,
     }
     result["p3_runtime"] = {
-        "phase_index": index,
+        "phase_index": domain_randomization_index(elapsed_s),
+        "environment_contract": "p35_static_dr_dynamic_push_v1",
         "base_added_mass_kg": added_mass,
+        "push_enabled": push_enabled,
+        "push_velocity_m_s": 0.0,
         "worker_command_override": True,
         "low_phase_command_owner": "p3_worker_recovery_sampler_2_to_8_seconds",
     }
+    stage = result.setdefault("p3_standard_joint", {})
+    push_schedule = stage.setdefault("push_schedule", {})
+    push_schedule["resume_offset_s"] = max(0.0, float(elapsed_s))
     return result
 
 
@@ -335,7 +432,7 @@ def joint_episode_success(standard_completed, subgoal_success_count, hard_failur
 
 def contract():
     return {
-        "name": "p3_standard_gait_radial_v5",
+        "name": "p35_low_speed_gait_push_v1",
         "policy_observation_dim": POLICY_OBS_DIM,
         "low_level_policy_observation_dim": LOW_LEVEL_POLICY_OBS_DIM,
         "high_level_actor_input_dim": 85,
@@ -361,16 +458,45 @@ def contract():
         "joint_success_min_subgoals": JOINT_SUCCESS_MIN_SUBGOALS,
         "low_level_storage": "proprio45+frozen_cnn_feature32",
         "anchor_cnn_reuse_requires_identical_frozen_weights": True,
-        "physics_randomization": "platform_friction_and_base_mass_only",
-        "observation_noise": "platform_explicit_term_bounds_by_phase_level",
+        "physics_randomization": "platform_process_start_friction_base_mass_restitution_dynamic_push",
+        "observation_noise": "platform_process_start_explicit_term_bounds",
         "step_transport": {
             "action_dim": P3_ACTION_DIM,
             "privileged_wire_dim": P3_PRIVILEGED_WIRE_DIM,
             "runtime_extra_dim": P3_WORKER_EXTRA_DIM,
+            "training_only_extra": {
+                "joint_acc12": [46, 58],
+                "contact_force14": [58, 72],
+                "contact_onset14": [72, 86],
+                "contact_over_threshold_duration14": [86, 100],
+                "joint_mapping_valid": 100,
+                "contact_mapping_valid": 101,
+                "push_event_flag": 102,
+                "push_delta_vx_vy": [103, 105],
+                "seconds_since_push": 105,
+                "push_runtime_active": 106,
+                "push_telemetry_valid": 107,
+            },
         },
         "low_phase_command_owner": "p3_worker_recovery_sampler_2_to_8_seconds",
-        "high_phase_command_owner": "p3_high_level_policy",
-        "low_level_frozen_while_high_level_owns_command": True,
+        "high_level_training": "disabled_full_session",
+        "high_level_frozen_modules": [
+            "navigation_encoder",
+            "actor_lstm",
+            "critic",
+            "safety_head",
+        ],
+        "training_schedule": [
+            {
+                "name": phase.name,
+                "start_s": phase.start_s,
+                "end_s": phase.end_s,
+                "low_level_trainable": phase.low_level_trainable,
+                "adapter_trainable": phase.adapter_trainable,
+                "high_level_trainable": phase.high_level_trainable,
+            }
+            for phase in PHASES
+        ],
         "local_out_of_bounds": "diagnostic_only_platform_reset_unavailable",
         "local_progress": {
             "positive_scale": 1.5,
@@ -382,12 +508,107 @@ def contract():
             "target_gradient_ratio": MIRROR_TARGET_GRADIENT_RATIO,
             "hard_gradient_ratio": MIRROR_MAX_GRADIENT_RATIO,
             "training_only": True,
+            "preflight": "joint_order+action_scale+pd+effort+contact_mapping",
         },
+        "auxiliary_gradient_targets": {
+            "anchor": ANCHOR_TARGET_GRADIENT_RATIO,
+            "memory": MEMORY_TARGET_GRADIENT_RATIO,
+            "mirror": MIRROR_TARGET_GRADIENT_RATIO,
+            "combined_hard_cap": AUXILIARY_MAX_GRADIENT_RATIO,
+        },
+        "deterministic_mean_smoothing": {
+            "version": "p3_action_smooth_v1",
+            "joint_target_scale": ACTION_TO_JOINT_SCALE,
+            "rate_threshold_rad_per_frame": {
+                "hip_thigh": 0.20,
+                "calf": 0.25,
+            },
+            "jerk_threshold_rad_per_frame2": {
+                "hip_thigh": 0.15,
+                "calf": 0.20,
+            },
+            "target_gradient_ratio": ACTION_SMOOTH_TARGET_GRADIENT_RATIO,
+            "mean_soft_limit": ACTION_MEAN_SOFT_LIMIT,
+            "range_target_gradient_ratio": ACTION_RANGE_TARGET_GRADIENT_RATIO,
+            "combined_auxiliary_hard_ratio": AUXILIARY_MAX_GRADIENT_RATIO,
+            "training_only": True,
+        },
+        "command_anchor_by_bucket": {
+            "straight": 0.35,
+            "reserved_reverse": 0.0,
+            "vx_vy": 0.30,
+            "vx_wz": 0.25,
+            "pure_yaw": 0.15,
+            "brake_restart": 0.10,
+            "zero": 0.10,
+        },
+        "command_domain": {
+            "vx_m_s": [0.0, 1.0],
+            "vy_m_s": [-0.30, 0.30],
+            "wz_rad_s": [-0.90, 0.90],
+            "bucket_weights": [0.25, 0.0, 0.10, 0.35, 0.08, 0.15, 0.07],
+            "reverse_recovery_enabled": False,
+            "reason": "high_level_contract_cannot_issue_negative_vx",
+        },
+        "worker_command_sampler": {
+            "seed": P3_COMMAND_SEED,
+            "rng": "dedicated_torch_generator",
+            "resume": "seeded_fresh_after_environment_reset",
+        },
+        "touchdown_frame": "full_root_quaternion_inverse_body_y",
+        "slip_measurement": "per_stance_accumulated_world_xy_distance",
+        "worker_command_sampler_resume": "seeded_fresh_after_environment_reset",
         "gait_event_caps": {
             "contact": GAIT_CONTACT_REWARD_CAP,
             "cross": GAIT_CROSS_REWARD_CAP,
             "starvation": GAIT_STARVATION_REWARD_CAP,
             "total": GAIT_TOTAL_REWARD_CAP,
         },
+        "stair_memory": {
+            "contract": "p35_camera_timing_v1",
+            "rollout_frames": 128,
+            "tbptt_frames": 128,
+            "near_clip_m": [0.10, 0.25],
+            "near_clip_distribution": "0.10+0.15*Beta(1,4)",
+            "memory_target_gradient_ratio": MEMORY_TARGET_GRADIENT_RATIO,
+            "memory_hard_gradient_ratio": MEMORY_MAX_GRADIENT_RATIO,
+            "high_level_frozen": True,
+            "low_level_cnn_frozen": True,
+            "clean_teacher": "selected_f2_low_policy_snapshot",
+            "capture_rate_hz": 30.0,
+            "control_rate_hz": 50.0,
+            "feature_fifo_frames": 10,
+            "active_delay_max_ms": 150.0,
+            "shadow_delay_max_ms": 250.0,
+            "teacher_selection": "pixel_fault_or_delivered_feature_age_positive",
+        },
+        "adapter_replay_schedule": [
+            {"start_s": 0.0, "end_s": 4500.0, "latest_recent_parent": [0.50, 0.25, 0.25]},
+            {"start_s": 4500.0, "end_s": 6300.0, "latest_recent_parent": [0.60, 0.25, 0.15]},
+            {"start_s": 6300.0, "end_s": 7200.0, "latest_recent_parent": [0.75, 0.15, 0.10]},
+        ],
+        "push": {
+            "event_term": "push_robot",
+            "implementation": "event_manager_public_get_set_wrapper",
+            "warm_start_s": 4500.0,
+            "full_start_s": 5400.0,
+            "interval_s": [12.0, 18.0],
+            "warm_velocity_xy_m_s": 0.05,
+            "full_velocity_xy_m_s": 0.08,
+            "post_push_reward_grace_s": 0.40,
+        },
         "gait_baseline_continuous_stride": GAIT_BASELINE_CONTINUOUS_STRIDE,
+        "gait_baseline": {
+            "version": GAIT_BASELINE_VERSION,
+            "terrain_buckets": ["slope", "slope_inv", "stairs", "stairs_inv"],
+            "terrain_column_boundaries": list(TERRAIN_COLUMN_BUCKET_BOUNDARIES),
+            "motion_buckets": ["low_speed", "forward", "turn_lateral"],
+            "excluded_command_buckets": ["brake_restart", "zero"],
+            "fallback_reward_scale": {
+                "exact": 1.0,
+                "same_terrain": 0.5,
+                "global": 0.0,
+                "disabled": 0.0,
+            },
+        },
     }

@@ -16,12 +16,13 @@ from agent_ppo.algorithm.algorithm_visual_ppo import AlgorithmVisualPPO
 from agent_ppo.checkpoint_io import CheckpointSaveError
 from agent_ppo.model.visual_actor_critic import VisualActorCritic
 from agent_ppo.workflow.p3_standard_joint_workflow import (
+    P35_REQUIRED_MONITOR_METRICS,
     _advance_platform_lifecycle,
     _finalize_low_level_update,
     _high_adapter_update_due,
     _low_policy_action,
+    _monitor_contract_metrics,
     _native_command_epoch,
-    _requires_environment_rebuild,
     _run_adapter_updates,
     _storage_bytes,
     _zero_inactive_high_commands,
@@ -191,17 +192,37 @@ def test_adapter_calibration_low_action_skips_ppo_metadata():
     assert actions.shape == (2, 12)
 
 
+def test_p35_monitor_contract_tracks_registration_and_data_age():
+    agent = SimpleNamespace()
+    metrics = {name: 1.0 for name in P35_REQUIRED_MONITOR_METRICS}
+    first = _monitor_contract_metrics(agent, metrics, 10.0)
+    assert first["p35_monitor_registered_metric_count"] == first[
+        "p35_monitor_expected_metric_count"
+    ]
+    assert first["p35_monitor_empty_metric_count"] == 0.0
+    missing = dict(metrics)
+    missing.pop("p35_reward_posture")
+    second = _monitor_contract_metrics(agent, missing, 14.0)
+    assert second["p35_monitor_registered_metric_count"] == second[
+        "p35_monitor_expected_metric_count"
+    ] - 1.0
+    assert second["p35_monitor_longest_data_age_s"] == pytest.approx(4.0)
+
+
 def test_coordinator_keeps_std_frozen_and_scales_low_lrs():
     visual = object.__new__(AlgorithmVisualPPO)
     visual.anchor_session_elapsed_hours = 0.0
     visual.current_phase = ""
+    actor = torch.nn.Sequential(
+        torch.nn.Linear(1, 2), torch.nn.ELU(), torch.nn.Linear(2, 1)
+    )
     visual.actor_critic = SimpleNamespace(
-        std=torch.nn.Parameter(torch.ones(1))
+        std=torch.nn.Parameter(torch.ones(1)), actor=actor
     )
     visual._set_trainable_phase = lambda phase: visual.actor_critic.std.requires_grad_(True)
     visual.optimizer = torch.optim.Adam(
         [
-            {"params": [torch.nn.Parameter(torch.ones(1))], "lr": 1e-5, "name": "actor"},
+            {"params": list(actor.parameters()), "lr": 1e-5, "name": "actor"},
             {"params": [torch.nn.Parameter(torch.ones(1))], "lr": 5e-6, "name": "lstm"},
             {"params": [torch.nn.Parameter(torch.ones(1))], "lr": 1e-4, "name": "critic"},
         ]
@@ -218,17 +239,11 @@ def test_coordinator_keeps_std_frozen_and_scales_low_lrs():
         logger=None,
     )
     assert not visual.actor_critic.std.requires_grad
-    assert [group["lr"] for group in visual.optimizer.param_groups] == pytest.approx([0.0, 0.0, 1e-4])
-    joint.update_clock(7200.0)
-    assert [group["lr"] for group in visual.optimizer.param_groups] == pytest.approx([0.0, 0.0, 0.0])
-
-
-def test_only_domain_randomization_boundaries_rebuild_environment():
-    assert _requires_environment_rebuild(1799.0, 1800.0)
-    assert not _requires_environment_rebuild(3599.0, 3600.0)
-    assert not _requires_environment_rebuild(5399.0, 5400.0)
-    assert not _requires_environment_rebuild(5999.0, 6000.0)
-    assert not _requires_environment_rebuild(7199.0, 7200.0)
+    assert [group["lr"] for group in visual.optimizer.param_groups] == pytest.approx([0.0, 0.0, 3e-5])
+    joint.update_clock(4500.0)
+    assert [group["lr"] for group in visual.optimizer.param_groups] == pytest.approx([3e-6, 1.5e-6, 3e-5])
+    assert all(not parameter.requires_grad for parameter in actor[0].parameters())
+    assert all(parameter.requires_grad for parameter in actor[-1].parameters())
 
 
 def test_high_adapter_updates_every_second_policy_rollout():
@@ -246,12 +261,18 @@ def test_adapter_update_metrics_distinguish_attempts_applied_and_skipped():
             {"adapter_loss": 0.0, "adapter_updates": 0.0},
         )
     )
+    replay_ratios = []
     agent = SimpleNamespace(
+        algorithm=SimpleNamespace(session_effective_seconds=5000.0),
+        response_aux_buffer=SimpleNamespace(
+            set_p3_replay_ratios=lambda *values: replay_ratios.append(values)
+        ),
         high_level_algorithm=SimpleNamespace(
             update_adapter_after_policy=lambda: next(results)
         )
     )
     metrics = _run_adapter_updates(agent, 2)
+    assert replay_ratios == [(0.60, 0.25, 0.15)]
     assert metrics["adapter_update_attempts"] == 2.0
     assert metrics["adapter_updates"] == 1.0
     assert metrics["adapter_skipped_updates"] == 1.0
@@ -343,13 +364,13 @@ def test_p3_lifecycle_checkpoint_failure_stops_training():
 
 
 def test_exact_resume_phase_must_match_effective_clock():
-    raw = {"phase_label": "lowmild"}
-    state = {"compound_schedule_phase": "lowmild"}
-    assert _validate_resume_phase(raw, state, 1800.0) == "lowmild"
+    raw = {"phase_label": "repair"}
+    state = {"compound_schedule_phase": "repair"}
+    assert _validate_resume_phase(raw, state, 1800.0) == "repair"
     with pytest.raises(RuntimeError, match="phase/time mismatch"):
         _validate_resume_phase(
-            {"phase_label": "highslow"},
-            {"compound_schedule_phase": "highslow"},
+            {"phase_label": "stable"},
+            {"compound_schedule_phase": "stable"},
             1800.0,
         )
 
@@ -408,7 +429,7 @@ def test_inactive_high_commands_are_zeroed_without_touching_live_envs():
     assert torch.equal(command.exec_cmd[1], torch.tensor([0.6, -0.1, 0.2]))
 
 
-def test_high_schedule_applies_real_adapter_learning_rates():
+def test_stair_memory_schedule_only_changes_adapter_learning_rate():
     algorithm = object.__new__(AlgorithmP3HighPPO)
     algorithm.config = {
         "response_adapter": {
@@ -440,23 +461,82 @@ def test_high_schedule_applies_real_adapter_learning_rates():
     algorithm.response_optimizer = torch.optim.Adam(
         [torch.nn.Parameter(torch.ones(1))], lr=3.0e-5
     )
+    actor_lrs = [group["lr"] for group in algorithm.actor_optimizer.param_groups]
+    critic_lr = algorithm.critic_optimizer.param_groups[0]["lr"]
 
     algorithm._apply_training_schedule(0.0)
     assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(3.0e-5)
 
     algorithm._apply_training_schedule(5400.0)
-    assert algorithm.current_phase == "adaptercalib"
+    assert algorithm.current_phase == "pushfull"
+    assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(3.0e-5)
+    assert [group["lr"] for group in algorithm.actor_optimizer.param_groups] == actor_lrs
+    assert algorithm.critic_optimizer.param_groups[0]["lr"] == critic_lr
+
+    algorithm._apply_training_schedule(6300.0)
+    assert algorithm.current_phase == "stable"
     assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(2.0e-4)
-    assert all(group["lr"] == 0.0 for group in algorithm.actor_optimizer.param_groups)
-    assert algorithm.critic_optimizer.param_groups[0]["lr"] == pytest.approx(9.0e-5)
+    assert [group["lr"] for group in algorithm.actor_optimizer.param_groups] == actor_lrs
+    assert algorithm.critic_optimizer.param_groups[0]["lr"] == critic_lr
 
-    algorithm._apply_training_schedule(6000.0)
-    assert algorithm.current_phase == "highadapt"
-    assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-5)
 
-    algorithm._apply_training_schedule(7200.0)
-    assert algorithm.current_phase == "highslow"
-    assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(1.0e-5)
+def test_short_high_adaptation_restores_parent_critic_optimizer_and_statistics():
+    source_critic = torch.nn.Linear(2, 1)
+    source_optimizer = torch.optim.Adam(source_critic.parameters(), lr=3.0e-4)
+    source_critic(torch.ones(2, 2)).square().mean().backward()
+    source_optimizer.step()
+
+    target_critic = torch.nn.Linear(2, 1)
+    target_optimizer = torch.optim.Adam(target_critic.parameters(), lr=3.0e-4)
+
+    def load_leaf(container, name, module, **_kwargs):
+        module.load_state_dict(container[name]["state_dict"], strict=True)
+
+    high = SimpleNamespace(
+        critic=target_critic,
+        critic_optimizer=target_optimizer,
+        _load_leaf=load_leaf,
+        return_statistics={},
+        actor_gradient_steps=0,
+        critic_gradient_steps=0,
+    )
+    joint = object.__new__(AlgorithmP3StandardJoint)
+    joint.high_algorithm = high
+    bundle = {
+        "modules": {
+            "high_level": {
+                "critic": {"state_dict": source_critic.state_dict()},
+            }
+        },
+        "optimizers": {"high_level_critic": source_optimizer.state_dict()},
+        "training_states": {
+            "high_level": {
+                "actor_gradient_steps": 123,
+                "critic_gradient_steps": 456,
+                "return_statistics": {
+                    "count": 789,
+                    "mean": 1.25,
+                    "m2": 3.5,
+                    "value_normalization_enabled": False,
+                },
+            }
+        },
+    }
+    joint._restore_high_value_state_for_short_adaptation(bundle)
+
+    for source, restored in zip(
+        source_critic.parameters(), target_critic.parameters()
+    ):
+        assert torch.equal(source, restored)
+        source_state = source_optimizer.state[source]
+        restored_state = target_optimizer.state[restored]
+        assert torch.equal(source_state["exp_avg"], restored_state["exp_avg"])
+        assert torch.equal(source_state["exp_avg_sq"], restored_state["exp_avg_sq"])
+    assert high.return_statistics["count"] == 789
+    assert high.return_statistics["mean"] == pytest.approx(1.25)
+    assert high.return_statistics["m2"] == pytest.approx(3.5)
+    assert high.actor_gradient_steps == 123
+    assert high.critic_gradient_steps == 456
 
 
 def test_p3_high_reward_profile_disables_track_only_shaping():

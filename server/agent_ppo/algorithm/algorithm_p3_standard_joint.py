@@ -3,14 +3,29 @@
 
 from __future__ import annotations
 import hashlib
+import math
 import os
 from uuid import uuid4
 import torch
 from agent_ppo.algorithm.algorithm_p2_nav_ppo import AlgorithmP2NavPPO
-from agent_ppo.checkpoint_io import normalize_kaiwu_train_bundle
+from agent_ppo.checkpoint_io import (
+    normalize_kaiwu_train_bundle,
+    validate_state_dict_finite,
+)
 from agent_ppo.feature import p2_contract, p3_contract
-from agent_ppo.feature.p3_gait import P3GaitBaseline, P3MirrorAuxiliary
+from agent_ppo.feature.p3_depth_memory import (
+    P35CameraFeatureTiming,
+    P3DepthFaultAugmenter,
+    P3MemoryAuxiliary,
+)
+from agent_ppo.feature.p3_gait import (
+    P3ActionSmoothAuxiliary,
+    P3GaitBaseline,
+    P3MirrorAuxiliary,
+    P35LowRewardShaper,
+)
 from agent_ppo.model.p2_high_level import (
+    navigation_critic_spec,
     navigation_safety_head_spec,
 )
 
@@ -95,7 +110,7 @@ class AlgorithmP3HighPPO(AlgorithmP2NavPPO):
         return super()._actor_micro_loss(batch)
 
     def _actor_update_enabled(self) -> bool:
-        return self.current_phase != "adaptercalib"
+        return False
 
     def update_adapter_after_policy(self):
         self.defer_adapter_update = False
@@ -138,7 +153,7 @@ class AlgorithmP3HighPPO(AlgorithmP2NavPPO):
                 high_adapt_lr,
                 0.005,
             )
-        elif phase.name == "adaptercalib":
+        elif phase.name in {"adaptercalib", "stable"}:
             nav, actor, critic, adapter_lr, entropy = (
                 0.0,
                 0.0,
@@ -157,16 +172,21 @@ class AlgorithmP3HighPPO(AlgorithmP2NavPPO):
         self.cnn_unfrozen = nav > 0.0
         self.entropy_coefficient = entropy
         self.optimizer_phase = phase.name
-        for group in self.actor_optimizer.param_groups:
-            name = str(group.get("name", ""))
-            if name == "navigation_safety_head":
-                group["lr"] = 0.0
-            else:
-                group["lr"] = self._actor_group_base_lr(group) * (
-                    nav if name.startswith("navigation_") else actor
-                )
-        self.critic_optimizer.param_groups[0]["lr"] = p2_contract.CRITIC_LR * critic
+        # This run never steps the high-level actor or critic.  Leave their
+        # optimizer and scheduler state byte-for-byte inherited from the
+        # parent; zero learning rates would still mutate the saved state.
+        del nav, actor, critic
         self.response_optimizer.param_groups[0]["lr"] = adapter_lr
+        for module in (
+            getattr(self, "navigation_encoder", None),
+            getattr(self, "actor", None),
+            getattr(self, "critic", None),
+            getattr(self, "safety_head", None),
+        ):
+            if module is not None:
+                module.eval()
+                for parameter in module.parameters():
+                    parameter.requires_grad_(False)
         return {"phase": phase.name, "cnn_unfrozen": self.cnn_unfrozen}
 
     @property
@@ -259,6 +279,39 @@ class AlgorithmP3StandardJoint:
             seed=int(self.config.get("mirror_seed", 3197)),
         )
         self.low_algorithm.p3_mirror_aux = self.mirror_aux
+        num_steps = int(
+            getattr(storage, "num_transitions_per_env", self.config.get("num_steps_per_env", 128))
+        )
+        self.depth_fault = P3DepthFaultAugmenter(
+            num_steps=num_steps,
+            num_envs=self.high_algorithm.num_envs,
+            depth_shape=(p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH, p2_contract.DEPTH_CHANNELS),
+            device=self.high_algorithm.device,
+            seed=int(self.config.get("depth_fault_seed", 3329)),
+        )
+        self.memory_aux = P3MemoryAuxiliary(
+            num_steps=num_steps,
+            num_envs=self.high_algorithm.num_envs,
+            obs_dim=77,
+            device=self.high_algorithm.device,
+            seed=int(self.config.get("memory_seed", 3331)),
+        )
+        camera_config = self.config.get("camera_timing") or {}
+        self.camera_timing = P35CameraFeatureTiming(
+            num_envs=self.high_algorithm.num_envs,
+            feature_dim=32,
+            device=self.high_algorithm.device,
+            capacity=int(camera_config.get("feature_fifo_frames", 10)),
+            seed=int(camera_config.get("capture_phase_seed", 3361)),
+            control_dt_s=1.0 / float(camera_config.get("control_rate_hz", 50.0)),
+            capture_rate_hz=float(camera_config.get("capture_rate_hz", 30.0)),
+        )
+        self.low_algorithm.p3_memory_aux = self.memory_aux
+        self.action_smooth_aux = P3ActionSmoothAuxiliary()
+        self.low_algorithm.p3_action_smooth_aux = self.action_smooth_aux
+        self.low_reward_shaper = P35LowRewardShaper(
+            self.high_algorithm.num_envs, self.high_algorithm.device
+        )
         terrain_size_x = float(self.config.get("terrain_size_x_m", 8.0))
         (
             self.platform_complete_radius_m,
@@ -269,6 +322,7 @@ class AlgorithmP3StandardJoint:
             str(group.get("name", index)): float(group["lr"])
             for index, group in enumerate(self.low_algorithm.optimizer.param_groups)
         }
+        self._high_frozen_digest = None
         self._apply_phase()
 
     @property
@@ -281,21 +335,26 @@ class AlgorithmP3StandardJoint:
         self.low_algorithm.current_phase = phase.name
         self.low_algorithm._set_trainable_phase(phase.name)
         self.low_algorithm.actor_critic.std.requires_grad_(False)
-        low_scales = {
-            "gaitcalib": {"actor": 0.00, "lstm": 0.00, "critic": 1.00},
-            "lowbase": {"actor": 0.50, "lstm": 0.50, "critic": 1.00},
-            "lowmild": {"actor": 0.50, "lstm": 0.50, "critic": 1.00},
-            "lowmedium": {"actor": 0.35, "lstm": 0.35, "critic": 0.50},
-            "adaptercalib": {"actor": 0.00, "lstm": 0.00, "critic": 0.00},
-            "highadapt": {"actor": 0.00, "lstm": 0.00, "critic": 0.00},
-            "highslow": {"actor": 0.00, "lstm": 0.00, "critic": 0.00},
+        low_lrs = {
+            "gaitfixcalib": {"actor": 0.0, "lstm": 0.0, "critic": 3.0e-5},
+            "repair": {"actor": 3.0e-6, "lstm": 1.5e-6, "critic": 3.0e-5},
+            "pushwarm": {"actor": 3.0e-6, "lstm": 1.5e-6, "critic": 3.0e-5},
+            "pushfull": {"actor": 1.5e-6, "lstm": 7.5e-7, "critic": 3.0e-5},
+            "stable": {"actor": 0.0, "lstm": 0.0, "critic": 0.0},
         }[phase.name]
         for index, group in enumerate(self.low_algorithm.optimizer.param_groups):
             name = str(group.get("name", index))
-            group["lr"] = self._low_base_lrs[name] * low_scales.get(name, 0.0)
+            group["lr"] = low_lrs.get(name, 0.0)
             trainable = group["lr"] > 0.0
-            for parameter in group["params"]:
-                parameter.requires_grad_(trainable)
+            if name == "actor":
+                for parameter in group["params"]:
+                    parameter.requires_grad_(False)
+                if trainable:
+                    for parameter in self.low_algorithm.actor_critic.actor[-1].parameters():
+                        parameter.requires_grad_(True)
+            else:
+                for parameter in group["params"]:
+                    parameter.requires_grad_(trainable)
         self.low_algorithm.actor_critic.std.requires_grad_(False)
         self.high_algorithm.update_training_clocks(self.session_effective_seconds)
 
@@ -315,6 +374,13 @@ class AlgorithmP3StandardJoint:
         self.m3_proxy_latched.zero_()
         self.high_algorithm.reset_live_state()
         self.low_algorithm.initialize_recurrent_states(self.high_algorithm.num_envs)
+        self.camera_timing.reset(
+            torch.ones(
+                self.high_algorithm.num_envs,
+                dtype=torch.bool,
+                device=self.high_algorithm.device,
+            )
+        )
 
     def update_runtime_terrain_size(self, values: torch.Tensor) -> None:
         finite = values[torch.isfinite(values) & (values > 0.0)]
@@ -502,16 +568,84 @@ class AlgorithmP3StandardJoint:
         return digest
 
     def should_collect_low_rollout(self):
-        return self.current_phase in {"gaitcalib", "lowbase", "lowmild", "lowmedium"}
+        return True
 
     def should_collect_high_rollout(self):
-        return self.current_phase in {"adaptercalib", "highadapt", "highslow"}
+        return False
 
-    def _load_p3_radial_warm_start(self, raw, path, *, platform_model_id):
+    def _current_high_frozen_digest(self) -> str:
+        return self.high_algorithm._module_digest(
+            (
+                ("navigation_encoder", self.high_algorithm.navigation_encoder),
+                ("actor", self.high_algorithm.actor),
+                ("critic", self.high_algorithm.critic),
+                ("safety_head", self.high_algorithm.safety_head),
+            )
+        )
+
+    def _capture_high_frozen_digest(self) -> None:
+        self._high_frozen_digest = self._current_high_frozen_digest()
+
+    def _restore_high_value_state_for_short_adaptation(self, bundle) -> None:
+        """Restore the parent value estimator after the policy-only reward loader."""
+        high = (bundle.get("modules") or {}).get("high_level") or {}
+        self.high_algorithm._load_leaf(
+            high,
+            "critic",
+            self.high_algorithm.critic,
+            class_name="P2NavigationCritic",
+            spec=navigation_critic_spec(),
+            context="P3 short high-level adaptation",
+        )
+        critic_optimizer = (bundle.get("optimizers") or {}).get(
+            "high_level_critic"
+        )
+        if not isinstance(critic_optimizer, dict):
+            raise KeyError(
+                "P3 short high-level adaptation requires high_level_critic optimizer"
+            )
+        validate_state_dict_finite(
+            critic_optimizer, "P3 short high-level adaptation critic optimizer"
+        )
+        self.high_algorithm.critic_optimizer.load_state_dict(critic_optimizer)
+
+        high_state = (bundle.get("training_states") or {}).get("high_level") or {}
+        return_statistics = high_state.get("return_statistics")
+        if not isinstance(return_statistics, dict):
+            raise KeyError(
+                "P3 short high-level adaptation requires return statistics"
+            )
+        restored_statistics = {
+            "count": int(return_statistics.get("count", 0)),
+            "mean": float(return_statistics.get("mean", 0.0)),
+            "m2": float(return_statistics.get("m2", 0.0)),
+            "value_normalization_enabled": bool(
+                return_statistics.get("value_normalization_enabled", False)
+            ),
+        }
+        if (
+            restored_statistics["count"] < 0
+            or not math.isfinite(restored_statistics["mean"])
+            or not math.isfinite(restored_statistics["m2"])
+            or restored_statistics["m2"] < 0.0
+        ):
+            raise ValueError(
+                "P3 short high-level adaptation return statistics are invalid"
+            )
+        self.high_algorithm.return_statistics = restored_statistics
+        self.high_algorithm.actor_gradient_steps = int(
+            high_state.get("actor_gradient_steps", 0)
+        )
+        self.high_algorithm.critic_gradient_steps = int(
+            high_state.get("critic_gradient_steps", 0)
+        )
+
+    def _load_p3_stair_memory_warm_start(self, raw, path, *, platform_model_id):
         bundle, _ = normalize_kaiwu_train_bundle(raw)
         mode = self.high_algorithm._load_p2_reward_warm_start(
             bundle, path, platform_model_id
         )
+        self._restore_high_value_state_for_short_adaptation(bundle)
         self._restore_low_state(raw, exact=False)
         optimizers = raw.get("optimizers") or {}
         low_optimizer = optimizers.get("low_level")
@@ -527,23 +661,15 @@ class AlgorithmP3StandardJoint:
                         "[P3] radial warm start kept fresh actor optimizer because "
                         f"the parent state was incompatible: {exc}"
                     )
-        low = (raw.get("modules") or {}).get("low_level") or {}
-        anchor = low.get("p3_anchor") if isinstance(low, dict) else None
-        if isinstance(anchor, dict):
-            encoder_state = anchor.get("encoder_state_dict")
-            actor_state = anchor.get("actor_state_dict")
-            if isinstance(encoder_state, dict) and isinstance(actor_state, dict):
-                self.low_algorithm.anchor_encoder.load_state_dict(
-                    encoder_state, strict=True
-                )
-                self.low_algorithm.anchor_actor.load_state_dict(actor_state, strict=True)
-        else:
-            self.low_algorithm.anchor_encoder.load_state_dict(
-                self.low_algorithm.actor_critic.vision_encoder.state_dict(), strict=True
-            )
-            self.low_algorithm.anchor_actor.load_state_dict(
-                self.low_algorithm.actor_critic.actor.state_dict(), strict=True
-            )
+        # The clean-memory teacher is the selected F2 policy itself, not the
+        # older anchor nested in that parent package.  Exact resume persists
+        # and restores this new immutable snapshot.
+        self.low_algorithm.anchor_encoder.load_state_dict(
+            self.low_algorithm.actor_critic.vision_encoder.state_dict(), strict=True
+        )
+        self.low_algorithm.anchor_actor.load_state_dict(
+            self.low_algorithm.actor_critic.actor.state_dict(), strict=True
+        )
         low_state = (raw.get("training_states") or {}).get("low_level") or {}
         self.low_updates = int(low_state.get("gradient_steps", 0))
         global_state = (raw.get("training_states") or {}).get("global") or {}
@@ -565,20 +691,26 @@ class AlgorithmP3StandardJoint:
         self._validate_anchor_cnn_reuse()
         self.parent_loaded = True
         self.reset_live_state()
+        self._capture_high_frozen_digest()
         self._apply_phase()
-        return f"p3_radial_warm_start:{mode}"
+        return f"p3_stair_memory_warm_start:{mode}"
 
     def _restore_low_state(self, raw, *, exact: bool) -> None:
         low = ((raw.get("modules") or {}).get("low_level") or {})
-        critic_name = "p3_critic" if exact else "critic"
+        critic_name = "p3_critic"
+        if not exact and critic_name not in low:
+            critic_name = "critic"
+            if self.logger:
+                self.logger.warning(
+                    "[P3] warm-start bundle has no p3_critic; using legacy low critic"
+                )
         critic_leaf = low.get(critic_name) if isinstance(low, dict) else None
         critic_state = critic_leaf.get("state_dict") if isinstance(critic_leaf, dict) else None
-        if isinstance(critic_state, dict):
-            try:
-                self.low_algorithm.actor_critic.critic.load_state_dict(critic_state, strict=True)
-            except (RuntimeError, ValueError) as exc:
-                if self.logger:
-                    self.logger.warning(f"[P3] incompatible parent low critic; rebuilt: {exc}")
+        if not isinstance(critic_state, dict):
+            raise KeyError(f"P3 warm start missing required low-level {critic_name}")
+        self.low_algorithm.actor_critic.critic.load_state_dict(
+            critic_state, strict=True
+        )
         distribution = low.get("action_distribution", {})
         distribution_state = (
             distribution.get("state_dict", {})
@@ -631,9 +763,24 @@ class AlgorithmP3StandardJoint:
             mirror_state = state.get("mirror_rng_state")
             if torch.is_tensor(mirror_state):
                 self.mirror_aux.generator.set_state(mirror_state.cpu())
+            depth_fault_state = state.get("depth_fault")
+            memory_state = state.get("memory_auxiliary")
+            camera_state = state.get("camera_timing")
+            if (
+                not isinstance(depth_fault_state, dict)
+                or not isinstance(memory_state, dict)
+                or not isinstance(camera_state, dict)
+            ):
+                raise KeyError("P3 exact resume missing stair-memory training state")
+            self.depth_fault.load_state_dict(depth_fault_state)
+            self.memory_aux.load_state_dict(memory_state)
+            self.camera_timing.load_state_dict(camera_state)
             gait_state = state.get("gait_baseline")
             if isinstance(gait_state, dict):
                 self.gait_baseline.load_state_dict(gait_state)
+            reward_state = state.get("p35_reward_baseline")
+            if isinstance(reward_state, dict):
+                self.low_reward_shaper.load_state_dict(reward_state)
 
     def load_parent(self, path, *, platform_model_id):
         mode = self.high_algorithm.load_p2_parent_bundle(
@@ -656,6 +803,7 @@ class AlgorithmP3StandardJoint:
         self.high_algorithm.reset_live_state()
         self.low_algorithm.initialize_recurrent_states(self.high_algorithm.num_envs)
         self.parent_loaded = True
+        self._capture_high_frozen_digest()
         self._apply_phase()
         return f"p3_joint_warm_start:{mode}"
 
@@ -667,8 +815,12 @@ class AlgorithmP3StandardJoint:
             return self.load_parent(path, platform_model_id=platform_model_id)
         contracts = raw.get("contracts") or {}
         if contracts.get("p3_standard_joint") != p3_contract.contract():
-            if str(self.config.get("load_mode", "")) == "p3_radial_warm_start":
-                return self._load_p3_radial_warm_start(
+            if str(self.config.get("load_mode", "")) in {
+                "p3_radial_warm_start",
+                "p3_stair_memory_warm_start",
+                "p35_parent_selection_warm_start",
+            }:
+                return self._load_p3_stair_memory_warm_start(
                     raw, path, platform_model_id=platform_model_id
                 )
             raise ValueError("P3 exact resume contract mismatch")
@@ -691,6 +843,24 @@ class AlgorithmP3StandardJoint:
         )
         self.current_iteration = int(global_state.get("current_iteration", 0))
         self.high_updates = int(global_state.get("high_updates", 0))
+        if self.high_updates != 0:
+            raise RuntimeError("P3 stair-memory exact resume requires high_updates=0")
+        runtime_m3 = global_state.get("runtime_m3_contract")
+        if not isinstance(runtime_m3, dict):
+            raise KeyError("P3 exact resume missing runtime M3 contract")
+        required = (
+            "platform_complete_radius_m",
+            "m3_target_radius_m",
+            "platform_boundary_radius_m",
+        )
+        values = [float(runtime_m3.get(name, float("nan"))) for name in required]
+        if not all(math.isfinite(value) and value > 0.0 for value in values):
+            raise ValueError("P3 exact resume runtime M3 contract is invalid")
+        (
+            self.platform_complete_radius_m,
+            self.m3_target_radius_m,
+            self.platform_boundary_radius_m,
+        ) = values
         current_digest = self.high_algorithm._module_digest(
             (
                 ("vision", self.high_algorithm.low_level_encoder),
@@ -718,12 +888,19 @@ class AlgorithmP3StandardJoint:
         )
         self._validate_anchor_cnn_reuse()
         self.parent_loaded = True
+        self._capture_high_frozen_digest()
+        saved_high_digest = str(global_state.get("high_level_frozen_digest", ""))
+        if not saved_high_digest or saved_high_digest != self._high_frozen_digest:
+            raise RuntimeError("P3 stair-memory exact resume high-level digest mismatch")
         self.high_algorithm.reset_live_state()
         self.low_algorithm.initialize_recurrent_states(self.high_algorithm.num_envs)
         self._apply_phase()
         return f"p3_exact_resume:{mode}"
 
     def save_training_bundle(self, path, *, platform_model_id):
+        high_digest = self._current_high_frozen_digest()
+        if self._high_frozen_digest is not None and high_digest != self._high_frozen_digest:
+            raise RuntimeError("P3 stair-memory high-level frozen digest drifted")
         current_low_digest = self.high_algorithm._module_digest(
             (
                 ("vision", self.high_algorithm.low_level_encoder),
@@ -777,12 +954,13 @@ class AlgorithmP3StandardJoint:
         )
         payload["training_states"]["global"].update({
             "compound_schedule_phase": self.current_phase,
-            "train_scope": "p3_standard_joint",
+            "train_scope": "low_level_and_response_adapter",
             "session_effective_seconds": self.session_effective_seconds,
             "lifetime_effective_seconds": self.lifetime_base_seconds + self.session_effective_seconds,
             "current_iteration": self.current_iteration,
             "low_updates": self.low_updates,
             "high_updates": self.high_updates,
+            "high_level_frozen_digest": high_digest,
             "p3_anchor_digest": anchor_digest,
             "low_level_version": self.low_updates,
             "domain_randomization_phase": p3_contract.domain_randomization_index(
@@ -793,6 +971,13 @@ class AlgorithmP3StandardJoint:
                 "noise": realized_dr.get("noise", {}),
                 "p3_runtime": realized_dr.get("p3_runtime", {}),
             },
+            "runtime_m3_contract": {
+                "terrain_size_x_m": 2.0 * self.platform_boundary_radius_m,
+                "platform_complete_radius_m": self.platform_complete_radius_m,
+                "m3_target_radius_m": self.m3_target_radius_m,
+                "platform_boundary_radius_m": self.platform_boundary_radius_m,
+            },
+            "worker_command_sampler_resume": "seeded_fresh_after_environment_reset",
         })
         payload["training_states"]["low_level"].update({
             "frozen": not p3_contract.phase_for_elapsed(self.session_effective_seconds).low_level_trainable,
@@ -800,8 +985,21 @@ class AlgorithmP3StandardJoint:
             "current_iteration": self.low_algorithm.current_iteration,
             "rng_state": self.low_algorithm._capture_rng_state(),
             "mirror_rng_state": self.mirror_aux.generator.get_state(),
-            "mirror_training_fraction": p3_contract.gait_training_fraction(
+            "mirror_training_fraction": p3_contract.mirror_training_fraction(
                 self.session_effective_seconds
+            ),
+            "depth_fault": self.depth_fault.state_dict(),
+            "memory_auxiliary": self.memory_aux.state_dict(),
+            "camera_timing": self.camera_timing.state_dict(),
+            "memory_training_fraction": p3_contract.memory_training_fraction(
+                self.session_effective_seconds
+            ),
+            "p35_reward_baseline": self.low_reward_shaper.state_dict(),
+            "action_smooth_training_fraction": (
+                p3_contract.action_smooth_training_fraction(
+                    self.session_effective_seconds,
+                    mapping_valid=self.mirror_mapping_valid,
+                )
             ),
             "gait_baseline": self.gait_baseline.state_dict(),
         })

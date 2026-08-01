@@ -206,6 +206,22 @@ class VisualActorCritic(ActorCritic):
         )
         return self.distribution.sample()
 
+    def act_from_proprio_cnn_features(
+        self, proprio, cnn_features, hidden_states=None, masks=None
+    ):
+        """P3 training-only camera-timing path using frozen cached features."""
+        if hidden_states is not None:
+            self._set_encoder_hidden(hidden_states)
+        if self.vision_encoder.get_hidden_state() is None:
+            self.vision_encoder.reset_hidden_state(proprio.shape[0], proprio.device)
+        self._last_cnn_features = cnn_features
+        latent = self.vision_encoder.forward_from_cnn_features(
+            cnn_features, proprio, masks=masks, detach_hidden=True
+        )
+        self._last_latent = latent
+        self._set_distribution(self.actor(torch.cat((proprio, latent), dim=-1)))
+        return self.distribution.sample()
+
     def act(self, obs, hidden_states=None, masks=None):
         self.update_distribution(obs, hidden_states=hidden_states, masks=masks)
         return self.distribution.sample()
