@@ -3362,3 +3362,7 @@
   smoke 派生进程，删除上传 ZIP、解压 checkpoint、`.uploading`/SHA 临时件、smoke 日志与
   临时 checkpoint，复核 GPU 回到 `0/5000 MiB`。完整 Isaac Camera、Push EventManager 和 save/resume 仍待
   下次使用进程组可控的 smoke runner 验证，不得将本次限时运行记为平台已验证。
+- 2026-08-02 监控配置快速更正（状态：本地已验证）：平台拒绝加载包含句点的标题
+  `P3.5 低速楼梯与后期Push` 和中文面板名 `P3.5训练侧奖励`，错误为“面板名称非法”。
+  根因是平台两类名称合同均不允许 `.`，与 metric key 和数据无关。显示名已改为
+  `P35 低速楼梯与后期Push` / `P35训练侧奖励`，未改变面板 key、指标或训练行为。

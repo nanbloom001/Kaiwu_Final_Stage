@@ -1228,7 +1228,7 @@ def _build_p2_monitor():
 
 def _build_p3_monitor():
     monitor = MonitorConfigBuilder()
-    monitor.title("P3.5 低速楼梯与后期Push")
+    monitor.title("P35 低速楼梯与后期Push")
     groups = (
         (
             "P3分阶段训练",
@@ -1294,7 +1294,7 @@ def _build_p3_monitor():
             "p3_low_reward",
             (
                 ("低层奖励分解", "p3_low_reward_terms", ("reward_track_lin_vel_xy", "reward_track_ang_vel_z", "reward_p3_sim2real_cost", "reward_energy", "reward_undesired_contacts", "reward_joint_acc", "reward_joint_position_penalty")),
-                ("P3.5训练侧奖励", "p35_low_reward_terms", ("p35_reward_progress", "p35_reward_default_posture", "p35_reward_joint_acc", "p35_reward_contact", "p35_reward_gait", "p35_reward_posture", "p35_reward_baseline_valid")),
+                ("P35训练侧奖励", "p35_low_reward_terms", ("p35_reward_progress", "p35_reward_default_posture", "p35_reward_joint_acc", "p35_reward_contact", "p35_reward_gait", "p35_reward_posture", "p35_reward_baseline_valid")),
                 ("步态Shadow诊断", "p3_gait_shadow_terms", ("shadow_p3_contact_quality", "shadow_p3_crossing", "shadow_p3_starvation")),
                 ("Sim2Real约束原始分量", "p3_sim2real_components", ("p3_sim2real_component_valid_share", "p3_sim2real_sustained_torque_raw", "p3_sim2real_torque_peak_raw", "p3_sim2real_action_rate_raw", "p3_sim2real_action_jerk_raw")),
                 ("关节力矩分位", "p3_torque_quantiles", ("hip_torque_p50", "hip_torque_p95", "hip_torque_max", "thigh_torque_p50", "thigh_torque_p95", "thigh_torque_max", "calf_torque_p50", "calf_torque_p95", "calf_torque_max")),

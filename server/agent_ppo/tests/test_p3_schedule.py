@@ -50,6 +50,16 @@ def test_p35_integrated_smoke_uses_current_repair_phase():
     assert 'PHASE_BOUNDARIES["stairrobust"]' not in source
 
 
+def test_p35_monitor_names_avoid_platform_forbidden_periods():
+    source = (
+        Path(__file__).resolve().parents[1] / "conf" / "monitor_builder.py"
+    ).read_text(encoding="utf-8")
+    assert 'monitor.title("P35 低速楼梯与后期Push")' in source
+    assert '"P35训练侧奖励"' in source
+    assert 'monitor.title("P3.5' not in source
+    assert '"P3.5训练侧奖励"' not in source
+
+
 @pytest.mark.parametrize(
     ("num_envs", "expected"), ((1, 1), (2, 2), (3, 3), (4, 4), (6, 3))
 )
