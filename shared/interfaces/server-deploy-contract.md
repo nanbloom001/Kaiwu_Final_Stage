@@ -317,6 +317,25 @@ checkpoint，才允许进入现有 Standard exporter 的部署审查。至少需
 
 `lbc_loco` 只表示结构可导出，不自动表示相机、ONNX、真机安全或比赛能力已验收。
 
+#### P3 Standard 884257 strict 实验部署口径
+
+`deploy/sim2real_test_p3_standard_strict` 是基于本机训练参考
+`/home/unitree/p3_training_reference/p3nav8h-r1_884257-evalfix-v2` 提取的低层实验覆盖，
+不是默认稳定入口，也不把 `deployable=false` 改写成可部署。其原子契约固化在该目录的
+`artifact_contract.json`：只选择 `modules.low_level.locomotion_encoder` 与
+`modules.low_level.actor`，网络 `goal_dim=0`，ONNX 的 `goal[1,4]` 仅为忽略占位；
+proprio45、LSTM 回灌、关节顺序、action scale/offset 与训练保持一致。
+
+powered 启动默认使用 `startup_shadow_enabled=false`：LT+X 进入低层状态时 reset LSTM，首个
+有效推理帧立即开始 command/action/last_action 同步闭环。禁止在非零行走命令下推进 recurrent
+hidden 却扣留对应真机动作；历史内部 shadow/stability gate 只保留为显式静止诊断配置。
+
+训练 workflow 在每次 `env.step` 前实际执行 `torch.clamp(actions,-6,6)`，因此该实验路线
+以 `[-6,6]` 作为有效 raw action 传输边界，不能沿用历史自动生成 `deploy.yaml` 中宽松的
+`[-100,100]`。任何未来改变 checkpoint/ONNX、proprio、深度、命令、action 或关节映射的
+提交，都必须同时更新训练来源说明、本节与 strict artifact contract。进入默认稳定路线前，
+仍必须补齐实测相机外参、无命令 shadow、吊起和地面真机证据。
+
 阶段 4 起，视觉训练恢复包统一为 `kaiwu_train_v1`（§2.1 视觉路径，含
 `modules.vision_encoder`）。`lbc_loco` 顶层 key 格式保留给后续部署导出制品：
 训练期只保存一个带 `vision*` 标签的 `kaiwu_train_v1` 文件，不再同时复制

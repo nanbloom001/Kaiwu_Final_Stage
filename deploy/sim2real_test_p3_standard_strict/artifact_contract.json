@@ -1,0 +1,158 @@
+{
+  "format": "kaiwu_train_v1",
+  "schema_version": 2,
+  "stage_type": "p3_standard_joint",
+  "phase_label": "highslow",
+  "deployable": false,
+  "experimental_low_level_override": true,
+  "training_reference": {
+    "path": "/home/unitree/p3_training_reference/p3nav8h-r1_884257-evalfix-v2",
+    "checkpoint_sha256": "8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23",
+    "active_config": "agent_ppo/conf/train_env_conf_standard_p3_standard_joint.toml",
+    "workflow_action_transport": "torch.clamp(actions, -6.0, 6.0) before every env.step"
+  },
+  "checkpoint": {
+    "path": "models/model.ckpt-highslow-884257.pkl",
+    "sha256": "8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23"
+  },
+  "onnx": {
+    "path": "runtime/unitree_rl_lab_test/logs/loco/exported/policy.onnx",
+    "sha256": "6ccaf7e033240720a66019885df091097efa2d6d8962a5840966ede8b9de2d87",
+    "opset": 18,
+    "ir_version": 10,
+    "minimum_onnxruntime_version": "1.19.2",
+    "inputs": [
+      {"name": "depth", "dtype": "float32", "rank": 4, "shape": [1, 180, 320, 1]},
+      {"name": "proprio", "dtype": "float32", "rank": 2, "shape": [1, 45]},
+      {"name": "goal", "dtype": "float32", "rank": 2, "shape": [1, 4], "semantic": "ignored_abi_placeholder"},
+      {"name": "loco_h", "dtype": "float32", "rank": 3, "shape": [2, 1, 64]},
+      {"name": "loco_c", "dtype": "float32", "rank": 3, "shape": [2, 1, 64]},
+      {"name": "nav_h", "dtype": "float32", "rank": 3, "shape": [2, 1, 64], "semantic": "passthrough_placeholder"},
+      {"name": "nav_c", "dtype": "float32", "rank": 3, "shape": [2, 1, 64], "semantic": "passthrough_placeholder"},
+      {"name": "cmd_override", "dtype": "float32", "rank": 2, "shape": [1, 4]}
+    ],
+    "outputs": [
+      {"name": "cmd", "dtype": "float32", "rank": 2, "shape": [1, 3]},
+      {"name": "cmd_raw", "dtype": "float32", "rank": 2, "shape": [1, 3]},
+      {"name": "clearance", "dtype": "float32", "rank": 2, "shape": [1, 3]},
+      {"name": "joint", "dtype": "float32", "rank": 2, "shape": [1, 12]},
+      {"name": "loco_h_out", "dtype": "float32", "rank": 3, "shape": [2, 1, 64]},
+      {"name": "loco_c_out", "dtype": "float32", "rank": 3, "shape": [2, 1, 64]},
+      {"name": "nav_h_out", "dtype": "float32", "rank": 3, "shape": [2, 1, 64]},
+      {"name": "nav_c_out", "dtype": "float32", "rank": 3, "shape": [2, 1, 64]}
+    ]
+  },
+  "configuration": {
+    "controller": {
+      "path": "runtime/unitree_rl_lab_test/deploy/robots/go2_loco/config/config.yaml",
+      "sha256": "154d1d47d3c11330c4384eaf6620f41e93cea390e4175f0a4c38898578058ffb"
+    },
+    "deploy": {
+      "path": "runtime/unitree_rl_lab_test/logs/loco/params/deploy.yaml",
+      "sha256": "5aa6ced0023641aed7a5c801f39dc290470a6a81003b62c273dca9a33e66b6a9"
+    }
+  },
+  "selected_modules": [
+    "modules.low_level.locomotion_encoder",
+    "modules.low_level.actor"
+  ],
+  "ignored_modules": [
+    "modules.high_level.actor",
+    "modules.high_level.response_adapter",
+    "modules.high_level.navigation_encoder",
+    "modules.critic"
+  ],
+  "network_goal_dim": 0,
+  "abi_goal_placeholder_dim": 4,
+  "proprio": {
+    "dim": 45,
+    "layout": "ang_vel3 | projected_gravity3 | cmd3 | joint_pos_rel12 | joint_vel_rel12 | last_action12",
+    "scales": {
+      "ang_vel": 0.25,
+      "projected_gravity": 1.0,
+      "cmd": 1.0,
+      "joint_pos_rel": 1.0,
+      "joint_vel_rel": 0.05,
+      "last_action": 1.0
+    }
+  },
+  "action": {
+    "dim": 12,
+    "training_effective_raw_action_clip": [-6.0, 6.0],
+    "scale": 0.25,
+    "offset": [0.1, -0.1, 0.1, -0.1, 0.8, 0.8, 1.0, 1.0, -1.5, -1.5, -1.5, -1.5],
+    "joint_ids_map": [3, 0, 9, 6, 4, 1, 10, 7, 5, 2, 11, 8],
+    "target_slew_rate_rad_s": 2.5,
+    "physical_limits_rad": [
+      [-0.9972, 0.9972], [-0.9972, 0.9972], [-0.9972, 0.9972], [-0.9972, 0.9972],
+      [-1.5208, 3.4407], [-1.5208, 3.4407], [-0.4736, 4.4879], [-0.4736, 4.4879],
+      [-2.6727, -0.88776], [-2.6727, -0.88776], [-2.6727, -0.88776], [-2.6727, -0.88776]
+    ],
+    "physical_limit_source": "/home/unitree/calibration_data/go2_with_d435i.urdf with 0.05 rad software margin",
+    "last_action_semantic": "executed_raw_action=(applied_joint_target-offset)/scale"
+  },
+  "control": {
+    "step_dt": 0.02,
+    "kp": [25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0, 25.0],
+    "kd": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+    "recurrent_state_shape": [2, 1, 64],
+    "recurrent_semantics": "zero on entry/reset/fault; feed each output state into the matching next-frame input"
+  },
+  "depth": {
+    "shape": [1, 180, 320, 1],
+    "normalization": "meters in (0,5) divided by 5; <=0, >=5, NaN and Inf map to 0",
+    "acquisition": {
+      "device": "Intel RealSense D435i",
+      "format": "Z16",
+      "preferred_profile": [424, 240, 30],
+      "allowed_fallback_profiles": [[480, 270, 30]],
+      "semantic": "raw capture only; every accepted profile must use its runtime intrinsics and be reprojected to depth.shape",
+      "camera_options": {
+        "visual_preset": "high_density",
+        "emitter_enabled": true,
+        "laser_power": "device_max",
+        "auto_exposure": true
+      },
+      "validity": {
+        "warning_fraction": 0.50,
+        "whole_image_hard_fraction": 0.70,
+        "central_third_hard_fraction": 0.70
+      }
+    },
+    "expected_intrinsics": {"source": "runtime per-device query", "sim_projection": {"fx": 168.61, "fy": 168.61, "cx": 160.0, "cy": 90.0}},
+    "extrinsics": {
+      "version": "p3-training-reference-884257",
+      "position_m": [0.339871, 0.034697, 0.075010],
+      "quaternion_wxyz": [0.982631, -0.007085, 0.184337, -0.020153],
+      "roll_pitch_yaw_rad": [-0.0229092511, 0.3703963519, -0.0453048197],
+      "source": "agent_ppo/conf/train_env_conf_standard_p3_standard_joint.toml",
+      "calibrated": false,
+      "note": "training reference only; live D435i mount must be measured before arm"
+    },
+    "temporal_filter_enabled": false,
+    "spatial_filter_enabled": false
+  },
+  "watchdog_ms": {
+    "lowstate": 50,
+    "policy_target": 100,
+    "inference_deadline": 20,
+    "command": 100
+  },
+  "diagnostic_threshold_ms": {
+    "depth_age_warning": 150
+  },
+  "safety": {
+    "fixed_command_default": [0.0, 0.0, 0.0],
+    "constant_depth_allowed_modes": ["preflight", "shadow", "offline"],
+    "motor_arm_requires": ["--arm", "physical gamepad confirmation"],
+    "startup_shadow": "startup_shadow_enabled=false by default: LT+X resets recurrent state and the first valid inference frame begins the synchronized command/action/last_action closed loop; setting it true restores the explicit stationary stability/time diagnostic gate",
+    "suspended_test_mode": "--suspended-test is accepted only with --fixed-zero --arm; it bypasses the optional startup gate when explicitly enabled, audits motion after clip/physical-limit/slew, and preserves tracking, freshness, inference, mechanical, stale-target, and takeover watchdogs",
+    "ground_test_mode": "--ground-test is accepted only with --fixed-zero --arm and cannot combine with --suspended-test; it bypasses the optional startup gate when explicitly enabled and disables the tracking-error soft gate while preserving post-slew step, freshness, inference, physical, velocity, torque, temperature, stale-target, and takeover guards",
+    "fixed_vx_walk_mode": "--fixed-vx --vx VALUE --arm accepts finite forward commands from 0 through 1.00 m/s; with the default startup configuration it publishes from the first valid post-reset inference frame, audits only the post-slew applied target step, and disables the tracking-error soft gate; physical limits, freshness, inference, velocity, torque, temperature, stale-target, and takeover guards remain active",
+    "torque_guard": "motor-reported torque above 14 Nm for hip/thigh or 27 Nm for calf is warning-only; torque SoftStop is disabled by matching its thresholds to the hard-fault boundaries; values above 22 Nm for hip/thigh or 43 Nm for calf still request immediate hard-fault takeover",
+    "depth_health_policy": "warning-only: missing first frame, stale/stopped frames, whole-image invalid fraction, and central-third invalid fraction never request takeover or block policy publication; successful RealSense pipeline startup is the only camera gate, and the latest frame (or initialized zero tensor before the first frame) remains the policy input",
+    "depth_fault_capture": "keep the latest 90 unique 320x180 projected depth frames in memory; the first depth-health warning requests a visloco_diag_TIMESTAMP_depth_warning dump after normal exit without takeover; --record-depth also requests the same dump after a normal powered-mode exit",
+    "persistent_fault_log": "each non-preflight run writes strict_controller_TIMESTAMP.log beside the VisionLoco CSV; FSM transitions and structured FAULT_SNAPSHOT, MECHANICAL_LIMIT, DEPTH_WARNING, LOWSTATE_FAULT, POLICY_TARGET_STALE, and BAD_ORIENTATION records are persisted and warning-or-higher records are flushed immediately",
+    "fault_takeover": "freeze policy target -> clear command/recurrent/last_action -> request Passive/FixStand -> prohibit stale target publication"
+  }
+}

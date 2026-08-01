@@ -1,0 +1,38 @@
+camera:
+  serial: "338622073957"
+  width: 480
+  height: 270
+  fps: 30
+  timeout_ms: 1000
+
+# Only listed options are written. USB 2.x is warning-only and does not change ranges.
+sensor_options:
+  global_time: 1
+  frames_queue: 2
+  auto_exposure: 1
+  emitter: 1
+  laser: 240
+
+filters:
+  spatial:
+    enabled: false
+    magnitude: 2
+    alpha: 0.5
+    delta: 20
+    holes: 0
+  temporal:
+    enabled: true
+    alpha: 0.5
+    delta: 20
+    persistence: 7
+  hole_fill:
+    enabled: true
+    # RealSense independent hole-filling mode: 0=left, 1=farthest, 2=nearest.
+    mode: 2
+
+test:
+  warmup_seconds: 2.0
+  duration_seconds: 10.0
+  require_synchronized_timestamps: true
+  strict_sensor_options: true
+  output_dir: logs/depth_latency_test

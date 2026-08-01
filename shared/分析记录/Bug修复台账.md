@@ -2,7 +2,185 @@
 
 > 维护规则：本文件是仓库级 Bug 根因与修复知识库，长期追加，不按训练阶段另起一份。
 > `server/CHANGELOG.md` 记录“改了什么”，本文件记录“为什么坏、如何证明修好、如何防复发”。
-> 最近更新：2026-07-27。
+> 最近更新：2026-08-02。
+
+## BUG-20260801-002：D435i 轻微晃动时画面冻结且设备发生 USB 重枚举
+
+- 状态：本地已验证；物理链路修复待用户验证。
+- 影响：`deploy/sim2real_test_p3_standard_strict` 的独立深度调参、断流诊断和后续真机视觉输入稳定性。
+- 首次发现：2026-08-01 机器狗本地 D435i 调参；任务名、模型 ID 和 checkpoint 不涉及。
+- 症状：用户观察到轻微晃动相机即画面卡顿；内核原文为
+  `usb 1-3.4: USB disconnect, device number 19`，后续在 `usb 1-2` 重新枚举并出现
+  `reset high-speed USB device number 20 using tegra-xusb`。后续还观察到上游 `usb 1-3` Hub
+  整体断开，其下相机、无线网卡和适配器同时掉线；相机也在不同 Hub 端口反复重枚举。
+- 根因：已确认设备发生物理 USB 断开/重枚举，并且当前只运行在 `480M / USB 2.x`；线缆、插头、
+  转接 Hub、供电或端口机械固定中的具体故障点仍为待验证假设。相机运动导致双目无效像素增加，
+  不能解释设备从 USB 总线消失。
+- 排除项：不是单纯深度滤波参数或场景运动造成的整机断流。GUI 积压仍可能增加显示延迟，但不能解释
+  内核 `USB disconnect`。
+- 修复：`tools/realsense_depth_tuner.py` 使用采集线程只发布最新帧，增加设备通知、拓扑变化、超时、
+  跳帧、相机/USB 与主机处理停顿分类，以及延迟/CPU/GPU/内存持久日志；GUI 按参数类别分组并支持
+  手动输入。GUI 限速读取最新帧且不再放大深度面板，减少显示线程与 30 FPS 采集争用。2026-08-01
+  追加修复相机硬件滑块逐格下发：最后一次变化稳定 400 ms 后才发送一次 UVC 控制请求；每个参数
+  增加基于 SDK `option_range.default` 的独立复位按钮。再次确认 USB 2 Hub 下 `330` 同样触发
+  `Protocol error`、端口 power cycle 和 `unable to enumerate USB device` 后，USB 2.x 操作上限默认
+  收紧到 `240`；连续三次超时且设备消失时自动退出并释放 pipeline。
+  `scripts/run_depth_tuner.sh` 补齐运行依赖检查，`DEPTH_TUNER.md` 增加最短诊断路径。
+- 验证：纯函数单元测试覆盖两类断流判定；Python 编译、shell 语法、无 GUI 采流和桌面 GUI smoke
+  在本机执行。物理线缆/端口更换后的晃动复测尚未执行，不能标记真机链路已修复。
+- 防复发：每次深度测试保留 `events.jsonl`、`metrics.csv` 与内核 USB 记录；部署前确认 D435i 为
+  USB 3.x 枚举并做固定线缆后的运动扰动测试。
+- 血缘：当前目录无可用 `.git` 元数据，commit/PR/分支未知；父模型、checkpoint、SHA256 不涉及。
+- 回滚：恢复上述三个调参工具文件的旧版本；不会改变正式控制器、训练契约或模型制品。
+- 再遇检查：`lsusb -t` 看速率 → `journalctl -k` 查 disconnect/reset → 查事件日志中的设备在位状态
+  → 对比 sensor/host gap → 最后看 CPU/GPU 与渲染耗时。
+
+### 2026-08-01 追加：比赛相关相机约束与低延迟参数面板
+
+- 状态：本地已验证，真机新 GUI smoke 待关闭旧进程后执行。用户要求把对单台 D435i 比赛运行有
+  直接影响的参数加入调参 GUI；正式控制器配置和训练/部署输入合同未改变。
+- 修改：Camera 页按“投射器/预设”“自动曝光约束”“低延迟、时间戳与设备诊断”分组，新增
+  `Frames Queue Size`、自动曝光上限开关/数值、自动增益上限开关/数值、`Global Time` 和内部错误
+  轮询，每项继续支持手动输入、设备范围、SDK 默认值和独立 Reset。曝光/增益上限标出
+  `restart stream`，新增按钮由采集线程安全执行 stop/start，重启前强制提交 debounce 中的参数。
+- 监控：实际曝光、增益、激光和 emitter 状态改从每帧 metadata 获取，避免周期性 UVC 查询加重当前
+  USB2 链路；Frame queue 与 USB descriptor 同步进入 GUI 和 `metrics.csv`。HDR、多相机同步、外部
+  触发、Decimation 和 Advanced Mode 参数未加入，因为会改变无关硬件路径、帧分布或训练几何。
+- 验证：`py_compile`、shell 语法、调参工具 10/10 和部署目录全套 Python 26/26 测试通过，覆盖比赛参数清单、restart-required
+  标记和无 UVC metadata 回读。真实相机 smoke 首次被用户仍在运行的旧 GUI PID `82518` 以
+  `VIDIOC_S_FMT errno=16 Device or resource busy` 阻止；没有终止该用户进程，因此不能把硬件新界面
+  标记为已验证。旧进程不会热加载新代码，必须关闭后重新启动。
+- 回滚与风险：回滚本次 `realsense_depth_tuner.py`、测试和文档改动即可；不会影响 powered 控制器。
+  Queue 设为 1 可能增加丢帧，曝光上限过低或增益上限过低可能增加深度空洞，过高则增加运动模糊或
+  噪声，必须逐项比较原始深度、frame gaps 和 metadata。
+
+### 2026-08-02 更正：USB2 Laser 上限不再作为硬门禁
+
+- 用户确认比赛设备暂时只能使用 USB 2.1，USB 版本不得成为启动、采流或参数范围硬门禁。此前为规避
+  物理掉线把 USB2 Laser 操作上限收紧到 `240`，属于诊断工具主动改变设备可调范围，现予以撤销。
+- 调参器保留 `USB2_LINK policy=warning_only`，不再调用 `cap_maximum()`，删除
+  `--usb2-laser-limit`；Laser 继续显示 SDK 声明范围。设置失败仍按 UVC/固件真实错误告警，软件自动
+  重连逻辑不变。该更正不宣称 USB2 链路已经稳定，也不修改正式控制器的相机参数。
+- 真机 GUI smoke 在 USB `2.1` 下完成 60 帧、0 timeout；启动只打印 warning-only，`session.json`
+  回读 Laser `max=device_max=360`，没有 `USB2_LASER_LIMIT_ACTIVE`。
+
+## BUG-20260802-001：D435i 重枚举后采流恢复但参数控制仍绑定旧 video 节点
+
+- 状态：本地已验证，真机重枚举 smoke 待执行。
+- 影响：`deploy/sim2real_test_p3_standard_strict/tools/realsense_depth_tuner.py` 的 Laser、曝光、增益
+  和其他 Stereo Module 参数控制；正式控制器、训练输入、checkpoint 和 ONNX 不受影响。
+- 症状与关键日志：`depth_tuner_20260801_232851_322` 中 Laser `0` 成功应用；请求 `90` 时
+  `get_xu(... UVCIOC_CTRL_QUERY) ... Protocol error`，随后同序列号设备先消失再出现。采流从 frame 0
+  恢复且 metadata 稳定报告 `Actual laser=90`，但后续 `150/180/240` 和曝光限制全部报
+  `map_device_descriptor Cannot open '/dev/video4 ... No such file or directory`。设备已重枚举为新的
+  video 节点，因此 Actual laser 不再跟随新请求。
+- 根因与排除方向：librealsense pipeline 能在短暂 USB 重枚举后继续交付帧，但脚本保存的
+  `depth_sensor`/NumericParameter target 仍引用旧 UVC 节点。旧实现还在 `OPTION_REJECTED` 时把 desired
+  写入 applied，导致 GUI 误报并抑制后续重试。不是 frame metadata 刷新延迟；metadata 正确证明
+  `90` 已成为设备实际值。物理 USB2 链路掉线是独立根因，本修复只解决软件恢复。
+- 修复：设备拓扑回调只记录状态并提交恢复请求，采集线程串行执行 stop/start、按固定 serial 重开
+  pipeline、获取新 depth sensor 并重绑 option。重连期间硬件控件禁用，显示
+  `DEVICE_LOST/RECONNECT_PENDING/RECONNECTING`；成功后记录 generation 和
+  `DEVICE_CONTROL_REBOUND`。只恢复 Queue、Global Time、Error Polling；Laser、preset、emitter、曝光
+  和增益同步设备当前值，禁止自动重放旧危险请求。设备缺席时先等待默认 10 秒再退出。
+- 参数状态：新增 `Laser requested/applied/frame actual`。设置失败把 applied 置为 unknown，并以 2 秒
+  间隔限频重试；若 set 成功但 get 失败，而帧 metadata 与 requested 一致，则记录
+  `OPTION_CONFIRMED_BY_FRAME_METADATA` 并停止重试。
+- 修改文件：调参脚本、`tests/test_depth_tuner.py`、`DEPTH_TUNER.md`、部署 README 与本台账。
+- 验证：`py_compile`、shell 语法、调参专项 14/14 和部署目录全套 Python 30/30 通过；模拟旧节点失效、同序列号新 sensor 重绑时，
+  Queue `2` 被恢复，Laser 旧请求 `240` 被丢弃并同步为设备当前 `90`，control state 回到 ONLINE、
+  generation 递增。用户当前仍运行旧 GUI 进程，未强制终止，因此真实 USB 重插/掉线恢复待关闭旧
+  进程并启动新代码后验证；平台、评估和 powered 真机均不适用。
+- 血缘：工作区无 `.git` 元数据，`git status --short --branch` 返回 not a git repository；commit/PR、
+  模型 ID、checkpoint 和 SHA256 不适用。
+- 遗留风险：软件重绑不能修复 USB2 Hub、线缆、供电或连接器导致的物理掉线。pipeline 重新打开失败
+  仍会结束调参会话；不自动恢复 Laser 可避免掉线循环，但操作者需要重新确认当前值后再调节。
+- 回滚：恢复调参脚本旧的单一 restart event、设置失败处理和 GUI 状态字段，并删除对应测试/文档；
+  不需要回滚正式控制器。再次遇到时最短检查路径为 topology event -> control state ->
+  `DEVICE_CONTROL_REBOUND` -> generation -> requested/applied/frame actual -> 新旧 `/dev/video*`。
+
+## BUG-20260802-002：Restart camera stream 在设备掉线后被当成致命异常并关闭 GUI
+
+- 状态：本地已验证，真机恢复 smoke 待相机重新枚举后执行。影响范围仅为
+  `deploy/sim2real_test_p3_standard_strict/tools/realsense_depth_tuner.py` 的曝光/增益限制提交、pipeline
+  重启和 USB 掉线恢复；正式控制器、训练输入、checkpoint、ONNX 与 powered 安全逻辑不变。
+- 症状与关键日志：会话 `depth_tuner_20260802_003921_388` 在 `00:40:37.757` 记录
+  `STREAM_RESTART_REQUESTED`，`00:40:37.783` 开始重启；第一次约 1 秒内完成 rebind。内核同一秒出现
+  `uvcvideo ... -71`、`usb 1-3.4: USB disconnect`，随后 descriptor read `-110/-71`、端口 power cycle
+  和 `unable to enumerate USB device`。设备消失后再次点击，日志在 `00:41:13` 执行 restart，最终
+  `CAPTURE_EXCEPTION: No device connected` 并关闭窗口。后续会话 0 帧，`--list-devices` 和 `lsusb -t`
+  均看不到 D435i。
+- 根因与排除方向：物理相机从 USB 总线消失是硬件/链路事实，软件不能凭 restart 恢复未枚举设备；
+  具体是 USB2 Hub、线缆、供电、连接器还是相机固件仍待物理复测。软件另有两个确定缺陷：普通采集
+  循环每 2 秒重试固件已用 HWMON `response -9` 拒绝的 restart-required 控件，产生大量 UVC 查询；
+  restart 按钮又强制全量提交所有硬件参数，并在单次 `pipeline.start()` 返回 `No device connected`
+  后把可恢复缺席升级为 capture fatal，GUI 1.5 秒后自动关闭。
+- 修改与理由：正常 `_apply_options()` 跳过 restart-required 控件，只允许按钮显式尝试一次 pending
+  曝光/增益限制；不再全量重放 Laser、preset、emitter 等无关参数。若全部限制被拒绝，记录
+  `RESTART_REQUIRED_OPTIONS_REJECTED` 和 `STREAM_RESTART_SKIPPED`，不停止正在工作的 pipeline。真正
+  reopen 失败时记录 `STREAM_RESTART_DEFERRED`，进入 `WAITING_FOR_DEVICE`；连续采流超时也停止失效
+  pipeline 后进入等待，而不是设置 `capture_exception`。同一序列号重新出现后仍复用既有 rebind，
+  只恢复 Queue、Global Time、Error Polling。GUI 和后端同时限制按钮：仅 `ONLINE` 且确有 pending
+  限制时允许请求，掉线等待期间硬件控件立即禁用，避免重复点击排队第二次 restart。固件拒绝后该值
+  不再保持 pending，只有用户再次修改或设备成功 rebind 才可重试；preset 变化也不再把未修改的
+  restart-required 参数伪装成 pending。
+- 验证：`py_compile`、调参专项 17/17 和部署 Python 全套 33/33 通过。新增回归覆盖“capture loop 永不重试 restart-required
+  控件”和“全部 restart-required 写入被拒绝时 pipeline.stop 调用数为 0、状态恢复 ONLINE”；既有
+  重枚举测试继续证明 Queue 恢复、Laser 同步设备当前值和 generation 递增。当前 D435i 尚未出现在
+  USB 总线，因此无法执行真实 stop/start/replug smoke，状态不得升级为真机已验证。
+- 血缘：工作区无 `.git` 元数据，`git status --short --branch` 返回 not a git repository；commit/PR、
+  模型 ID、checkpoint 和 SHA256 不适用。
+- 遗留风险与回滚：软件等待不会修复 `-71/-110` 或 `unable to enumerate`；设备不恢复时 GUI 会持续
+  保持等待，需要操作者重新插拔/断电恢复相机。回滚为恢复 restart-required 的周期 `_apply_options`
+  和单次失败 fatal 逻辑，但会重新引入 UVC 请求风暴与假崩溃，不建议。再次遇到时按
+  `STREAM_RESTART_*` -> `WAITING_FOR_DEVICE` -> `lsusb -t` -> `journalctl -k` -> 同序列号
+  `DEVICE_CONTROL_REBOUND` 的顺序检查。
+
+## BUG-20260802-003：深度调参面板把应用到 GUI 的局部耗时显示成端到端延迟
+
+- 状态：本地已验证并完成真机相机 GUI smoke。影响范围仅为
+  `deploy/sim2real_test_p3_standard_strict/tools/realsense_depth_tuner.py` 的诊断时间统计与日志；相机
+  profile、滤波算法、正式控制器、训练输入、checkpoint 和 ONNX 不变。
+- 症状与证据：用户在 temporal alpha `0.5`、delta `20`、persistence `7`、Frame queue `16` 时体感
+  延迟约 `100 ms`，旧面板截图却显示 `To display=32.7 ms`。会话
+  `depth_tuner_20260802_012841_211` 实际 `total_display_ms` 平均 `42.40 ms`、范围
+  `23.83..64.94 ms`，相对 queue offset 平均 `22.29 ms`、曝光约 `11.55 ms`；旧数值仍未包含相机
+  内部绝对排队、USB 基线、GUI 图像转换、X11 compositor 和屏幕扫描。
+- 根因：旧实现用 `ready-arrival + GUI tick-ready` 作为 `To display`，起点是主机已经收到帧，而不是
+  RealSense 帧时间戳；relative queue 又按本会话最小 offset 归零。GUI 在 PhotoImage 转换前停止
+  计时，capture image 与另一次 metrics snapshot 也可能跨帧拼接。
+- 修复：在 `global_time/system_time` 域使用主机墙钟减帧时间戳，新增 receive、app-ready、GUI-submit
+  三个绝对帧龄；hardware clock、负偏移超过 5 ms 或大于 60 s 的异常值返回 NaN 并标记
+  `latency_clock_valid=0`。GUI 原子取得 dashboard/frame/metrics，在 PhotoImage configure 后结束计时，
+  并分离 GUI scheduling 与 conversion。面板移除误导性的 `To display`，queue 明确标为 relative。
+- 训练诊断输出：新增 `display_latency.csv`，每个 GUI submit 帧绑定 frame number、timestamp domain、
+  三段帧龄、曝光、queue 和 temporal 参数；每秒 flush，避免逐帧 fsync 放大延迟。训练域随机化使用
+  receive 帧龄分布，GUI-submit 仅解释体感；compositor、显示器扫描和像素响应仍需外部测量。
+- 追加无头复现入口：`tools/realsense_latency_test.py` 读取
+  `configs/depth_latency_test.yaml`，默认 2 秒预热后逐帧测量 10 秒，终端打印 receive/processed 平均和
+  最大延迟，并保存每帧 CSV、P50/P95/P99 summary 及合并后的配置快照。传感器参数只下发 YAML 中
+  显式列出的键，requested/applied/rejected 全部进入 summary；USB2 为 warning-only。模板默认
+  `strict_sensor_options=true`，任一硬件参数未实际回读确认即失败。
+- 无头真机验证：默认 YAML 在 D435i USB2.1 上完成 2 秒预热和 `10.033 s` 正式采样，301 帧、
+  `30.000 FPS`、0 丢帧、同步时间戳有效率 100%；global time、Frame queue `2`、自动曝光、emitter 和
+  Laser `150` 均请求/回读一致。receive 延迟平均/最大 `28.971/31.016 ms`，P95/P99
+  `30.236/30.716 ms`；Temporal alpha `0.5`、delta `20`、persistence `7` 后 processed 平均/最大
+  `31.001/32.963 ms`，主机滤波处理平均 `2.030 ms`。
+- 2026-08-02 追加更正：用户后续配置将 `filters.hole_fill.mode` 设为 `3`，而当前
+  librealsense 独立孔洞填充器的合法范围是 `0..2`，启动只显示 SDK 原始报错
+  `out of range value for argument "value"`。模板已改为 `mode=2`，滤波器参数现在下发前校验
+  min/max/step，传感器参数失败也会记录完整 YAML 键、请求值和设备范围。该更正
+  当前状态为“代码已修复待真机复测”；USB2 仍只告警，未新增总线硬门禁。
+- 验证：`py_compile`、调参专项 20/20 和部署 Python 全套 36/36 通过，覆盖 global/system 绝对帧龄、
+  hardware clock 拒绝、异常 offset 拒绝及 display CSV 字段。两次真机 GUI smoke 分别完成 90/60 帧、
+  0 timeout，设备真实报告 `timestamp_domain.global_time`、`latency_clock_valid=1`。90 帧会话的 39 个
+  GUI submit 样本中 receive 平均 `14.88 ms`，GUI submit 平均 `80.42 ms`、范围
+  `47.64..115.17 ms`；最终 60 帧会话 25 个样本 receive 平均 `9.13 ms`、GUI submit 平均
+  `74.68 ms`、范围 `51.51..137.38 ms`。这与用户约 100 ms 体感一致，并证明旧面板确实低估。
+- 血缘与回滚：工作区无 `.git` 元数据，分支、commit、PR 不可用；模型 ID/checkpoint/SHA256 不涉及。
+  回滚为恢复旧 `total_display_ms` 面板并删除 `display_latency.csv`，会重新引入低估和跨帧统计。
+  再遇检查：timestamp domain -> latency_clock_valid -> receive P50/P95/P99 -> queue/filter 配置 -> GUI
+  submit；禁止把 Capture wait、Host gap 或 relative queue 直接相加成端到端延迟。
 
 ## 1. 使用方法
 
@@ -1210,6 +1388,502 @@
   不得修改 checkpoint 标签、父模型或 `base_env.py`。
 - 再遇检查：save path category → `id_list`/`kaiwu.json` → ZIP 是否生成 → 前端模型列表；
   不要先调 `dump_model_freq`、文件名或网络结构。
+
+## BUG-20260801-001：P3 Standard 训练有效动作边界与部署安全/诊断口径漂移
+
+- 状态：本地已验证。
+- 影响：部署、checkpoint/ONNX 身份、action 处理、相机/状态新鲜度、真机安全和 sim2real 诊断。
+- 首次发现：2026-08-01，Go2 P3 Standard strict 重建任务；训练参考
+  `/home/unitree/p3_training_reference/p3nav8h-r1_884257-evalfix-v2`，模型/checkpoint 标签
+  `highslow-884257`。开始时仓库 Git 元数据在当前受限执行环境不可用，`git status --short --branch`
+  返回“not a git repository”，因此当前分支、已有暂存和 commit/PR 无法核实；任务外目录未清理。
+- 症状：训练 workflow 在每次 `env.step` 前执行 `torch.clamp(actions,-6,6)`，但历史生成的
+  `deploy.yaml` 使用 `[-100,100]`；旧部署没有把 checkpoint、ONNX、精确 ABI、config/deploy
+  一起做 SHA 门禁，也没有在同一日志中分离 model raw、clipped、requested、slew、physical、
+  applied 和 executed feedback。LowState/深度/推理/目标新鲜度、机械阈值和 powered 前 shadow
+  稳定门控也未形成单一 fail-closed 契约。
+- 根因：部署口径主要继承 exporter 的静态配置，没有从实际训练 transport、训练参考相机配置和
+  Go2 URDF 重新审计有效边界；处理层和诊断层混用 `action/target` 聚合字段，无法区分策略本体
+  高频、限幅器修改、跟踪误差和单腿机械响应。该根因是代码/契约缺口；历史 RR 高频是否为机械
+  或策略根因仍为待验证假设。
+- 排除项：checkpoint 与 strict ONNX 字节身份一致，SHA256 分别为同源 checkpoint
+  `8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23` 和 ONNX
+  `6ccaf7e033240720a66019885df091097efa2d6d8962a5840966ede8b9de2d87`；100 帧逐帧
+  checkpoint→ONNX recurrent rollout 的 joint 最大绝对误差仅 `8.345e-07`，cmd/cmd_raw/
+  clearance 为零误差，因此当前没有证据指向 exporter 数值错误。短历史日志不足以证明 RR 根因。
+- 修复：新增独立目录 `deploy/sim2real_test_p3_standard_strict`，不修改默认稳定入口。新增
+  `artifact_contract.json`、精确 ONNX ABI/哈希预检、训练有效 raw clip `[-6,6]`、完整 action
+  分层与 executed-action 回灌、URDF 关节软件边界、不可变 LowState snapshot、D435i 精确 profile、
+  新鲜度/推理/机械 watchdog、故障冻结与 FixStand/Passive 接管、sensor-only/shadow 无 LowCmd
+  模式，以及 powered 内部 2 秒 + 连续 LowState/深度稳定门控。新增 strict CSV 分层、逐关节
+  `5-10/10-15/15-25 Hz`、交替符号、四腿集中度、左右不对称、q/target/dq/tau 和 freshness 分析。
+- 验证：Python 12 项安全测试通过，含制品字节和 ONNX ABI 故障注入、非有限 action、深度 golden
+  vector、watchdog、并发读取和合成高频/单腿诊断；C++ normal 与 ThreadSanitizer 两项测试通过；
+  controller `--preflight` 在 DDS/LowCmd 初始化前通过精确 ABI 和哈希检查；100 帧 parity 通过。
+  历史 121 帧 fixed-zero 日志可由新分析器读取，RR 高频集中度在 raw/applied 两层分别为中位腿的
+  `1.486x/2.218x`，但仅登记为待复测信号。本机未检测到 RealSense；sensor-only、60 秒 shadow、
+  吊起、地面、平台和真机验证均未执行，且本任务未创建 LowCmd、未发送电机命令。
+- 防复发：preflight 同时绑定 checkpoint、ONNX、config、deploy SHA，并逐项校验 8 入 8 出名称、
+  dtype、rank、shape、opset 和 IR；CMake 注册 normal/TSan 测试；powered 必须 `--arm`、RealSense
+  探测、同进程 shadow/stability gate 和物理手柄确认。后续接口变化必须原子更新训练来源说明、
+  strict contract、deploy 和 `shared/interfaces/server-deploy-contract.md`。
+- 血缘：当前分支/commit/PR 因 Git 元数据不可见而未知；父模型 ID 未作为独立字段提供；checkpoint
+  标签 `highslow-884257`，checkpoint/ONNX SHA 如上，contract SHA256
+  `9043327ba7341808631f3097ec6566b4bf3dce5d8c71fbca02d7a059b29ba139`。
+- 遗留风险：训练相机外参仅作为参考复制，`calibrated=false`，实机安装外参必须测量；本机未发现
+  默认稳定 `sim2real_test_loco` 的成功诊断 CSV，无法做匹配 baseline 比较；历史 P3 日志很短；
+  LowState tick、D435i 时钟和机械阈值仍需 60 秒无命令数据校核后才能进入吊起测试。
+- 回滚：停止使用并移除独立 `deploy/sim2real_test_p3_standard_strict` 目录，同时回滚本条契约文档；
+  默认 `deploy/sim2real_test_loco` 未被本修复修改。不得通过放宽 clip、关闭 watchdog 或复用旧二进制回滚。
+- 再遇检查：训练 workflow 的 env.step 前处理 → checkpoint/ONNX/config/deploy SHA 与精确 ABI →
+  LowState/depth/inference/target freshness → raw/clipped/applied/executed 各层频谱 → 单腿与左右机械响应。
+
+### 2026-08-01 审查修复记录
+
+- 代码审查发现并修复：powered 主循环忽略 SIGINT；策略线程失活时 `run()` 可能使用缓存 snapshot；
+  RealSense 缺少精确 profile 或 intrinsics 时静默回退；policy loop 顶层异常未统一转为安全接管。
+- 修改：`CtrlFSM::stop()` 先停止 recurrent publisher 再退出当前状态；main 主循环检查 stop signal
+  并执行 FSM/Go2 shutdown；`State_VisionLoco::run()` 每次 FSM 周期重新采集并校验当前 LowState，
+  失效时清零增益并请求 Passive；RealSense 只接受精确 `424x240@30 Z16` 且 intrinsics 缺失直接
+  hard fail；策略线程增加顶层 `std::exception`/unknown exception hard-fault boundary。
+- 验证：CMake 构建成功；C++ `ctest` 的 normal 与 TSan 均通过；Python 12 项测试通过；100 帧
+  recurrent parity 通过，joint 最大误差 `8.345e-07`；controller `--preflight` 通过且未创建
+  DDS/LowCmd。未执行相机、sensor-only、shadow 或真机验证，故状态仍为“本地已验证”。
+- 新 controller SHA256：`f8f30c47573c731df536374ff8b5691f7c6abf9cc6fce5f221d562ddded30c0a`。
+
+### 2026-08-01 架高静态测试追加记录
+
+- 发现并修复一个实际启动问题：`param::load_config_file()` 只识别目录名 `build`，在
+  `build-strict` 下没有加载 config，导致 LowState 建链后 YAML 节点为空。现在改为从可执行文件
+  路径向上搜索实际存在的 `config/config.yaml` 或 `config.yaml`。
+- 硬件证据：USB/udev 访问授权后 D435i `338622073957`、firmware `5.13.0.55` 可枚举；
+  strict preflight 通过；LowState 报告 connection established；没有 LowCmd。
+- 真实阻断：设备没有 `424x240@30 Z16`，仅有 `640x480@30 Z16` 等 profile，strict sensor-only
+  按契约 hard fail。独立读取 120 帧 640x480 深度，120 个唯一帧、无重复/倒退，时间间隔均值
+  `33.397 ms`，有效像素比例均值 `0.862199`。这证明相机帧通路稳定，但不证明训练几何对齐。
+- 验证：C++ normal/TSan 两项通过；未完成 strict 60 秒 sensor-only CSV、shadow 或真机控制。
+- 新 controller SHA256：`95bdbbac73bb9cab85980e3c14afb288cc261b5b46e8eb8f0e35c596dd3d734e`。
+
+### 2026-08-01 采集 profile 契约更正
+
+- 更正：上述“`424x240@30 Z16` 为严格训练 profile”的结论不正确。P3 训练环境的
+  深度张量和低层 ONNX 输入均为 `320x180x1`；`424x240@30` 只是其他部署路线的原始采集
+  期望值。当前 D435I 不支持该深度 profile，其他部署会选择 `480x270@30`，然后用当前
+  profile 的运行时内参重投影到训练针孔模型。
+- 根因：将“真机原始采集 profile”、“仿真相机几何”和“网络输入 shape”误合并为一个
+  exact-profile 门禁；同时旧诊断指标统计原始图有效率，不是网络实际看到的投影张量有效率。
+- 修复：strict 路线只允许已审计的 `424x240@30` 和 `480x270@30 Z16`；两者均必须成功
+  取得有限、尺寸匹配的运行时内参，再重投影到 `320x180` 训练针孔。不允许任意最近
+  profile 或无内参 resize。深度无效率、前方无效率、均值和最小值改为从低层实际消费的
+  `320x180` 投影结果统计。
+- 范围：仅低层 `modules.low_level.locomotion_encoder + actor`。高层导航 actor、goal 计算、
+  nav LSTM 均不参与本轮测试；ONNX 中的 goal/nav 端口仅作 ABI 占位/透传。
+- 验证：C++ 重投影回归新增同内参恒等映射和 `0/5m -> 0`、`2.5m -> 0.5` 断言；
+  normal 与 TSan 测试二进制直接运行通过。真机 `480x270@30` sensor-only 复测待执行，
+  故整体状态仍为“代码已修复待验证”。
+- 制品：config SHA256 `4bc83952683bc3502a0684445f60787ae723f1c9bb37a01187419df4247bc9fd`；
+  controller SHA256 `cb7f804e6bc014408121641b177123d3eb82f39fd8da9e8928b607315bffa01c`；
+  checkpoint/ONNX 未变。回滚时恢复旧 exact-profile 门禁会重现已确认的伪阻断；安全回退是停止使用
+  整个实验目录并回到默认稳定路线。
+
+### 2026-08-01 采集 profile 更正后真机 sensor-only 验证
+
+- 首次复测已成功选择 `480x270@30 Z16`，取得内参 `fx=fy=241.9, cx=242.0, cy=135.2`，
+  并声明重投影目标 `320x180, fx=fy=168.61, cx=160, cy=90`。随后因后台抓帧线程尚未产生
+  第一帧，主循环就将初始空帧判为 `stale/invalid depth`。根因为启动竞态，不是投影或相机断流。
+- 修复：sensor-only/shadow 在进入 50 Hz 主循环前，最多等待 3 s 的首个有效投影帧；超时仍
+  hard fail。不用常量深度、旧帧或无内参 resize 绕过门禁。
+- 真机证据：`logs/sensor-only_1785524014.csv`，`104.920 s`、5247 个 50 Hz 采样；3151 个唯一
+  深度帧，实际 `30.023 Hz`，帧号无倒退、无跳帧；深度 age 均值/p95/最大值
+  `16.701/31.656/33.589 ms`。投影后整图无效率均值/p95/最大值
+  `5.14%/5.49%/10.70%`，前方无效率 `1.63%/1.86%/9.96%`，均低于门禁。LowState tick
+  无重复、无倒退，平均步进 20 ms。
+- 分析器防线：新增投影后整图/前方无效率、policy/camera 实际频率、相机时间戳间隔、
+  depth frame 倒退/跳帧和 LowState tick 单调性统计。正常的 50 Hz 消费者复用 30 Hz 最新帧会得到
+  约 40% repeated-policy-frame ratio，不得误判为相机冻结。
+- 状态：低层传感器与投影链路“本地已验证”。低层 ONNX shadow、吊起 powered、平地和平台
+  仍未验证；高层导航网络未加载、未测试。全过程没有创建 LowCmd，没有发送电机命令。
+- 最终 controller SHA256：`34275dcad7c782a8b4978522d32b7d5758d26b587e2f1645edc597ffc4ea2358`；
+  contract SHA256：`5c3f409f503a25399fc65c825ffb453345ed34500990a05dcb07f7be5575fa60`。
+
+### 2026-08-01 架高 LT+X 无响应修复
+
+- 状态：本地已验证，真机复测待执行。影响范围仅为实验部署路线
+  `deploy/sim2real_test_p3_standard_strict` 的 powered VisionLoco 启动生命周期与诊断；
+  checkpoint、ONNX、训练观测和动作合同未改变。当前工作区仍无法读取 Git 元数据，
+  `git status --short --branch` 返回“not a git repository”，分支、commit 和 PR 未知。
+- 症状与证据：架高 `--fixed-zero --arm` 后，LT+X 确实进入 VisionLoco 并创建
+  `visloco_diag_1785525352.csv`，但只记录 5 帧（`t_ms=5..84`）便返回 FixStand。
+  全部帧 `shadow_gate_ready=0`；LowState age 最大约 `0.133 ms`、深度 age 最大约
+  `32.013 ms`、推理最大约 `4.531 ms`，没有传感器或 ONNX deadline 故障。
+- 根因：启动门控要求至少 2 秒、连续 100 帧稳定 LowState 和 60 帧稳定深度，但
+  `run()` 从进入状态起就对初始化目标启用 `policy_target_stale_ms=100`，门控期间故意不发布
+  策略目标却在约 100 ms 被判为 `policy_target_stale`，触发 SoftStop -> FixStand。另有两个
+  同源缺陷：门控期间每周期把目标改成当前实测位置，削弱位置保持并使架高关节速度升至约
+  `1.279 rad/s`；`shadow_gate_ready` 未锁存，策略开始运动后可能因超过静止速度阈值再次关闭。
+- 修复：新增 pre-publication/active/fault-freeze 三态目标决策。门控期间保持进入 VisionLoco
+  时冻结的关节位置；首次策略目标发布后才启用 100 ms stale watchdog；安全故障继续跟随当前
+  实测位置并请求接管。启动门控改为一次通过后锁存到状态退出。新增
+  `--suspended-test`，且只接受 `--fixed-zero --arm`；它只绕过启动稳定门控，其他传感器、推理、
+  机械、action/slew、stale target 和接管保护全部保留，并在 CSV 中记录
+  `suspended_test_bypass=1`。非法组合在 DDS/LowCmd 初始化前拒绝。
+- 排除方向：没有证据表明 LT+X 手柄映射失效；日志文件只在 VisionLoco `enter()` 后创建。
+  没有放宽 `stable_max_joint_velocity_rad_s=0.5` 或运行期 `dq_warning/dq_hard_fault`；架高绕过
+  模式下静止速度阈值不参与放行，正常/落地模式仍保持原保护。
+- 本地验证：全核心并行 CMake 构建成功；C++ normal 与 ThreadSanitizer 两项通过；Python
+  12 项安全测试通过；新增回归覆盖门控等待超过 100 ms 不误报 stale、live target 超过
+  100 ms 仍触发冻结、gate hold 使用冻结目标、fault freeze 使用实测目标、门控锁存和架高参数
+  组合。两个非法 `--suspended-test` 组合均按预期退出。100 帧 checkpoint->ONNX recurrent
+  parity 通过，joint 最大绝对误差 `8.345e-07`；strict preflight 通过且未创建 LowCmd。
+- 制品：父模型/模型 ID 未新增；checkpoint `highslow-884257` SHA256
+  `8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23`，ONNX SHA256
+  `6ccaf7e033240720a66019885df091097efa2d6d8962a5840966ede8b9de2d87`，controller SHA256
+  `07845742fef4e5363367069bf4c9f1361da7263bf8923aeddaab8e8c165cb2b0`，contract SHA256
+  `f182f754aa5fef86f60db3d3fdeaf36825598e5c14e0b19f3943cc1763d4529c`。
+- 遗留风险：尚未取得修复后的 powered 真机日志，故不得升级为真机已验证。架高绕过模式会让
+  策略在首个有效推理帧后接管，四肢可能快速运动；必须确保完全离地、周围无人和障碍物、手指
+  远离关节，并保持 LT+B/急停可立即操作。该模式禁止落地和非零速度命令。
+- 回滚：移除 `--suspended-test` 参数与三态目标决策并恢复旧二进制；但旧版会确定性重现约
+  100 ms 自动退回，不能作为 powered 测试版本。安全回退应停止实验并使用 Passive，而不是
+  关闭 watchdog。
+- 再遇检查：确认 CSV 是否创建 -> `suspended_test_bypass/shadow_gate_ready` -> 首次策略发布时刻
+  -> `policy_target_stale` 是否只发生在 active 阶段 -> LowState/depth/inference freshness ->
+  dq/tau/temperature 与 motion rejection。
+
+#### 2026-08-01 第二次架高测试更正
+
+- 修复后的首次 `--suspended-test` 复测证明启动 bypass 生效：
+  `visloco_diag_1785527113.csv` 首帧即为 `shadow_gate_ready=1`、
+  `suspended_test_bypass=1`。但日志仅 2 帧（`t_ms=7,25`），第二帧因
+  `requested_target_step_max=0.129362 rad > max_target_step_rad=0.05 rad`，且
+  `max_consecutive_motion_violations=1`，触发 `repeated_unsafe_motion` SoftStop。
+- 这不是机械越界：当帧最大关节速度约 `0.911 rad/s`、最大估算力矩约 `1.41 Nm`、
+  tracking error `0.050379 rad < 0.45 rad`、推理 `7.253 ms < 20 ms`，LowState/深度均新鲜。
+  动作链已经把实际目标变化限制为 `0.05 rad/frame`；旧 motion guard 却用 slew 前的网络请求
+  变化再次拒绝，和执行层限速重复，无法观察模型在架高状态下的真实连续输出。
+- 更正修复：普通模式继续按 slew 前 requested target 做保守审计；仅
+  `--suspended-test --fixed-zero --arm` 改为审计 clip、物理限位和 slew 后真正可能下发的
+  applied target step，并保留 `0.45 rad` tracking error 以及全部 freshness、inference、机械、
+  stale-target 和接管保护。新增回归确认：普通模式拒绝 `requested=0.129 rad`；架高模式在
+  `applied=0.05 rad` 时允许，在 `applied=0.051 rad` 或 tracking error `0.451 rad` 时拒绝。
+- 验证：全核心构建成功；C++ normal/TSan、Python 12 项、100 帧 parity 和 strict preflight
+  全部通过；非法非零速度架高组合仍在 DDS/LowCmd 前拒绝。真机复测待执行，状态保持
+  “本地已验证”。新 controller SHA256
+  `160ee7b9898f1f41a9147542a72d4de420367408be3778420c44fe83f36c8264`；artifact contract
+  SHA256 `bbd037d9fd0dedf25b2ab6e7cc863a347b3fcc88e6e6c2399f81952db6e49512`。
+  checkpoint/ONNX 未变。
+
+#### 2026-08-01 平地零速度跟踪门禁与低门控诊断模式
+
+- 状态：代码已修复待真机验证。影响范围仅为实验部署路线
+  `deploy/sim2real_test_p3_standard_strict` 新增的显式平地诊断模式；普通模式和架高模式的既有
+  门禁不变。当前工作区仍无法读取 Git 元数据，分支、commit 和 PR 未知。
+- 症状与证据：机器狗落在平地后使用原架高诊断模式运行，日志
+  `visloco_diag_1785528463.csv` 共 10 帧、约 `0.179 s`。第 9 帧策略关节 j9（SDK FR calf）
+  `tracking_error_max=0.451216 rad`，刚超过 `0.45 rad` 阈值，触发 motion rejection 和
+  SoftStop。目标受 slew 限制以 `0.05 rad/frame` 从约 `-1.49 rad` 向 `-1.09 rad` 移动，实测
+  关节在负载下保持约 `-1.54 rad`；估算力矩升至约 `11.617 Nm`。LowState、深度、推理与姿态
+  没有同时出现异常，不能把该停止归因为数据链路丢失。
+- 根因与边界：这是“位置策略目标与落地负载下实际关节未及时跟随”的诊断门禁，不是 URDF
+  物理越界或力矩硬限位。零速度命令不等于零力矩；控制器仍按
+  `tau_est = Kp * (q_target - q) - Kd * dq` 产生站立/姿态控制力矩。直接全局放宽普通模式会掩盖
+  后续真实部署的跟踪异常，因此只新增需要操作者显式选择的受限诊断入口。
+- 修复：新增 `--ground-test`，仅接受 `--fixed-zero --arm --ground-test`，并与
+  `--suspended-test` 互斥；非法组合在 preflight/DDS/LowCmd 之前退出。该模式绕过启动稳定门控、
+  以 slew 后 applied target 审计动作步长，并关闭 `0.45 rad` tracking-error 软门禁。仍保留
+  raw action 非有限检查与 `[-6,6]` clip、`0.05 rad/frame` slew、URDF 物理限位、LowState/深度
+  freshness、推理 deadline、policy target stale、关节速度/估算力矩/温度软硬门禁和接管。
+  CSV 每帧记录 `ground_test_permissive=1`。
+- 排除方向：未修改 checkpoint、ONNX、训练观测/动作口径、Kp/Kd、力矩阈值、物理关节限位或
+  非零速度路径；`--ground-test` 不接受 `--fixed-vx`，也不是可长期运行的部署配置。
+- 本地验证：使用全部 CPU 核心并行构建成功；C++ normal 与 ThreadSanitizer 2/2、Python
+  12/12、100 帧 checkpoint->ONNX recurrent parity 和 strict preflight 均通过，joint 最大
+  绝对误差 `8.345e-07`。回归确认普通模式仍拒绝 `requested=0.129 rad`，架高模式仍在
+  tracking error `0.451 rad` 拒绝，平地诊断模式允许 tracking error `0.60 rad` 但在 applied
+  step `0.051 rad` 拒绝。三种非法 CLI 组合均在 DDS 初始化前退出，未创建 LowCmd。
+- 制品：checkpoint `highslow-884257` SHA256
+  `8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23`；ONNX SHA256
+  `6ccaf7e033240720a66019885df091097efa2d6d8962a5840966ede8b9de2d87`；controller SHA256
+  `0d49a5812e6ca2a003dc2a61c0c155b41b9b1ec153b31945a2e4540238f79bd5`；artifact contract
+  SHA256 `0e3cea64c80d14ce2897dff4365dbf354a1a478f536306bb44763f9a3020833c`。
+- 遗留风险：尚未取得该模式的真机日志，故状态不能升级为真机已验证。跟踪误差软门禁被有意
+  关闭后，落地姿态偏差可能继续积累到速度或力矩门禁才停止；首次测试应限制在约 1 秒、平整
+  防滑且四周净空的地面，操作者持续握持手柄并准备 LT+B/实体急停，禁止人员接触腿部。
+- 回滚：停止使用 `--ground-test` 即恢复普通门禁；代码回滚可移除该 CLI、状态参数和对应测试，
+  checkpoint/ONNX/config 无需回滚。
+- 再遇检查：CSV 的 `ground_test_permissive` -> 首个 rejection 原因 -> 逐关节
+  q_target/q/dq/tau_est -> FR calf 是否持续失跟 -> freshness/inference -> 速度、力矩、温度门禁与
+  takeover 是否按预期触发。
+
+#### 2026-08-01 固定速度行走误停门禁与终端速度范围
+
+- 状态：代码已修复待真机验证。影响范围仅为实验部署路线
+  `deploy/sim2real_test_p3_standard_strict` 的 `--fixed-vx` 低层行走测试；训练模型、ONNX、
+  Kp/Kd、关节物理限位和机械保护阈值未改变。Git 元数据不可用，分支、commit 和 PR 未知。
+- 症状与证据：平地 `--fixed-zero --arm --ground-test` 日志
+  `visloco_diag_1785529952.csv` 持续 2030 帧、40.578 s、50.00 Hz，可正常站立且没有 motion
+  rejection。最大电机上报 `tau_est=16.263359 Nm`、最大 PD 估算 `16.447447 Nm`，均为 FR calf；
+  小腿告警/软停/硬故障为 `27/36/43 Nm`，全程力矩告警帧数为 0。最大跟踪误差
+  `0.649902 rad`，说明普通 fixed-vx 若继续使用 `0.45 rad` 跟踪软门禁，会在已验证为可站立的
+  输出量级下误停。普通模式对 slew 前网络请求跳变的重复审计也会拒绝实际已被限制到
+  `0.05 rad/frame` 的目标。
+- 根因与修复：此前 fixed-vx 沿用保守 bring-up 门禁，没有吸收零速平地真机证据。现在 fixed-vx
+  保留启动稳定门控，但动作步长只审计 clip、物理限制和 slew 后真正可能下发的 applied target，
+  并关闭 tracking-error 软门禁；CSV 新增 `walking_test_permissive=1`。仍保留 raw action 有限性与
+  `[-6,6]` clip、`0.05 rad/frame` slew、URDF 限位、LowState/深度 freshness、推理 deadline、
+  policy-target stale、关节速度、力矩、温度和接管保护。
+- 速度范围：`--vx VALUE` 已存在，部署校验上限由 `0.10` 放宽到 `1.00 m/s`；仅接受有限的
+  `[0,1.00]`。该范围与训练端
+  `train_env_conf_standard_p3_standard_joint.toml` 和 `deploy.yaml` 的 `lin_vel_x=[0,1]` 对齐。
+  下一轮计划值为 `0.3 m/s`；允许 `1.0 m/s` 不等于该速度已经通过真机验证。
+- 排除方向：没有提高力矩阈值，因为本轮站立力矩本就没有触发既有告警；没有关闭物理限位、
+  过温、传感器/推理失效或硬故障接管；没有放宽侧向速度和角速度，本入口仍固定为纯前向命令。
+- 本地验证：全核心并行构建成功；新增单元回归覆盖 fixed-vx 使用 post-slew 审计且忽略
+  `0.65 rad` tracking error，并覆盖速度 `0/0.3/1.0` 接受、负值/`1.001`/Inf 拒绝。C++ normal
+  与 ThreadSanitizer 2/2、Python 12/12、100 帧 checkpoint->ONNX parity、JSON/脚本语法和 strict
+  preflight 全部通过，joint 最大绝对误差 `8.345e-07`；preflight 未创建 LowCmd。非零真机尚未
+  运行，状态不得升级。
+- 制品：checkpoint `highslow-884257` SHA256
+  `8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23`；ONNX SHA256
+  `6ccaf7e033240720a66019885df091097efa2d6d8962a5840966ede8b9de2d87`；controller SHA256
+  `17ba8caf6ddc2bb84f950dc40d2070c80107cdca155a5233b919ed12a8d74449`；artifact contract
+  SHA256 `81db4c7333819d38439498c47520b6128cadfc63daf56c99f2099f8f4a931b7f`。
+- 遗留风险与测试边界：fixed-vx 的跟踪误差不会再单独触发 SoftStop，姿态或关节失跟将主要由
+  物理、速度、力矩、温度、翻倒和操作者接管限制。首次 `0.3 m/s` 应在平整防滑、足够开阔的
+  场地做短距离直行，操作者跟随并持续准备 LT+B/实体急停；不得直接跳到 `1.0 m/s`。
+- 回滚：恢复 fixed-vx 的 pre-slew/tracking guard 和 `0.10 m/s` 校验；checkpoint、ONNX、配置
+  与训练端均无需回滚。
+- 再遇检查：确认 `walking_test_permissive=1` 与 `vx=0.3` -> applied step -> q/dq/tau/temp ->
+  姿态与翻倒接管 -> LowState/深度/推理 freshness -> LT+B 是否立即返回 Passive。
+
+#### 2026-08-01 行走力矩软停止提升至硬边界
+
+- 状态：本地已验证，真机复测待执行。影响范围仅为实验部署路线
+  `deploy/sim2real_test_p3_standard_strict` 的电机上报力矩门禁配置；checkpoint、ONNX、动作链、
+  Kp/Kd、速度/温度/位置门禁和数据链路 watchdog 未改变。Git 元数据不可用，分支、commit、PR
+  未知。
+- 症状与证据：两次 `0.8 m/s` 日志 `visloco_diag_1785531316.csv`、
+  `visloco_diag_1785531327.csv` 分别在 2.946 s 和 5.063 s 结束。停止前 FL thigh（策略 j4）
+  `tau_est` 连续升至 `17.712610 Nm`、`17.267321 Nm`，PD 估算升至 `18.191326 Nm`、
+  `17.798235 Nm`，紧邻原髋/大腿 `18 Nm` SoftStop。两次均无 motion rejection、deadline miss、
+  推理异常、数据过期、明显倾倒或速度硬越界。由于机械检查在故障帧写 CSV 之前 break，精确终端
+  原文未被 CSV 保存；“下一帧触发 `joint_effort_soft_4`”为高置信推断，仍待终端/复测确认。
+- 根因：原配置在髋/大腿 `14 Nm` warning 与 `22 Nm` hard fault 之间额外设置 `18 Nm`
+  SoftStop，小腿对应 `27/36/43 Nm`。该中间停止线会在模型仍低于既定硬机械边界时返回 FixStand，
+  不符合当前实机能力表征阶段“告警但继续观察直到硬边界”的测试要求。
+- 修复：保持 warning 为髋/大腿 `14 Nm`、小腿 `27 Nm`；将 `tau_soft_stop` 从 `18/36 Nm`
+  提高为与 `tau_hard_fault` 相同的 `22/43 Nm`。运行时先检查 hard fault，再检查 soft stop，因此
+  相同阈值使 torque SoftStop 分支不可达：warning 到 hard 之间只打印告警，真正超过
+  `22/43 Nm` 仍触发 HardFault 并请求 Passive。没有移除最低硬机械保护。
+- 本地验证：控制器读取外部 YAML，本次无需重编译，二进制保持不变。新增 Python 回归解析真实
+  YAML，确认 12 个关节 `tau_soft_stop == tau_hard_fault`、硬边界为前 8 关节 `22 Nm`、后 4
+  关节 `43 Nm`，且 warning 均低于 hard。C++ normal/TSan 2/2、Python 13/13、100 帧
+  checkpoint->ONNX parity、JSON/脚本检查和 strict preflight 全部通过；joint 最大绝对误差
+  `8.345e-07`，preflight 未创建 LowCmd。
+- 制品：controller config SHA256
+  `3dcb2006ba22fa56c662b6ebe6917ae995027e5ba8d56d9e6a28819e5f0ef952`；artifact contract
+  SHA256 `ad91cb497f052aadabc4fa291f9ae2944f44438767e654118adc0347b2c752f1`；controller 二进制未变，
+  SHA256 `17ba8caf6ddc2bb84f950dc40d2070c80107cdca155a5233b919ed12a8d74449`；checkpoint/ONNX 未变。
+- 遗留风险：允许髋/大腿在 `18..22 Nm`、小腿在 `36..43 Nm` 继续运行会增加瞬态冲击和热负荷；
+  warning 只每 50 帧打印一次，不能替代操作者观察。真机复测必须保持开阔防滑场地、短距离、
+  LT+B/实体急停可立即操作，并重点检查 j4 力矩是否继续快速累积到 `22 Nm`。
+- 回滚：把 `tau_soft_stop` 恢复为前 8 关节 `18 Nm`、后 4 关节 `36 Nm`，同步恢复 config 和
+  artifact contract 哈希；二进制无需回滚。
+- 再遇检查：终端 `joint_effort_*` 原文 -> CSV 最后 10 帧 j4 tau/pd_tau/qerr -> warning 是否出现
+  -> 是否到 `22 Nm` hard fault -> 温度、姿态与 LT+B 接管。
+
+#### 2026-08-01 楼梯前 depth_invalid 接管原因与故障前深度录像
+
+- 状态：本地已验证，真机相机选项与楼梯复测待执行。影响范围为实验部署路线
+  `deploy/sim2real_test_p3_standard_strict` 的 D435i 有效性门禁、故障诊断、FSM 转移日志和深度
+  故障录像；网络输入 shape 与 `(0,5 m)/5` 训练归一化不变。Git 元数据不可用，分支、commit、
+  PR 未知。
+- 症状与证据：楼梯前终端明确打印 `[VisionLoco] hard fault: depth_invalid`，随后自动进入 Go2
+  Passive 阻尼模式。最近多次日志在接近楼梯时投影整图/中下前方框无效率快速上升；例如
+  `visloco_diag_1785532117.csv` 最后帧为 `dep_inval=0.468160`、诊断前框
+  `front_inval=0.559028`，最近有效深度约 `0.218 m`。深度年龄最大约 `33 ms < 150 ms`，因此不是
+  `depth_stale`。旧 CSV 的 front box 是中下方 `96x72`，而相机有效性使用中央三分之一全高度，
+  故无法从旧 CSV 精确还原触发帧的实际中央无效率。
+- 根因判断：`depth_invalid` 只由投影尺寸错误、整图无效率达到阈值或中央三分之一无效率达到阈值
+  产生；尺寸在此前传感器长跑中稳定，楼梯前又出现近距离有效点与空洞同步增加，因此当前高置信
+  根因为近距离楼梯面、遮挡/双目视差空洞或弱纹理使中央区域超过旧 `0.50` 门限。软件 `5 m`
+  远距离边界不是此次故障原因。具体是哪些台阶/像素失效仍需新增图像证据确认。
+- 修复与诊断：FSM 每个 registered check 现在携带原因，转移日志直接打印
+  `VisionLoco -> Passive trigger=hard_fault:depth_invalid`；手柄、LowState timeout、翻倒和 SoftStop
+  也有独立 trigger。深度故障现场额外打印 policy/camera frame、age、profile、投影尺寸、整图和
+  中央三分之一无效率、最小/平均深度、序列号与固件。CSV 新增实际相机有效性两列。
+- 相机与门限调整：保持训练口径 `(0,5 m)/5`，没有把 `>=5 m` 改成新的模型语义。D435i 请求
+  High Density preset、发射器开启、设备允许的最大激光功率和自动曝光，并在启动时回读打印。
+  整图/中央三分之一无效率从 `0.50` 开始警告，硬 invalid 边界放宽为 `0.70`。
+- 接口核查：主机安装 librealsense `2.54.2`，controller 直接链接 `librealsense2.so.2.54` 并通过
+  `rs2::pipeline` 获取 Z16、内参、帧号和时间戳。ROS 2 在线枚举没有 D435i 深度 topic；
+  `/frontvideostream` 为 `Go2FrontVideoData` 彩色视频，`/pctoimage_local` 为 `PcToImage` 点云投影。
+  实机 D435i 固件 `5.13.0.55`，SDK 工具推荐 `5.15.1`；本任务未执行固件升级，固件差异列为
+  后续空洞问题的待验证因素。
+- 故障录像：内存只保存最近 90 个唯一的 `320x180` 投影深度帧，约 3 秒；正常运行不持续写盘。
+  `depth_invalid/depth_stale` 先触发 fail-closed 接管，再在 `exit()` 把环形缓冲写为 16-bit 毫米
+  PGM（0 为无效）、8-bit 有效掩码 PGM（255 有效/0 无效）、无效像素为洋红色的 RGB PPM 预览和
+  `manifest.csv`，目录为 `visloco_diag_TIMESTAMP_depth_fault/`，因此写盘不会延迟 Passive 切换。
+  新增 `--record-depth`，可在 powered 模式手动退出后把同一环形缓冲写到
+  `visloco_diag_TIMESTAMP_depth_capture/`。
+- 本地验证：全核心并行构建成功；C++ normal/TSan 2/2、Python 14/14、100 帧 parity、JSON/脚本
+  检查和 strict preflight 全部通过，joint 最大绝对误差 `8.345e-07`，preflight 未创建 LowCmd。
+  当前隔离环境未检测到物理相机，所以真实设备选项支持/回读与故障录像尚待下一次真机运行验证。
+- 制品：config SHA256
+  `64d37ed0efa9f6c81f6f1309ed684f90cbb2f8284077fa35c22cd9e08298014b`；controller SHA256
+  `dc06652c44f75a2d0d47bc1501d564c30511b1965b96e7a761c940c0b6c456d4`；artifact contract
+  SHA256 `492a34f6729d94710e07d080eb6a0b357e6938e9734017c4dd103712499d72ce`；checkpoint/ONNX 未变。
+- 遗留风险：把无效率硬线放宽到 `0.70` 会让模型在更多零深度输入下继续运行；楼梯属于高风险
+  场景，首次复测应低速、短距离并保持 LT+B/实体急停。High Density 与最大激光功率可能增加
+  功耗和对其他主动红外设备的干扰；自动曝光响应仍需图像确认。
+- 回滚：恢复无效率 `0.60/0.50`、默认相机选项和旧 controller/config/contract；删除录像环形
+  缓冲与具名转移日志不影响 checkpoint/ONNX。
+- 再遇检查：启动 camera option 回读 -> `depth validity warning` ->
+  `TAKEOVER -> Passive reason=...` -> FSM trigger -> depth fault 目录 manifest 最后帧 -> PGM 中零值
+  分布与楼梯边缘 -> 再判断阈值、曝光、激光或安装角度。
+
+#### 2026-08-01 DEPLOY-P3-DEPTH-GATE-002 深度内容与持续出帧门禁降为告警
+
+- 状态：本地已验证并完成真机 sensor-only smoke，powered 真机验证待执行。影响范围仅为实验部署路线
+  `deploy/sim2real_test_p3_standard_strict` 的 RealSense 启动、sensor-only/shadow smoke 和 powered
+  VisionLoco 深度健康处理；训练归一化、投影、checkpoint、ONNX ABI、LowState 与机械安全门禁不变。
+  工作区没有 Git 元数据，`git status --short --branch` 返回“not a git repository”，分支、commit、
+  PR 均未知。
+- 用户可见症状与证据：更换线材后的 `--sensor-only` smoke 中，RealSense 管线成功打开并回读
+  `laser_power(max)=360.000`，但 3 秒内没有通过旧无效率门禁的投影帧，程序以
+  `strict no-command fault: no valid projected depth frame within 3s` 退出。用户确认模型已经针对深度
+  空洞强化训练，要求像素可用性、首帧等待以及运行中持续出帧/150 ms freshness 全部仅告警。
+- 根因与排除方向：旧 `DepthFrame.valid` 同时混合了“结构完整帧已到达”和“整图/中央三分之一无效率
+  低于 0.70”两种语义，启动、smoke、powered 主循环和可选 shadow gate 又共同把它当硬门禁；因此
+  相机管线已经运行也会因为场景内容进入退出或 Passive。此次不是训练/部署张量 shape 或归一化
+  不一致；USB 2.1 链路稳定性仍是独立待验证因素，不能通过拆门禁宣称已修复。
+- 修改文件与核心修复：`DepthSource.h` 把 `valid` 收窄为真实相机帧结构完整，继续把无效像素编码为
+  0 并记录比例；`main.cpp` 删除 3 秒首帧硬等待以及 stale/invalid 退出；
+  `State_VisionLoco.cpp` 删除 `depth_invalid/depth_stale` hard fault、Passive 和策略发布阻断，改为
+  `DEPTH_WARNING warning_only=true` 的状态切换日志，恢复时打印 recovered，并让可选启动诊断不再依赖
+  深度内容或 cadence。配置删除两个 0.70 硬阈值；README、ARTIFACTS、artifact contract 和测试同步。
+- 诊断保留：RealSense 管线启动失败仍阻止进入部署；无首帧时模型使用初始化的全零 `320x180`
+  张量，断流时继续使用最近一帧。无效率、中央无效率、frame number 和 age 继续写日志；第一次健康
+  告警请求在正常退出后写 `visloco_diag_TIMESTAMP_depth_warning/`，不会因录像触发接管。
+- 验证：Release 全核心并行构建成功；C++ normal/TSan 2/2、Python 24/24、100 帧 parity 和带相机
+  preflight 全部通过，joint 最大绝对误差 `8.345e-07`，preflight 明确
+  `motor_command_channel_created=false`。真机 `--sensor-only` 在 360 激光功率下运行到 15 秒测试超时
+  后干净退出：初始化后记录 577 个控制样本/11.52 s，相机帧号到 366；即使末帧整图/中央无效率为
+  `0.9863/0.9952`，也只有 `DEPTH_WARNING warning_only=true`，没有 `DEPTH_FAULT`、
+  `hard_fault:depth_*` 或 Passive，且 LowCmd 从未创建。该 smoke 未创建电机命令，不能替代 powered
+  评估；当前用户权限无法读取 `dmesg`，本轮 USB/UVC 内核错误证据未取得。
+- 回归防线：Python 合同测试要求配置中不存在无效率硬阈值、合同明确包含 `warning-only`，源码诊断
+  marker 必须为 `DEPTH_WARNING`；sensor-only smoke 应在高无效率或帧 stale 时继续运行而非退出。
+- 制品：任务名 `DEPLOY-P3-DEPTH-GATE-002`；模型 ID/checkpoint
+  `p3nav8h-r1_884257-evalfix-v2` / `model.ckpt-highslow-884257.pkl`；commit/PR 不适用；修改后
+  config SHA256 `86f667f8573604a87ddd9c1af96d0e8fd9fe313264b906b250bb9390f911abe2`；
+  controller SHA256 `5eeb65aad78226903a30477138ea0ed72c82b9ea356c87cca2d97b2320619d91`；
+  artifact contract SHA256 `7f72ebf8b8181ae51acd6023e2d59133e47529c27bea7ace30058a6ccb82b3f7`。
+- 2026-08-02 提交格式更正：上述 config 哈希是当时真机工作树 CRLF 字节的历史证据，
+  不予改写。新分支按仓库 `.gitattributes` 以 LF 提交，检出可复现的 controller config / policy
+  deploy SHA256 分别为 `154d1d47d3c11330c4384eaf6620f41e93cea390e4175f0a4c38898578058ffb` /
+  `5aa6ced0023641aed7a5c801f39dc290470a6a81003b62c273dca9a33e66b6a9`；机器可读 contract 与
+  `ARTIFACTS.md` 已同步，preflight 应以新哈希校验。配置语义没有变化。
+- 遗留风险：这项用户指定的放宽允许全零或长期陈旧深度持续驱动策略，摄像头物理断连后也不会自动
+  Passive，风险显著高于原 fail-closed 行为。首次 powered 测试必须低速、短距离、开阔防滑，并让
+  LT+B 与实体急停始终可立即触达。回滚方式是恢复 3 秒首帧、0.70 内容门禁、150 ms freshness
+  hard fault 及旧 `depth_invalid/depth_stale` 接管分支。
+- 再遇最短检查：`RealSense ... initialized` -> `DEPTH_WARNING warning_only=true` -> 确认没有
+  `hard_fault:depth_*`/Passive -> frame number 与 age 是否恢复 -> 退出后查看 `_depth_warning/manifest.csv`
+  -> 同时核查 `dmesg` 的 USB/UVC 错误，避免把链路断流误判成模型问题。
+
+#### 2026-08-01 DEPLOY-P3-STARTUP-001 recurrent shadow 空跑导致起步前扑
+
+- 状态：代码已修复待真机验证。影响范围仅为实验部署路线
+  `deploy/sim2real_test_p3_standard_strict` 的 powered VisionLoco 启动时序；checkpoint、ONNX、
+  proprio/depth/action 合同和独立深度孔洞填充均未改变。工作区仍无法读取 Git 元数据，
+  `git status --short --branch` 返回“not a git repository”，分支、commit 和 PR 未知。
+- 用户可见症状与证据：上一轮 23 次 powered 运行中，22 次通过内部启动门控；门控通常约
+  `2.2 s` 后放行，此时 `vx` 已达到 `0.5 m/s`。放行后 0.6 s 内最大关节跟踪误差中位数
+  `1.001 rad`、22 次中 17 次达到 `0.9 rad`、实测最大力矩中位数 `25.60 Nm`、最高
+  `28.59 Nm`。例如 `visloco_diag_1785535126.csv` 中右前小腿目标与实测最大相差
+  `1.065 rad`，与“刚开始走就向前栽”一致。
+- 根因：旧启动门控在约 2 s 内每帧执行 `runner_->act()` 并把 fixed command 从 0 递增到
+  `0.5 m/s`，因此 loco LSTM hidden 持续推进；同时 `shadow_gate_ready=0` 使策略目标不下发，
+  `last_action_raw_` 保持 0，真机仍站立。门控打开后直接接入已推进两秒的行走 hidden，跳过了
+  训练中的“推理 -> 执行动作 -> 回填 last_action -> 下一帧”闭环，并可能从任意步态相位开始。
+- 排除方向：训练参考与部署的 `joint_ids_map`、默认站姿、action scale/offset、25/0.5 PD 增益和
+  proprio 顺序一致；日志中 inference deadline miss、motion rejection/violation 均为 0。深度
+  `depth_invalid` 是多次 Passive 的另一独立问题，不解释无深度故障运行中的重复起步冲击。
+- 修复：新增 `strict_safety.startup_shadow_enabled`，默认 `false`。LT+X 进入 VisionLoco 时仍先
+  reset recurrent state、清零 command 与 last_action；首个 LowState/深度有效且推理成功的帧立即
+  发布经过 clip/物理限位/slew 的动作，并从该帧开始同步回填 executed last_action。原稳定/时间
+  gate 仅在显式设为 `true` 时保留给静止诊断；`--suspended-test`/`--ground-test` 的动作审计和
+  其他 freshness、机械、目标 stale 与接管保护不变。
+- 修改文件：`State_VisionLoco.cpp/.h`、`StrictSafety.h`、controller `config.yaml`、C++/Python
+  安全测试、实验 README/ARTIFACTS、`artifact_contract.json` 与共享接口契约。
+- 本地验证：使用 `cmake --build ... --parallel $(nproc)` 全核构建成功；C++ normal/TSan 2/2、
+  Python 14/14、100 帧 checkpoint->ONNX recurrent parity、JSON/Python 语法和 strict preflight
+  全部通过，joint 最大绝对误差 `8.345e-07`；preflight 明确
+  `motor_command_channel_created=false`。物理相机在隔离 preflight 中未检测到，本条尚无修复后
+  powered 真机日志，因此状态不得升级为真机已验证。
+- 制品：父模型/模型 ID/checkpoint 未变；checkpoint SHA256
+  `8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23`，ONNX SHA256
+  `6ccaf7e033240720a66019885df091097efa2d6d8962a5840966ede8b9de2d87`，config SHA256
+  `77ecb3e82a4d5a18ff45b10f456df4d8741fc0a9ad1f6a595fbdf822815e9bb1`，controller SHA256
+  `7bbe121de6c6ad0ba2efa6f7f4ed36a832e244c31e797233cecb1bc5277fbef4`，artifact contract SHA256
+  `072714385892e7e7fbd316bbdb723d36ba94b75a04389addd6baff3140f6e4e1`；commit/PR 不可用。
+- 遗留风险：立即闭环消除了 hidden/action 历史错位，但不能证明模型本身已具备稳定真机步态。
+  `--fixed-vx` 仍关闭 tracking-error SoftStop，首次复测必须从架高 `--fixed-zero` 开始，再做平地
+  `0.3 m/s` 短测，保持 LT+B/实体急停和防摔保护。不得因为本地测试通过直接尝试楼梯。
+- 回滚：把 `startup_shadow_enabled` 显式设为 `true` 可恢复旧等待行为；代码级回滚为恢复初始
+  `shadow_gate_ready=false`。旧行为会重新引入 recurrent/action 历史失配，只适合零命令静止诊断。
+- 再遇检查：CSV 首帧 `shadow_gate_ready` 应为 1 -> 首帧 `vx` 应从约 `0.014 m/s` 起步 ->
+  `last_action` 应从每帧实际 applied target 回填 -> 前 0.6 s tracking error/tau/pgx -> 再区分
+  模型 sim2real 能力、足端打滑、相机故障或机械接管。
+
+#### 2026-08-01 DEPLOY-P3-DIAG-001 自动接管原因未持久化且故障上下文不足
+
+- 状态：本地已验证。影响范围仅为实验部署路线
+  `deploy/sim2real_test_p3_standard_strict` 的控制器日志与诊断；安全阈值、状态转移、模型输入输出、
+  checkpoint、ONNX 和训练/部署数值合同均未改变。工作区根目录仍无法读取 Git 元数据，
+  `git status --short --branch` 返回“not a git repository”，当前分支、commit 和 PR 未知。
+- 用户可见症状与关键证据：此前多轮自动进入 Passive/FixStand 时，逐帧 CSV 能看到故障前数据，
+  但终端中的 `hard fault`、FSM `trigger=` 和退出原因没有写入持久文件；非深度故障只能根据末帧
+  `tau/qerr/pgz` 反推，无法确认究竟是 `joint_effort_hard_N`、`bad_orientation`、LowState、推理异常
+  或 `policy_target_stale`。历史日志中存在 FL thigh 力矩接近 `22 Nm` 和 tilt 接近 `1.0 rad` 的不同
+  候选原因，证明仅靠 CSV 末帧不能给出确定结论。
+- 根因：控制器默认 spdlog 仅输出终端，VisionLoco CSV 也不保存 FSM 转移原文；机械、姿态、LowState、
+  策略目标 stale 和策略线程异常缺少统一的故障瞬时快照。另有诊断实现风险：策略线程的 `frame_`
+  与 `last_exec_cmd_` 若直接由 FSM 线程读取会产生数据竞态，因此不能简单在检查回调中打印原字段。
+- 排除方向：没有修改力矩、速度、位置、温度、深度无效率或 stale 时间阈值；没有把警告升级为接管，
+  也没有关闭既有保护。此次修复不声称已解释历史每一次失败，只确保下一次能保存精确触发原因。
+- 修改文件：controller `main.cpp`、`State_VisionLoco.cpp/.h`、实验 README/ARTIFACTS、
+  `artifact_contract.json`、Python 回归测试和本台账。
+- 核心修复：每个非 preflight 运行创建毫秒级唯一的
+  `logs/loco/logs/strict_controller_TIMESTAMP.log`，同时写终端和文件，warning 及以上立即 flush；新增
+  `FAULT_SNAPSHOT` 统一记录 severity/reason、policy frame、command、LowState tick/age、投影重力/倾角、
+  最大绝对 q/dq/tau、最高温度、电池、最近 tracking/requested/applied/PD 指标和深度帧/age/无效率。
+  `MECHANICAL_LIMIT`、`DEPTH_FAULT`、`LOWSTATE_FAULT`、`POLICY_TARGET_STALE`、`BAD_ORIENTATION` 使用
+  独立标签；策略线程未捕获异常也保存最后 snapshot。跨线程帧号和命令改用独立 atomic 诊断镜像，
+  姿态/stale 日志按一次故障只打印一次，避免 1 kHz FSM 重复刷屏。
+- 本地验证：使用 `cmake --build ... --parallel $(nproc)` 全核构建成功；C++ normal 与 TSan 均通过，
+  Python 15/15 通过（新增持久日志/标签契约测试），100 帧 checkpoint->ONNX recurrent parity 通过，
+  joint 最大绝对误差 `8.345e-07`；JSON 解析、冲突标记/尾随空白检查和 strict preflight 均通过，
+  preflight 明确 `motor_command_channel_created=false`。本轮未启动 DDS/LowCmd，尚无真机生成的新版
+  `strict_controller_*.log`，故真机日志可写性和断电场景保留程度待下一轮验证。
+- 制品：父模型/模型 ID/checkpoint 未变；checkpoint SHA256
+  `8dc9d6028bd8850a3e59cfde2bd2ee1fe5b6768f1af47477a20c28a831edcb23`，ONNX SHA256
+  `6ccaf7e033240720a66019885df091097efa2d6d8962a5840966ede8b9de2d87`，config SHA256
+  `77ecb3e82a4d5a18ff45b10f456df4d8741fc0a9ad1f6a595fbdf822815e9bb1`，controller SHA256
+  `add8cb1271e9640f7867b1b3328f53c84a766cb4fc086c75d52c72e9c2465708`，artifact contract SHA256
+  `45c1f5e7a56d41939b71acfb5c7dc764a235bc0ad975b963203559523fb86ee4`；commit/PR 不可用。
+- 长期防线：Python 测试验证持久 file sink 与六类结构化标签存在；TSan 覆盖控制器共享安全类型，
+  后续真机日志分析应先读取 `strict_controller_*.log` 的 `trigger=` 与 `FAULT_SNAPSHOT`，再把时间点与
+  `visloco_diag_*.csv`、深度 manifest 对齐，禁止继续只凭最后一行 CSV 猜测根因。
+- 遗留风险：basic file sink 能保证 warning/critical 在进程正常运行时即时 flush，但掉电、存储设备
+  故障或内核未落盘仍可能丢失最后数据；info 周期日志在非故障异常掉电时可能未全部刷新。下一轮真机
+  应验证文件创建、故障行完整性和 FSM trigger 顺序，之后才能升级为真机/平台已验证。
+- 回滚：移除 `setup_runtime_logging()` 和新增结构化日志/atomic 诊断镜像，恢复旧 controller 二进制；
+  回滚只降低可观测性，不需要修改 config、checkpoint 或 ONNX。
+- 再遇检查：最新 `strict_controller_*.log` -> 首个 `MECHANICAL_LIMIT/DEPTH_FAULT/LOWSTATE_FAULT/`
+  `POLICY_TARGET_STALE/BAD_ORIENTATION` -> 紧随其后的 `FAULT_SNAPSHOT` -> FSM `trigger=` ->
+  `EXIT due to safety takeover` -> 按 policy frame 对齐 `visloco_diag_*.csv` 和深度 manifest。
 
 ## 3. 已知高频误判
 

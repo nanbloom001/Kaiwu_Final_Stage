@@ -1,0 +1,10 @@
+/logs/
+__pycache__/
+*.py[cod]
+
+runtime/unitree_rl_lab_test/logs/loco/logs/
+runtime/unitree_rl_lab_test/deploy/robots/go2_loco/Testing/
+runtime/unitree_rl_lab_test/deploy/robots/go2_loco/build-strict/*
+
+core
+core.*

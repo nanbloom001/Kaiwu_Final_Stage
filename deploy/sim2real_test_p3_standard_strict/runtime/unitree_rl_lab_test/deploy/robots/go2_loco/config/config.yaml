@@ -1,0 +1,148 @@
+FSM:
+  _: # enabled fsms
+    Passive:
+      id: 1
+    FixStand:
+      id: 2
+    # Velocity 需要 logs/rsl_rl/unitree_go2_velocity 策略目录；本机没有，先禁用
+    # Velocity:
+    #   id: 3
+    #   type: RLBase
+    VisionLoco:
+      id: 4
+      type: VisionLoco
+  Passive:
+    transitions:
+      FixStand: LT + A.on_pressed
+    mode: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    kd: [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+  FixStand:
+    transitions:
+      Passive: LT + B.on_pressed
+      VisionLoco: LT + X.on_pressed
+    kp: [60, 80, 80, 60, 80, 80, 60, 80, 80, 60, 80, 80]
+    kd: [5, 4, 4, 5, 4, 4, 5, 4, 4, 5, 4, 4]
+    ts: [0, 1, 2]
+    qs: [
+      [],
+      [0.0, 1.36, -2.65, 0.0, 1.36, -2.65, 0.0, 1.36, -2.65, 0.0, 1.36, -2.65],
+      # Hardware motor order mapped from the P3 policy default through joint_ids_map.
+      [-0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 1.0, -1.5, 0.1, 1.0, -1.5],
+    ]
+  Velocity:
+    transitions:
+      Passive: LT + B.on_pressed
+    policy_dir: ../../../logs/rsl_rl/unitree_go2_velocity
+  VisionLoco:
+    transitions:
+      Passive: LT + B.on_pressed
+    # 放 <policy_dir>/exported/policy.onnx + <policy_dir>/params/deploy.yaml
+    # loco 阶段 ONNX 由 export_loco_onnx.py 生成（8 入 8 出，nav 端口占位）。
+    policy_dir: ../../../logs/loco
+    # 深度源: realsense（D435i 直连）或 constant（仅用于链路检查）。
+    # loco 阶段仍需 depth：depth → cnn → loco_lstm → loco_latent → teacher_actor。
+    depth:
+      source: realsense
+      constant_value: 0.6
+      # Raw acquisition profiles are implementation details. Both are reprojected
+      # with their runtime intrinsics to the frozen training tensor 320x180x1.
+      preferred_profile: [424, 240, 30]
+      allowed_fallback_profiles: [[480, 270, 30]]
+      require_allowed_profile_for_arm: true
+      # Pixel invalidity and frame freshness are diagnostics only. They never
+      # request Passive or block policy publication; holes keep training semantics (zero).
+      camera_options:
+        visual_preset: high_density
+        emitter_enabled: true
+        laser_power: max
+        auto_exposure: true
+      extrinsics_version: p3-training-reference-884257
+      extrinsics_calibrated: false
+      extrinsics_position_m: [0.339871, 0.034697, 0.075010]
+      extrinsics_quaternion_wxyz: [0.982631, -0.007085, 0.184337, -0.020153]
+      filters:
+        mode: none
+        spatial_magnitude: 2
+        spatial_smooth_alpha: 0.5
+        spatial_smooth_delta: 20
+        temporal_alpha: 0.25
+        temporal_delta: 20
+    # goal_position(4): orientation, pitch, distance(m), yaw。
+    # loco 阶段图内忽略 goal（仅为端口兼容传入），保留仅为诊断日志记录。
+    goal: [0.0, 0.0, 10.0, 0.0]
+
+    # loco 阶段命令来源：
+    #   fixed: 固定速度基础运控（loco 阶段默认）；
+    #   uwb  : 外层几何控制器生成受限 cmd（loco 阶段仍可用，走同一套 command_for_frame）；
+    #   nav  : loco 阶段无 learned nav actor（模型无 nav 分支），选 nav 等价零速度，
+    #          仅保留分支以复用 State；正式 loco 测试请用 fixed / uwb。
+    command_source: fixed
+    # Conservative first bring-up command; raise only after standing checks.
+    fixed_cmd: [0.0, 0.0, 0.0]
+    uwb:
+      topic: rt/uwbstate
+      sport_state_topic: rt/sportmodestate
+      max_vx: 0.70
+      max_vy: 0.00
+      max_wz: 0.40
+      yaw_kp: 0.80
+      stop_distance: 0.35
+      slow_distance: 1.00
+      turn_in_place_angle: 1.0472  # 60 deg
+      stale_timeout: 0.50
+      cmd_slew_rate: [0.70, 0.30, 1.00]  # 每秒最大 vx/vy/wz 变化量
+      # lowcmd 模式会关闭 SportModeState；用静止 UWB tag 的相对位姿差分估计实际 vx/vy。
+      # 仅用于日志，不参与 fixed/nav 命令生成。测试期间不要移动 tag。
+      diagnostic_feedback: true
+      velocity_filter_alpha: 0.20
+
+    # 每次进入 VisionLoco 都在 logs/loco/logs/ 创建一份逐帧 CSV。
+    logging:
+      enabled: true
+      flush_every: 50
+      max_consecutive_errors: 1
+      # Diagnostic sanity ceiling only. Training transport clipping is the
+      # independent strict_safety.raw_action_clip=[-6,6] layer.
+      max_raw_action_abs: 100.0
+      max_target_step_rad: 0.05
+      target_slew_rate_rad_s: 2.5
+      max_tracking_error_rad: 0.45
+      max_consecutive_motion_violations: 1
+
+    strict_safety:
+      lowstate_stale_ms: 50
+      # Warning threshold only. Stale/stopped depth never requests takeover.
+      depth_stale_ms: 150
+      # Keep recent unique projected frames in memory. A depth-health warning
+      # requests a dump after normal exit; it does not request takeover.
+      depth_fault_capture_enabled: true
+      depth_fault_capture_frames: 90
+      depth_capture_dump_on_exit: false
+      policy_target_stale_ms: 100
+      inference_deadline_ms: 20
+      command_stale_ms: 100
+      stable_lowstate_frames: 100
+      # Legacy duration counter for the optional startup diagnostic. It advances
+      # every control frame and no longer depends on depth content or cadence.
+      stable_depth_frames: 60
+      # Default powered behavior: LT+X resets the recurrent policy and begins the
+      # command/action/last_action closed loop on the first valid inference frame.
+      # Set true only for an explicit stationary diagnostic; never advance an LSTM
+      # under a walking command while withholding its actions.
+      startup_shadow_enabled: false
+      shadow_gate_seconds: 2.0
+      stable_max_joint_velocity_rad_s: 0.5
+      stable_max_tilt_rad: 0.35
+      raw_action_clip: [-6.0, 6.0]
+      target_slew_rate_rad_s: 2.5
+      joint_lower: [-0.9972, -0.9972, -0.9972, -0.9972, -1.5208, -1.5208, -0.4736, -0.4736, -2.6727, -2.6727, -2.6727, -2.6727]
+      joint_upper: [0.9972, 0.9972, 0.9972, 0.9972, 3.4407, 3.4407, 4.4879, 4.4879, -0.88776, -0.88776, -0.88776, -0.88776]
+      dq_warning: [18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 10.0, 10.0, 10.0, 10.0]
+      dq_hard_fault: [28.0, 28.0, 28.0, 28.0, 28.0, 28.0, 28.0, 28.0, 15.0, 15.0, 15.0, 15.0]
+      tau_warning: [14.0, 14.0, 14.0, 14.0, 14.0, 14.0, 14.0, 14.0, 27.0, 27.0, 27.0, 27.0]
+      # Warning-only region extends to the hard mechanical boundary. The hard
+      # check runs first, so matching soft/hard values make torque SoftStop unreachable.
+      tau_soft_stop: [22.0, 22.0, 22.0, 22.0, 22.0, 22.0, 22.0, 22.0, 43.0, 43.0, 43.0, 43.0]
+      tau_hard_fault: [22.0, 22.0, 22.0, 22.0, 22.0, 22.0, 22.0, 22.0, 43.0, 43.0, 43.0, 43.0]
+      motor_temperature_warning_c: 65
+      motor_temperature_hard_c: 75
