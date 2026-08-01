@@ -154,7 +154,7 @@ def _module_changes(agent, before) -> dict[str, bool]:
 def _run_integrated(env, agent, config):
     """Exercise one full 128-frame low PPO + Adapter + memory update."""
     joint = agent.algorithm
-    joint.update_clock(PHASE_BOUNDARIES["stairrobust"])
+    joint.update_clock(PHASE_BOUNDARIES["repair"])
     obs, critic_wire = _reset_env(env, agent, config)
 
     low_before = _snapshot_modules(agent)

@@ -30,6 +30,16 @@ from agent_ppo.model.p2_high_level import (
 )
 
 
+P3_CONTRACT_WARM_START_MODES = frozenset(
+    {
+        "p3_radial_warm_start",
+        "p3_stair_memory_warm_start",
+        "p35_parent_selection_warm_start",
+        "p35_previous_run_final_warm_start",
+    }
+)
+
+
 def _validate_resume_phase(raw: dict, global_state: dict, elapsed_s: float) -> str:
     expected = p3_contract.phase_for_elapsed(elapsed_s).name
     saved = raw.get("phase_label")
@@ -815,11 +825,7 @@ class AlgorithmP3StandardJoint:
             return self.load_parent(path, platform_model_id=platform_model_id)
         contracts = raw.get("contracts") or {}
         if contracts.get("p3_standard_joint") != p3_contract.contract():
-            if str(self.config.get("load_mode", "")) in {
-                "p3_radial_warm_start",
-                "p3_stair_memory_warm_start",
-                "p35_parent_selection_warm_start",
-            }:
+            if str(self.config.get("load_mode", "")) in P3_CONTRACT_WARM_START_MODES:
                 return self._load_p3_stair_memory_warm_start(
                     raw, path, platform_model_id=platform_model_id
                 )

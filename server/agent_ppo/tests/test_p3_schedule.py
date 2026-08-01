@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import copy
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -9,6 +10,7 @@ import pytest
 from agent_ppo.algorithm.algorithm_p3_standard_joint import (
     AlgorithmP3HighPPO,
     AlgorithmP3StandardJoint,
+    P3_CONTRACT_WARM_START_MODES,
     _validate_resume_phase,
 )
 from agent_ppo.feature import p2_contract, p3_contract
@@ -31,6 +33,20 @@ from agent_ppo.workflow.p3_standard_joint_workflow import (
 
 def _module():
     return torch.nn.Linear(1, 1)
+
+
+def test_p35_previous_run_final_is_an_explicit_contract_warm_start():
+    assert "p35_previous_run_final_warm_start" in P3_CONTRACT_WARM_START_MODES
+
+
+def test_p35_integrated_smoke_uses_current_repair_phase():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "tools"
+        / "p3_joint_rollout_smoke.py"
+    ).read_text(encoding="utf-8")
+    assert 'PHASE_BOUNDARIES["repair"]' in source
+    assert 'PHASE_BOUNDARIES["stairrobust"]' not in source
 
 
 def test_p3_visual_schedule_enables_expected_low_modules():

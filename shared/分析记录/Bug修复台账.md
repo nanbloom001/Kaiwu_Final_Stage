@@ -3335,3 +3335,20 @@
   P3.5 的显式分组 LR 调度，但防止旧 fixed PPO 入口静默漂移。
 - 实现血缘补录：上述 P3.5 训练、审查修复、合同与回归测试已落在 commit `ee5afc8`；PR、新训练
   task、新 checkpoint、父包文件 SHA256、容器 smoke、平台评估和真机结果仍待产生。
+- 2026-08-02 开发容器更正（状态：代码已修复待容器复测）：真实
+  `model.ckpt-stairfinal-1013548.pkl` 首次 warm-start 暴露配置 `p35_previous_run_final_warm_start`
+  未加入 loader 合同迁移允许列表，因而错误抛出 `P3 exact resume contract mismatch`。现将所有
+  显式 P3 合同 warm-start mode 收敛为常量并补回归；exact resume 的严格合同校验保持不变。
+- 同次容器检查发现 `p3_joint_rollout_smoke.py` 的 integrated 场景仍引用已删除阶段
+  `stairrobust`，会在 Isaac 初始化后以 `KeyError` 退出；现改为当前 `repair` 边界并增加静态回归，
+  避免浪费开发容器启动时间。
+- 开发容器验证补充：模型包通过新的 VSCode Remote 文件协议上传到
+  `agent_ppo/test_artifacts/p3stairmem8h_1013548.zip`，大小 `33824100` bytes，上传 staging 与最终
+  文件均通过 SHA256 `5ef4021d9ab56cee5ffbc2673248dfc50e616795691a413b38ecdcef332f7e80`；未调用
+  RPC 分片上传器。只提取 `model.ckpt-stairfinal-1013548.pkl`，checkpoint SHA256 为
+  `574924419ccd58923ccb5b6b2b29a88464ca2744e06bc888b7c7f5021f75250a`，没有用压缩包内旧源码
+  覆盖当前分支。容器定向回归 `193 passed`；真实父包 smoke 通过 warm-start、冻结 Actor/Critic
+  校准、可训练 LSTM/Actor/Critic+memory 更新、高层 optimizer/digest 冻结及 save/exact-resume。
+  1-env、128 帧 integrated Isaac smoke 启动后显存峰值约 `2.78 GiB`、运行期约 `1.09 GiB`，无
+  OOM；约 4 分钟时平台先返回 `WEBIDE_RECORD_NOT_FOUND`，随后 VSCode Remote WebSocket 也断开，
+  未取得最终结果，因此 Isaac Camera、真实 Push EventManager 与完整 rollout 仍标记待验证。

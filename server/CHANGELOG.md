@@ -31,6 +31,8 @@
   Adapter 在最后低层冻结阶段仍按每 rollout 一次更新，replay 比例随阶段切换为
   `50/25/25 -> 60/25/15 -> 75/15/10`；监控合同健康度改为按真实注册、有限数据和最后更新时间计算。
   父包固定为任务 235689 的最终 `stairfinal-1013548`，SHA256 在真实制品加载后记录。
+  开发容器真实父包 smoke 进一步修复 `p35_previous_run_final_warm_start` 未加入合同迁移允许列表的
+  启动阻断；上一轮 P3 checkpoint 现在走显式 warm-start，而不会误入 exact-resume 合同校验。
 
 - **[P3 楼梯半盲记忆与域随机化八小时恢复]** 新任务
   `p3std8h-stairmem-dr` 从 `p3nav8h-r1_884257-F2` 显式 warm start，保持 57901 低层输入、
