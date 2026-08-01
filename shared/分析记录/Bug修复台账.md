@@ -3333,3 +3333,5 @@
   完整回归还发现通用 `AlgorithmPPO` 的 fixed schedule 守卫被删除，导致 optimizer LR 漂移静默
   通过；现恢复初始化 LR 的前后 update 校验，并使用配置的 adaptive min/max。该通用修复不改变
   P3.5 的显式分组 LR 调度，但防止旧 fixed PPO 入口静默漂移。
+- 实现血缘补录：上述 P3.5 训练、审查修复、合同与回归测试已落在 commit `ee5afc8`；PR、新训练
+  task、新 checkpoint、父包文件 SHA256、容器 smoke、平台评估和真机结果仍待产生。
