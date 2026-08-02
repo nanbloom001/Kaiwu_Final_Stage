@@ -13,7 +13,7 @@ LOW_LEVEL_POLICY_OBS_DIM = 57901
 PROPRIO_SCAN_DIM = 301
 GOAL4_SLICE = slice(301, 305)
 DEPTH_SLICE = slice(305, 57905)
-SESSION_TARGET_SECONDS = 7200.0
+SESSION_TARGET_SECONDS = 28800.0
 P3_WORKER_EXTRA_DIM = 108
 P3_PRIVILEGED_WIRE_DIM = 493
 RUNTIME_TERRAIN_SIZE_INDEX = 0
@@ -76,11 +76,13 @@ class P3Phase:
 
 
 PHASES = (
-    P3Phase("gaitfixcalib", 0.0, 900.0, True, True, False),
-    P3Phase("repair", 900.0, 4500.0, True, True, False),
-    P3Phase("pushwarm", 4500.0, 5400.0, True, True, False),
-    P3Phase("pushfull", 5400.0, 6300.0, True, True, False),
-    P3Phase("stable", 6300.0, SESSION_TARGET_SECONDS, False, True, False),
+    P3Phase("calib", 0.0, 900.0, True, True, False),
+    P3Phase("gaitwarm", 900.0, 2700.0, True, True, False),
+    P3Phase("gaitfull", 2700.0, 7200.0, True, True, False),
+    P3Phase("camfull", 7200.0, 14400.0, True, True, False),
+    P3Phase("pushwarm", 14400.0, 21600.0, True, True, False),
+    P3Phase("pushfull", 21600.0, 27000.0, True, True, False),
+    P3Phase("stable", 27000.0, SESSION_TARGET_SECONDS, True, True, False),
 )
 
 MIRROR_SEQUENCE_SHARE = 0.25
@@ -92,6 +94,8 @@ ACTION_SMOOTH_TARGET_GRADIENT_RATIO = 0.0
 ACTION_RANGE_TARGET_GRADIENT_RATIO = 0.0
 AUXILIARY_MAX_GRADIENT_RATIO = 0.05
 ANCHOR_TARGET_GRADIENT_RATIO = 0.030
+P35_GAIT_RESPONSIBILITY_WEIGHT = 0.035
+P35_LOW_STAIR_GAIT_RESPONSIBILITY_WEIGHT = 0.050
 ACTION_MEAN_SOFT_LIMIT = 5.0
 ACTION_TO_JOINT_SCALE = 0.25
 GAIT_CONTACT_REWARD_CAP = 0.18
@@ -116,7 +120,25 @@ def mirror_training_fraction(elapsed_s: float) -> float:
 def depth_fault_strength(elapsed_s: float) -> float:
     # P3.5 inherits the parent model's final 50% fault mixture. Camera timing,
     # rather than stronger pixel corruption, is the active curriculum.
-    return 0.0 if float(elapsed_s) < 900.0 else 0.5
+    elapsed = float(elapsed_s)
+    if elapsed < 900.0:
+        return 0.0
+    if elapsed < 2700.0:
+        return 0.25
+    return 0.5
+
+
+def p35_reward_training_fraction(elapsed_s: float) -> float:
+    elapsed = max(0.0, float(elapsed_s))
+    if elapsed < 900.0:
+        return 0.0
+    if elapsed < 2700.0:
+        return 0.25 * (elapsed - 900.0) / 1800.0
+    if elapsed < 7200.0:
+        return 0.25 + 0.25 * (elapsed - 2700.0) / 4500.0
+    if elapsed >= 27000.0:
+        return 0.0
+    return 0.50
 
 
 def memory_training_fraction(elapsed_s: float) -> float:
@@ -126,9 +148,9 @@ def memory_training_fraction(elapsed_s: float) -> float:
 def adapter_replay_ratios(elapsed_s: float) -> tuple[float, float, float]:
     """Return latest, recent and parent completed-record replay shares."""
     elapsed = max(0.0, float(elapsed_s))
-    if elapsed < 4500.0:
+    if elapsed < 14400.0:
         return 0.50, 0.25, 0.25
-    if elapsed < 6300.0:
+    if elapsed < 21600.0:
         return 0.60, 0.25, 0.15
     return 0.75, 0.15, 0.10
 
@@ -139,35 +161,70 @@ def adapter_updates_per_low_rollout(elapsed_s: float) -> int:
 
 def camera_delay_probabilities(elapsed_s: float) -> tuple[float, float, float]:
     """Return nominal, 40-100 ms and 100-150 ms active-delay shares."""
-    if float(elapsed_s) < 900.0:
+    elapsed = float(elapsed_s)
+    if elapsed < 900.0:
         return 1.0, 0.0, 0.0
-    if float(elapsed_s) < 4500.0:
-        return 0.70, 0.30, 0.0
+    if elapsed < 2700.0:
+        return 0.80, 0.20, 0.0
+    if elapsed < 7200.0:
+        return 0.70, 0.25, 0.05
     return 0.50, 0.35, 0.15
 
 
-def push_phase_config(elapsed_s: float) -> dict[str, float | bool | str]:
+def push_phase_config(
+    elapsed_s: float,
+    schedule: dict | None = None,
+) -> dict[str, float | bool | str]:
+    smoke = (schedule or {}).get("smoke_test_override")
+    if isinstance(smoke, dict) and bool(smoke.get("enabled", False)):
+        maximum = float(smoke.get("max_velocity_xy_m_s", 0.03))
+        minimum_interval = float(smoke.get("min_interval_s", 0.5))
+        maximum_interval = float(smoke.get("max_interval_s", 1.0))
+        if not (
+            0.0 < maximum <= 0.05
+            and 0.0 < minimum_interval <= maximum_interval <= 4.0
+        ):
+            raise ValueError("P3 smoke Push override is outside its safe bounds")
+        return {
+            "name": "smoke",
+            "active": True,
+            "max_velocity_xy_m_s": maximum,
+            "min_interval_s": minimum_interval,
+            "max_interval_s": maximum_interval,
+        }
+    schedule = schedule or {}
+    warm_minimum = float(schedule.get("warm_min_interval_s", 20.0))
+    warm_maximum = float(schedule.get("warm_max_interval_s", 30.0))
+    full_minimum = float(schedule.get("full_min_interval_s", 17.0))
+    full_maximum = float(schedule.get("full_max_interval_s", 27.0))
+    if not (
+        0.0 < warm_minimum <= warm_maximum < 40.0
+        and 0.0 < full_minimum <= full_maximum < 40.0
+    ):
+        raise ValueError("P3 production Push intervals must fit the 40 s episode")
     elapsed = max(0.0, float(elapsed_s))
-    if elapsed < 4500.0:
+    if elapsed < 14400.0:
         return {
             "name": "disabled",
             "active": False,
             "max_velocity_xy_m_s": 0.0,
-            "min_interval_s": 12.0,
-            "max_interval_s": 18.0,
+            "min_interval_s": warm_minimum,
+            "max_interval_s": warm_maximum,
         }
-    if elapsed < 5400.0:
-        maximum = 0.05
+    if elapsed < 21600.0:
+        maximum = 0.04
         name = "pushwarm"
+        minimum_interval, maximum_interval = warm_minimum, warm_maximum
     else:
-        maximum = 0.08
+        maximum = 0.05
         name = "pushfull"
+        minimum_interval, maximum_interval = full_minimum, full_maximum
     return {
         "name": name,
         "active": True,
         "max_velocity_xy_m_s": maximum,
-        "min_interval_s": 12.0,
-        "max_interval_s": 18.0,
+        "min_interval_s": minimum_interval,
+        "max_interval_s": maximum_interval,
     }
 
 
@@ -217,8 +274,8 @@ def materialize_environment_config(usr_conf: dict, elapsed_s: float) -> dict:
     noise_level = float(config.get("noise_level", 0.35))
     restitution = config.get("restitution_range", [0.0, 0.05])
     push_enabled = bool(config.get("push_robots", True))
-    min_push_interval = float(config.get("min_push_interval_s", 12.0))
-    max_push_interval = float(config.get("push_interval_s", 18.0))
+    min_push_interval = float(config.get("min_push_interval_s", 17.0))
+    max_push_interval = float(config.get("push_interval_s", 30.0))
     if not 0.0 < min_push_interval <= max_push_interval:
         raise ValueError("P3 push interval must be finite, positive, and ordered")
 
@@ -246,7 +303,7 @@ def materialize_environment_config(usr_conf: dict, elapsed_s: float) -> dict:
     }
     result["p3_runtime"] = {
         "phase_index": domain_randomization_index(elapsed_s),
-        "environment_contract": "p35_static_dr_dynamic_push_v1",
+        "environment_contract": "p35_gaitfix8h_static_dr_dynamic_push_v1",
         "base_added_mass_kg": added_mass,
         "push_enabled": push_enabled,
         "push_velocity_m_s": 0.0,
@@ -432,7 +489,12 @@ def joint_episode_success(standard_completed, subgoal_success_count, hard_failur
 
 def contract():
     return {
-        "name": "p35_low_speed_gait_push_v1",
+        "name": "p35_gaitfix8h_v1",
+        "parent": {
+            "model_id": 1013548,
+            "label": "stairfinal",
+            "checkpoint_sha256": "574924419ccd58923ccb5b6b2b29a88464ca2744e06bc888b7c7f5021f75250a",
+        },
         "policy_observation_dim": POLICY_OBS_DIM,
         "low_level_policy_observation_dim": LOW_LEVEL_POLICY_OBS_DIM,
         "high_level_actor_input_dim": 85,
@@ -583,19 +645,34 @@ def contract():
             "teacher_selection": "pixel_fault_or_delivered_feature_age_positive",
         },
         "adapter_replay_schedule": [
-            {"start_s": 0.0, "end_s": 4500.0, "latest_recent_parent": [0.50, 0.25, 0.25]},
-            {"start_s": 4500.0, "end_s": 6300.0, "latest_recent_parent": [0.60, 0.25, 0.15]},
-            {"start_s": 6300.0, "end_s": 7200.0, "latest_recent_parent": [0.75, 0.15, 0.10]},
+            {"start_s": 0.0, "end_s": 14400.0, "latest_recent_parent": [0.50, 0.25, 0.25]},
+            {"start_s": 14400.0, "end_s": 21600.0, "latest_recent_parent": [0.60, 0.25, 0.15]},
+            {"start_s": 21600.0, "end_s": 28800.0, "latest_recent_parent": [0.75, 0.15, 0.10]},
         ],
         "push": {
             "event_term": "push_robot",
             "implementation": "event_manager_public_get_set_wrapper",
-            "warm_start_s": 4500.0,
-            "full_start_s": 5400.0,
-            "interval_s": [12.0, 18.0],
-            "warm_velocity_xy_m_s": 0.05,
-            "full_velocity_xy_m_s": 0.08,
+            "timer_scope": "per_environment_episode",
+            "episode_length_s": 40.0,
+            "warm_start_s": 14400.0,
+            "full_start_s": 21600.0,
+            "warm_interval_s": [20.0, 30.0],
+            "full_interval_s": [17.0, 27.0],
+            "warm_velocity_xy_m_s": 0.04,
+            "full_velocity_xy_m_s": 0.05,
             "post_push_reward_grace_s": 0.40,
+        },
+        "p35_reward": {
+            "baseline_contract": "p35_low_reward_baseline_v3",
+            "course_max_fraction": 0.50,
+            "positive_cap": 0.04,
+            "negative_cap": 0.08,
+            "component_fail_closed": True,
+            "global_fallback_trains": False,
+            "gait_responsibility_weight": P35_GAIT_RESPONSIBILITY_WEIGHT,
+            "low_stair_gait_responsibility_weight": (
+                P35_LOW_STAIR_GAIT_RESPONSIBILITY_WEIGHT
+            ),
         },
         "gait_baseline_continuous_stride": GAIT_BASELINE_CONTINUOUS_STRIDE,
         "gait_baseline": {

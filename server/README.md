@@ -20,39 +20,48 @@
 ## 活动基线
 
 - **当前 P3 功能分支入口**：`P3StandardJointConfig`（`p3_standard_joint`），分支
-  `codex/p35-gaitfix2h`，任务 `p35gaitfix2h`。128 env、25 秒 episode、课程关闭，总计
-  7200 秒；父包固定为上一轮任务 235689 的最终 `stairfinal` checkpoint，模型 ID `1013548`。
-  父包下载加载后必须补录文件 SHA256 和模块 digest。完整 policy observation 仍为 57905，低层输入 57901、
-  Actor77、动作 12、高层输入 85 均不变。
+  `codex/p35-gaitfix8h`，任务 `p35gaitfix8h`。128 env、40 秒 episode、课程关闭，总计
+  28800 秒；父包固定为任务 235689 的 `stairfinal-1013548`，checkpoint SHA256 为
+  `574924419ccd58923ccb5b6b2b29a88464ca2744e06bc888b7c7f5021f75250a`，warm start 前硬校验该文件。
+  不继承专项奖励失效的两小时 P3.5 末尾模型。policy 57905、低层输入 57901、Actor77、动作12、
+  高层输入85及部署接口不变。
 - 仅低层 LSTM、RNN output、最终 action head、Critic 与 ResponseAdapter 更新。低层 CNN、
   Actor body/std、高层 NavigationEncoder/Actor/Critic/SafetyHead 及其 optimizer state 全程冻结，
-  `high_updates=0`。阶段为 `gaitfixcalib(0-15m)`、`repair(15-75m)`、`pushwarm(75-90m)`、
-  `pushfull(90-105m)`、`stable(105-120m)`；最后 15 分钟低层完全冻结、Adapter 使用 `1e-5`。
+  `high_updates=0`。阶段为 `calib(0-15m)`、`gaitwarm(15-45m)`、`gaitfull(45m-2h)`、
+  `camfull(2-4h)`、`pushwarm(4-6h)`、`pushfull(6-7.5h)`、`stable(7.5-8h)`；末30分钟
+  Actor/LSTM冻结、Critic `1e-5`、Adapter `1e-5`。
 - training-only worker wire 为 `critic323 | response+diagnostic62 | p3_extra108 = 493`。新增
   joint-acc12、14 槽 contact force/onset/over-threshold duration、映射有效位和 Push
   event/delta/age/active/telemetry；这些字段不进入 policy、eval、ONNX 或部署。worker wire 拆分后
   立即回填 target/exec command，供 gait baseline、reward、Adapter 与监控使用。
 - 相机训练使用冻结 CNN feature32 的每环境随机 phase 30Hz capture、50Hz hold 和 10 帧 FP16
-  队列。前 15 分钟主动延迟关闭；15-75 分钟为 70% nominal、30% 40-100ms；75 分钟后为
-  50% nominal、35% 40-100ms、15% 100-150ms。150-250ms 只作 shadow；像素故障维持父包末段
-  50% 强度，不继续增加。eval/deploy 不启用人工增强。
+  队列。前15分钟主动延迟关闭；15-45分钟为80% nominal、20% 40-100ms；45分钟至2小时为
+  70/25/5%，2小时后为50/35/15% nominal/40-100/100-150ms。150-250ms只作shadow；像素故障采用
+  25%→50%的保守课程，不继续增加。eval/deploy 不启用人工增强。
 - DR 固定为 friction `[0.65,1.25]`、base mass `+-0.4kg`、restitution `[0,0.05]`、noise
-  `0.35`。EventManager `push_robot` 在进程创建时保留但速度为零；75 分钟后通过公开
-  `get_term_cfg/set_term_cfg/reset` 切到 `+-0.05m/s`，90 分钟后切到 `+-0.08m/s`，间隔
-  12-18 秒。透明 wrapper 调用 Isaac 原 `push_by_setting_velocity` 并记录真实 delta；断点 session
-  时间通过 `env.usr_conf` 传给 worker，75 分钟后的 resume 不重新等待。未修改平台覆盖的
+  `0.35`。EventManager `push_robot` 在进程创建时保留但速度为零；4小时后通过公开
+  `get_term_cfg/set_term_cfg/reset` 切到 `+-0.04m/s,20-30s`，6小时后切到
+  `+-0.05m/s,17-27s`。interval timer 会随每环境 episode reset 重采样；两个生产区间均短于
+  40秒 episode。wrapper 只把 runtime-active 且实际非零的 delta 记录为真实 Push；关闭阶段的
+  零速度 EventTerm 调用不会重置 age 或触发奖励 grace。
+  断点按 session 时间恢复 Push 阶段。未修改平台覆盖的
   `isaac_env/base_env.py`。
-- 前 15 分钟从父策略采集 joint/posture/gait envelope，之后使用正常区间严格为零且有 cap 的真实
+- 前15分钟按base/joint/contact/gait四条独立健康门控采集四地形×运动桶基线；5分钟任一连续类别
+  或映射仍为零、15分钟核心基线未完成时保存 `baselinefault` 并停止。之后使用正常区间严格为零且有cap的真实
   推进、默认姿态、joint acceleration、undesired contact、gait responsibility 与合并姿态项。
-  Push 后 0.4 秒只减半 joint-acc/gait/非关键姿态。Hip/Thigh `17.6/22Nm`、Calf
+  真实 Push 后 0.4 秒只减半 joint-acc/gait/非关键姿态。Hip/Thigh `17.6/22Nm`、Calf
   `34.4/43Nm` 保留低权重平方软约束，不改变仿真 effort limit；强 contact quality/crossing/
   starvation、deterministic smoothing 和 action-range auxiliary 保持 shadow-only。anchor、memory、
   mirror 梯度目标为 3%/1.5%/0.5%，合计硬上限 5%。
+- ContactSensor装配忽略`*_rotor`与foot，只把base、聚合Head及四腿hip/thigh/calf映射到14槽；
+  integrated smoke对joint/contact/gait映射无效硬失败，并用测试专属短周期实际触发非零Push。
+  基线面板中的`eligible_count`是累计环境帧数，`eligible_share`才是除以基线观察环境帧总数后的
+  有效率，二者不得混用。
 - P3 评估使用两个显式入口：`p3_standard_eval`（Standard+Camera，低层-only，obs 57901，
   只加载 `modules.low_level.locomotion_encoder/actor`）与 `p3_track_eval`（Track+Camera，
   完整低层+NavigationEncoder+三轴 Actor+ResponseAdapter，obs 57905）。二者共用
   `p3_standard_joint_eval_candidates` 与 `validate_p3_eval_bundle`，新标签优先级
-  `stable>pushfull>pushwarm>repair>gaitfixcalib`，并兼容 stair-memory/旧 P3 标签；绝不回退
+  `stable>pushfull>pushwarm>camfull>gaitfull>gaitwarm>calib`，并兼容两小时与旧 P3 标签；绝不回退
   P2/LBC/随机权重；
   SafetyHead/Critic/optimizer/训练 buffer 均不创建。
 - 低层恢复命令域与可部署高层保持一致，`vx=[0,1.0]`，不训练高层无法发布的负 `vx`。七桶 wire
@@ -60,8 +69,11 @@
   `vx+wz` 35%、`vx+vy` 10%、pure-yaw 8%、brake/restart 15% 和 zero 7%。所有包含 `vx` 的
   样本共用低/中/高 `0.10-0.35/0.35-0.70/0.70-1.00m/s` 与 55/30/15 分布。
 - 低层步态诊断仍按正/逆坡、正/逆楼梯和运动桶报告接触、滑移、触地、交叉与饥饿，但后三项
-  本轮不进入 PPO。mirror 前 45 分钟仅 shadow，之后目标梯度最多 1%；足端、关节、PD、effort
+  本轮不进入 PPO。mirror 前45分钟仅shadow，之后目标梯度为0.5%；足端、关节、PD、effort
   或 action-scale 映射异常时 mirror 与步态训练项自动归零并告警，主训练不因模型 ID 停止。
+  P35 gait responsibility默认系数为`0.035`；仅正/逆楼梯的低速直行桶使用`0.050`，对应raw单项
+  下限`-0.05`，总P35负cap仍为`-0.08`。joint-acc继续使用非触地P95与onset P99/放宽阈值，未随
+  gait调整。面板单独报告两个低速楼梯桶的逐腿步频、最大/最小比和对角相对失衡。
 
 - **当前功能分支入口**：`P2NavPPOConfig`（`p2_nav_ppo`），任务名 `p2nav2hsafedir`。
   它显式从最新验证通过的完整三轴 `p2nav10hvyavoid2` 包做

@@ -1,6 +1,7 @@
 import pytest
 import torch
 import time
+from types import SimpleNamespace
 
 from agent_ppo.algorithm.algorithm_visual_ppo import _calibrate_auxiliary_gradients
 from agent_ppo.algorithm.algorithm_p3_standard_joint import AlgorithmP3HighPPO
@@ -18,7 +19,10 @@ from agent_ppo.feature.p3_gait import (
     validate_joint_order,
 )
 from agent_ppo.feature.p2_worker_bridge import P2WorkerBridge
-from agent_ppo.feature.reward_process import p3_normalized_torque_excess
+from agent_ppo.feature.reward_process import (
+    p3_normalized_torque_excess,
+    p35_near_hard_torque_barrier,
+)
 from agent_ppo.workflow.p3_standard_joint_workflow import (
     _accumulate_action_bucket,
     _accumulate_command,
@@ -34,6 +38,16 @@ def test_torque_soft_constraint_starts_at_80_percent_and_is_squared():
     hard = torch.tensor([22.0, 22.0, 22.0, 43.0, 43.0])
     excess = p3_normalized_torque_excess(torque, soft, hard)
     assert excess.tolist() == pytest.approx([0.0, 0.25, 1.0, 1.0, 2.25])
+
+
+def test_near_hard_torque_barrier_starts_at_95_percent_without_clipping():
+    hard = torch.tensor([22.0, 43.0])
+    torque = torch.stack((0.95 * hard, 0.975 * hard, hard, 1.10 * hard))
+    barrier = p35_near_hard_torque_barrier(torque, hard)
+    assert barrier[0].tolist() == pytest.approx([0.0, 0.0])
+    assert barrier[1].tolist() == pytest.approx([0.25, 0.25], abs=2.0e-6)
+    assert barrier[2].tolist() == pytest.approx([1.0, 1.0], abs=2.0e-6)
+    assert barrier[3].tolist() == pytest.approx([2.25, 2.25], abs=2.0e-6)
 
 
 def _ready_p35_reward_shaper(num_envs=2):
@@ -96,7 +110,10 @@ def test_p35_reward_shaper_contact_and_push_grace_are_bounded():
         command=torch.zeros(1, 3),
         dones=torch.zeros(1, dtype=torch.bool),
     )
+    normal_raw_contact = normal.last_raw_components["contact"].clone()
     extra[:, p3_contract.SECONDS_SINCE_PUSH_INDEX] = 0.2
+    extra[:, p3_contract.PUSH_RUNTIME_ACTIVE_INDEX] = 1.0
+    extra[:, p3_contract.PUSH_TELEMETRY_VALID_INDEX] = 1.0
     _, grace_components = grace.rewards(
         proprio=proprio,
         aux=aux,
@@ -106,12 +123,71 @@ def test_p35_reward_shaper_contact_and_push_grace_are_bounded():
         dones=torch.zeros(1, dtype=torch.bool),
     )
     assert -0.06 <= float(normal_components["contact"]) < 0.0
-    assert grace_components["contact"] == pytest.approx(
-        normal_components["contact"]
+    assert grace.last_raw_components["contact"] == pytest.approx(
+        normal_raw_contact
     )
-    assert grace_components["joint_acc"] == pytest.approx(
-        0.5 * normal_components["joint_acc"]
+    assert abs(float(sum(grace_components.values()))) <= 0.08 + 1.0e-7
+
+
+def test_p35_push_grace_requires_active_valid_runtime_event():
+    inactive = _ready_p35_reward_shaper(1)
+    active = _ready_p35_reward_shaper(1)
+    proprio = torch.zeros(1, 45)
+    aux = torch.zeros(1, p2_contract.WORKER_AUX_DIM)
+    aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE] = 0.6
+    extra = torch.zeros(1, p3_contract.P3_WORKER_EXTRA_DIM)
+    extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.JOINT_ACCELERATION_SLICE] = 20.0
+    extra[:, p3_contract.SECONDS_SINCE_PUSH_INDEX] = 0.2
+    inactive.rewards(
+        proprio=proprio,
+        aux=aux,
+        next_aux=aux,
+        extra=extra,
+        command=torch.zeros(1, 3),
+        dones=torch.zeros(1, dtype=torch.bool),
     )
+    extra[:, p3_contract.PUSH_RUNTIME_ACTIVE_INDEX] = 1.0
+    extra[:, p3_contract.PUSH_TELEMETRY_VALID_INDEX] = 1.0
+    active.rewards(
+        proprio=proprio,
+        aux=aux,
+        next_aux=aux,
+        extra=extra,
+        command=torch.zeros(1, 3),
+        dones=torch.zeros(1, dtype=torch.bool),
+    )
+    assert float(active.last_raw_components["joint_acc"]) == pytest.approx(
+        0.5 * float(inactive.last_raw_components["joint_acc"])
+    )
+
+
+def test_p35_gait_weight_increases_only_for_low_straight_stairs():
+    shaper = _ready_p35_reward_shaper(4)
+    proprio = torch.zeros(4, 45)
+    aux = torch.zeros(4, p2_contract.WORKER_AUX_DIM)
+    next_aux = aux.clone()
+    next_aux[:, p2_contract.PRE_STEP_TERRAIN_TYPE_INDEX] = torch.tensor(
+        (8.0, 14.0, 0.0, 8.0)
+    )
+    next_aux[:, 3] = torch.tensor((0.15, 0.15, 0.15, 0.40))
+    next_aux[:, p2_contract.GAIT_VALID_INDEX] = 1.0
+    extra = torch.zeros(4, p3_contract.P3_WORKER_EXTRA_DIM)
+    extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.SECONDS_SINCE_PUSH_INDEX] = 10.0
+    command = next_aux[:, 3:6].clone()
+    shaper.rewards(
+        proprio=proprio,
+        aux=aux,
+        next_aux=next_aux,
+        extra=extra,
+        command=command,
+        dones=torch.zeros(4, dtype=torch.bool),
+    )
+    gait = shaper.last_raw_components["gait"]
+    assert gait.tolist() == pytest.approx((-0.05, -0.05, -0.0175, -0.0175))
 
 
 def test_p35_push_wrapper_records_actual_delta_and_switches_public_term():
@@ -159,18 +235,23 @@ def test_p35_push_wrapper_records_actual_delta_and_switches_public_term():
     bridge._p35_push_telemetry_valid = False
     bridge._p35_push_event_count = 0
     bridge._p35_push_phase_name = None
-    bridge._p35_resume_offset_s = 4500.0
+    bridge._p35_resume_offset_s = 14400.0
     bridge._p35_started_monotonic = time.monotonic()
     bridge._p35_install_push_wrapper()
     assert bridge._p35_push_telemetry_valid
+    # The EventManager may invoke the zero-velocity term while the curriculum
+    # is disabled.  Such a physical no-op must not become a training event.
+    cfg.func(bridge.env, torch.tensor([0, 2]), **cfg.params)
+    assert not bool(bridge._p35_push_event_flag.any())
+    assert bridge._p35_push_event_count == 0
+    bridge._p35_update_push_phase()
+    assert bridge._p35_push_runtime_active
     cfg.func(bridge.env, torch.tensor([0, 2]), **cfg.params)
     assert bridge._p35_push_event_flag.tolist() == [True, False, True]
     assert torch.allclose(
         bridge._p35_push_delta[[0, 2]], torch.tensor([[0.03, -0.02], [0.03, -0.02]])
     )
-    bridge._p35_update_push_phase()
-    assert bridge._p35_push_runtime_active
-    assert cfg.params["velocity_range"]["x"] == (-0.05, 0.05)
+    assert cfg.params["velocity_range"]["x"] == (-0.04, 0.04)
     assert manager.reset_count == 1
 
 
@@ -361,8 +442,37 @@ def test_p35_joint_acceleration_uses_normal_foot_touchdown():
     assert touchdown["joint_acc"] == 0.0
 
 
+def test_p35_joint_acceleration_relaxes_calf_columns_for_every_environment():
+    shaper = _ready_p35_reward_shaper(16)
+    proprio = torch.zeros(16, 45)
+    aux = torch.zeros(16, p2_contract.WORKER_AUX_DIM)
+    aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE] = 0.6
+    extra = torch.zeros(16, p3_contract.P3_WORKER_EXTRA_DIM)
+    extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.SECONDS_SINCE_PUSH_INDEX] = 10.0
+    extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE.start] = 1.0
+    joint_acc = extra[:, p3_contract.JOINT_ACCELERATION_SLICE]
+    joint_acc[0, 8] = 17.0
+    joint_acc[1, 4] = 17.0
+
+    _, components = shaper.rewards(
+        proprio=proprio,
+        aux=aux,
+        next_aux=aux,
+        extra=extra,
+        command=torch.zeros(16, 3),
+        dones=torch.zeros(16, dtype=torch.bool),
+    )
+
+    assert components["joint_acc"][0] == 0.0
+    assert components["joint_acc"][1] < 0.0
+
+
 def test_p35_joint_acceleration_baseline_does_not_leak_between_legs():
     shaper = P35LowRewardShaper(128, "cpu")
+    shaper.MIN_CONTINUOUS_SAMPLES = 128
+    shaper.MIN_ONSET_SAMPLES = 128
     proprio = torch.zeros(128, 45)
     aux = torch.zeros(128, p2_contract.WORKER_AUX_DIM)
     extra = torch.zeros(128, p3_contract.P3_WORKER_EXTRA_DIM)
@@ -379,7 +489,7 @@ def test_p35_joint_acceleration_baseline_does_not_leak_between_legs():
     shaper.observe(proprio, aux, extra, healthy)
     shaper.finalize()
 
-    threshold = shaper.thresholds["joint_acc_onset"]
+    threshold = shaper.thresholds[("joint_acc_onset", 0, 0)]
     assert threshold[[0, 4, 8]].tolist() == pytest.approx([20.0, 20.0, 20.0])
     assert threshold[[1, 5, 9]].tolist() == pytest.approx([15.0, 15.0, 15.0])
 
@@ -408,6 +518,77 @@ def test_p35_posture_uses_roll_angle_as_primary_axis():
     assert float(roll_components["posture"]) < float(pitch_components["posture"])
 
 
+def test_p35_component_validity_does_not_couple_progress_to_contact_mapping():
+    shaper = _ready_p35_reward_shaper(1)
+    proprio = torch.zeros(1, 45)
+    aux = torch.zeros(1, p2_contract.WORKER_AUX_DIM)
+    next_aux = aux.clone()
+    next_aux[:, 15] = 0.01
+    extra = torch.zeros(1, p3_contract.P3_WORKER_EXTRA_DIM)
+    extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 0.0
+    reward, components = shaper.rewards(
+        proprio=proprio,
+        aux=aux,
+        next_aux=next_aux,
+        extra=extra,
+        command=torch.tensor([[0.3, 0.0, 0.0]]),
+        dones=torch.zeros(1, dtype=torch.bool),
+        scale=0.5,
+    )
+    assert float(components["progress"]) > 0.0
+    assert components["contact"] == 0.0
+    assert reward == pytest.approx(sum(components.values()))
+
+
+def test_p35_reward_components_sum_exactly_after_global_caps():
+    shaper = _ready_p35_reward_shaper(1)
+    proprio = torch.zeros(1, 45)
+    proprio[:, 9:21] = 5.0
+    aux = torch.zeros(1, p2_contract.WORKER_AUX_DIM)
+    aux[:, 22] = 5.0
+    extra = torch.zeros(1, p3_contract.P3_WORKER_EXTRA_DIM)
+    extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.JOINT_ACCELERATION_SLICE] = 100.0
+    extra[:, p3_contract.CONTACT_FORCE_SLICE] = 100.0
+    extra[:, p3_contract.CONTACT_ONSET_SLICE] = 1.0
+    reward, components = shaper.rewards(
+        proprio=proprio,
+        aux=aux,
+        next_aux=aux,
+        extra=extra,
+        command=torch.zeros(1, 3),
+        dones=torch.zeros(1, dtype=torch.bool),
+    )
+    component_sum = sum(components.values())
+    assert reward == pytest.approx(component_sum)
+    assert -0.08 - 1.0e-7 <= float(reward) <= 0.04 + 1.0e-7
+
+
+def test_p35_stable_shadow_keeps_raw_diagnostics_but_applies_zero():
+    shaper = _ready_p35_reward_shaper(1)
+    proprio = torch.zeros(1, 45)
+    aux = torch.zeros(1, p2_contract.WORKER_AUX_DIM)
+    next_aux = aux.clone()
+    next_aux[:, 15] = 0.02
+    extra = torch.zeros(1, p3_contract.P3_WORKER_EXTRA_DIM)
+    extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 1.0
+    reward, components = shaper.rewards(
+        proprio=proprio,
+        aux=aux,
+        next_aux=next_aux,
+        extra=extra,
+        command=torch.tensor([[0.2, 0.0, 0.0]]),
+        dones=torch.zeros(1, dtype=torch.bool),
+        scale=0.0,
+    )
+    assert float(reward) == 0.0
+    assert all(float(value) == 0.0 for value in components.values())
+    assert float(shaper.last_raw_components["progress"]) > 0.0
+
+
 def test_p3_command_sampler_rejects_enabling_unreachable_reverse_domain():
     with pytest.raises(ValueError, match="reverse_recovery"):
         P3RecoveryCommandSampler(
@@ -429,17 +610,25 @@ def test_p3_contract_records_forward_only_command_and_gait_fallback_semantics():
         "turn_lateral",
     ]
     assert value["gait_baseline"]["fallback_reward_scale"]["global"] == 0.0
+    assert value["p35_reward"]["gait_responsibility_weight"] == 0.035
+    assert value["p35_reward"]["low_stair_gait_responsibility_weight"] == 0.05
     assert [
         (phase["name"], phase["start_s"], phase["end_s"])
         for phase in value["training_schedule"]
     ] == [
-        ("gaitfixcalib", 0.0, 900.0),
-        ("repair", 900.0, 4500.0),
-        ("pushwarm", 4500.0, 5400.0),
-        ("pushfull", 5400.0, 6300.0),
-        ("stable", 6300.0, 7200.0),
+        ("calib", 0.0, 900.0),
+        ("gaitwarm", 900.0, 2700.0),
+        ("gaitfull", 2700.0, 7200.0),
+        ("camfull", 7200.0, 14400.0),
+        ("pushwarm", 14400.0, 21600.0),
+        ("pushfull", 21600.0, 27000.0),
+        ("stable", 27000.0, 28800.0),
     ]
     assert value["high_level_training"] == "disabled_full_session"
+    assert value["push"]["timer_scope"] == "per_environment_episode"
+    assert value["push"]["episode_length_s"] == 40.0
+    assert value["push"]["warm_interval_s"] == [20.0, 30.0]
+    assert value["push"]["full_interval_s"] == [17.0, 27.0]
     assert "short_high_adaptation_preserves" not in value
 
 
@@ -595,13 +784,24 @@ def test_near_clip_stair_completion_rate_joins_terminal_and_clip_bucket():
     aux[:, p2_contract.PRE_STEP_TERRAIN_TYPE_INDEX] = torch.tensor(
         (8.0, 14.0, 0.0, 8.0)
     )
+    aux[1, 15] = 4.0
     near_clip = torch.tensor((0.101, 0.249, 0.120, 0.101))
-    _accumulate_outcomes(accumulator, aux, near_clip)
+    algorithm = SimpleNamespace(
+        m3_proxy_latched=torch.zeros(4, dtype=torch.bool),
+        episode_origin_valid=torch.ones(4, dtype=torch.bool),
+        episode_origin_xy=torch.zeros(4, 2),
+        platform_complete_radius_m=3.9,
+    )
+    _accumulate_outcomes(SimpleNamespace(algorithm=algorithm), accumulator, aux, near_clip)
     metrics = _command_metrics(accumulator)
     assert metrics["near_clip_bin_0_stair_attempt_count"] == 2.0
     assert metrics["near_clip_bin_0_stair_completion_rate"] == pytest.approx(0.5)
     assert metrics["near_clip_bin_9_stair_attempt_count"] == 1.0
-    assert metrics["near_clip_bin_9_stair_completion_rate"] == 0.0
+    assert metrics["near_clip_bin_9_stair_completion_rate"] == 1.0
+    assert metrics["p3_window_completion_rate"] == pytest.approx(0.75)
+    assert metrics["p3_window_raw_completion_rate"] == pytest.approx(0.5)
+    assert metrics["p3_window_hard_after_completion_count"] == 1.0
+    assert metrics["p3_window_true_timeout_count"] == 1.0
 
 
 def test_p3_gait_metrics_exclude_invalid_frames_and_average_impact_per_onset():
@@ -788,6 +988,164 @@ def test_unfinished_gait_baseline_checkpoint_preserves_samples():
     restored.load_state_dict(baseline.state_dict())
     assert restored.sample_counts[key] == 2
     assert torch.equal(restored.samples[key][0], torch.tensor([0.4, 0.5]))
+
+
+def test_unfinished_p35_baseline_checkpoint_preserves_reservoir_and_digest():
+    baseline = P35LowRewardShaper(4, "cpu")
+    proprio = torch.zeros(4, 45)
+    aux = torch.zeros(4, p2_contract.WORKER_AUX_DIM)
+    aux[:, p2_contract.GAIT_VALID_INDEX] = 1.0
+    extra = torch.zeros(4, p3_contract.P3_WORKER_EXTRA_DIM)
+    extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 1.0
+    baseline.observe(proprio, aux, extra, torch.ones(4, dtype=torch.bool))
+    state = baseline.state_dict()
+    restored = P35LowRewardShaper(4, "cpu")
+    restored.load_state_dict(state)
+    key = ("joint_pos", 0, 0)
+    assert restored.sample_counts[key] == baseline.sample_counts[key] == 4
+    assert torch.equal(restored.samples[key][0], baseline.samples[key][0])
+    assert restored.state_dict()["digest"] == state["digest"]
+
+
+def test_p35_onset_events_are_collected_when_continuous_sampling_is_skipped():
+    baseline = P35LowRewardShaper(4, "cpu")
+    proprio = torch.zeros(4, 45)
+    aux = torch.zeros(4, p2_contract.WORKER_AUX_DIM)
+    aux[:, p2_contract.GAIT_VALID_INDEX] = 1.0
+    extra = torch.zeros(4, p3_contract.P3_WORKER_EXTRA_DIM)
+    extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE.start] = 1.0
+
+    baseline.observe(
+        proprio,
+        aux,
+        extra,
+        torch.ones(4, dtype=torch.bool),
+        collect_continuous=False,
+    )
+
+    assert baseline.sample_counts[("joint_pos", 0, 0)] == 0
+    assert baseline.sample_counts[("posture", 0, 0)] == 0
+    assert baseline.sample_counts[("joint_acc_onset", 0, 0)] == 4
+
+
+def test_p35_reservoir_sampling_is_seeded_and_exactly_resumable():
+    key = ("joint_pos", 0, 0)
+    first = torch.arange(50, dtype=torch.float32).unsqueeze(1).repeat(1, 12)
+    second = torch.arange(50, 100, dtype=torch.float32).unsqueeze(1).repeat(1, 12)
+    baseline = P35LowRewardShaper(1, "cpu", seed=71)
+    baseline.MAX_SAMPLES_PER_BUCKET = 8
+    baseline._append(*key, first)
+    state = baseline.state_dict()
+
+    restored = P35LowRewardShaper(1, "cpu", seed=999)
+    restored.MAX_SAMPLES_PER_BUCKET = 8
+    restored.load_state_dict(state)
+    baseline._append(*key, second)
+    restored._append(*key, second)
+
+    expected = baseline._combined(key)
+    actual = restored._combined(key)
+    assert baseline.sample_counts[key] == restored.sample_counts[key] == 8
+    assert baseline.sample_seen_counts[key] == restored.sample_seen_counts[key] == 100
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual[:, 0], torch.arange(8, dtype=torch.float32))
+    assert restored.state_dict()["digest"] == baseline.state_dict()["digest"]
+
+
+def test_p35_baseline_digest_covers_behavioral_resume_state():
+    baseline = P35LowRewardShaper(2, "cpu")
+    baseline.frames_since_onset.fill_(2.0)
+    baseline.onset_ema.fill_(0.25)
+
+    finalized = baseline.state_dict()
+    finalized["finalized"] = True
+    with pytest.raises(ValueError, match="digest mismatch"):
+        P35LowRewardShaper(2, "cpu").load_state_dict(finalized)
+
+    temporal = baseline.state_dict()
+    temporal["frames_since_onset"] = temporal["frames_since_onset"].clone()
+    temporal["frames_since_onset"][0, 0] += 1.0
+    with pytest.raises(ValueError, match="digest mismatch"):
+        P35LowRewardShaper(2, "cpu").load_state_dict(temporal)
+
+    provenance = baseline.state_dict()
+    provenance["threshold_source"] = {"joint_pos|0|0": 1}
+    with pytest.raises(ValueError, match="digest mismatch"):
+        P35LowRewardShaper(2, "cpu").load_state_dict(provenance)
+
+    denominator = baseline.state_dict()
+    denominator["observation_count"] = torch.tensor(1.0)
+    with pytest.raises(ValueError, match="digest mismatch"):
+        P35LowRewardShaper(2, "cpu").load_state_dict(denominator)
+
+
+def test_p35_baseline_diagnostics_separate_eligible_counts_and_shares():
+    shaper = P35LowRewardShaper(4, "cpu")
+    proprio = torch.zeros(4, 45)
+    aux = torch.zeros(4, p2_contract.WORKER_AUX_DIM)
+    extra = torch.zeros(4, p3_contract.P3_WORKER_EXTRA_DIM)
+    extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] = 1.0
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 1.0
+    aux[:, p2_contract.GAIT_VALID_INDEX] = 1.0
+    base = torch.tensor([True, True, False, False])
+    shaper.observe(
+        proprio,
+        aux,
+        extra,
+        base,
+        joint_healthy=torch.tensor([True, False, False, False]),
+        contact_healthy=torch.tensor([True, True, True, False]),
+        gait_healthy=torch.tensor([False, True, False, False]),
+    )
+    metrics = shaper.diagnostics()
+    assert metrics["p35_baseline_observation_count"] == 4.0
+    assert metrics["p35_baseline_eligible_base_count"] == 2.0
+    assert metrics["p35_baseline_eligible_base_share"] == 0.5
+    assert metrics["p35_baseline_eligible_joint_count"] == 1.0
+    assert metrics["p35_baseline_eligible_joint_share"] == 0.25
+    assert metrics["p35_baseline_eligible_contact_count"] == 3.0
+    assert metrics["p35_baseline_eligible_contact_share"] == 0.75
+    assert metrics["p35_baseline_eligible_gait_count"] == 1.0
+    assert metrics["p35_baseline_eligible_gait_share"] == 0.25
+
+    restored = P35LowRewardShaper(4, "cpu")
+    restored.load_state_dict(shaper.state_dict())
+    assert restored.diagnostics() == metrics
+
+
+def test_p35_contact_mapping_uses_canonical_sensor_body_names():
+    bridge = object.__new__(P2WorkerBridge)
+    bridge._p35_contact_slot_ids = None
+    # Exact order printed by the real Isaac ContactSensor in the Kaiwu
+    # development container. Feet and motor rotors must not occupy any of the
+    # P3.5 base/head/hip/thigh/calf reward slots.
+    names = (
+        "base",
+        "FL_hip", "FL_thigh", "FL_calf", "FL_foot",
+        "FL_calf_rotor", "FL_thigh_rotor", "FL_hip_rotor",
+        "FR_hip", "FR_thigh", "FR_calf", "FR_foot",
+        "FR_calf_rotor", "FR_thigh_rotor", "FR_hip_rotor",
+        "Head_upper", "Head_lower",
+        "RL_hip", "RL_thigh", "RL_calf", "RL_foot",
+        "RL_calf_rotor", "RL_thigh_rotor", "RL_hip_rotor",
+        "RR_hip", "RR_thigh", "RR_calf", "RR_foot",
+        "RR_calf_rotor", "RR_thigh_rotor", "RR_hip_rotor",
+    )
+    assert len(names) == 31
+    bridge._gait_window = SimpleNamespace(sensor_body_names=names)
+    slots = bridge._p35_contact_slots()
+    assert bridge._p35_contact_mapping_valid
+    assert len(slots) == 14
+    assert slots == [
+        [0], [15, 16],
+        [1], [2], [3],
+        [8], [9], [10],
+        [17], [18], [19],
+        [24], [25], [26],
+    ]
 
 
 def test_adapter_calibration_skips_high_actor_optimizer_step():

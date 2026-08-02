@@ -29,9 +29,9 @@ def test_low_level_adapter_removes_only_goal4():
 
 def test_p35_adapter_replay_schedule_and_stable_updates():
     assert p3.adapter_replay_ratios(0.0) == (0.50, 0.25, 0.25)
-    assert p3.adapter_replay_ratios(4500.0) == (0.60, 0.25, 0.15)
-    assert p3.adapter_replay_ratios(6300.0) == (0.75, 0.15, 0.10)
-    assert p3.adapter_updates_per_low_rollout(7000.0) == 1
+    assert p3.adapter_replay_ratios(14400.0) == (0.60, 0.25, 0.15)
+    assert p3.adapter_replay_ratios(21600.0) == (0.75, 0.15, 0.10)
+    assert p3.adapter_updates_per_low_rollout(28000.0) == 1
 
 
 def test_subgoals_stay_inside_tile_inner_boundary():
@@ -94,7 +94,7 @@ def test_environment_config_is_identical_across_training_phases():
     assert startup["domain_rand"]["push_interval_s"] == 15.0
     assert startup["domain_rand"]["max_push_vel_xy"] == 0.0
     assert startup["p3_runtime"]["environment_contract"] == (
-        "p35_static_dr_dynamic_push_v1"
+        "p35_gaitfix8h_static_dr_dynamic_push_v1"
     )
 
 
@@ -116,11 +116,17 @@ def test_local_bounds_and_phase_boundaries():
     origin = torch.tensor([[10.0, -5.0], [10.0, -5.0]])
     root = torch.tensor([[13.2, -5.0], [13.2001, -5.0]])
     assert p3.local_out_of_bounds(root, origin).tolist() == [False, True]
-    assert p3.phase_for_elapsed(0).name == "gaitfixcalib"
-    assert p3.phase_for_elapsed(900).name == "repair"
-    assert p3.phase_for_elapsed(4500).name == "pushwarm"
-    assert p3.phase_for_elapsed(5400).name == "pushfull"
-    assert p3.phase_for_elapsed(6300).name == "stable"
+    assert p3.phase_for_elapsed(0).name == "calib"
+    assert p3.phase_for_elapsed(900).name == "gaitwarm"
+    assert p3.phase_for_elapsed(2700).name == "gaitfull"
+    assert p3.phase_for_elapsed(7200).name == "camfull"
+    assert p3.phase_for_elapsed(14400).name == "pushwarm"
+    assert p3.phase_for_elapsed(21600).name == "pushfull"
+    assert p3.phase_for_elapsed(27000).name == "stable"
+    assert p3.p35_reward_training_fraction(899.0) == 0.0
+    assert p3.p35_reward_training_fraction(2700.0) == pytest.approx(0.25)
+    assert p3.p35_reward_training_fraction(7200.0) == pytest.approx(0.50)
+    assert p3.p35_reward_training_fraction(27000.0) == 0.0
     assert p3.action_smooth_training_fraction(899.0) == 0.0
     assert p3.action_smooth_training_fraction(1800.0) == 0.0
     assert p3.action_smooth_training_fraction(3600.0) == 0.0
@@ -313,19 +319,20 @@ def test_p3_production_config_and_monitor_are_standard_specific():
         config = tomllib.load(stream)
     assert config["env"] == {
         "num_envs": 128,
-        "episode_length_s": 25.0,
+        "episode_length_s": 40.0,
         "task": "standard",
     }
     assert config["terrain"]["mode"] == "standard"
     assert config["terrain"]["curriculum"] is False
-    assert config["p3_standard_joint"]["run_name"] == "p35gaitfix2h"
+    assert config["p3_standard_joint"]["run_name"] == "p35gaitfix8h"
+    assert config["p3_standard_joint"]["schedule_mode"] == "p35_gaitfix_v1"
     assert config["domain_rand"]["push_robots"] is True
-    assert config["domain_rand"]["min_push_interval_s"] == 12.0
-    assert config["domain_rand"]["push_interval_s"] == 18.0
+    assert config["domain_rand"]["min_push_interval_s"] == 17.0
+    assert config["domain_rand"]["push_interval_s"] == 30.0
     assert config["p3_standard_joint"]["command_schedule"]["seed"] == p3.P3_COMMAND_SEED
     assert p3.P3_WORKER_EXTRA_DIM == 108
     assert p3.P3_PRIVILEGED_WIRE_DIM == 493
-    assert config["p3_standard_joint"]["target_effective_seconds"] == 7200
+    assert config["p3_standard_joint"]["target_effective_seconds"] == 28800
     assert config["p3_standard_joint"]["num_steps_per_env"] == 128
     assert config["p3_standard_joint"]["tbptt_sequence_length"] == 128
     monitor_source = (root / "conf/monitor_builder.py").read_text()

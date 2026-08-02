@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import copy
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from agent_ppo.algorithm.algorithm_p3_standard_joint import (
     AlgorithmP3HighPPO,
     AlgorithmP3StandardJoint,
     P3_CONTRACT_WARM_START_MODES,
+    _validate_configured_parent_digest,
     _validate_resume_phase,
 )
 from agent_ppo.feature import p2_contract, p3_contract
@@ -25,11 +27,16 @@ from agent_ppo.workflow.p3_standard_joint_workflow import (
     _low_policy_action,
     _monitor_contract_metrics,
     _native_command_epoch,
+    _p35_baseline_gate_reason,
     _run_adapter_updates,
     _storage_bytes,
     _zero_inactive_high_commands,
 )
-from agent_ppo.tools.p3_joint_rollout_smoke import _smoke_num_mini_batches
+from agent_ppo.tools.p3_joint_rollout_smoke import (
+    _assert_p35_runtime_health,
+    _load_config,
+    _smoke_num_mini_batches,
+)
 
 
 def _module():
@@ -38,15 +45,25 @@ def _module():
 
 def test_p35_previous_run_final_is_an_explicit_contract_warm_start():
     assert "p35_previous_run_final_warm_start" in P3_CONTRACT_WARM_START_MODES
+    assert "p35_fixed_parent_warm_start" in P3_CONTRACT_WARM_START_MODES
 
 
-def test_p35_integrated_smoke_uses_current_repair_phase():
+def test_p35_fixed_parent_digest_is_a_hard_gate(tmp_path):
+    artifact = tmp_path / "parent.pkl"
+    artifact.write_bytes(b"fixed-p35-parent")
+    expected = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    assert _validate_configured_parent_digest(str(artifact), expected) == expected
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        _validate_configured_parent_digest(str(artifact), "0" * 64)
+
+
+def test_p35_integrated_smoke_uses_current_gaitwarm_phase():
     source = (
         Path(__file__).resolve().parents[1]
         / "tools"
         / "p3_joint_rollout_smoke.py"
     ).read_text(encoding="utf-8")
-    assert 'PHASE_BOUNDARIES["repair"]' in source
+    assert 'PHASE_BOUNDARIES["gaitwarm"]' in source
     assert 'PHASE_BOUNDARIES["stairrobust"]' not in source
 
 
@@ -60,11 +77,100 @@ def test_p35_monitor_names_avoid_platform_forbidden_periods():
     assert '"P3.5训练侧奖励"' not in source
 
 
+def test_p35_baseline_correctness_gate_rejects_empty_and_invalid_calibration():
+    shaper = SimpleNamespace(
+        sample_count={
+            "joint_pos": 0,
+            "joint_acc_noncontact": 0,
+            "joint_acc_onset": 0,
+            "posture": 0,
+            "frequency": 0,
+        },
+        eligibility={
+            name: torch.tensor(0.0)
+            for name in ("base", "joint", "contact", "gait")
+        },
+        finalized=False,
+        valid=False,
+        component_valid={
+            name: False
+            for name in (
+                "progress", "default_posture", "joint_acc",
+                "contact", "gait", "posture",
+            )
+        },
+    )
+    agent = SimpleNamespace(algorithm=SimpleNamespace(low_reward_shaper=shaper))
+    assert "five_minute_empty_samples" in _p35_baseline_gate_reason(agent, 300.0)
+    shaper.sample_count = {name: 1 for name in shaper.sample_count}
+    shaper.eligibility = {
+        name: torch.tensor(1.0) for name in shaper.eligibility
+    }
+    assert _p35_baseline_gate_reason(agent, 300.0) is None
+    shaper.finalized = True
+    assert "fifteen_minute_invalid_components" in _p35_baseline_gate_reason(
+        agent, 900.0
+    )
+
+
 @pytest.mark.parametrize(
     ("num_envs", "expected"), ((1, 1), (2, 2), (3, 3), (4, 4), (6, 3))
 )
 def test_p35_smoke_uses_a_divisible_minibatch_count(num_envs, expected):
     assert _smoke_num_mini_batches(num_envs, 4) == expected
+
+
+def test_p35_smoke_config_enables_bounded_real_push_only_for_smoke():
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "conf"
+        / "train_env_conf_standard_p3_standard_joint.toml"
+    )
+    config = _load_config(path, 1, True)
+    schedule = config["p3_standard_joint"]["push_schedule"]
+    phase = p3_contract.push_phase_config(900.0, schedule)
+    assert phase == {
+        "name": "smoke",
+        "active": True,
+        "max_velocity_xy_m_s": 0.03,
+        "min_interval_s": 0.5,
+        "max_interval_s": 1.0,
+    }
+    assert p3_contract.push_phase_config(900.0)["active"] is False
+
+
+def test_p35_production_push_intervals_fit_forty_second_episode():
+    disabled = p3_contract.push_phase_config(0.0)
+    warm = p3_contract.push_phase_config(14400.0)
+    full = p3_contract.push_phase_config(21600.0)
+    assert (disabled["min_interval_s"], disabled["max_interval_s"]) == (20.0, 30.0)
+    assert (warm["min_interval_s"], warm["max_interval_s"]) == (20.0, 30.0)
+    assert (full["min_interval_s"], full["max_interval_s"]) == (17.0, 27.0)
+    assert full["max_interval_s"] < 40.0
+
+
+def test_p35_smoke_runtime_health_rejects_invalid_mapping_or_missing_push():
+    extra = torch.ones(2, p3_contract.P3_WORKER_EXTRA_DIM)
+    agent = SimpleNamespace(_p3_extra=extra)
+    healthy = {
+        "gait_sensor_mapping_valid": 1.0,
+        "gait_window_valid": 1.0,
+        "p35_push_telemetry_valid_share": 1.0,
+        "p35_push_runtime_active_share": 1.0,
+        "p35_push_event_count": 1.0,
+        "p35_push_delta_vx_max": 0.02,
+        "p35_push_delta_vy_max": 0.01,
+        "p35_push_config_violation_count": 0.0,
+    }
+    _assert_p35_runtime_health(agent, healthy)
+    invalid_mapping = dict(healthy)
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 0.0
+    with pytest.raises(AssertionError, match="mapping invalid"):
+        _assert_p35_runtime_health(agent, invalid_mapping)
+    extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] = 1.0
+    missing_push = dict(healthy, p35_push_event_count=0.0)
+    with pytest.raises(AssertionError, match="no real Push"):
+        _assert_p35_runtime_health(agent, missing_push)
 
 
 def test_p3_visual_schedule_enables_expected_low_modules():
@@ -85,6 +191,67 @@ def test_p3_visual_schedule_enables_expected_low_modules():
     algorithm._set_trainable_phase("highslow")
     assert not any(parameter.requires_grad for parameter in algorithm.actor_critic.actor.parameters())
     assert not any(parameter.requires_grad for parameter in algorithm.actor_critic.vision_encoder.rnn.parameters())
+
+
+def test_p35_visual_schedule_trains_only_action_head_and_recurrent_path():
+    algorithm = object.__new__(AlgorithmVisualPPO)
+    algorithm.schedule_mode = "p35_gaitfix_v1"
+    actor = torch.nn.Sequential(
+        torch.nn.Linear(1, 2), torch.nn.ELU(), torch.nn.Linear(2, 1)
+    )
+    algorithm.actor_critic = SimpleNamespace(
+        actor=actor,
+        critic=_module(),
+        std=torch.nn.Parameter(torch.ones(1)),
+        vision_encoder=SimpleNamespace(
+            cnn=_module(), rnn=_module(), rnn_output_layer=_module()
+        ),
+    )
+    algorithm._set_trainable_phase("calib")
+    assert not any(parameter.requires_grad for parameter in actor.parameters())
+    assert not any(
+        parameter.requires_grad
+        for parameter in algorithm.actor_critic.vision_encoder.rnn.parameters()
+    )
+    algorithm._set_trainable_phase("gaitwarm")
+    assert not any(parameter.requires_grad for parameter in actor[0].parameters())
+    assert all(parameter.requires_grad for parameter in actor[-1].parameters())
+    assert all(
+        parameter.requires_grad
+        for parameter in algorithm.actor_critic.vision_encoder.rnn.parameters()
+    )
+    assert not any(
+        parameter.requires_grad
+        for parameter in algorithm.actor_critic.vision_encoder.cnn.parameters()
+    )
+    algorithm._set_trainable_phase("stable")
+    assert not any(parameter.requires_grad for parameter in actor.parameters())
+    assert not any(
+        parameter.requires_grad
+        for parameter in algorithm.actor_critic.vision_encoder.rnn.parameters()
+    )
+    assert all(
+        parameter.requires_grad
+        for parameter in algorithm.actor_critic.critic.parameters()
+    )
+
+
+def test_p35_fixed_parent_digest_gate_precedes_stage_type_dispatch(tmp_path):
+    artifact = tmp_path / "parent.pkl"
+    torch.save({"stage_type": "p2_nav_ppo"}, artifact)
+    expected = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    algorithm = object.__new__(AlgorithmP3StandardJoint)
+    algorithm.config = {
+        "load_mode": "p35_fixed_parent_warm_start",
+        "parent_checkpoint_sha256": expected,
+    }
+    algorithm.load_parent = lambda path, platform_model_id: "loaded-parent"
+    assert algorithm.load_checkpoint(
+        str(artifact), platform_model_id="1013548"
+    ) == "loaded-parent"
+    algorithm.config["parent_checkpoint_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="SHA256 mismatch"):
+        algorithm.load_checkpoint(str(artifact), platform_model_id="1013548")
 
 
 def test_visual_ppo_training_mode_keeps_only_frozen_modules_in_eval():
@@ -297,7 +464,7 @@ def test_adapter_update_metrics_distinguish_attempts_applied_and_skipped():
     )
     replay_ratios = []
     agent = SimpleNamespace(
-        algorithm=SimpleNamespace(session_effective_seconds=5000.0),
+        algorithm=SimpleNamespace(session_effective_seconds=15000.0),
         response_aux_buffer=SimpleNamespace(
             set_p3_replay_ratios=lambda *values: replay_ratios.append(values)
         ),
@@ -398,9 +565,9 @@ def test_p3_lifecycle_checkpoint_failure_stops_training():
 
 
 def test_exact_resume_phase_must_match_effective_clock():
-    raw = {"phase_label": "repair"}
-    state = {"compound_schedule_phase": "repair"}
-    assert _validate_resume_phase(raw, state, 1800.0) == "repair"
+    raw = {"phase_label": "gaitwarm"}
+    state = {"compound_schedule_phase": "gaitwarm"}
+    assert _validate_resume_phase(raw, state, 1800.0) == "gaitwarm"
     with pytest.raises(RuntimeError, match="phase/time mismatch"):
         _validate_resume_phase(
             {"phase_label": "stable"},
@@ -501,13 +668,13 @@ def test_stair_memory_schedule_only_changes_adapter_learning_rate():
     algorithm._apply_training_schedule(0.0)
     assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(3.0e-5)
 
-    algorithm._apply_training_schedule(5400.0)
+    algorithm._apply_training_schedule(21600.0)
     assert algorithm.current_phase == "pushfull"
     assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(3.0e-5)
     assert [group["lr"] for group in algorithm.actor_optimizer.param_groups] == actor_lrs
     assert algorithm.critic_optimizer.param_groups[0]["lr"] == critic_lr
 
-    algorithm._apply_training_schedule(6300.0)
+    algorithm._apply_training_schedule(27000.0)
     assert algorithm.current_phase == "stable"
     assert algorithm.response_optimizer.param_groups[0]["lr"] == pytest.approx(2.0e-4)
     assert [group["lr"] for group in algorithm.actor_optimizer.param_groups] == actor_lrs

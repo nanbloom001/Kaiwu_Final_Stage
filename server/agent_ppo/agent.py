@@ -289,7 +289,7 @@ class Agent(BaseAgent):
             optimizer=self.low_level_optimizer,
             sequence_length=int(conf.get("tbptt_sequence_length", 128)),
             schedule_mode=str(conf.get("schedule_mode", "p35_gaitfix_v1")),
-            run_name=str(conf.get("run_name", "p35gaitfix2h")),
+            run_name=str(conf.get("run_name", "p35gaitfix8h")),
             source_parent_model_id=conf.get("parent_model_id"),
             anchor_schedule_hours=[], action_anchor_schedule=None,
             latent_anchor_schedule=None, anchor_phase_labels=None,
@@ -1733,7 +1733,9 @@ class Agent(BaseAgent):
                     "[P3] skip framework bootstrap save id=0 before parent preload"
                 )
                 return
-            phase_label = self.algorithm.current_phase
+            phase_label = getattr(
+                self.algorithm, "checkpoint_label_override", None
+            ) or self.algorithm.current_phase
             p3_path = f"{path}/model.ckpt-{phase_label}-{str(id)}.pkl"
             if not validate_probe_filename(p3_path):
                 raise ValueError(

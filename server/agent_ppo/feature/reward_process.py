@@ -35,6 +35,21 @@ def p3_normalized_torque_excess(
     )
 
 
+def p35_near_hard_torque_barrier(
+    absolute_torque: torch.Tensor,
+    hard_limit: torch.Tensor,
+) -> torch.Tensor:
+    """Steep but bounded cost that starts at 95% of the physical hard line."""
+    return torch.square(
+        torch.clamp(
+            (absolute_torque - 0.95 * hard_limit)
+            / (0.05 * hard_limit).clamp_min(1.0e-6),
+            0.0,
+            1.5,
+        )
+    )
+
+
 class RewardProcess(RewardProcessBase):
     def _p2_goal_geometry(self):
         goal = getattr(self.env, "goal_positions", None)
@@ -380,6 +395,7 @@ class RewardProcess(RewardProcessBase):
         peak_weight: float = 0.02,
         action_rate_weight: float = 0.03,
         action_jerk_weight: float = 0.01,
+        hard_barrier_weight: float = 0.005,
         frame_cap: float = 0.12,
         ema_window_s: float = 0.20,
     ):
@@ -446,6 +462,9 @@ class RewardProcess(RewardProcessBase):
         peak = p3_normalized_torque_excess(
             absolute_torque, soft, hard
         ).mean(dim=1)
+        hard_barrier = p35_near_hard_torque_barrier(
+            absolute_torque, hard
+        ).amax(dim=1)
 
         if (
             torch.is_tensor(current_action)
@@ -488,6 +507,7 @@ class RewardProcess(RewardProcessBase):
             + float(peak_weight) * peak
             + float(action_rate_weight) * rate
             + float(action_jerk_weight) * jerk
+            + float(hard_barrier_weight) * hard_barrier
         )
         return torch.clamp(total, 0.0, float(frame_cap))
 

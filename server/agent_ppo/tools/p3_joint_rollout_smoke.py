@@ -23,10 +23,12 @@ from agent_ppo.workflow.p3_standard_joint_workflow import (
 
 
 PHASE_BOUNDARIES = {
-    "repair": 900.0,
-    "pushwarm": 4500.0,
-    "pushfull": 5400.0,
-    "stable": 6300.0,
+    "gaitwarm": 900.0,
+    "gaitfull": 2700.0,
+    "camfull": 7200.0,
+    "pushwarm": 14400.0,
+    "pushfull": 21600.0,
+    "stable": 27000.0,
 }
 SCENARIOS = (*PHASE_BOUNDARIES, "integrated")
 
@@ -94,6 +96,12 @@ def _load_config(path: Path, num_envs: int, compact_terrain: bool) -> dict:
     # Isaac rollout. Unit tests separately cover the production interval of 2.
     config["p3_standard_joint"]["response_adapter"]["high_update_interval"] = 1
     p3_conf = config["p3_standard_joint"]
+    p3_conf.setdefault("push_schedule", {})["smoke_test_override"] = {
+        "enabled": True,
+        "max_velocity_xy_m_s": 0.03,
+        "min_interval_s": 0.5,
+        "max_interval_s": 1.0,
+    }
     requested_batches = int(p3_conf.get("num_mini_batches", 4))
     p3_conf["num_mini_batches"] = _smoke_num_mini_batches(
         num_envs, requested_batches
@@ -164,10 +172,39 @@ def _module_changes(agent, before) -> dict[str, bool]:
     }
 
 
+def _assert_p35_runtime_health(agent, metrics) -> None:
+    extra = agent._p3_extra
+    mapping_checks = {
+        "joint": extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] > 0.5,
+        "contact": extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] > 0.5,
+    }
+    invalid = [name for name, value in mapping_checks.items() if not bool(value.all())]
+    for name in ("gait_sensor_mapping_valid", "gait_window_valid"):
+        if float(metrics.get(name, 0.0)) <= 0.0:
+            invalid.append(name)
+    if invalid:
+        raise AssertionError(f"P3.5 runtime mapping invalid: {invalid}")
+
+    if float(metrics.get("p35_push_telemetry_valid_share", 0.0)) < 0.99:
+        raise AssertionError("P3.5 Push telemetry is unavailable")
+    if float(metrics.get("p35_push_runtime_active_share", 0.0)) < 0.99:
+        raise AssertionError("P3.5 smoke Push phase did not activate")
+    if float(metrics.get("p35_push_event_count", 0.0)) <= 0.0:
+        raise AssertionError("P3.5 smoke observed no real Push event")
+    maximum = max(
+        float(metrics.get("p35_push_delta_vx_max", 0.0)),
+        float(metrics.get("p35_push_delta_vy_max", 0.0)),
+    )
+    if not 0.0 < maximum <= 0.03001:
+        raise AssertionError(f"P3.5 smoke Push delta is invalid: {maximum}")
+    if float(metrics.get("p35_push_config_violation_count", 0.0)) != 0.0:
+        raise AssertionError("P3.5 smoke Push exceeded its configured bound")
+
+
 def _run_integrated(env, agent, config):
     """Exercise one full 128-frame low PPO + Adapter + memory update."""
     joint = agent.algorithm
-    joint.update_clock(PHASE_BOUNDARIES["repair"])
+    joint.update_clock(PHASE_BOUNDARIES["gaitwarm"])
     obs, critic_wire = _reset_env(env, agent, config)
 
     low_before = _snapshot_modules(agent)
@@ -192,6 +229,7 @@ def _run_integrated(env, agent, config):
         raise AssertionError("stair-memory smoke unexpectedly advanced high_updates")
     if float(low_metrics.get("memory_loss", 0.0)) <= 0.0:
         raise AssertionError(f"memory auxiliary did not run: {low_metrics}")
+    _assert_p35_runtime_health(agent, low_metrics)
     return obs, critic_wire, low_metrics, low_changes
 
 

@@ -48,6 +48,11 @@ P35_REQUIRED_MONITOR_METRICS = (
     "p35_reward_gait",
     "p35_reward_posture",
     "p35_reward_baseline_valid",
+    "p35_baseline_samples_joint_pos",
+    "p35_baseline_samples_joint_acc_noncontact",
+    "p35_baseline_samples_posture",
+    "p35_baseline_samples_frequency",
+    "p35_baseline_eligible_contact_share",
     "p3_low_updates",
     "p3_high_updates",
 )
@@ -316,7 +321,13 @@ def _command_accumulator(device, *, push_limit_m_s: float = 0.0):
         "feedback_true_error": torch.zeros((), device=device),
         "terrain_columns": torch.zeros(20, device=device),
         "terrain_levels": torch.zeros(10, device=device),
+        # Platform-aligned outcomes count a latched/reached 3.9 m proxy as
+        # completion even if the worker later emits a time-limit or fall code.
+        # Preserve the raw worker reason codes as a separate diagnostic.
         "outcomes": torch.zeros(3, device=device),
+        "raw_outcomes": torch.zeros(3, device=device),
+        "timeout_after_completion": torch.zeros((), device=device),
+        "hard_after_completion": torch.zeros((), device=device),
         "near_clip_stair_outcomes": torch.zeros(10, 3, device=device),
         "standard_successes": torch.zeros((), device=device),
         "platform_successes": torch.zeros((), device=device),
@@ -343,6 +354,8 @@ def _command_accumulator(device, *, push_limit_m_s: float = 0.0):
         "gait_bucket_slip": torch.zeros(gait_bucket_count, 4, device=device),
         "gait_bucket_impact": torch.zeros(gait_bucket_count, 4, device=device),
         "gait_bucket_stance": torch.zeros(gait_bucket_count, 4, device=device),
+        "gait_bucket_duty": torch.zeros(gait_bucket_count, 4, device=device),
+        "gait_bucket_frequency": torch.zeros(gait_bucket_count, 4, device=device),
         "command_bucket_count": torch.zeros(7, device=device),
         "command_bucket_clipped": torch.zeros(7, device=device),
         "command_anchor_sum": torch.zeros(7, device=device),
@@ -477,7 +490,14 @@ def _accumulate_command(accumulator, target, exec_command, aux, extra=None):
         ).sum(dim=0)
         push_valid = extra[:, p3_contract.PUSH_TELEMETRY_VALID_INDEX] > 0.5
         push_active = extra[:, p3_contract.PUSH_RUNTIME_ACTIVE_INDEX] > 0.5
-        push_event = (extra[:, p3_contract.PUSH_EVENT_FLAG_INDEX] > 0.5) & push_valid
+        push_delta = extra[:, p3_contract.PUSH_DELTA_VELOCITY_SLICE]
+        push_event = (
+            (extra[:, p3_contract.PUSH_EVENT_FLAG_INDEX] > 0.5)
+            & push_valid
+            & push_active
+            & torch.isfinite(push_delta).all(dim=-1)
+            & (push_delta.abs().amax(dim=-1) > 1.0e-6)
+        )
         accumulator["push_runtime_active"] += push_active.float().sum()
         accumulator["push_telemetry_valid"] += push_valid.float().sum()
         if bool(push_event.any()):
@@ -534,12 +554,19 @@ def _accumulate_command(accumulator, target, exec_command, aux, extra=None):
                  (delta[:, 1] > 0).sum(), (delta[:, 1] < 0).sum())
             ).to(accumulator["push_direction_count"])
         seconds_since = extra[:, p3_contract.SECONDS_SINCE_PUSH_INDEX]
-        finite_age = seconds_since[torch.isfinite(seconds_since)]
+        finite_age = seconds_since[
+            push_valid & push_active & torch.isfinite(seconds_since)
+        ]
         if finite_age.numel():
             accumulator["push_seconds_since_min"] = torch.minimum(
                 accumulator["push_seconds_since_min"], finite_age.min()
             )
-        post = push_valid & (seconds_since >= 0.0) & (seconds_since <= 2.0)
+        post = (
+            push_valid
+            & push_active
+            & (seconds_since >= 0.0)
+            & (seconds_since <= 2.0)
+        )
         if bool(post.any()):
             accumulator["push_post_count"] += post.float().sum()
             accumulator["push_post_roll_peak"] = torch.maximum(
@@ -597,6 +624,8 @@ def _accumulate_command(accumulator, target, exec_command, aux, extra=None):
                 extra[:, p3_contract.GAIT_IMPACT_SPEED_SLICE] * onset_f,
             ),
             ("gait_bucket_stance", extra[:, p3_contract.GAIT_CONTINUOUS_STANCE_SLICE]),
+            ("gait_bucket_duty", aux[:, p2_contract.GAIT_DUTY_SLICE]),
+            ("gait_bucket_frequency", aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE]),
         ):
             accumulator[name].scatter_add_(
                 0,
@@ -615,17 +644,41 @@ def _accumulate_command(accumulator, target, exec_command, aux, extra=None):
     ).to(accumulator["terrain_levels"])
 
 
-def _accumulate_outcomes(accumulator, aux, near_clip_m=None):
+def _accumulate_outcomes(agent, accumulator, aux, near_clip_m=None):
     reset = aux[:, 24] > 0.5
     reason = aux[:, 25].round().long()
     for index, code in enumerate((1, 2, 3)):
-        accumulator["outcomes"][index] += (reset & (reason == code)).float().sum()
+        accumulator["raw_outcomes"][index] += (
+            reset & (reason == code)
+        ).float().sum()
+
+    algorithm = agent.algorithm
+    proxy_complete = algorithm.m3_proxy_latched.clone()
+    origin_valid = algorithm.episode_origin_valid
+    if bool(origin_valid.any()):
+        pose_xy = aux[:, 15:17].to(algorithm.episode_origin_xy)
+        radius = p3_contract.radial_distance(pose_xy, algorithm.episode_origin_xy)
+        proxy_complete |= origin_valid & (
+            radius >= float(algorithm.platform_complete_radius_m)
+        )
+    completed = reset & ((reason == 1) | proxy_complete)
+    failure = reset & (reason == 2) & ~completed
+    timeout = reset & (reason == 3) & ~completed
+    accumulator["outcomes"][0] += completed.float().sum()
+    accumulator["outcomes"][1] += failure.float().sum()
+    accumulator["outcomes"][2] += timeout.float().sum()
+    accumulator["hard_after_completion"] += (
+        reset & (reason == 2) & completed
+    ).float().sum()
+    accumulator["timeout_after_completion"] += (
+        reset & (reason == 3) & completed
+    ).float().sum()
     if torch.is_tensor(near_clip_m) and near_clip_m.shape == reset.shape:
         columns = aux[:, p2_contract.PRE_STEP_TERRAIN_TYPE_INDEX].round().long()
         stairs = (columns >= 8) & (columns < 20)
         bins = torch.floor((near_clip_m.to(aux) - 0.10) / 0.015).long().clamp(0, 9)
-        for index, code in enumerate((1, 2, 3)):
-            selected = reset & stairs & (reason == code)
+        for index, selected in enumerate((completed, failure, timeout)):
+            selected = selected & stairs
             accumulator["near_clip_stair_outcomes"][:, index].scatter_add_(
                 0,
                 bins[selected],
@@ -747,6 +800,41 @@ def _command_metrics(accumulator):
         )
     for index, label in enumerate(("completed", "failure", "timeout")):
         result[f"p3_window_{label}_count"] = accumulator["outcomes"][index]
+    outcome_total = accumulator["outcomes"].sum()
+    outcome_denominator = outcome_total.clamp_min(1.0)
+    result["p3_window_episode_count"] = outcome_total
+    result["p3_window_completion_rate"] = (
+        accumulator["outcomes"][0] / outcome_denominator
+    )
+    result["p3_window_abnormal_rate"] = (
+        accumulator["outcomes"][1] / outcome_denominator
+    )
+    result["p3_window_timeout_rate"] = (
+        accumulator["outcomes"][2] / outcome_denominator
+    )
+    for index, label in enumerate(("completed", "failure", "timeout")):
+        result[f"p3_window_raw_{label}_count"] = accumulator[
+            "raw_outcomes"
+        ][index]
+    raw_total = accumulator["raw_outcomes"].sum()
+    raw_denominator = raw_total.clamp_min(1.0)
+    result["p3_window_raw_episode_count"] = raw_total
+    result["p3_window_raw_completion_rate"] = (
+        accumulator["raw_outcomes"][0] / raw_denominator
+    )
+    result["p3_window_raw_abnormal_rate"] = (
+        accumulator["raw_outcomes"][1] / raw_denominator
+    )
+    result["p3_window_raw_timeout_rate"] = (
+        accumulator["raw_outcomes"][2] / raw_denominator
+    )
+    result["p3_window_true_timeout_count"] = accumulator["outcomes"][2]
+    result["p3_window_timeout_after_completion_count"] = accumulator[
+        "timeout_after_completion"
+    ]
+    result["p3_window_hard_after_completion_count"] = accumulator[
+        "hard_after_completion"
+    ]
     for index in range(10):
         attempts = accumulator["near_clip_stair_outcomes"][index].sum()
         result[f"near_clip_bin_{index}_stair_attempt_count"] = attempts
@@ -843,10 +931,17 @@ def _command_metrics(accumulator):
             result[f"p35_push_delta_{axis}_p95"] = torch.quantile(values, 0.95)
             result[f"p35_push_delta_{axis}_max"] = values.max()
             result[f"p35_push_delta_{axis}_positive_share"] = (delta[:, index] > 0).float().mean()
+    else:
+        for axis in ("vx", "vy"):
+            for statistic in ("p50", "p95", "max", "positive_share"):
+                result[f"p35_push_delta_{axis}_{statistic}"] = count.new_zeros(())
     if accumulator["push_recovery_time_samples"]:
         recovery = torch.cat(accumulator["push_recovery_time_samples"])
         result["p35_push_recovery_time_p50_s"] = torch.quantile(recovery, 0.50)
         result["p35_push_recovery_time_p95_s"] = torch.quantile(recovery, 0.95)
+    else:
+        result["p35_push_recovery_time_p50_s"] = count.new_full((), -1.0)
+        result["p35_push_recovery_time_p95_s"] = count.new_full((), -1.0)
     for index, name in enumerate(("slope", "slope_inv", "stairs", "stairs_inv")):
         result[f"p35_push_terrain_{name}_count"] = accumulator["push_terrain_count"][index]
     for index in range(10):
@@ -872,6 +967,13 @@ def _command_metrics(accumulator):
                 accumulator["gait_bucket_count"][bucket] / gait_bucket_total
             )
             for leg_index, leg in enumerate(("fl", "fr", "rl", "rr")):
+                result[f"p3_{terrain}_{motion}_{leg}_duty_factor"] = (
+                    accumulator["gait_bucket_duty"][bucket, leg_index] / bucket_count
+                )
+                result[f"p3_{terrain}_{motion}_{leg}_step_frequency"] = (
+                    accumulator["gait_bucket_frequency"][bucket, leg_index]
+                    / bucket_count
+                )
                 result[f"p3_{terrain}_{motion}_{leg}_slip_distance"] = (
                     accumulator["gait_bucket_slip"][bucket, leg_index]
                     / accumulator["gait_bucket_slip_count"][bucket, leg_index].clamp_min(1.0)
@@ -883,6 +985,16 @@ def _command_metrics(accumulator):
                 result[f"p3_{terrain}_{motion}_{leg}_stance_s"] = (
                     accumulator["gait_bucket_stance"][bucket, leg_index] / bucket_count
                 )
+            frequency = accumulator["gait_bucket_frequency"][bucket] / bucket_count
+            result[f"p3_{terrain}_{motion}_step_frequency_ratio"] = (
+                frequency.max() / frequency.min().clamp_min(1.0e-6)
+            )
+            diagonal_a = 0.5 * (frequency[0] + frequency[3])
+            diagonal_b = 0.5 * (frequency[1] + frequency[2])
+            result[f"p3_{terrain}_{motion}_diagonal_frequency_relative"] = (
+                (diagonal_a - diagonal_b).abs()
+                / (0.5 * (diagonal_a + diagonal_b)).clamp_min(0.20)
+            )
     keys = tuple(result)
     values = torch.stack([result[key].reshape(()) for key in keys]).detach().cpu().tolist()
     return dict(zip(keys, values))
@@ -901,7 +1013,8 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
         agent.device,
         push_limit_m_s=float(
             p3_contract.push_phase_config(
-                agent.algorithm.session_effective_seconds
+                agent.algorithm.session_effective_seconds,
+                agent.algorithm.config.get("push_schedule") or {},
             )["max_velocity_xy_m_s"]
         ),
     )
@@ -937,6 +1050,11 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
             "progress", "default_posture", "joint_acc", "contact", "gait", "posture"
         )
     }
+    p35_reward_raw_sums = {name: torch.zeros((), device=agent.device) for name in p35_reward_sums}
+    p35_reward_eligible_sums = {
+        name: torch.zeros((), device=agent.device) for name in p35_reward_sums
+    }
+    p35_reward_cap_correction = torch.zeros((), device=agent.device)
     for _ in range(storage.num_transitions_per_env):
         critic_obs, aux = split_p2_transport(critic_wire)
         p0, p1 = nav_contract.POLICY_CMD_SLICE
@@ -1059,6 +1177,7 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
             worker_aux=next_aux,
         )
         _accumulate_outcomes(
+            agent,
             command_accumulator,
             next_aux,
             agent.algorithm.depth_fault.near_clip_m,
@@ -1070,26 +1189,56 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
         )
         hard = dones & ~timeouts
         extra = agent._p3_extra
-        healthy = (
-            (next_aux[:, p2_contract.GAIT_VALID_INDEX] > 0.5)
-            & ~dones
+        base_healthy = (
+            ~dones
             & (next_aux[:, p2_contract.BODY_COLLISION_FORCE_INDEX] < 30.0)
             & (next_aux[:, 21:23].abs().amax(dim=-1) < 0.35)
             & (torch.linalg.vector_norm(next_aux[:, 12:15] - exec_command, dim=-1) < 0.50)
+            & torch.isfinite(next_aux).all(dim=-1)
+            & torch.isfinite(next_obs[:, :45]).all(dim=-1)
         )
+        joint_healthy = base_healthy & (
+            extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] > 0.5
+        ) & torch.isfinite(
+            extra[:, p3_contract.JOINT_ACCELERATION_SLICE]
+        ).all(dim=-1)
+        contact_healthy = base_healthy & (
+            extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] > 0.5
+        ) & torch.isfinite(
+            extra[:, p3_contract.CONTACT_FORCE_SLICE]
+        ).all(dim=-1) & torch.isfinite(
+            extra[:, p3_contract.CONTACT_ONSET_SLICE]
+        ).all(dim=-1) & torch.isfinite(
+            extra[:, p3_contract.CONTACT_OVER_THRESHOLD_DURATION_SLICE]
+        ).all(dim=-1)
+        gait_healthy = base_healthy & (
+            next_aux[:, p2_contract.GAIT_VALID_INDEX] > 0.5
+        ) & torch.isfinite(
+            next_aux[:, p2_contract.GAIT_DUTY_SLICE]
+        ).all(dim=-1) & torch.isfinite(
+            next_aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE]
+        ).all(dim=-1)
         if agent.algorithm.session_effective_seconds < 900.0:
             agent.algorithm.gait_baseline.observe(
                 next_aux,
                 extra,
-                healthy,
+                gait_healthy,
                 collect_continuous=(
                     storage.step % p3_contract.GAIT_BASELINE_CONTINUOUS_STRIDE == 0
                 ),
             )
-            if storage.step % p3_contract.GAIT_BASELINE_CONTINUOUS_STRIDE == 0:
-                agent.algorithm.low_reward_shaper.observe(
-                    proprio, next_aux, extra, healthy
-                )
+            agent.algorithm.low_reward_shaper.observe(
+                next_obs[:, :45],
+                next_aux,
+                extra,
+                base_healthy,
+                joint_healthy=joint_healthy,
+                contact_healthy=contact_healthy,
+                gait_healthy=gait_healthy,
+                collect_continuous=(
+                    storage.step % p3_contract.GAIT_BASELINE_CONTINUOUS_STRIDE == 0
+                ),
+            )
         contact_reward, cross_reward, starvation_reward = (
             agent.algorithm.gait_baseline.rewards(
                 next_aux,
@@ -1103,15 +1252,27 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
             (contact_reward.mean(), cross_reward.mean(), starvation_reward.mean())
         )
         p35_reward, p35_components = agent.algorithm.low_reward_shaper.rewards(
-            proprio=proprio,
+            proprio=next_obs[:, :45],
             aux=aux,
             next_aux=next_aux,
             extra=extra,
             command=exec_command,
             dones=dones,
+            scale=p3_contract.p35_reward_training_fraction(
+                agent.algorithm.session_effective_seconds
+            ),
         )
         for name, values in p35_components.items():
             p35_reward_sums[name] += values.mean()
+            p35_reward_raw_sums[name] += agent.algorithm.low_reward_shaper.last_raw_components[
+                name
+            ].mean()
+            p35_reward_eligible_sums[name] += agent.algorithm.low_reward_shaper.last_eligible[
+                name
+            ].float().mean()
+        p35_reward_cap_correction += (
+            agent.algorithm.low_reward_shaper.last_cap_correction.mean()
+        )
         rewards = rewards + p35_reward
         if train_low:
             transition.rewards = rewards.clone()
@@ -1200,12 +1361,45 @@ def _collect_low_rollout(env, agent, obs, critic_wire, *, train_low):
             },
             "gait_baseline_samples": float(agent.algorithm.gait_baseline.total_samples),
             "p35_reward_baseline_valid": float(agent.algorithm.low_reward_shaper.valid),
+            "p35_reward_scale": float(
+                p3_contract.p35_reward_training_fraction(
+                    agent.algorithm.session_effective_seconds
+                )
+            ),
+            "p35_reward_cap_correction": float(
+                p35_reward_cap_correction / storage.num_transitions_per_env
+            ),
             **{
                 f"p35_reward_{name}": float(
                     value / storage.num_transitions_per_env
                 )
                 for name, value in p35_reward_sums.items()
             },
+            **{
+                f"p35_reward_raw_{name}": float(
+                    value / storage.num_transitions_per_env
+                )
+                for name, value in p35_reward_raw_sums.items()
+            },
+            **{
+                f"p35_reward_eligible_{name}": float(
+                    value / storage.num_transitions_per_env
+                )
+                for name, value in p35_reward_eligible_sums.items()
+            },
+            **{
+                f"p35_baseline_samples_{name}": float(value)
+                for name, value in agent.algorithm.low_reward_shaper.sample_count.items()
+            },
+            **{
+                f"p35_baseline_seen_{name}": float(value)
+                for name, value in agent.algorithm.low_reward_shaper.sample_seen_count.items()
+            },
+            **{
+                f"p35_baseline_component_valid_{name}": float(value)
+                for name, value in agent.algorithm.low_reward_shaper.component_valid.items()
+            },
+            **agent.algorithm.low_reward_shaper.diagnostics(),
             "p3_low_storage_bytes": float(storage_bytes),
             "env_step_time_s": env_step_elapsed,
             **agent.algorithm.depth_fault.diagnostics(),
@@ -1227,7 +1421,8 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
         agent.device,
         push_limit_m_s=float(
             p3_contract.push_phase_config(
-                agent.algorithm.session_effective_seconds
+                agent.algorithm.session_effective_seconds,
+                agent.algorithm.config.get("push_schedule") or {},
             )["max_velocity_xy_m_s"]
         ),
     )
@@ -1300,6 +1495,7 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
                 worker_aux=next_aux,
             )
             _accumulate_outcomes(
+                agent,
                 command_accumulator,
                 next_aux,
                 agent.algorithm.depth_fault.near_clip_m,
@@ -1518,7 +1714,35 @@ def _monitor_contract_metrics(agent, metrics: dict, elapsed_s: float) -> dict[st
         "p35_monitor_metric_with_data_count": float(with_data),
         "p35_monitor_empty_metric_count": float(expected - with_data),
         "p35_monitor_longest_data_age_s": max(ages, default=0.0),
+        "p35_monitor_semantic_health": float(
+            elapsed_s < 900.0 or agent.algorithm.low_reward_shaper.valid
+        ),
     }
+
+
+def _p35_baseline_gate_reason(agent, elapsed_s: float) -> str | None:
+    shaper = agent.algorithm.low_reward_shaper
+    if elapsed_s >= 300.0 and not getattr(agent, "_p35_baseline_5m_gate_passed", False):
+        required_continuous = (
+            "joint_pos", "joint_acc_noncontact", "posture", "frequency"
+        )
+        empty = [
+            name for name in required_continuous
+            if shaper.sample_count.get(name, 0) <= 0
+        ]
+        eligibility_empty = [
+            name for name in ("base", "joint", "contact", "gait")
+            if shaper.eligibility.get(name, 0) <= 0
+        ]
+        if empty or eligibility_empty:
+            return f"five_minute_empty_samples={empty},eligibility={eligibility_empty}"
+        agent._p35_baseline_5m_gate_passed = True
+    if elapsed_s >= 900.0 and shaper.finalized and not shaper.valid:
+        disabled = [
+            name for name, valid in shaper.component_valid.items() if not valid
+        ]
+        return f"fifteen_minute_invalid_components={disabled}"
+    return None
 
 
 def _install_sigterm_handler():
@@ -1578,16 +1802,24 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             now = time.monotonic()
             elapsed = elapsed_before + (now - loop_started)
             changed = agent.algorithm.update_clock(elapsed)
+            baseline_finalized_now = False
             if elapsed >= 900.0 and not agent.algorithm.gait_baseline.finalized:
                 agent.algorithm.gait_baseline.finalize()
+                baseline_finalized_now = True
+            if elapsed >= 900.0 and not agent.algorithm.low_reward_shaper.finalized:
                 agent.algorithm.low_reward_shaper.finalize()
+                baseline_finalized_now = True
+            if baseline_finalized_now:
                 logger.info(
                     "[P35Baseline] "
                     f"valid={int(agent.algorithm.low_reward_shaper.valid)} "
                     f"samples={agent.algorithm.low_reward_shaper.sample_count} "
                     "threshold_ranges="
-                    f"{ {name: [float(value.min()), float(value.max())] for name, value in agent.algorithm.low_reward_shaper.thresholds.items()} } "
-                    f"disabled_rewards={[] if agent.algorithm.low_reward_shaper.valid else ['progress','posture','joint_acc','contact','gait']}"
+                    f"{ {str(name): [float(value.min()), float(value.max())] for name, value in agent.algorithm.low_reward_shaper.thresholds.items()} } "
+                    "component_valid="
+                    f"{agent.algorithm.low_reward_shaper.component_valid} "
+                    "disabled_rewards="
+                    f"{[name for name, valid in agent.algorithm.low_reward_shaper.component_valid.items() if not valid]}"
                 )
             agent.training_elapsed_h = elapsed / 3600.0
             agent.algorithm.current_iteration += 1
@@ -1622,7 +1854,6 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     **agent.algorithm.memory_metrics(),
                 }
             )
-            metrics.update(_monitor_contract_metrics(agent, metrics, elapsed))
             rollout_frames = (
                 p2_contract.NAV_ROLLOUT_TICKS * p2_contract.NAV_PERIOD_FRAMES
                 if collect_high
@@ -1641,7 +1872,9 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             realized = p3_contract.materialize_environment_config(usr_conf, elapsed)
             domain_rand = realized.get("domain_rand", {})
             runtime = realized.get("p3_runtime", {})
-            push_phase = p3_contract.push_phase_config(elapsed)
+            push_phase = p3_contract.push_phase_config(
+                elapsed, conf.get("push_schedule") or {}
+            )
             metrics.update(
                 {
                     "p3_dr_phase": float(runtime.get("phase_index", 0)),
@@ -1658,6 +1891,19 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     "p3_dr_runtime_telemetry_available": 0.0,
                 }
             )
+            metrics.update(_monitor_contract_metrics(agent, metrics, elapsed))
+            baseline_gate_reason = _p35_baseline_gate_reason(agent, elapsed)
+            if baseline_gate_reason is not None:
+                agent.algorithm.p35_diagnostic_stop_reason = baseline_gate_reason
+                agent.algorithm.checkpoint_label_override = "baselinefault"
+                logger.error(
+                    "[P35Baseline] hard_gate=1 reason="
+                    f"{baseline_gate_reason} samples="
+                    f"{agent.algorithm.low_reward_shaper.sample_count} eligibility="
+                    f"{agent.algorithm.low_reward_shaper.eligibility}"
+                )
+                agent.save_model()
+                raise RuntimeError(f"P35 baseline correctness gate failed: {baseline_gate_reason}")
             push_preflight_valid = float(
                 metrics.get("p35_push_telemetry_valid_share", 0.0) > 0.99
             )
@@ -1674,7 +1920,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 logger.info(
                     f"[P3] rollout-boundary phase change {phase_before} -> "
                     f"{agent.algorithm.current_phase}; "
-                    "episode_reset=True; environment_contract=p35_static_dr_dynamic_push_v1"
+                    "episode_reset=True; environment_contract=p35_gaitfix8h_static_dr_dynamic_push_v1"
                 )
                 # Phase boundaries clear recurrent/live state, but platform-owned
                 # physics and EventManager objects remain the startup instances.
@@ -1710,8 +1956,25 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 _monitor_put(monitor, metrics)
                 last_log = now
         agent.save_model()
-    except (KeyboardInterrupt, SystemExit):
-        agent.save_model()
+    except BaseException as exc:
+        if not getattr(agent.algorithm, "p35_diagnostic_stop_reason", None):
+            agent.algorithm.p35_diagnostic_stop_reason = (
+                f"{type(exc).__name__}:{exc}"
+            )
+        if not getattr(agent.algorithm, "checkpoint_label_override", None):
+            agent.algorithm.checkpoint_label_override = "emergency"
+        try:
+            agent.save_model()
+            logger.error(
+                "[P35EmergencySave] saved=1 exception="
+                f"{type(exc).__name__}:{exc}"
+            )
+        except Exception as save_exc:
+            logger.error(
+                "[P35EmergencySave] saved=0 exception="
+                f"{type(exc).__name__}:{exc} save_error="
+                f"{type(save_exc).__name__}:{save_exc}"
+            )
         raise
     finally:
         if hasattr(signal, "SIGTERM") and previous_sigterm is not None:

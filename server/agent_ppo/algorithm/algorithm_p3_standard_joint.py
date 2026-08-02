@@ -36,8 +36,25 @@ P3_CONTRACT_WARM_START_MODES = frozenset(
         "p3_stair_memory_warm_start",
         "p35_parent_selection_warm_start",
         "p35_previous_run_final_warm_start",
+        "p35_fixed_parent_warm_start",
     }
 )
+
+
+def _validate_configured_parent_digest(path: str, expected_sha256: str | None) -> str:
+    """Verify the explicitly selected warm-start artifact when a digest is set."""
+    expected = str(expected_sha256 or "").strip().lower()
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
+    if expected and actual != expected:
+        raise ValueError(
+            "P3 configured parent checkpoint SHA256 mismatch: "
+            f"expected={expected} actual={actual} path={path}"
+        )
+    return actual
 
 
 def _validate_resume_phase(raw: dict, global_state: dict, elapsed_s: float) -> str:
@@ -320,7 +337,9 @@ class AlgorithmP3StandardJoint:
         self.action_smooth_aux = P3ActionSmoothAuxiliary()
         self.low_algorithm.p3_action_smooth_aux = self.action_smooth_aux
         self.low_reward_shaper = P35LowRewardShaper(
-            self.high_algorithm.num_envs, self.high_algorithm.device
+            self.high_algorithm.num_envs,
+            self.high_algorithm.device,
+            seed=int(self.config.get("p35_baseline_seed", 3373)),
         )
         terrain_size_x = float(self.config.get("terrain_size_x_m", 8.0))
         (
@@ -346,11 +365,13 @@ class AlgorithmP3StandardJoint:
         self.low_algorithm._set_trainable_phase(phase.name)
         self.low_algorithm.actor_critic.std.requires_grad_(False)
         low_lrs = {
-            "gaitfixcalib": {"actor": 0.0, "lstm": 0.0, "critic": 3.0e-5},
-            "repair": {"actor": 3.0e-6, "lstm": 1.5e-6, "critic": 3.0e-5},
-            "pushwarm": {"actor": 3.0e-6, "lstm": 1.5e-6, "critic": 3.0e-5},
-            "pushfull": {"actor": 1.5e-6, "lstm": 7.5e-7, "critic": 3.0e-5},
-            "stable": {"actor": 0.0, "lstm": 0.0, "critic": 0.0},
+            "calib": {"actor": 0.0, "lstm": 0.0, "critic": 3.0e-5},
+            "gaitwarm": {"actor": 3.0e-6, "lstm": 1.5e-6, "critic": 3.0e-5},
+            "gaitfull": {"actor": 3.0e-6, "lstm": 1.5e-6, "critic": 3.0e-5},
+            "camfull": {"actor": 2.0e-6, "lstm": 1.0e-6, "critic": 2.0e-5},
+            "pushwarm": {"actor": 1.5e-6, "lstm": 7.5e-7, "critic": 2.0e-5},
+            "pushfull": {"actor": 1.0e-6, "lstm": 5.0e-7, "critic": 1.5e-5},
+            "stable": {"actor": 0.0, "lstm": 0.0, "critic": 1.0e-5},
         }[phase.name]
         for index, group in enumerate(self.low_algorithm.optimizer.param_groups):
             name = str(group.get("name", index))
@@ -821,9 +842,21 @@ class AlgorithmP3StandardJoint:
         raw = torch.load(path, weights_only=False, map_location="cpu")
         if not isinstance(raw, dict):
             raise ValueError("P3 checkpoint must be a mapping")
+        contracts = raw.get("contracts") or {}
+        exact_resume = (
+            raw.get("stage_type") == self.STAGE_TYPE
+            and contracts.get("p3_standard_joint") == p3_contract.contract()
+        )
+        if (
+            not exact_resume
+            and str(self.config.get("load_mode", ""))
+            == "p35_fixed_parent_warm_start"
+        ):
+            _validate_configured_parent_digest(
+                path, self.config.get("parent_checkpoint_sha256")
+            )
         if raw.get("stage_type") != self.STAGE_TYPE:
             return self.load_parent(path, platform_model_id=platform_model_id)
-        contracts = raw.get("contracts") or {}
         if contracts.get("p3_standard_joint") != p3_contract.contract():
             if str(self.config.get("load_mode", "")) in P3_CONTRACT_WARM_START_MODES:
                 return self._load_p3_stair_memory_warm_start(
@@ -984,6 +1017,9 @@ class AlgorithmP3StandardJoint:
                 "platform_boundary_radius_m": self.platform_boundary_radius_m,
             },
             "worker_command_sampler_resume": "seeded_fresh_after_environment_reset",
+            "p35_diagnostic_stop_reason": getattr(
+                self, "p35_diagnostic_stop_reason", None
+            ),
         })
         payload["training_states"]["low_level"].update({
             "frozen": not p3_contract.phase_for_elapsed(self.session_effective_seconds).low_level_trainable,

@@ -4,6 +4,53 @@
 
 ## [未发布]
 
+- **[P3.5低速楼梯gait责任小幅增强]** 一小时曲线中，父模型冻结窗口四腿步频最大/最小比约
+  `1.94`，训练后仍约`2.04-2.05`；同期实际`p35_reward_gait`仅约低层平均奖励的`0.35%`，且
+  cap correction接近0，表明信号偏弱而非总cap截断。仅将正/逆楼梯、`vx<0.20m/s`且无明显
+  `vy/wz`的低速直行桶责任系数由`0.035`提高到`0.050`；其他地形、转向、横移和中高速楼梯
+  保持原系数与focus，P35总负cap仍为`-0.08`。新增正逆低速楼梯逐腿step-frequency、最大/最小比
+  和对角相对失衡面板；joint-acc的非触地/onset分阈值、权重和cap均未改变。
+
+- **[P3.5 八小时基线闭环、相机时序与后期轻 Push]** 从提交 `b247dc6` 建立
+  `codex/p35-gaitfix8h`，任务 `p35gaitfix8h` 固定 warm start
+  `stairfinal-1013548`，并硬校验 checkpoint SHA256
+  `574924419ccd58923ccb5b6b2b29a88464ca2744e06bc888b7c7f5021f75250a`；不继承两小时
+  P3.5 末尾模型。训练扩为28800秒、128 env、40秒 episode；高层、低层 CNN、Actor body/std
+  冻结，只更新低层 LSTM/action head/Critic 与 ResponseAdapter。
+  上一轮 `P35Baseline valid=0` 的根因是所有基线共用
+  `healthy & valid_joint & valid_contact`，单一 contact 映射失败会把 progress/posture/joint/gait
+  样本全部清零；现在拆为 base/joint/contact/gait 独立门控，统一使用同一 post-step obs/aux/extra，
+  contact body 按 canonical name 精确装配。基线合同升级为 `p35_low_reward_baseline_v3`，保存未完成
+  reservoir、逐桶计数、RNG/阈值/digest；5分钟空样本或15分钟核心基线无效会保存带 stop reason 的
+  `baselinefault` 并中止，不再以有限零值显示为健康。
+  七阶段为 `calib/gaitwarm/gaitfull/camfull/pushwarm/pushfull/stable`；P35课程最多50%，stable只保留
+  raw诊断、不加入storage reward；额外奖励
+  每帧限制为 `+0.04/-0.08`，面板同时记录 raw/applied/eligible/cap、分项基线样本/回退/阈值，
+  并使用 episode terminal 分母报告完成、异常和 timeout 率。95% torque hard line 前新增小型陡峭
+  barrier，不硬裁剪楼梯瞬时发力。相机训练覆盖40-150ms并保留50%故障强度；Push在4小时后启用
+  `+-0.04m/s,20-30s`，6小时后为`+-0.05m/s,17-27s`，两档均在40秒episode内保留触发和恢复窗口。
+  关闭阶段EventManager仍可能调用零速度term；wrapper现仅记录runtime-active且实际非零的delta，
+  避免假Push重置age并错误减半步态/姿态/joint-acc奖励。终止面板另拆worker原始reason与平台径向
+  完成口径，已越过3.9m后才发生的time-limit/fall不再污染真正未完成timeout率。training wire、
+  policy/eval/ONNX/部署接口不变，`server/isaac_env/base_env.py` 未修改。
+  独立审查发现内部 `schedule_mode` 曾误改为底层 PPO 不识别的新字符串，会静默冻结所有阶段的
+  Actor/LSTM；现保留已验证内部 key `p35_gaitfix_v1`，仅外部checkpoint合同使用
+  `p35_gaitfix8h_v1`，并增加真实 trainability 回归。固定父包SHA校验也前移到stage分流之前，覆盖
+  P3与非P3父包，同时不对合同一致的exact resume误用父包digest。
+  未提交变更复审进一步修正四项基线闭环：Calf触地加速度的20%放宽改为切joint列而非env行；
+  `joint_acc_onset`改为逐帧采集，只有连续统计按5帧stride降采样；每桶8192条缓存改为带独立seed、
+  total-seen计数和可exact-resume RNG的Algorithm R reservoir，不再永久保留最早样本；baseline digest
+  现覆盖finalized/valid、threshold source、RNG和gait时序状态，字段被篡改或损坏时会硬失败。
+  容器1-env Isaac预检进一步发现ContactSensor同时列出实体腿段与同名`*_rotor`，canonical装配会把
+  rotor误计为第二个hip/thigh/calf并关闭全部contact shaping；现明确排除rotor body，并用容器真实
+  31项body-name顺序（含4个foot、12个rotor和2个Head）及精确14槽索引补回归。integrated smoke
+  增加仅测试配置可启用的`+-0.03m/s,0.5-1.0s` Push override，并把joint/contact/gait映射、真实非零
+  Push事件、delta边界和telemetry设为硬断言；生产4小时/6小时Push时程不变。基线监控将累计
+  eligibility拆为`*_count`和以实际观察环境帧为分母的`*_share`，denominator纳入checkpoint digest，
+  不再把单调累计数显示为有效率。同步开发容器后定向回归84项通过；真实1-env/128-frame integrated
+  smoke捕获2次原生Push（`|delta vx|max=0.0255`、`|delta vy|max=0.0299m/s`），mapping/telemetry有效、
+  配置越界为0，低层PPO/Adapter及save/exact-resume通过且高层/CNN保持冻结。
+
 - **[P3.5 两小时低速楼梯、相机时序与后期 Push]** 新分支
   `codex/p35-gaitfix2h`、任务 `p35gaitfix2h` 将 P3 训练收敛为 7200 秒低层专项修复。
   保持 policy `57905`、低层 `57901/Actor77/action12` 和高层 85 维合同不变；只训练低层

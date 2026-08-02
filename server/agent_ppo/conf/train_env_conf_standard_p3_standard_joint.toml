@@ -1,7 +1,7 @@
-# P3.5 Standard 2-hour low-speed gait, camera timing and late-push repair.
+# P3.5 Standard 8-hour low-speed gait, camera timing and late-push repair.
 [env]
 num_envs = 128
-episode_length_s = 25.0
+episode_length_s = 40.0
 task = "standard"
 [env_conf]
 task_name = "Unitree-Go2-Velocity-Camera"
@@ -38,8 +38,8 @@ friction_range = [0.65, 1.25]
 randomize_base_mass = true
 added_mass_range = [-0.40, 0.40]
 push_robots = true
-push_interval_s = 18.0
-min_push_interval_s = 12.0
+push_interval_s = 30.0
+min_push_interval_s = 17.0
 max_push_vel_xy = 0.0
 restitution_range = [0.0, 0.05]
 [noise]
@@ -71,14 +71,15 @@ max_depth = 5.0
 enabled = false
 
 [p3_standard_joint]
-run_name = "p35gaitfix2h"
+run_name = "p35gaitfix8h"
 schedule_mode = "p35_gaitfix_v1"
 parent_model_id = 1013548
 parent_model_label = "p3stairmem8h-stairfinal-1013548"
 parent_source_task_id = 235689
-load_mode = "p35_previous_run_final_warm_start"
-task_end_hours = 2.0
-target_effective_seconds = 7200
+parent_checkpoint_sha256 = "574924419ccd58923ccb5b6b2b29a88464ca2744e06bc888b7c7f5021f75250a"
+load_mode = "p35_fixed_parent_warm_start"
+task_end_hours = 8.0
+target_effective_seconds = 28800
 max_iterations = 200000
 num_steps_per_env = 128
 tbptt_sequence_length = 128
@@ -95,6 +96,7 @@ log_interval = 5
 mirror_seed = 3197
 depth_fault_seed = 3329
 memory_seed = 3331
+p35_baseline_seed = 3373
 subgoal_seed = 3107
 milestone_success_reward = 1.5
 m3_success_reward = 15.0
@@ -145,8 +147,8 @@ base_added_mass_kg = 0.40
 noise_level = 0.35
 restitution_range = [0.00, 0.05]
 push_robots = true
-min_push_interval_s = 12.0
-push_interval_s = 18.0
+min_push_interval_s = 17.0
+push_interval_s = 30.0
 
 [p3_standard_joint.camera_timing]
 capture_rate_hz = 30.0
@@ -158,12 +160,14 @@ capture_phase_seed = 3361
 
 [p3_standard_joint.push_schedule]
 term_name = "push_robot"
-warm_start_s = 4500.0
-full_start_s = 5400.0
-warm_max_velocity_xy_m_s = 0.05
-full_max_velocity_xy_m_s = 0.08
-min_interval_s = 12.0
-max_interval_s = 18.0
+warm_start_s = 14400.0
+full_start_s = 21600.0
+warm_max_velocity_xy_m_s = 0.04
+full_max_velocity_xy_m_s = 0.05
+warm_min_interval_s = 20.0
+warm_max_interval_s = 30.0
+full_min_interval_s = 17.0
+full_max_interval_s = 27.0
 resume_offset_s = 0.0
 
 [rewards.track_lin_vel_xy]
@@ -193,6 +197,7 @@ sustained_weight = 0.004
 peak_weight = 0.001
 action_rate_weight = 0.001
 action_jerk_weight = 0.0003
+hard_barrier_weight = 0.005
 frame_cap = 0.015
 ema_window_s = 0.35
 [rewards.undesired_contacts]

@@ -304,9 +304,11 @@ def test_stair_memory_schedule_and_checkpoint_labels_are_explicit():
     assert p3_contract.depth_fault_strength(21600.0) == 0.5
     assert p3_contract.mirror_training_fraction(2699.0) == 0.0
     assert p3_contract.mirror_training_fraction(2700.0) == 1.0
-    assert P3_STANDARD_JOINT_PHASE_LABELS[-5:] == (
-        "gaitfixcalib",
-        "repair",
+    assert P3_STANDARD_JOINT_PHASE_LABELS[-7:] == (
+        "calib",
+        "gaitwarm",
+        "gaitfull",
+        "camfull",
         "pushwarm",
         "pushfull",
         "stable",

@@ -20,56 +20,176 @@ JOINT_SIGN = torch.tensor([-1, -1, -1, -1, 1, 1, 1, 1, 1, 1, 1, 1], dtype=torch.
 class P35LowRewardShaper:
     """Parent-envelope P3.5 shaping with fail-closed training signals."""
 
-    CONTRACT = "p35_low_reward_baseline_v2"
-    MAX_SAMPLES = 65536
+    CONTRACT = "p35_low_reward_baseline_v3"
+    MAX_SAMPLES_PER_BUCKET = 8192
+    MIN_CONTINUOUS_SAMPLES = 4096
+    MIN_ONSET_SAMPLES = 512
+    TERRAIN_BUCKETS = 4
+    MOTION_BUCKETS = 4  # low, forward, turn/lateral, brake/zero
+    SAMPLE_NAMES = (
+        "joint_pos",
+        "joint_acc_noncontact",
+        "joint_acc_onset",
+        "posture",
+        "frequency",
+    )
+    COMPONENTS = (
+        "progress",
+        "default_posture",
+        "joint_acc",
+        "contact",
+        "gait",
+        "posture",
+    )
 
-    def __init__(self, num_envs: int, device):
+    def __init__(self, num_envs: int, device, *, seed: int = 3373):
         self.num_envs = int(num_envs)
         self.device = torch.device(device)
+        self.seed = int(seed)
+        self.generator = torch.Generator(device="cpu")
+        self.generator.manual_seed(self.seed)
         self.samples = {
-            name: []
-            for name in ("joint_pos", "joint_acc_noncontact", "joint_acc_onset", "posture", "frequency")
+            (name, terrain, motion): []
+            for name in self.SAMPLE_NAMES
+            for terrain in range(self.TERRAIN_BUCKETS)
+            for motion in range(self.MOTION_BUCKETS)
         }
-        self.sample_count = {name: 0 for name in self.samples}
-        self.thresholds: dict[str, torch.Tensor] = {}
+        self.sample_counts = {key: 0 for key in self.samples}
+        self.sample_count = {name: 0 for name in self.SAMPLE_NAMES}
+        self.sample_seen_counts = {key: 0 for key in self.samples}
+        self.sample_seen_count = {name: 0 for name in self.SAMPLE_NAMES}
+        self.thresholds: dict[tuple[str, int, int] | str, torch.Tensor] = {}
+        self.threshold_source: dict[tuple[str, int, int], int] = {}
+        self.component_valid = {name: False for name in self.COMPONENTS}
+        self.eligibility = {
+            name: torch.zeros((), device=self.device)
+            for name in ("base", "joint", "contact", "gait")
+        }
+        self.observation_count = torch.zeros((), device=self.device)
         self.finalized = False
         self.valid = False
         self.frames_since_onset = torch.zeros(
             self.num_envs, 4, device=self.device
         )
         self.onset_ema = torch.zeros_like(self.frames_since_onset)
+        self.last_raw_components = {
+            name: torch.zeros(self.num_envs, device=self.device)
+            for name in self.COMPONENTS
+        }
+        self.last_cap_correction = torch.zeros(self.num_envs, device=self.device)
+        self.last_eligible = {
+            name: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            for name in self.COMPONENTS
+        }
 
-    def _append(self, name: str, values: torch.Tensor) -> None:
-        remaining = self.MAX_SAMPLES - self.sample_count[name]
-        if remaining <= 0 or values.numel() == 0:
+    @staticmethod
+    def _terrain_bucket(aux: torch.Tensor) -> torch.Tensor:
+        return P3GaitBaseline._terrain_bucket(aux)
+
+    @staticmethod
+    def _motion_bucket(aux: torch.Tensor, extra: torch.Tensor) -> torch.Tensor:
+        result = P3GaitBaseline._motion_bucket(aux, extra)
+        command_bucket = extra[:, p3_contract.COMMAND_BUCKET_INDEX].round().long()
+        result[(command_bucket == 5) | (command_bucket == 6)] = 3
+        return result
+
+    def _append(
+        self,
+        name: str,
+        terrain: int,
+        motion: int,
+        values: torch.Tensor,
+    ) -> None:
+        key = (name, terrain, motion)
+        if values.ndim < 2 or values.shape[0] == 0:
             return
-        selected = values.detach()[:remaining].to(self.device)
-        self.samples[name].append(selected)
-        self.sample_count[name] += selected.shape[0]
+        incoming = values.detach().float().cpu()
+        rows = int(incoming.shape[0])
+        seen_before = self.sample_seen_counts[key]
+        self.sample_seen_counts[key] += rows
+        self.sample_seen_count[name] += rows
+
+        reservoir = self._combined(key)
+        if reservoir.numel() == 0:
+            reservoir = incoming[:0]
+        fill = min(self.MAX_SAMPLES_PER_BUCKET - reservoir.shape[0], rows)
+        if fill > 0:
+            reservoir = torch.cat((reservoir, incoming[:fill]), dim=0)
+
+        remaining = incoming[fill:]
+        if remaining.shape[0] > 0:
+            # Batched Algorithm R. Each row draws from the number of rows seen
+            # before it; duplicate slots are applied in order so the last draw
+            # has the same result as the scalar reservoir algorithm.
+            prior_seen = seen_before + fill
+            denominators = torch.arange(
+                prior_seen + 1,
+                prior_seen + remaining.shape[0] + 1,
+                dtype=torch.float64,
+            )
+            slots = torch.floor(
+                torch.rand(
+                    remaining.shape[0],
+                    generator=self.generator,
+                    dtype=torch.float64,
+                )
+                * denominators
+            ).long()
+            replacements = torch.nonzero(
+                slots < self.MAX_SAMPLES_PER_BUCKET, as_tuple=False
+            ).flatten()
+            for row_index in replacements.tolist():
+                reservoir[slots[row_index]] = remaining[row_index]
+
+        self.samples[key] = [reservoir]
+        retained = int(reservoir.shape[0])
+        delta = retained - self.sample_counts[key]
+        self.sample_counts[key] = retained
+        self.sample_count[name] += delta
 
     def observe(
         self,
         proprio: torch.Tensor,
         aux: torch.Tensor,
         extra: torch.Tensor,
-        healthy: torch.Tensor,
+        base_healthy: torch.Tensor,
+        *,
+        joint_healthy: torch.Tensor | None = None,
+        contact_healthy: torch.Tensor | None = None,
+        gait_healthy: torch.Tensor | None = None,
+        collect_continuous: bool = True,
     ) -> None:
-        if self.finalized or not bool(healthy.any()):
+        if self.finalized:
             return
         valid_joint = extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] > 0.5
         valid_contact = extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] > 0.5
-        selected = healthy & valid_joint & valid_contact
-        if not bool(selected.any()):
-            return
+        gait_valid = aux[:, p2_contract.GAIT_VALID_INDEX] > 0.5
+        joint_healthy = (
+            base_healthy & valid_joint
+            if joint_healthy is None
+            else joint_healthy & valid_joint
+        )
+        contact_healthy = (
+            base_healthy & valid_contact
+            if contact_healthy is None
+            else contact_healthy & valid_contact
+        )
+        gait_healthy = (
+            base_healthy & gait_valid
+            if gait_healthy is None
+            else gait_healthy & gait_valid
+        )
+        self.observation_count += base_healthy.numel()
+        self.eligibility["base"] += base_healthy.sum()
+        self.eligibility["joint"] += joint_healthy.sum()
+        self.eligibility["contact"] += contact_healthy.sum()
+        self.eligibility["gait"] += gait_healthy.sum()
+        terrain_bucket = self._terrain_bucket(aux)
+        motion_bucket = self._motion_bucket(aux, extra)
         joint_acc = extra[:, p3_contract.JOINT_ACCELERATION_SLICE].abs()
         foot_onset = extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE] > 0.5
         joint_onset = foot_onset.repeat(1, 3)
-        noncontact_rows = selected & ~joint_onset.any(dim=-1)
-        onset_rows = selected & joint_onset.any(dim=-1)
-        self._append("joint_pos", proprio[selected, 9:21].abs())
-        self._append("joint_acc_noncontact", joint_acc[noncontact_rows])
         onset_acc = joint_acc.masked_fill(~joint_onset, float("nan"))
-        self._append("joint_acc_onset", onset_acc[onset_rows])
         posture = torch.stack(
             (
                 aux[:, 22].abs(),
@@ -79,38 +199,176 @@ class P35LowRewardShaper:
             ),
             dim=-1,
         )
-        self._append("posture", posture[selected])
-        self._append("frequency", aux[selected, p2_contract.GAIT_STEP_FREQUENCY_SLICE])
+        for terrain in range(self.TERRAIN_BUCKETS):
+            for motion in range(self.MOTION_BUCKETS):
+                bucket = (terrain_bucket == terrain) & (motion_bucket == motion)
+                base_rows = base_healthy & bucket
+                joint_rows = joint_healthy & bucket
+                gait_rows = gait_healthy & bucket & (motion < 3)
+                noncontact_rows = joint_rows & ~joint_onset.any(dim=-1)
+                onset_rows = joint_rows & joint_onset.any(dim=-1)
+                if collect_continuous:
+                    self._append(
+                        "joint_pos", terrain, motion, proprio[base_rows, 9:21].abs()
+                    )
+                    self._append(
+                        "joint_acc_noncontact", terrain, motion, joint_acc[noncontact_rows]
+                    )
+                self._append("joint_acc_onset", terrain, motion, onset_acc[onset_rows])
+                if collect_continuous:
+                    self._append("posture", terrain, motion, posture[base_rows])
+                    self._append(
+                        "frequency",
+                        terrain,
+                        motion,
+                        aux[gait_rows, p2_contract.GAIT_STEP_FREQUENCY_SLICE],
+                    )
+
+    def _combined(self, key: tuple[str, int, int]) -> torch.Tensor:
+        parts = self.samples.get(key, [])
+        if not parts:
+            return torch.empty(0)
+        if len(parts) == 1:
+            return parts[0]
+        return torch.cat(parts, dim=0)
+
+    def _select_threshold_values(
+        self, name: str, terrain: int, motion: int, minimum: int
+    ) -> tuple[torch.Tensor | None, int]:
+        exact = self._combined((name, terrain, motion))
+        if exact.shape[0] >= minimum:
+            return exact, 0
+        terrain_parts = [
+            self._combined((name, terrain, candidate))
+            for candidate in range(self.MOTION_BUCKETS)
+        ]
+        terrain_parts = [value for value in terrain_parts if value.shape[0] > 0]
+        terrain_values = torch.cat(terrain_parts, dim=0) if terrain_parts else torch.empty(0)
+        if terrain_values.shape[0] >= minimum:
+            return terrain_values, 1
+        return None, 3
 
     def finalize(self) -> None:
         if self.finalized:
             return
-        required = ("joint_pos", "joint_acc_noncontact", "posture", "frequency")
-        self.valid = all(self.sample_count[name] >= 128 for name in required)
-        if self.valid:
-            for name in required:
-                values = torch.cat(self.samples[name], dim=0).float()
-                quantile = 0.99 if name == "joint_pos" else (0.05 if name == "frequency" else 0.95)
-                self.thresholds[name] = torch.quantile(values, quantile, dim=0)
-            if self.sample_count["joint_acc_onset"] >= 128:
-                onset = torch.cat(self.samples["joint_acc_onset"], dim=0).float()
-                fallback = 1.5 * self.thresholds["joint_acc_noncontact"]
-                values = []
-                for joint_index in range(onset.shape[-1]):
-                    joint_values = onset[:, joint_index]
-                    joint_values = joint_values[torch.isfinite(joint_values)]
-                    values.append(
-                        torch.quantile(joint_values, 0.99)
-                        if joint_values.numel() >= 32
-                        else fallback[joint_index]
+        quantiles = {
+            "joint_pos": 0.99,
+            "joint_acc_noncontact": 0.95,
+            "joint_acc_onset": 0.99,
+            "posture": 0.95,
+            "frequency": 0.05,
+        }
+        for terrain in range(self.TERRAIN_BUCKETS):
+            for motion in range(self.MOTION_BUCKETS):
+                for name in self.SAMPLE_NAMES:
+                    if name == "frequency" and motion == 3:
+                        continue
+                    minimum = (
+                        self.MIN_ONSET_SAMPLES
+                        if name == "joint_acc_onset"
+                        else self.MIN_CONTINUOUS_SAMPLES
                     )
-                self.thresholds["joint_acc_onset"] = torch.stack(values)
-            else:
-                self.thresholds["joint_acc_onset"] = 1.5 * self.thresholds[
-                    "joint_acc_noncontact"
-                ]
-        self.samples = {name: [] for name in self.samples}
+                    values, source = self._select_threshold_values(
+                        name, terrain, motion, minimum
+                    )
+                    key = (name, terrain, motion)
+                    if values is not None:
+                        finite = torch.isfinite(values)
+                        safe = torch.where(finite, values, float("nan"))
+                        columns = []
+                        for column in range(safe.shape[-1]):
+                            column_values = safe[:, column]
+                            column_values = column_values[torch.isfinite(column_values)]
+                            if column_values.numel() >= max(32, minimum // 8):
+                                columns.append(torch.quantile(column_values, quantiles[name]))
+                            elif name == "joint_acc_onset":
+                                fallback = self.thresholds.get(
+                                    ("joint_acc_noncontact", terrain, motion)
+                                )
+                                columns.append(
+                                    1.5 * fallback[column]
+                                    if fallback is not None
+                                    else torch.tensor(float("nan"))
+                                )
+                            else:
+                                columns.append(torch.tensor(float("nan")))
+                        threshold = torch.stack(columns)
+                        if bool(torch.isfinite(threshold).all()):
+                            self.thresholds[key] = threshold
+                            self.threshold_source[key] = source
+                onset_key = ("joint_acc_onset", terrain, motion)
+                noncontact_key = ("joint_acc_noncontact", terrain, motion)
+                if motion < self.MOTION_BUCKETS and onset_key not in self.thresholds:
+                    fallback = self.thresholds.get(noncontact_key)
+                    if fallback is not None:
+                        self.thresholds[onset_key] = 1.5 * fallback
+                        self.threshold_source[onset_key] = self.threshold_source.get(
+                            noncontact_key, 1
+                        )
+        active = [
+            (terrain, motion)
+            for terrain in range(self.TERRAIN_BUCKETS)
+            for motion in range(3)
+        ]
+        all_motion = [
+            (terrain, motion)
+            for terrain in range(self.TERRAIN_BUCKETS)
+            for motion in range(self.MOTION_BUCKETS)
+        ]
+        self.component_valid.update(
+            progress=True,
+            default_posture=all(
+                ("joint_pos", terrain, motion) in self.thresholds
+                for terrain, motion in all_motion
+            ),
+            joint_acc=all(
+                ("joint_acc_noncontact", terrain, motion) in self.thresholds
+                and ("joint_acc_onset", terrain, motion) in self.thresholds
+                for terrain, motion in all_motion
+            ),
+            contact=bool(self.eligibility["contact"] > 0),
+            gait=all(
+                ("frequency", terrain, motion) in self.thresholds
+                for terrain, motion in active
+            ),
+            posture=all(
+                ("posture", terrain, motion) in self.thresholds
+                for terrain, motion in all_motion
+            ),
+        )
+        self.valid = all(self.component_valid.values())
+        self.samples = {key: [] for key in self.samples}
         self.finalized = True
+
+    def _threshold(
+        self, name: str, aux: torch.Tensor, extra: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Keep old fixture/checkpoint construction readable for local tests.
+        legacy = self.thresholds.get(name)
+        if legacy is not None:
+            return legacy.to(aux).expand(aux.shape[0], -1), torch.ones(
+                aux.shape[0], dtype=torch.bool, device=aux.device
+            )
+        terrain = self._terrain_bucket(aux)
+        motion = self._motion_bucket(aux, extra)
+        width = 12 if name.startswith("joint") else 4
+        result = torch.zeros(aux.shape[0], width, device=aux.device, dtype=aux.dtype)
+        valid = torch.zeros(aux.shape[0], dtype=torch.bool, device=aux.device)
+        for terrain_index in range(self.TERRAIN_BUCKETS):
+            for motion_index in range(self.MOTION_BUCKETS):
+                selected = (terrain == terrain_index) & (motion == motion_index)
+                value = self.thresholds.get((name, terrain_index, motion_index))
+                if value is not None and bool(selected.any()):
+                    result[selected] = value.to(result)
+                    valid[selected] = True
+        return result, valid
+
+    def _component_ready(self, name: str) -> bool:
+        if self.component_valid.get(name, False):
+            return True
+        return bool(self.valid and all(key in self.thresholds for key in (
+            "joint_pos", "joint_acc_noncontact", "joint_acc_onset", "posture", "frequency"
+        )))
 
     @staticmethod
     def _huber_excess(excess: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
@@ -130,23 +388,26 @@ class P35LowRewardShaper:
         extra: torch.Tensor,
         command: torch.Tensor,
         dones: torch.Tensor,
+        scale: float = 1.0,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         zero = command.new_zeros(command.shape[0])
-        if not self.finalized or not self.valid:
-            return zero, {
-                name: zero.clone()
-                for name in ("progress", "default_posture", "joint_acc", "contact", "gait", "posture")
+        if not self.finalized:
+            components = {name: zero.clone() for name in self.COMPONENTS}
+            self.last_raw_components = {name: value.clone() for name, value in components.items()}
+            self.last_eligible = {
+                name: torch.zeros_like(value, dtype=torch.bool)
+                for name, value in components.items()
             }
+            self.last_cap_correction = zero.clone()
+            return zero, components
         joint_valid = extra[:, p3_contract.JOINT_ACCELERATION_MAPPING_VALID_INDEX] > 0.5
         contact_valid = extra[:, p3_contract.CONTACT_REWARD_MAPPING_VALID_INDEX] > 0.5
-        finite = (
-            torch.isfinite(extra).all(dim=-1)
-            & torch.isfinite(aux).all(dim=-1)
+        base_finite = (
+            torch.isfinite(aux).all(dim=-1)
             & torch.isfinite(next_aux).all(dim=-1)
-            & torch.isfinite(proprio).all(dim=-1)
             & torch.isfinite(command).all(dim=-1)
         )
-        valid = joint_valid & contact_valid & finite
+        proprio_finite = torch.isfinite(proprio).all(dim=-1)
         moving = command[:, :2].norm(dim=-1) > 0.05
         yaw = aux[:, 17]
         world_command = torch.stack(
@@ -161,9 +422,13 @@ class P35LowRewardShaper:
         posture_ok = aux[:, 21:23].abs().amax(dim=-1) < 0.50
         progress = 0.15 * (velocity * direction).sum(dim=-1)
         progress = torch.clamp(progress, -0.15, 0.15)
-        progress = torch.where(valid & moving & posture_ok & ~dones, progress, zero)
+        progress_valid = base_finite & moving & posture_ok & ~dones
+        progress = torch.where(progress_valid, progress, zero)
 
-        joint_limit = 1.10 * self.thresholds["joint_pos"].clamp_min(1.0e-4)
+        joint_threshold, joint_position_bucket_valid = self._threshold(
+            "joint_pos", next_aux, extra
+        )
+        joint_limit = 1.10 * joint_threshold.clamp_min(1.0e-4)
         joint_excess = torch.relu(proprio[:, 9:21].abs() - joint_limit) / joint_limit
         default_posture = -self._huber_excess(joint_excess).mean(dim=-1)
         default_posture *= torch.where(moving, 0.60, 1.0)
@@ -172,12 +437,18 @@ class P35LowRewardShaper:
         joint_acc = extra[:, p3_contract.JOINT_ACCELERATION_SLICE].abs()
         foot_onset = extra[:, p3_contract.GAIT_CONTACT_ONSET_SLICE] > 0.5
         joint_onset = foot_onset.repeat(1, 3)
-        noncontact_limit = 1.10 * self.thresholds["joint_acc_noncontact"].clamp_min(1.0)
+        noncontact_threshold, joint_acc_bucket_valid = self._threshold(
+            "joint_acc_noncontact", next_aux, extra
+        )
+        onset_threshold, joint_onset_bucket_valid = self._threshold(
+            "joint_acc_onset", next_aux, extra
+        )
+        noncontact_limit = 1.10 * noncontact_threshold.clamp_min(1.0)
         onset_limit = torch.maximum(
-            self.thresholds["joint_acc_onset"], 1.5 * self.thresholds["joint_acc_noncontact"]
+            onset_threshold, 1.5 * noncontact_threshold
         )
         onset_limit = onset_limit.clone()
-        onset_limit[8:12] *= 1.20
+        onset_limit[:, 8:12] *= 1.20
         acceleration_limit = torch.where(joint_onset, onset_limit, noncontact_limit)
         acceleration_excess = torch.relu(joint_acc - acceleration_limit) / acceleration_limit
         joint_acc_reward = -acceleration_excess.square().mean(dim=-1).clamp(max=0.08)
@@ -212,39 +483,72 @@ class P35LowRewardShaper:
         )
         alpha = p2_contract.CONTROL_DT_S / 1.5
         self.onset_ema.mul_(1.0 - alpha).add_(foot_onset.to(command) * alpha)
-        frequency_floor = self.thresholds["frequency"].clamp_min(0.05)
-        observed_frequency = aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE]
+        frequency_threshold, frequency_bucket_valid = self._threshold(
+            "frequency", next_aux, extra
+        )
+        frequency_floor = frequency_threshold.clamp_min(0.05)
+        observed_frequency = next_aux[:, p2_contract.GAIT_STEP_FREQUENCY_SLICE]
         frequency_deficit = torch.relu(frequency_floor - observed_frequency) / frequency_floor
         prolonged = torch.relu(self.frames_since_onset * p2_contract.CONTROL_DT_S - 1.0) / 0.5
         diagonal = (self.onset_ema[:, [0, 3]] - self.onset_ema[:, [1, 2]]).abs().mean(dim=-1)
         turn_scale = (1.0 - 0.5 * (command[:, 1].abs() + command[:, 2].abs()).clamp(0.0, 1.0))
-        gait_reward = -0.035 * torch.maximum(
+        gait_excess = torch.maximum(
             torch.maximum(frequency_deficit.amax(dim=-1), prolonged.amax(dim=-1).clamp(max=1.0)),
             diagonal.clamp(max=1.0),
-        ) * turn_scale
+        )
+        terrain = self._terrain_bucket(next_aux)
+        motion = self._motion_bucket(next_aux, extra)
+        low_straight_stairs = (terrain >= 2) & (motion == 0)
+        gait_weight = torch.where(
+            low_straight_stairs,
+            p3_contract.P35_LOW_STAIR_GAIT_RESPONSIBILITY_WEIGHT,
+            p3_contract.P35_GAIT_RESPONSIBILITY_WEIGHT,
+        )
+        gait_reward = -gait_weight * gait_excess * turn_scale
+        gait_focus = torch.where(
+            low_straight_stairs,
+            1.0,
+            torch.where(
+                ((terrain < 2) & (motion == 0)) | ((terrain >= 2) & (motion == 1)),
+                0.5,
+                torch.where(motion == 2, 0.25, 0.0),
+            ),
+        )
+        gait_reward *= gait_focus
 
         posture_values = torch.stack(
             (
-                aux[:, 22].abs(),
-                aux[:, 18].abs(),
-                aux[:, 19].abs(),
-                aux[:, 21].abs(),
+                next_aux[:, 22].abs(),
+                next_aux[:, 18].abs(),
+                next_aux[:, 19].abs(),
+                next_aux[:, 21].abs(),
             ),
             dim=-1,
         )
-        posture_limit = self.thresholds["posture"].clamp_min(1.0e-3)
+        posture_threshold, posture_bucket_valid = self._threshold(
+            "posture", next_aux, extra
+        )
+        posture_limit = posture_threshold.clamp_min(1.0e-3)
         posture_excess = torch.relu(posture_values - posture_limit) / posture_limit
         posture_weights = posture_excess.new_tensor((1.0, 1.0, 0.65, 0.30))
         posture_reward = -(
             self._huber_excess(posture_excess) * posture_weights
         ).sum(dim=-1).div(posture_weights.sum()).clamp(max=0.08)
 
-        grace = extra[:, p3_contract.SECONDS_SINCE_PUSH_INDEX] <= 0.40
+        push_active = extra[:, p3_contract.PUSH_RUNTIME_ACTIVE_INDEX] > 0.5
+        push_valid = extra[:, p3_contract.PUSH_TELEMETRY_VALID_INDEX] > 0.5
+        seconds_since_push = extra[:, p3_contract.SECONDS_SINCE_PUSH_INDEX]
+        grace = (
+            push_active
+            & push_valid
+            & (seconds_since_push >= 0.0)
+            & (seconds_since_push <= 0.40)
+        )
         grace_scale = torch.where(grace, 0.5, 1.0)
         joint_acc_reward *= grace_scale
         gait_reward *= grace_scale
         posture_reward *= grace_scale
-        components = {
+        raw_components = {
             "progress": progress,
             "default_posture": default_posture,
             "joint_acc": joint_acc_reward,
@@ -252,30 +556,238 @@ class P35LowRewardShaper:
             "gait": gait_reward,
             "posture": posture_reward,
         }
-        for name in components:
-            components[name] = torch.where(valid, components[name], zero)
+        component_masks = {
+            "progress": progress_valid & self._component_ready("progress"),
+            "default_posture": (
+                base_finite & proprio_finite & joint_position_bucket_valid
+                & self._component_ready("default_posture")
+            ),
+            "joint_acc": (
+                base_finite & joint_valid & joint_acc_bucket_valid
+                & joint_onset_bucket_valid & self._component_ready("joint_acc")
+            ),
+            "contact": (
+                base_finite & contact_valid
+                & torch.isfinite(extra[:, p3_contract.CONTACT_FORCE_SLICE]).all(dim=-1)
+                & self._component_ready("contact")
+            ),
+            "gait": (
+                base_finite & frequency_bucket_valid
+                & (next_aux[:, p2_contract.GAIT_VALID_INDEX] > 0.5)
+                & self._component_ready("gait")
+            ),
+            "posture": (
+                base_finite & posture_bucket_valid & self._component_ready("posture")
+            ),
+        }
+        for name in raw_components:
+            raw_components[name] = torch.where(
+                component_masks[name], raw_components[name], zero
+            )
+        scaled = {name: value * float(scale) for name, value in raw_components.items()}
+        stacked = torch.stack(tuple(scaled.values()), dim=-1)
+        positive = stacked.clamp_min(0.0).sum(dim=-1)
+        negative = (-stacked.clamp_max(0.0)).sum(dim=-1)
+        positive_scale = torch.where(
+            positive > 0.04, 0.04 / positive.clamp_min(1.0e-9), 1.0
+        )
+        negative_scale = torch.where(
+            negative > 0.08, 0.08 / negative.clamp_min(1.0e-9), 1.0
+        )
+        applied = torch.where(
+            stacked >= 0.0,
+            stacked * positive_scale.unsqueeze(-1),
+            stacked * negative_scale.unsqueeze(-1),
+        )
+        components = {
+            name: applied[:, index]
+            for index, name in enumerate(scaled)
+        }
+        total = applied.sum(dim=-1)
+        self.last_raw_components = {
+            name: value.detach() for name, value in raw_components.items()
+        }
+        self.last_eligible = {
+            name: value.detach() for name, value in component_masks.items()
+        }
+        self.last_cap_correction = total.detach() - stacked.sum(dim=-1).detach()
         self.frames_since_onset[dones] = 0.0
         self.onset_ema[dones] = 0.0
-        return sum(components.values(), zero.clone()), components
+        return total, components
+
+    def diagnostics(self) -> dict[str, float]:
+        """Return compact, scalar-only baseline provenance diagnostics."""
+        result: dict[str, float] = {}
+        observation_count = float(self.observation_count)
+        result["p35_baseline_observation_count"] = observation_count
+        for name, value in self.eligibility.items():
+            count = float(value)
+            result[f"p35_baseline_eligible_{name}_count"] = count
+            result[f"p35_baseline_eligible_{name}_share"] = (
+                count / observation_count if observation_count > 0.0 else 0.0
+            )
+        sources = tuple(self.threshold_source.values())
+        denominator = float(max(1, len(sources)))
+        result["p35_baseline_exact_share"] = sources.count(0) / denominator
+        result["p35_baseline_same_terrain_share"] = sources.count(1) / denominator
+        expected = sum(
+            1
+            for name in self.SAMPLE_NAMES
+            for _terrain in range(self.TERRAIN_BUCKETS)
+            for motion in range(self.MOTION_BUCKETS)
+            if not (name == "frequency" and motion == 3)
+        )
+        result["p35_baseline_disabled_share"] = max(
+            0.0, float(expected - len(sources)) / float(max(1, expected))
+        )
+        for name in self.SAMPLE_NAMES:
+            values = [
+                value.detach().float().reshape(-1)
+                for key, value in self.thresholds.items()
+                if isinstance(key, tuple) and key[0] == name
+            ]
+            if values:
+                joined = torch.cat(values)
+                finite = joined[torch.isfinite(joined)]
+                if finite.numel():
+                    result[f"p35_baseline_{name}_threshold_min"] = float(finite.min())
+                    result[f"p35_baseline_{name}_threshold_max"] = float(finite.max())
+        return result
 
     def state_dict(self) -> dict:
-        return {
+        state = {
             "contract": self.CONTRACT,
             "finalized": self.finalized,
             "valid": self.valid,
+            "component_valid": dict(self.component_valid),
             "sample_count": dict(self.sample_count),
-            "thresholds": {name: value.detach().cpu() for name, value in self.thresholds.items()},
+            "sample_seen_count": dict(self.sample_seen_count),
+            "sample_counts": {
+                "|".join(map(str, key)): value for key, value in self.sample_counts.items()
+            },
+            "sample_seen_counts": {
+                "|".join(map(str, key)): value
+                for key, value in self.sample_seen_counts.items()
+            },
+            "samples": {
+                "|".join(map(str, key)): self._combined(key)
+                for key in self.samples
+                if self.sample_counts[key] > 0 and not self.finalized
+            },
+            "thresholds": {
+                ("|".join(map(str, name)) if isinstance(name, tuple) else name): value.detach().cpu()
+                for name, value in self.thresholds.items()
+            },
+            "threshold_source": {
+                "|".join(map(str, key)): value
+                for key, value in self.threshold_source.items()
+            },
+            "eligibility": {
+                name: value.detach().cpu() for name, value in self.eligibility.items()
+            },
+            "observation_count": self.observation_count.detach().cpu(),
+            "frames_since_onset": self.frames_since_onset.detach().cpu(),
+            "onset_ema": self.onset_ema.detach().cpu(),
+            "seed": self.seed,
+            "rng_state": self.generator.get_state(),
         }
+        state["digest"] = self._state_digest(state)
+        return state
+
+    @staticmethod
+    def _state_digest(state: dict) -> str:
+        digest = hashlib.sha256()
+        digest.update(str(state.get("contract", "")).encode())
+        for scalar in ("finalized", "valid", "seed"):
+            digest.update(str(scalar).encode())
+            digest.update(str(state.get(scalar)).encode())
+        for section in (
+            "sample_count",
+            "sample_seen_count",
+            "sample_counts",
+            "sample_seen_counts",
+            "component_valid",
+            "eligibility",
+            "threshold_source",
+        ):
+            values = state.get(section) or {}
+            for name in sorted(values):
+                digest.update(str(name).encode())
+                value = values[name]
+                if torch.is_tensor(value):
+                    digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+                else:
+                    digest.update(str(value).encode())
+        for section in ("samples", "thresholds"):
+            for name, value in sorted((state.get(section) or {}).items()):
+                digest.update(str(name).encode())
+                digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+        tensor_names = ["rng_state", "frames_since_onset", "onset_ema"]
+        # Preserve exact-resume compatibility with baseline-v3 checkpoints
+        # written before the monitoring denominator was added.
+        if "observation_count" in state:
+            tensor_names.append("observation_count")
+        for name in tensor_names:
+            digest.update(name.encode())
+            value = state.get(name)
+            if torch.is_tensor(value):
+                digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+            else:
+                digest.update(str(value).encode())
+        return digest.hexdigest()
 
     def load_state_dict(self, state: dict) -> None:
         if state.get("contract") != self.CONTRACT:
             raise ValueError("P3.5 reward baseline checkpoint contract mismatch")
+        expected_digest = state.get("digest")
+        if expected_digest and expected_digest != self._state_digest(state):
+            raise ValueError("P3.5 reward baseline checkpoint digest mismatch")
         self.finalized = bool(state.get("finalized", False))
         self.valid = bool(state.get("valid", False))
+        self.seed = int(state.get("seed", self.seed))
+        self.component_valid.update(state.get("component_valid") or {})
         self.sample_count.update(state.get("sample_count") or {})
-        self.thresholds = {
-            name: value.to(self.device) for name, value in (state.get("thresholds") or {}).items()
+        self.sample_seen_count.update(
+            state.get("sample_seen_count") or state.get("sample_count") or {}
+        )
+        self.sample_counts.update({
+            tuple([parts[0], int(parts[1]), int(parts[2])]): int(value)
+            for name, value in (state.get("sample_counts") or {}).items()
+            for parts in [name.split("|")]
+        })
+        self.sample_seen_counts.update({
+            tuple([parts[0], int(parts[1]), int(parts[2])]): int(value)
+            for name, value in (
+                state.get("sample_seen_counts") or state.get("sample_counts") or {}
+            ).items()
+            for parts in [name.split("|")]
+        })
+        for name, value in (state.get("samples") or {}).items():
+            parts = name.split("|")
+            key = (parts[0], int(parts[1]), int(parts[2]))
+            self.samples[key] = [value.detach().float().cpu()]
+        self.thresholds = {}
+        for name, value in (state.get("thresholds") or {}).items():
+            parts = name.split("|")
+            key = (parts[0], int(parts[1]), int(parts[2])) if len(parts) == 3 else name
+            self.thresholds[key] = value.to(self.device)
+        self.threshold_source = {
+            (parts[0], int(parts[1]), int(parts[2])): int(value)
+            for name, value in (state.get("threshold_source") or {}).items()
+            for parts in [name.split("|")]
         }
+        for name, value in (state.get("eligibility") or {}).items():
+            self.eligibility[name] = torch.as_tensor(value, device=self.device).reshape(())
+        if torch.is_tensor(state.get("observation_count")):
+            self.observation_count.copy_(
+                state["observation_count"].to(self.device).reshape(())
+            )
+        if torch.is_tensor(state.get("frames_since_onset")):
+            self.frames_since_onset.copy_(state["frames_since_onset"].to(self.device))
+        if torch.is_tensor(state.get("onset_ema")):
+            self.onset_ema.copy_(state["onset_ema"].to(self.device))
+        if torch.is_tensor(state.get("rng_state")):
+            self.generator.set_state(state["rng_state"].cpu())
 
 
 def validate_joint_order(names) -> bool:

@@ -1240,7 +1240,8 @@ def _build_p3_monitor():
                 ("平台生命周期", "p3_lifecycle", ("platform_lifecycle_callbacks", "platform_lifecycle_failures")),
                 ("低层收敛", "p3_low_losses", ("p3_low_policy_loss", "p3_low_value_loss", "p3_low_entropy", "p3_low_approx_kl", "p3_low_clip_fraction", "low_reward_mean", "low_done_rate")),
                 ("低层更新职责", "p3_low_update_scope", ("p3_low_actor_update_active", "p3_low_critic_update_active", "p3_low_update_time_s")),
-                ("Rollout reset终止结果", "p3_window_outcomes", ("p3_window_completed_count", "p3_window_failure_count", "p3_window_timeout_count")),
+                ("平台口径终止结果", "p3_window_outcomes", ("p3_window_episode_count", "p3_window_completed_count", "p3_window_failure_count", "p3_window_true_timeout_count", "p3_window_completion_rate", "p3_window_abnormal_rate", "p3_window_timeout_rate", "p3_window_timeout_after_completion_count", "p3_window_hard_after_completion_count")),
+                ("Worker原始终止原因", "p3_window_raw_outcomes", ("p3_window_raw_episode_count", "p3_window_raw_completed_count", "p3_window_raw_failure_count", "p3_window_raw_timeout_count", "p3_window_raw_completion_rate", "p3_window_raw_abnormal_rate", "p3_window_raw_timeout_rate")),
                 ("Rollout径向事件", "p3_radial_milestones", ("p3_m1_success_count", "p3_m2_success_count", "p3_standard_success_count", "p3_platform_success_count", "p3_joint_success_count", "p3_proxy_platform_agreement_count")),
                 ("径向进展与M3边界", "p3_radial_progress", ("p3_radial_distance_mean", "p3_best_radial_distance_mean", "p3_m3_hold_share", "p3_m3_target_boundary_gap_m", "p3_m3_proxy_target_gap_m")),
             ),
@@ -1295,6 +1296,14 @@ def _build_p3_monitor():
             (
                 ("低层奖励分解", "p3_low_reward_terms", ("reward_track_lin_vel_xy", "reward_track_ang_vel_z", "reward_p3_sim2real_cost", "reward_energy", "reward_undesired_contacts", "reward_joint_acc", "reward_joint_position_penalty")),
                 ("P35训练侧奖励", "p35_low_reward_terms", ("p35_reward_progress", "p35_reward_default_posture", "p35_reward_joint_acc", "p35_reward_contact", "p35_reward_gait", "p35_reward_posture", "p35_reward_baseline_valid")),
+                ("P35原始与缩放", "p35_reward_raw_and_scale", ("p35_reward_raw_progress", "p35_reward_raw_default_posture", "p35_reward_raw_joint_acc", "p35_reward_raw_contact", "p35_reward_raw_gait", "p35_reward_raw_posture", "p35_reward_scale", "p35_reward_cap_correction")),
+                ("P35奖励有效率", "p35_reward_eligibility", ("p35_reward_eligible_progress", "p35_reward_eligible_default_posture", "p35_reward_eligible_joint_acc", "p35_reward_eligible_contact", "p35_reward_eligible_gait", "p35_reward_eligible_posture")),
+                ("P35基线样本", "p35_baseline_samples", ("p35_baseline_samples_joint_pos", "p35_baseline_samples_joint_acc_noncontact", "p35_baseline_samples_joint_acc_onset", "p35_baseline_samples_posture", "p35_baseline_samples_frequency", "p35_baseline_observation_count")),
+                ("P35基线有效率", "p35_baseline_eligibility", ("p35_baseline_eligible_base_share", "p35_baseline_eligible_joint_share", "p35_baseline_eligible_contact_share", "p35_baseline_eligible_gait_share")),
+                ("P35基线有效数", "p35_baseline_eligibility_count", ("p35_baseline_eligible_base_count", "p35_baseline_eligible_joint_count", "p35_baseline_eligible_contact_count", "p35_baseline_eligible_gait_count")),
+                ("P35分项有效性", "p35_baseline_components", ("p35_baseline_component_valid_progress", "p35_baseline_component_valid_default_posture", "p35_baseline_component_valid_joint_acc", "p35_baseline_component_valid_contact", "p35_baseline_component_valid_gait", "p35_baseline_component_valid_posture", "p35_monitor_semantic_health")),
+                ("P35基线回退", "p35_baseline_fallback", ("p35_baseline_exact_share", "p35_baseline_same_terrain_share", "p35_baseline_disabled_share")),
+                ("P35基线阈值", "p35_baseline_thresholds", ("p35_baseline_joint_pos_threshold_min", "p35_baseline_joint_pos_threshold_max", "p35_baseline_joint_acc_noncontact_threshold_min", "p35_baseline_joint_acc_noncontact_threshold_max", "p35_baseline_joint_acc_onset_threshold_min", "p35_baseline_joint_acc_onset_threshold_max", "p35_baseline_posture_threshold_min", "p35_baseline_posture_threshold_max", "p35_baseline_frequency_threshold_min", "p35_baseline_frequency_threshold_max")),
                 ("步态Shadow诊断", "p3_gait_shadow_terms", ("shadow_p3_contact_quality", "shadow_p3_crossing", "shadow_p3_starvation")),
                 ("Sim2Real约束原始分量", "p3_sim2real_components", ("p3_sim2real_component_valid_share", "p3_sim2real_sustained_torque_raw", "p3_sim2real_torque_peak_raw", "p3_sim2real_action_rate_raw", "p3_sim2real_action_jerk_raw")),
                 ("关节力矩分位", "p3_torque_quantiles", ("hip_torque_p50", "hip_torque_p95", "hip_torque_max", "thigh_torque_p50", "thigh_torque_p95", "thigh_torque_max", "calf_torque_p50", "calf_torque_p95", "calf_torque_max")),
@@ -1368,6 +1377,27 @@ def _build_p3_monitor():
             f"p3_{terrain}_{motion}_sample_share"
             for terrain in ("slope", "slope_inv", "stairs", "stairs_inv")
             for motion in ("low_speed", "forward", "turn_lateral")
+        ),
+    )
+    _add_multi_line_panel(
+        monitor,
+        "低速楼梯逐腿步频",
+        "p35_low_stair_leg_frequency",
+        tuple(
+            f"p3_{terrain}_low_speed_{leg}_step_frequency"
+            for terrain in ("stairs", "stairs_inv")
+            for leg in ("fl", "fr", "rl", "rr")
+        ),
+    )
+    _add_multi_line_panel(
+        monitor,
+        "低速楼梯步频失衡",
+        "p35_low_stair_frequency_imbalance",
+        (
+            "p3_stairs_low_speed_step_frequency_ratio",
+            "p3_stairs_inv_low_speed_step_frequency_ratio",
+            "p3_stairs_low_speed_diagonal_frequency_relative",
+            "p3_stairs_inv_low_speed_diagonal_frequency_relative",
         ),
     )
     for terrain in ("slope", "slope_inv", "stairs", "stairs_inv"):

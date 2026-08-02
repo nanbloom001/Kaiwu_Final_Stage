@@ -429,36 +429,65 @@ class P2WorkerBridge:
     def _p35_contact_slots(self):
         if getattr(self, "_p35_contact_slot_ids", None) is not None:
             return self._p35_contact_slot_ids
-        names = [
-            name.lower()
+        raw_names = [
+            str(name)
             for name in getattr(self._gait_window, "sensor_body_names", ())
         ]
+
+        def canonical(name: str) -> str | None:
+            value = name.rsplit("/", 1)[-1].lower().replace("-", "_")
+            tokens = tuple(token for token in value.split("_") if token)
+            # ContactSensor also exposes motor rotor bodies whose names contain
+            # the same leg/link tokens. They are not the physical hip/thigh/calf
+            # collision links used by the P3.5 14-slot reward contract.
+            if "rotor" in tokens:
+                return None
+            if value == "base" or tokens[-1:] == ("base",):
+                return "base"
+            if "head" in value:
+                return "head"
+            leg = next((token for token in ("fl", "fr", "rl", "rr") if token in tokens), None)
+            link = next(
+                (token for token in ("hip", "thigh", "calf") if token in tokens),
+                None,
+            )
+            return f"{leg}_{link}" if leg is not None and link is not None else None
+
+        canonical_names = [canonical(name) for name in raw_names]
         slots: list[list[int]] = []
 
-        def matches(*tokens):
+        def matches(value: str):
             return [
-                index
-                for index, name in enumerate(names)
-                if all(token in name for token in tokens)
+                index for index, candidate in enumerate(canonical_names)
+                if candidate == value
             ]
 
-        base = [index for index, name in enumerate(names) if name == "base"]
-        if not base:
-            base = matches("base")
-        slots.append(base[:1])
+        slots.append(matches("base"))
         slots.append(matches("head"))
         for leg in ("fl", "fr", "rl", "rr"):
             for link in ("hip", "thigh", "calf"):
-                slots.append(matches(leg, link))
+                slots.append(matches(f"{leg}_{link}"))
+        missing = [index for index, slot in enumerate(slots) if not slot]
+        duplicate = [
+            index for index, slot in enumerate(slots)
+            if index != 1 and len(slot) != 1
+        ]
         self._p35_contact_mapping_valid = (
             len(slots) == 14
-            and all(len(slot) >= 1 for slot in slots)
-            and all(len(slot) == 1 for index, slot in enumerate(slots) if index != 1)
+            and not missing
+            and not duplicate
+        )
+        self._p35_contact_mapping_reason = (
+            "ok"
+            if self._p35_contact_mapping_valid
+            else f"missing={missing},duplicate={duplicate}"
         )
         self._p35_contact_slot_ids = slots
         _print(
             "[P35Baseline] contact_mapping_valid="
-            f"{int(self._p35_contact_mapping_valid)} slots={slots} names={names}"
+            f"{int(self._p35_contact_mapping_valid)} "
+            f"reason={self._p35_contact_mapping_reason} slots={slots} "
+            f"raw_names={raw_names} canonical_names={canonical_names}"
         )
         return slots
 
@@ -563,16 +592,28 @@ class P2WorkerBridge:
             before = robot.data.root_vel_w[ids, :2].detach().clone()
             original(env, env_ids, **kwargs)
             after = robot.data.root_vel_w[ids, :2].detach()
-            delta = torch.nan_to_num(after - before)
-            bridge._p35_push_event_flag[ids] = True
-            bridge._p35_push_delta[ids] = delta
-            bridge._p35_seconds_since_push[ids] = 0.0
-            bridge._p35_push_event_count += int(ids.numel())
+            raw_delta = after - before
+            delta = torch.nan_to_num(raw_delta)
+            effective = (
+                torch.isfinite(raw_delta).all(dim=-1)
+                & (delta.abs().amax(dim=-1) > 1.0e-6)
+            )
+            if not bridge._p35_push_runtime_active:
+                effective.zero_()
+            effective_ids = ids[effective]
+            effective_delta = delta[effective]
+            if effective_ids.numel() == 0:
+                return
+            bridge._p35_push_event_flag[effective_ids] = True
+            bridge._p35_push_delta[effective_ids] = effective_delta
+            bridge._p35_seconds_since_push[effective_ids] = 0.0
+            bridge._p35_push_event_count += int(effective_ids.numel())
             if bridge._p35_push_event_count <= 5 or bridge._p35_push_event_count % 50 == 0:
                 _print(
                     "[P35PushEvent] "
-                    f"count={bridge._p35_push_event_count} env_ids={ids[:8].tolist()} "
-                    f"delta_mean={delta.mean(dim=0).tolist()}"
+                    f"count={bridge._p35_push_event_count} "
+                    f"env_ids={effective_ids[:8].tolist()} "
+                    f"delta_mean={effective_delta.mean(dim=0).tolist()}"
                 )
 
         cfg.func = _wrapped_push
@@ -580,13 +621,13 @@ class P2WorkerBridge:
             "x": (0.0, 0.0), "y": (0.0, 0.0), "z": (0.0, 0.0),
             "roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0),
         }
-        cfg.interval_range_s = (12.0, 18.0)
+        cfg.interval_range_s = (20.0, 30.0)
         try:
             setter(term_name, cfg)
             self._p35_push_telemetry_valid = True
             _print(
                 "[P35PushPreflight] valid=1 term=push_robot mode=interval "
-                "interval=(12,18) initial_velocity=0 wrapper=installed"
+                "interval=(20,30) initial_velocity=0 wrapper=installed"
             )
         except Exception as exc:
             _print(f"[P35PushPreflight] valid=0 reason=set_failed error={type(exc).__name__}")
@@ -594,7 +635,10 @@ class P2WorkerBridge:
     def _p35_update_push_phase(self) -> None:
         if not self._p35_push_telemetry_valid:
             return
-        phase = p3_contract.push_phase_config(self._p35_push_elapsed_s())
+        phase = p3_contract.push_phase_config(
+            self._p35_push_elapsed_s(),
+            self.config.get("push_schedule") or {},
+        )
         if phase["name"] == self._p35_push_phase_name:
             return
         manager = self.env.event_manager

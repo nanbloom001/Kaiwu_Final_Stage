@@ -3366,3 +3366,143 @@
   `P3.5 低速楼梯与后期Push` 和中文面板名 `P3.5训练侧奖励`，错误为“面板名称非法”。
   根因是平台两类名称合同均不允许 `.`，与 metric key 和数据无关。显示名已改为
   `P35 低速楼梯与后期Push` / `P35训练侧奖励`，未改变面板 key、指标或训练行为。
+
+## BUG-20260802-009：P3.5 两小时专项奖励全零且 Push 周期长于 episode
+
+- 日期：2026-08-02；状态：本地已验证，待开发容器与平台 smoke。
+- 影响范围：新分支 `codex/p35-gaitfix8h` 的 `p3_standard_joint` 训练入口、P35 training-only
+  基线/奖励、ContactSensor装配、相机时序、后期Push、checkpoint与监控。不改变57905/57901、
+  Actor77、12维动作、493维training wire、Standard/Track评估或部署I/O；
+  `server/isaac_env/base_env.py`零修改。
+- 用户可见症状与证据：两小时任务日志持续打印
+  `P35Baseline valid=0 samples={'joint_pos': 0, 'joint_acc_noncontact': 0, 'joint_acc_onset': 0, 'posture': 0, 'frequency': 0}`
+  及 `disabled_rewards=['progress','posture','joint_acc','contact','gait']`。任务虽然完成，但P3.5专项
+  reward没有进入PPO storage，因此该轮专项验收失败，末尾模型不作为新父模型。另有25秒episode与
+  30-45秒Push interval矛盾：Isaac Lab镜像 `EventManager.reset(env_ids)` 会在每环境episode开始时
+  重采样非global interval timer，所以正常timeout前不可能收到首次Push。
+- 根因与排除方向：`P35LowRewardShaper.observe()`曾把所有采样统一绑定
+  `healthy & valid_joint & valid_contact`，任一ContactSensor槽映射失败会连带清零progress、joint、
+  posture和gait。基线只保存完成阈值而不保存未完成reservoir，exact resume也会丢失15分钟前样本；
+  监控只检查有限值，会把“有效但为0”误报为健康。Push问题不是`push_interval_s=45`代表episode，
+  而是45秒是interval上界；初始`max_push_vel_xy=0`是保留EventTerm的有意占位，后期由公开API改为非零。
+- 核心修复：训练固定从任务235689的`stairfinal-1013548` warm start，加载前硬校验checkpoint
+  SHA256 `574924419ccd58923ccb5b6b2b29a88464ca2744e06bc888b7c7f5021f75250a`，不继承失败的两小时末尾包。
+  基线升级为`p35_low_reward_baseline_v3`，拆成base/joint/contact/gait健康门控和逐component有效合同，
+  统一使用同一post-step obs/aux/extra；ContactSensor按robot canonical body name精确对应base、Head聚合
+  与四腿hip/thigh/calf。保存未完成reservoir、逐桶计数、threshold source、RNG/state digest和时序状态；
+  只允许同地形回退，全局只诊断。5分钟连续样本或任一映射仍为0、15分钟核心基线无效时，写入
+  `p35_diagnostic_stop_reason`并保存`baselinefault`后硬停止；其他异常尝试保存`emergency`。
+- 八小时合同：任务`p35gaitfix8h`、28800秒、128 env、60秒episode、课程关闭；阶段为
+  `calib/gaitwarm/gaitfull/camfull/pushwarm/pushfull/stable`。P35奖励课程最大50%，应用后每帧限制
+  `+0.04/-0.08`，raw/applied/eligible/cap精确分解。4小时后Push为`+-0.04m/s,30-45s`，6小时后为
+  `+-0.05m/s,25-40s`；60秒episode确保正常存活环境有触发及恢复窗口。95%硬力矩线前新增低权重
+  barrier但不硬裁剪。高层、低层CNN、Actor body/std全程冻结，`high_updates=0`。
+- 监控与防复发：新增每类样本/eligible/component-valid、同桶/同地形/disabled占比、阈值范围、
+  raw/applied/cap、episode分母的完成/异常/timeout率、地形运动桶逐腿duty/frequency、Push实测delta和
+  recovery；监控semantic health不再以有限零值代替基线健康。checkpoint保存诊断原因、基线digest、
+  session阶段、Adapter replay和冻结高层digest。
+- 独立核验更正：内部`schedule_mode`一度误写为底层PPO未识别的`p35_gaitfix8h_v1`，会落入legacy
+  分支并把gait/camera/push阶段Actor/LSTM静默冻结。现内部继续使用已验证的`p35_gaitfix_v1`，
+  八小时checkpoint外部合同仍为`p35_gaitfix8h_v1`，并新增calib/gaitwarm/stable逐模块
+  `requires_grad`测试。父包SHA硬校验前移到stage-type分流前，非P3父包也不能绕过；合同一致的exact
+  resume不与父包SHA比较。
+- 本地验证：完整`agent_ppo/tests`为`435 passed, 5 skipped, 3 subtests passed`；覆盖分项门控、
+  post-step基线、unfinished reservoir/digest、5/15分钟硬门禁、奖励cap/stable shadow、95% torque
+  barrier、60秒episode/Push合同、内部schedule trainability和父包SHA分流。Python编译、TOML解析、
+  monitor build、`git diff --check`和`BaseEnv`零差异均已确认。额外`server/tests`为104 passed，
+  另有3项与本分支无关的既有失败：旧LBC `max_iterations`期望、既有`p2_terminal_smoke.py`直接导入
+  BaseEnv及旧Camera stage推断期望；本任务未修改这些文件或扩大范围。当前尚未同步开发容器，未取得
+  真实ContactSensor14槽、128-env PPO/Adapter显存、动态Push delta、平台15-30分钟smoke、A/B评估、
+  ONNX recurrent parity或真机证据，状态不得升级为平台/评估已验证。
+- 血缘与回滚：基线提交`b247dc6`，分支`codex/p35-gaitfix8h`；父模型ID`1013548`、标签
+  `stairfinal`、来源任务`235689`，新task/model/commit/PR尚未产生。任何硬门禁或关键评估失败时继续
+  使用父模型1013548；再次遇到全零先检查`[P35Baseline]`四类eligibility与canonical mapping，再检查
+  post-step wire和逐桶样本，不得通过删除门禁或把0标为健康来绕过。
+- 2026-08-02 未提交变更复审更正（状态：本地已验证）：复审发现Calf触地阈值误写为
+  `onset_limit[8:12]`，实际切到env轴，导致只有env 8-11全部关节被放宽；P35 shaper又只每5帧调用，
+  连带漏采80% contact-onset；所谓reservoir实际只保留每桶最早8192条且没有RNG；state digest也未覆盖
+  finalized/valid、threshold source、RNG、frames-since-onset和onset EMA。现改为joint列
+  `[:,8:12]`、onset逐帧/连续量5帧stride、带seed和total-seen的Algorithm R reservoir，并把全部行为
+  状态纳入digest。新增多环境列语义、onset独立采样、跨checkpoint随机序列一致及逐字段篡改回归；
+  `PY311test`在正确的`server/`项目根目录完成`439 passed, 5 skipped, 3 subtests passed`，并通过
+  Python编译、TOML解析、`git diff --check`和BaseEnv零差异检查。本轮尚未重新同步开发容器或取得
+  平台证据，状态不得升级为平台已验证。
+- 2026-08-02 容器预检追加（状态：开发容器已验证，平台训练待验证）：1-env真实ContactSensor打印显示实体
+  `FL_hip`等腿段之外还包含`FL_hip_rotor`等12个rotor body；旧canonical逻辑只匹配leg/link token，
+  因而12个腿槽全部出现duplicate并输出`contact_mapping_valid=0`。这会让15分钟P35基线硬门禁失败。
+  现对token中含`rotor`的sensor body返回None，保留base唯一、Head聚合和12个实体腿段唯一映射；测试
+  fixture已加入完整rotor集合。修复同步后，同一容器真实日志确认`contact_mapping_valid=1`，槽位为base
+  唯一、Head两项聚合及12个实体腿段各唯一；`P35PushPreflight valid=1`。使用SHA256为
+  `574924419ccd58923ccb5b6b2b29a88464ca2744e06bc888b7c7f5021f75250a`的真实父checkpoint完成1-env、
+  128帧integrated smoke：父包warm-start、低层PPO、Adapter一次更新、Camera时序、冻结高层/CNN、
+  save/exact-resume全部`PASS`，`high_updates=0`。容器P3/P3.5定向测试为`116 passed`。生产Push在4小时
+  后启用，本次只验证EventTerm/wrapper装配，未取得非零实际delta；15分钟calibration样本增长、
+  128-env显存和真实Push事件仍由平台任务验证。测试结束已停止精确smoke进程并删除上传ZIP、解压父包、
+  round-trip、日志、pid、`.uploading`/`.nfs`及生成deploy配置，复核测试目录为`CLEAN`。
+- 2026-08-02 正式任务前监控/smoke补强（状态：本地已验证，待开发容器复测）：独立复审确认旧fixture
+  仅覆盖27个合成名称，未把真实ContactSensor的4个foot及31项顺序锁定；integrated smoke固定在
+  `gaitwarm`，只验证wrapper装配而不会触发4小时后的非零Push，且未对joint/contact/gait映射硬失败；
+  `p35_baseline_eligible_*`又直接发布累计数却在面板中按有效率理解。现用容器打印的完整31项名称和
+  精确14槽索引回归，明确过滤12个rotor与4个foot；smoke工具通过仅内存配置存在、速度不超过
+  `0.03m/s`且周期`0.5-1.0s`的测试override触发真实Isaac原生Push，并硬断言mapping、telemetry、
+  event count、非零delta及配置边界，生产4小时/6小时Push合同不变。P35基线新增累计观察环境帧
+  denominator，面板分别发布`eligible_*_count`与`eligible_*_share`，denominator进入checkpoint和
+  state digest；旧baseline-v3若无该字段仍可校验加载但只从新采集开始提供可靠share。本地定向测试
+  `112 passed`、Python编译和`git diff --check`通过；开发容器真实非零Push及最终integrated smoke
+  尚未复测，因此不得把先前仅wrapper装配证据升级为真实Push已验证。新task/model/commit/PR仍未知，
+  回滚继续使用父模型`1013548`及生产Push原时程。
+- 2026-08-02 容器复测追加（状态：开发容器已验证，平台训练待验证）：8个代码/测试文件经safe bundle
+  同步与远端校验；容器Isaac Python定向回归`84 passed`。父ZIP通过VSCode Remote文件协议上传，
+  `33824100` bytes、SHA256
+  `5ef4021d9ab56cee5ffbc2673248dfc50e616795691a413b38ecdcef332f7e80`，未使用RPC分片；解出的
+  `stairfinal-1013548` checkpoint再次核对SHA256
+  `574924419ccd58923ccb5b6b2b29a88464ca2744e06bc888b7c7f5021f75250a`。真实1-env、128帧
+  integrated Isaac smoke输出`status=PASS`：完整31-body canonical映射通过，
+  `gait_sensor_mapping_valid/gait_window_valid`在75帧窗口建立后非零；测试专属Push捕获2次Isaac原生
+  event，`|delta vx|max=0.0255200`、`|delta vy|max=0.0299183m/s`、正负方向各50%、环境覆盖率1、
+  telemetry/runtime-active share均1且配置越界0。低层LSTM/Actor/Critic与Adapter更新，CNN、导航编码、
+  高层Actor/Critic不变，`high_updates=0`，save/exact-resume通过。PASS后Isaac close仍短时保留进程组，
+  已按本次精确PGID/PID终止；上传ZIP、解压checkpoint、round-trip、日志和生成deploy配置均删除，
+  复核`test_artifacts`无本轮文件且无smoke进程。此证据只验证开发容器，不替代正式平台前15分钟
+  baseline样本增长、128-env显存或4/6小时生产Push时程；新task/model/commit/PR仍未知。
+- 2026-08-02 35分钟平台数据更正（状态：代码已修复待平台验证）：抓取
+  `20260802-085932`显示Push仍处于关闭阶段、配置delta为0，但事件计数、`seconds_since_push`和
+  Push后恢复窗口仍持续变化。根因是Isaac EventManager会按interval调用保留的零速度term；旧wrapper
+  无条件把每次调用标为真实Push并开启0.4秒reward grace，物理没有扰动却减半了joint-acc、gait与
+  非关键姿态项。现只有`runtime_active=1`、telemetry有效、delta有限且绝对值大于`1e-6m/s`的环境才
+  累计事件、清零age和进入grace；workflow监控使用同一有效事件合同，无样本时Push幅度显式输出0、
+  recovery输出-1，避免面板缺线。episode由60秒缩短为40秒，Push warm/full周期相应改为
+  `20-30s`与`17-27s`，均严格短于episode；未调整P35奖励权重，避免在步频比仍处于早期恢复时引入
+  第二个变量，修复假grace本身会恢复既有奖励强度。终止监控拆分为worker原始reason与平台径向口径：
+  已达到/锁存3.9m代理半径后发生的fall或time-limit单独记录为`*_after_completion`，不再计入真正
+  未完成timeout。修改文件为`p2_worker_bridge.py`、`p3_gait.py`、`p3_contract.py`、workflow、monitor、
+  P3 TOML及对应测试/合同文档；`BaseEnv`仍为零修改。正确server项目根下完整回归为
+  `444 passed, 5 skipped, 3 subtests passed`，Python编译、TOML解析、diff check和BaseEnv零差异通过；
+  容器同步和新平台任务尚未执行，故不得标记为平台已验证。回滚可恢复40秒修改前的episode/interval，
+  但不得回滚有效Push事件判定与raw/aligned终止口径拆分。
+- 2026-08-02 快速容器复测（状态：容器代码回归通过，Isaac集成待验证）：同步后的开发容器使用
+  Isaac Kit Python、Isaac ML torch prebundle与平台pytest环境完成P3/P3.5定向回归，结果为
+  `106 passed, 1 warning`；显式合同检查输出`P35_CONFIG_CONTRACT_PASS`，确认episode为40秒、
+  pushwarm为20-30秒、pushfull为17-27秒。定向回归覆盖关闭阶段零速度调用不计为真实Push、
+  runtime-active非零delta计数、grace门控、raw/aligned终止拆分与监控默认值。容器中已无任何`.pkl`
+  checkpoint（此前按清理要求删除），故本轮未伪造父包、未启动1-env Camera/PPO integrated smoke；
+  该层仍需重新上传父checkpoint后验证。测试产生的`.pytest_cache`和tests `__pycache__`已删除，未发现
+  本轮smoke进程；保留既有`common_python/tools`缓存，不越界清理平台或用户文件。
+- 2026-08-02 一小时步频复核与定向调权（状态：本地已验证，待容器复测）：抓取
+  `20260802-092705`排除前10分钟后，父模型冻结10-15分钟四腿step-frequency最大/最小比约`1.94`、
+  对角相对失衡约`0.56`；15-30、30-45、45-60分钟分别约为`2.09/2.04/2.05`与
+  `0.64/0.62/0.61`，未优于父模型。45-60分钟实际`p35_reward_gait≈-2.41e-4/tick`，仅约
+  `low_reward_mean`的`0.35%`、progress的`1.9%`；eligibility约`0.76`且cap correction接近0，排除
+  映射失效和总cap截断，主因是目标桶信号偏弱。修复仅把正/逆楼梯、低速直行
+  (`vx<0.20m/s, |vy|<=0.05, |wz|<=0.10`)的gait responsibility raw系数/单项cap从`0.035/-0.035`
+  调到`0.050/-0.050`；其他地形与运动桶、P35总负cap`-0.08`、joint-acc非触地/onset阈值及其
+  权重、姿态、tracking、torque/energy和辅助梯度均不变。新增正逆低速楼梯逐腿频率、最大/最小比和
+  对角相对失衡监控，避免继续用全局四腿均值替代目标桶。本地定向回归`107 passed`并通过Python
+  编译；容器同步、容器回归及平台新曲线尚待本轮后续证据。回滚只需恢复两个gait常量与条件面板，
+  不应回滚此前Push有效事件和40秒episode修复。
+- 2026-08-02 定向调权容器复测追加（状态：开发容器已验证，平台曲线待验证）：5个代码/测试文件
+  经safe bundle同步并校验，二次dry-run为`files to overwrite: 0`。容器使用Isaac Kit Python、ML torch
+  prebundle与平台pytest环境完成`107 passed, 1 warning`；回归明确断言两个低速直行楼梯桶raw gait
+  为`-0.05`，低速坡面和中速楼梯仍为`-0.0175`，joint-acc分阈值及Push有效事件门控未变化。
+  本轮未上传父checkpoint，故未重复1-env PPO/Camera integrated smoke；pytest缓存已删除且无smoke
+  进程残留。平台仍需在新任务30-60分钟窗口核对新增条件步频比、对角失衡和楼梯非劣化。

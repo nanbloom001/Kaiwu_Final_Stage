@@ -224,7 +224,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             self.current_phase = "lowbase"
         elif self.schedule_mode in {"p3_stair_memory_v1", "p35_gaitfix_v1"}:
             self.current_phase = (
-                "gaitfixcalib"
+                "calib"
                 if self.schedule_mode == "p35_gaitfix_v1"
                 else "staircalib"
             )
@@ -340,9 +340,10 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 self.anchor_phase_end_hours = [0.25, 0.75, 2.0, 6.0]
             elif self.schedule_mode == "p35_gaitfix_v1":
                 self.anchor_phase_labels = [
-                    "gaitfixcalib", "repair", "pushwarm", "pushfull", "stable"
+                    "calib", "gaitwarm", "gaitfull", "camfull",
+                    "pushwarm", "pushfull", "stable"
                 ]
-                self.anchor_phase_end_hours = [0.25, 1.25, 1.50, 1.75]
+                self.anchor_phase_end_hours = [0.25, 0.75, 2.0, 4.0, 6.0, 7.5]
             else:
                 self.anchor_phase_labels = ["commandbase", "commandblend", "commandfull"]
                 self.anchor_phase_end_hours = [0.5, 3.0]
@@ -579,7 +580,7 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 actor_enabled = phase != "staircalib"
                 recurrent_enabled = phase != "staircalib"
             elif self.schedule_mode == "p35_gaitfix_v1":
-                actor_enabled = phase not in {"gaitfixcalib", "stable"}
+                actor_enabled = phase not in {"calib", "stable"}
                 recurrent_enabled = actor_enabled
             else:
                 enabled = not (
@@ -620,7 +621,6 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 self.schedule_mode == "p3_low_recovery_v1"
                 and phase in {"adaptercalib", "highadapt", "highslow"}
             )
-            or (self.schedule_mode == "p35_gaitfix_v1" and phase == "stable")
         )
         for parameter in self.actor_critic.critic.parameters():
             parameter.requires_grad_(critic_enabled)

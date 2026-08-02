@@ -462,32 +462,35 @@ training_states.global.low_updates / high_updates / compound_schedule_phase
 training_states.global.p3_anchor_digest / low_level_version
 training_states.global.domain_randomization_phase / domain_randomization_realized
 training_states.global.runtime_m3_contract
-contracts.p3_standard_joint.name = "p35_low_speed_gait_push_v1"
+contracts.p3_standard_joint.name = "p35_gaitfix8h_v1"
 ```
 
-当前两小时 P3.5 session 的阶段标签固定为 `gaitfixcalib`、`repair`、`pushwarm`、
-`pushfull`、`stable`。候选文件缺失时可继续查找配置父包；一旦选中文件，格式、模块、
+当前八小时 P3.5 session 的阶段标签固定为 `calib`、`gaitwarm`、`gaitfull`、`camfull`、
+`pushwarm`、`pushfull`、`stable`。候选文件缺失时可继续查找配置父包；一旦选中文件，格式、模块、
 spec/shape、optimizer exact-resume 状态或有限值不兼容必须停止。平台模型 ID、文件名 ID 和
 lineage 只用于选择、告警与追溯，不得形成单点硬门禁。live hidden、未完成 rollout、未完成
 future history和每环境局部目标状态不保存，resume 后统一 reset。
 
-本轮父包选择固定为任务 `235689` 的最终 `stairfinal` checkpoint（模型 ID `1013548`）；实际文件
-SHA256 与模块 digest 必须由加载器在下载并解析真实制品后记录。训练命令中所有含 `vx` 的类型
+本轮父包固定为任务 `235689` 的 `stairfinal` checkpoint（模型 ID `1013548`），加载前必须校验
+SHA256 `574924419ccd58923ccb5b6b2b29a88464ca2744e06bc888b7c7f5021f75250a`；不使用专项奖励失效的
+两小时 P3.5 末尾模型。训练命令中所有含 `vx` 的类型
 共用 `0.10-0.35/0.35-0.70/0.70-1.00m/s` 三档和 `55/30/15` 概率。ResponseAdapter replay
 按 session 阶段使用 `50/25/25`、`60/25/15`、`75/15/10` 的最新/近期/父 records 比例；最后
-15 分钟低层冻结不代表 Adapter 冻结，仍每 rollout 更新一次。
+30分钟 Actor/LSTM 冻结不代表 Critic 或 Adapter 冻结，仍每 rollout 更新一次。
 
-当前 7200 秒 session 只执行低层 recurrent PPO 和 ResponseAdapter：`0-900s gaitfixcalib`、
-`900-4500s repair`、`4500-5400s pushwarm`、`5400-6300s pushfull`、
-`6300-7200s stable`。低层 rollout 与 TBPTT 均为 128 帧；低层 CNN、高层
+当前28800秒 session 只执行低层 recurrent PPO 和 ResponseAdapter：`0-900s calib`、
+`900-2700s gaitwarm`、`2700-7200s gaitfull`、`7200-14400s camfull`、
+`14400-21600s pushwarm`、`21600-27000s pushfull`、`27000-28800s stable`。
+低层 rollout 与 TBPTT 均为128帧；低层CNN、高层
 NavigationEncoder/Actor/Critic/SafetyHead 全程冻结，高层 rollout、PPO 和 optimizer/scheduler
-step 均不执行，`high_updates` 必须保持 0。P3.5 另外冻结低层 Actor body/std，只允许 LSTM、
-RNN output、最终 action head 和 Critic 更新；`stable` 阶段低层全部冻结。从旧 P3 合同 warm
+step 均不执行，`high_updates` 必须保持0。P3.5另外冻结低层Actor body/std，只允许LSTM、
+RNN output、最终action head和Critic更新；`stable`阶段Actor/LSTM冻结、Critic继续更新，P35分项
+只计算raw诊断、不加入storage reward。从旧P3合同warm
 start 时保留高层模块及 optimizer 状态，仅重置本轮 session clock、rollout 与 live hidden。
 
 训练期 depth contract 不改变模型输入布局。每环境 `near_clip` 保持父包合同；冻结 CNN feature32
 通过随机 phase 的 30Hz capture、50Hz hold 和 10 帧 FP16 队列模拟相机时序，主动延迟上限
-150ms，150-250ms 只作 shadow。完整 128 帧 sequence 继续使用父包末段 50% 深度故障强度。
+150ms，150-250ms只作shadow。完整128帧sequence使用0→25%→50%的保守故障课程。
 clean 路径使用冻结父模型 anchor，fault/delayed 路径只允许 memory auxiliary 更新低层 LSTM、
 RNN output 与最终 action head；eval/export/deploy 忽略这些 training-only state，且不运行人工增强。
 memory auxiliary 的选择 mask 是像素故障与实际交付 feature age 大于零的并集，必须分别报告
@@ -517,13 +520,21 @@ action scale、PD stiffness/damping、effort limit 和 `contact_forces` 足端�
 body-y；P2 共享诊断继续报告接触帧平均滑移速度，P3 私有 tail 只在 stance 结束帧报告一次累计
 世界 XY 滑移距离，训练奖励不会在后续窗口重复扣分。镜像合同固定为
 `FL<->FR`、`RL<->RR`，`vy/wz` 与左右相关轴取反，Hip 按机械轴交换并取反、Thigh/Calf 仅交换；
-depth 水平翻转，scan 置换由真实 lateral ray 坐标生成。前 15 分钟采集 4 类地形 × 3 类运动健康
-基线；样本不足按同地形、全局逐级回退，全局仍不足时对应接触/交叉/饥饿奖励归零。镜像和步态
+depth 水平翻转，scan 置换由真实 lateral ray 坐标生成。前15分钟按独立 base/joint/contact/gait
+门控采集4类地形×4类运动基线；不足时只允许同地形回退，全局回退仅诊断、不进入塑形。5分钟
+空样本或15分钟核心基线无效必须保存诊断checkpoint并中止。镜像和步态
 baseline/RNG 仅写入 training state，`p3_standard_eval` 与 `p3_track_eval` 必须忽略它们。
+训练监控中的P35 baseline eligibility必须同时发布累计`*_count`和以观察环境帧总数为分母的
+`*_share`；累计数不能命名或展示为share。ContactSensor canonical装配必须忽略`*_rotor`和foot，
+真实31项body-name回归固定base、聚合Head及12个实体hip/thigh/calf槽位。
+P35 gait responsibility默认raw系数为`0.035`，只有正/逆楼梯、`vx<0.20m/s`且不属于转向/横移的
+低速直行桶使用`0.050`；P35总负cap保持`-0.08`。该training-only奖励与新增条件步频面板不改变
+57905/57901 observation、12维动作、checkpoint网络shape或部署接口。
 worker command sampler 位于独立环境 worker，当前公开 transport 不回传其 live RNG/hold 状态；
 checkpoint 明确记录 `seeded_fresh_after_environment_reset`，不得宣称该部分 exact resume。
 
-P3 评估候选标签优先级为 `stable > pushfull > pushwarm > repair > gaitfixcalib`，随后兼容
+P3评估候选标签优先级为 `stable > pushfull > pushwarm > camfull > gaitfull > gaitwarm > calib`，
+随后兼容 `repair > gaitfixcalib` 与
 `stairfinal/stairrobust/stairadapt/stairwarm/staircalib` 及
 旧 `highslow/highadapt/adaptercalib/lowfull/lowmedium/lowmild/lowbase`；无同 ID P3 文件时只允许
 唯一 discovery，多个候选明确报歧义。请求 ID、
@@ -533,10 +544,16 @@ P3 评估候选标签优先级为 `stable > pushfull > pushwarm > repair > gaitf
 每个阶段边界先保存 checkpoint，再通过平台公开 `env.reset(config)` 开始新 episode并清理 live
 recurrent 状态；该调用不会重建平台 create-once 的 Isaac 环境。friction `[0.65,1.25]`、base mass
 `+-0.4kg`、restitution `[0,0.05]`、noise `0.35` 在首次 reset 装配。`push_robot` EventTerm 同时
-以零 XY 速度保留；75 分钟通过 EventManager `get_term_cfg/set_term_cfg/reset` 切到
-`+-0.05m/s`，90 分钟切到 `+-0.08m/s`，间隔 12-18 秒。wrapper 必须先调用 Isaac 原
-`push_by_setting_velocity`，再记录推前/推后的真实 root velocity delta；配置值不得冒充实测值。
+以零XY速度保留；4小时通过EventManager `get_term_cfg/set_term_cfg/reset` 切到
+`+-0.04m/s,20-30s`，6小时切到`+-0.05m/s,17-27s`。interval timer随每环境episode reset重采样，
+训练episode固定40秒，生产Push上界必须严格短于episode。wrapper必须先调用Isaac原
+`push_by_setting_velocity`，再只记录runtime-active且实际非零的root velocity delta；关闭阶段
+EventTerm的零速度调用不得累计事件、重置age或触发0.4秒奖励grace，配置值也不得冒充实测值。
+终止监控同时保留worker原始reason和平台径向口径：已经达到3.9m代理半径后发生的time-limit或
+hard reset计为完成后的终止原因，不得继续混入真正未完成timeout率。
 checkpoint session 时间经 reset `usr_conf` 传给 worker，断点恢复立即恢复对应 Push 阶段。
+integrated smoke可通过不落入生产TOML的测试专属override将Push缩短为0.5-1.0秒，并必须捕获非零
+root-velocity delta；该override不改变上述4小时/6小时生产时程。
 未验证的 COM、PD、action gain/delay 不属于运行合同。低层 optimizer 成功后先推进 low-level
 digest/version 并清除未完成 future history，再执行一次 Adapter update。
 
