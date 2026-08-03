@@ -3740,7 +3740,7 @@
 
 ## BUG-20260804-002：P4 10Hz 迁移会重复放大连续奖励且八小时墙钟不足
 
-- 日期：2026-08-04；状态：开发容器已验证，待正式平台长训验证。
+- 日期：2026-08-04；状态：平台已验证，正式长训进行中。
 - 影响范围：分支 `codex/p4-maze8h-attack`、任务 `p4maze8h-10hzroute`、P4 高层 10Hz rollout、
   reward 分解、exact resume、平台任务时长和监控面板。父包为 `p4nav2h_1256446-F`，平台模型
   ID `1256446`，checkpoint SHA256
@@ -3830,3 +3830,22 @@
 - 发现平台 logger 不兼容 Python logging 的 printf 参数转发，导致自动分支和 exact-resume 对齐日志
   显示未展开的 `%s/%d`。已改为调用前完成字符串格式化；这是可观测性修复，不改变正在运行任务的
   数值行为，当前任务无需为此重启。待下一次任务或 exact resume smoke 验证新日志文本。
+
+### 2026-08-04 `mazeprobe -> mazeattack` 平台验证追加
+
+- 正式任务在 `session_effective_seconds=3702.76` 的干净 rollout 边界将
+  `maze_phase_probe/maze_phase_attack` 从 `1/0` 切换为 `0/1`。实际学习率同步从 probe 的
+  `navigation=2.25e-5, actor=7.5e-5, critic=3.0e-4, safety=4.5e-4, adapter=5e-6`
+  切换为 attack 的 `navigation=1.8e-5, actor=2.55e-4, critic=2.4e-4,
+  safety=3.0e-4, adapter=5e-6`，与 `visual_recovery` 课程合同一致。
+- 切换后连续观察 6 个独立高层 update rollout：`approx_kl` 在约 `0.015-0.022`
+  稳定，`clip_fraction` 在约 `0.16-0.18` 稳定，未继续单调上冲；吞吐约
+  `155-158 samples/s`，`max_memory_reserved=1103101952` bytes 保持不变，
+  `high_updates` 从 `13888` 持续增长到 `14128`。`low_digest_drift=0` 且
+  `reward_conservation_error=0`，证明低层冻结、reward 结算和 10Hz 更新链未因阶段切换回归。
+- 行为指标在 rollout 间仍有显著噪声：切换后 `route_efficiency` 约 `0.40-0.52`、
+  `goal_progress_m_per_s` 约 `0.096-0.228`、`body_collision_onset` 约
+  `0.021-0.027`；`head_correct_actor_wrong_rate` 约 `0.39-0.55`，尚未呈现稳定下降。
+  这些证据支持“训练链路正常推进，暂无需中断或重训”，但不证明最终迷宫完成率已提升。
+  最终导航能力、提前避障、S-turn 和路径效率仍需在长训后通过固定种子 Track 评估和视频验证，
+  不得将平台训练稳定性等同为评估已验证。
