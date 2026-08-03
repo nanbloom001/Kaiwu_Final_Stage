@@ -108,7 +108,7 @@ P2_MONITOR_GROUPS = (
             (
                 "生命周期回调",
                 "p2_lifecycle",
-                ("lifecycle_success", "lifecycle_failures"),
+                ("platform_lifecycle_callbacks", "lifecycle_failures"),
             ),
         ),
     ),
@@ -389,7 +389,7 @@ P2_MONITOR_GROUPS = (
                     "safe_alternative_available",
                     "selected_safest_direction",
                     "selected_safest_direction_rate",
-                    "student_risk_left", "student_risk_center", "student_risk_right",
+                    "safety_head_risk_left", "safety_head_risk_center", "safety_head_risk_right",
                     "reward_missed_safe_direction",
                 ),
             ),
@@ -1144,9 +1144,11 @@ def _add_line_panel(monitor, name, name_en, metric):
     )
 
 
-def _add_track_panel(monitor, name, name_en, metric_prefix, aggregation):
+def _add_track_panel(
+    monitor, name, name_en, metric_prefix, aggregation, *, level_count=10
+):
     monitor.add_panel(name=name, name_en=name_en, type="line")
-    for level in range(10):
+    for level in range(level_count):
         metric = f"{metric_prefix}{level}"
         monitor.add_metric(metrics_name=metric, expr=f"{aggregation}({metric}{{}})")
     monitor.end_panel()
@@ -1215,10 +1217,110 @@ def _build_nav_monitor():
     return monitor.build()
 
 
+def _add_p4_track_outcome_panels(monitor):
+    monitor.add_group(
+        group_name="Track 20列窗口结果", group_name_en="p4_track_outcomes"
+    )
+    for panel in TRACK_PANEL_SPECS:
+        _add_track_panel(monitor, *panel, level_count=20)
+    monitor.end_group()
+
+
 def _build_p2_monitor():
     monitor = MonitorConfigBuilder()
     monitor.title("P2连续导航训练")
     for group_name, group_name_en, panels in P2_MONITOR_GROUPS:
+        monitor.add_group(group_name=group_name, group_name_en=group_name_en)
+        for name, name_en, metrics in panels:
+            _add_multi_line_panel(monitor, name, name_en, metrics)
+        monitor.end_group()
+    return monitor.build()
+
+
+def _build_p4_monitor():
+    monitor = MonitorConfigBuilder()
+    monitor.title("P4 Maze感知诊断与软巡航训练")
+    _add_p4_track_outcome_panels(monitor)
+    for group_name, group_name_en, panels in P2_MONITOR_GROUPS:
+        monitor.add_group(group_name=group_name, group_name_en=group_name_en)
+        for name, name_en, metrics in panels:
+            _add_multi_line_panel(monitor, name, name_en, metrics)
+        monitor.end_group()
+    groups = (
+        (
+            "P4目标与动作",
+            "p4_goal_mapper",
+            (
+                ("目标滤波", "p4_goal_belief", ("goal_innovation_d2", "goal_measurement_accepted", "goal_measurement_clipped", "goal_measurement_rejected", "goal_age_s", "goal_dropout_active", "goal_jump_active", "goal_process_variance_m2", "goal_candidate_count")),
+                ("目标滤波分位", "p4_goal_quantiles", ("goal_innovation_d2_p50", "goal_innovation_d2_p90", "goal_innovation_d2_p99", "goal_age_s_p50", "goal_age_s_p90")),
+                ("目标距离分桶", "p4_goal_distance_buckets", ("goal_distance_0_5_share", "goal_accept_0_5", "goal_clipped_0_5", "goal_reject_0_5", "goal_distance_5_10_share", "goal_accept_5_10", "goal_clipped_5_10", "goal_reject_5_10", "goal_distance_10_plus_share", "goal_accept_10_plus", "goal_clipped_10_plus", "goal_reject_10_plus")),
+                ("目标状态", "p4_goal_state", ("goal_map_x_m", "goal_map_y_m", "goal_map_distance_m", "goal_propagated", "goal_epoch_changed", "goal_reacquire_pending", "goal_reacquisition_time_s", "goal_fault_allowed", "goal_freshness", "goal_stale_low_speed_active", "raw_goal_distance_gt10_share")),
+                ("软巡航与动态上限", "p4_soft_cruise", ("policy_target_vx", "limited_target_vx", "effective_speed_cap", "safety_speed_cap", "safety_cap_predictive_risk", "soft_cruise_clear_factor", "soft_cruise_low_error", "soft_cruise_high_error", "reward_soft_cruise", "mapper_version_valid")),
+                ("动作映射", "p4_action_mapping", ("normalized_action_vx", "normalized_action_vy", "normalized_action_wz", "policy_target_vx", "policy_target_vy", "policy_target_wz", "limited_target_vx", "limited_target_vy", "limited_target_wz", "mapped_cmd_vx", "mapped_cmd_vy", "mapped_cmd_wz")),
+                ("转向抵消", "p4_yaw_cancellation", ("yaw_exec_cancellation", "yaw_true_cancellation", "yaw_exec_sign_flip", "yaw_true_sign_flip", "yaw_true_overshoot", "reward_yaw_raw")),
+            ),
+        ),
+        (
+            "P4感知诊断",
+            "p4_maze_perception",
+            (
+                ("视觉可分性", "p4_teacher_scene", ("teacher_scene_corridor", "teacher_scene_left_open", "teacher_scene_right_open", "teacher_scene_junction", "teacher_scene_dead_end", "teacher_scene_fuzzy", "teacher_safe_top1_clear", "scanner_valid_share", "safety_bce", "diagnostic_teacher_coverage", "diagnostic_wall_auroc", "diagnostic_wall_miss_rate", "diagnostic_safe_top1_accuracy", "diagnostic_scene_macro_f1", "diagnostic_clean_live_latent_cosine", "diagnostic_goal_wall_auroc", "diagnostic_goal_safe_top1_accuracy", "diagnostic_goal_scene_macro_f1")),
+                ("SafetyHead风险", "p4_safety_head_risk", ("teacher_risk_left", "teacher_risk_center", "teacher_risk_right", "safety_head_risk_left", "safety_head_risk_center", "safety_head_risk_right", "safe_alternative_available", "selected_safest_direction", "head_correct_actor_wrong")),
+                ("风险到减速", "p4_risk_deceleration", ("risk_decel_policy_vx", "risk_decel_limited_vx", "risk_no_deceleration", "predictive_collision_risk", "body_collision_onset", "wall_stuck_candidate_share", "wall_stuck_reset_triggered")),
+                ("LSTM记忆消融", "p4_zero_hidden_shadow", ("zero_hidden_action_mae", "zero_hidden_direction_disagreement", "camera_clean_live_action_mae", "camera_clean_live_latent_cosine")),
+            ),
+        ),
+        (
+            "P4安全奖励",
+            "p4_safety_rewards",
+            (
+                ("安全原始项", "p4_safety_raw", ("reward_predictive_raw", "reward_missed_safe_raw", "reward_yaw_raw")),
+                ("安全应用项", "p4_safety_applied", ("reward_predictive_collision_risk", "reward_missed_safe_direction", "reward_yaw_cancellation", "reward_safety_group_scale", "reward_stuck_reset")),
+                ("奖励守恒", "p4_reward_conservation", ("reward_decomposed_total", "rollout_reward_mean", "reward_conservation_error")),
+            ),
+        ),
+        (
+            "P4相机时序",
+            "p4_camera_timing",
+            (
+                ("共享帧状态", "p4_camera_frames", ("camera_capture", "camera_frame_changed", "camera_frame_id", "camera_age_s", "camera_raw_hole_rate", "camera_near_clip_added_hole_rate", "camera_delivered_hole_rate", "camera_center_hole_rate", "camera_lower_hole_rate", "near_clip_m", "near_clip_normalized")),
+                ("故障样本", "p4_camera_masks", ("camera_delay_only", "camera_fault_only", "camera_fault_delay_overlap", "camera_fault_kind", "camera_shadow_age_250ms")),
+                ("一致性监督", "p4_camera_aux", ("camera_memory_loss", "camera_clean_live_action_mae", "camera_clean_live_latent_cosine", "camera_aux_coefficient", "camera_aux_gradient_ratio", "camera_delay_only_share", "camera_fault_only_share", "camera_fault_delay_overlap_share")),
+            ),
+        ),
+        (
+            "P4墙面卡滞回收",
+            "p4_stuck_reset",
+            (
+                ("卡滞证据", "p4_stuck_evidence", ("motion_confined_share", "wall_evidence_share", "wall_stuck_candidate_share", "wall_stuck_duration_s", "wall_stuck_duration_p50_s", "wall_stuck_duration_p90_s", "wall_stuck_mapping_valid")),
+                ("卡滞回收", "p4_stuck_outcome", ("wall_stuck_would_reset", "wall_stuck_reset_triggered", "wall_stuck_reset_rate", "rollout_wall_stuck_reset_count", "wall_stuck_saved_seconds", "rollout_wall_stuck_saved_seconds", "collision_to_stuck_reset_delay_s", "reset_after_push_share", "episode_starts_per_hour")),
+                ("平台终止项", "p4_stuck_term", ("wall_stuck_term_available", "wall_stuck_term_config_valid")),
+            ),
+        ),
+        (
+            "P4 Push与响应",
+            "p4_push_adapter",
+            (
+                ("Push装配", "p4_push_assembly", ("push_term_assembly_valid", "push_runtime_active", "push_telemetry_valid")),
+                ("Push实测", "p4_push_actual", ("push_epoch", "push_event_count", "push_lifetime_count", "push_env_coverage", "seconds_since_push", "push_runtime_active", "push_telemetry_valid", "push_actual_delta_vx_mean", "push_actual_delta_vy_mean", "push_actual_delta_vx_abs_max", "push_actual_delta_vy_abs_max")),
+                ("Push累计", "p4_push_totals", ("push_rollout_event_count_total", "push_lifetime_event_count_total", "push_env_coverage_rate")),
+                ("Push后恢复", "p4_push_recovery", ("push_grace_active", "push_tracking_response_mae", "push_recovery_pending", "push_tracking_recovery_time_s")),
+                ("Push标签拒绝", "p4_push_label_reject", ("adapter_push_rejected_02s", "adapter_push_rejected_06s", "adapter_push_rejected_10s", "adapter_push_rejected_pose")),
+                ("Adapter兼容池", "p4_adapter_compat", ("adapter_compatible_current_records", "adapter_compatible_parent_records", "adapter_compat_migrated_legacy_parent_records", "adapter_legacy_parent_rejected_records", "adapter_compat_rejected_records", "adapter_target_current_ratio", "adapter_target_p35_ratio", "adapter_target_earlier_ratio", "adapter_latest_replay_ratio", "adapter_recent_replay_ratio", "adapter_parent_replay_ratio")),
+                ("Adapter拒绝原因", "p4_adapter_rejections", ("adapter_compat_rejected_missing_contract", "adapter_compat_rejected_mismatch_version", "adapter_compat_rejected_mismatch_schema", "adapter_compat_rejected_mismatch_low_level_digest", "adapter_compat_rejected_mismatch_feedback_digest", "adapter_compat_rejected_mismatch_capability_digest", "adapter_compat_rejected_mismatch_response_profile15", "adapter_compat_rejected_mismatch_action_mapper", "adapter_compat_rejected_mismatch_observation_layout", "adapter_compat_rejected_mismatch_label_layout")),
+            ),
+        ),
+        (
+            "P4冻结与性能",
+            "p4_runtime",
+            (
+                ("监控合同健康度", "p4_monitor_contract", ("p4_monitor_expected_metric_count", "p4_monitor_metric_with_data_count", "p4_monitor_empty_metric_count", "p4_monitor_longest_data_age_s")),
+                ("冻结合同", "p4_frozen_contract", ("low_digest_drift", "low_optimizer_steps", "high_updates", "p4_tbptt_sequences_per_env", "p4_tbptt_nav_ticks")),
+                ("资源与吞吐", "p4_resources", ("memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved", "samples_per_s")),
+            ),
+        ),
+    )
+    for group_name, group_name_en, panels in groups:
         monitor.add_group(group_name=group_name, group_name_en=group_name_en)
         for name, name_en, metrics in panels:
             _add_multi_line_panel(monitor, name, name_en, metrics)
@@ -1397,6 +1499,8 @@ def build_monitor():
         return _build_p15_monitor()
     if policy_entry in {"p2_nav_ppo", "p2_nav_eval"}:
         return _build_p2_monitor()
+    if policy_entry == "p4_nav_ppo":
+        return _build_p4_monitor()
     if policy_entry == "p3_standard_joint":
         return _build_p3_monitor()
     return _build_nav_monitor()

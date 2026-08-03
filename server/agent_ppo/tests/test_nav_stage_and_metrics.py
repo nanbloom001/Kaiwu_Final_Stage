@@ -25,6 +25,7 @@ from agent_ppo.conf.conf import (
     P3StandardEvalConfig,
     P3StandardJointConfig,
     P3TrackEvalConfig,
+    P4NavPPOConfig,
     StandardVisualPPOConfig,
     _configured_training_stage,
     _infer_stage_from_task_name,
@@ -60,6 +61,7 @@ class TestNavStageSelection(unittest.TestCase):
             "p15_response": P15ResponseConfig,
             "p2_nav_ppo": P2NavPPOConfig,
             "p3_standard_joint": P3StandardJointConfig,
+            "p4_nav_ppo": P4NavPPOConfig,
         }[policy_entry]
         self.assertIs(Config.CURRENT, expected)
 
@@ -88,6 +90,7 @@ class TestNavStageSelection(unittest.TestCase):
             "p15_response": "P15ResponseConfig",
             "p2_nav_ppo": "P2NavPPOConfig",
             "p3_standard_joint": "P3StandardJointConfig",
+            "p4_nav_ppo": "P4NavPPOConfig",
         }[policy_entry]
         self.assertEqual(current_assignment.value.id, expected_name)
 
@@ -359,6 +362,15 @@ class TestNavStageSelection(unittest.TestCase):
         self.assertNotIn("step_score_track_l", monitor_source)
         self.assertNotIn("hard_termination_rate", nav_panel_source)
         self.assertNotIn('name_en="value_loss"', monitor_source)
+
+    def test_p4_monitor_declares_all_twenty_track_columns(self):
+        monitor_source = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "conf"
+            / "monitor_builder.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("level_count=20", monitor_source)
+        self.assertIn('group_name_en="p4_track_outcomes"', monitor_source)
 
     def test_monitor_panel_names_use_platform_supported_characters(self):
         monitor_path = (

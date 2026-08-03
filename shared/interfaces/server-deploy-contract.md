@@ -523,6 +523,72 @@ baseline/RNG 仅写入 training state，`p3_standard_eval` 与 `p3_track_eval` �
 worker command sampler 位于独立环境 worker，当前公开 transport 不回传其 live RNG/hold 状态；
 checkpoint 明确记录 `seeded_fresh_after_environment_reset`，不得宣称该部分 exact resume。
 
+#### `p4_nav_ppo`：冻结 P3.5 低层的 Track 导航鲁棒包
+
+P4 Maze 强化当前父包选择为 `p4nav8h-r3` 最终 `pnavstable-1207698`。该 ID只用于候选选择；
+请求/配置 ID 不可用时只允许唯一结构兼容 P4 discovery，多个候选必须报歧义。选中包仍须通过
+stage、模块 spec、tensor shape 与有限值验证后才能 warm start。
+
+P4 不改变部署形状：worker policy 仍为 57905、低层输入 57901、Actor77、joint12，高层 Actor85。
+R2 训练 wire 为 `p4_worker_wire_v2=507`：稳定 P3.5 的 493 维之后仅附加未裁剪米制 goal2 与
+wall-stuck diagnostics12；这些字段不进入 Actor/Critic。Track eval wire 仍为 385，Standard/Track
+评估和部署 I/O 不变。低层 CNN/LSTM/Actor/std/Critic
+全程冻结；P4 只更新 NavigationEncoder、高层 Actor/LSTM、新建 Critic、SafetyHead 和
+ResponseAdapter。低层可复用 delivered frame 对应的 feature32，但 recurrent hidden 必须在每个
+50Hz tick 使用当前 proprio 推进；高层 32 个 5Hz tick 必须拆成两个 TBPTT16 序列。
+
+高层 normalized tanh-Gaussian 与 log-prob 不变，物理映射版本固定为
+`p4_capability_action_mapper_v1`：`vx=[0,effective_max_vx]`、`vy=+-0.30`、`wz=+-0.90`。
+checkpoint 与 Track eval 必须携带并核验 mapper 版本；`p2_legacy_action_mapper_v1` 只用于父策略
+逐值迁移验证。GoalBelief v3 直接取代旧 Actor Goal 链，训练时只从 P4 tail 读取未裁剪米制目标，
+并用 SportMode `vx/vy` 与 IMU `wz` 传播；episode reset 立即重建，普通 segment 变化不伪装成目标
+变化。critic、reward、terminal 和 scorer 仍读取干净真值。反馈 xy 无效时不使用伪零平移，过程
+方差放大四倍；短跳变不会立即接管，持续五次一致的 5Hz 测量可重捕获。历史目标 stale 时保留
+0.05 freshness 下限并限制 `vx<=0.20, |vy|<=0.10, |wz|<=0.25`；从未获得有效目标时停止平移。
+
+共享相机链只缓存 raw/captured/delivered depth 与冻结低层 CNN feature，不缓存最终 recurrent
+latent。clean teacher 每 rollout 从当前高层策略刷新，使用相同 Goal/capability/Adapter/reset 与
+独立 hidden；训练 storage 只增加 clean action mean 和 delay-only/fault-only/overlap mask。
+人工 fault、clean teacher、SafetyHead、Critic、Push wrapper、optimizer 和 storage 均不进入
+eval/export。
+
+Push pulse 由 EventManager 原函数 wrapper 回传的 worker step 去重；`push_epoch` 变化或
+`seconds_since_push<horizon` 会使 Adapter 0.2/0.6/1.0 秒标签失效，pose/stuck 使用 1.0 秒合同。
+Adapter replay 必须先同时核验 record schema、低层 digest、feedback digest、capability/mapper 与
+observation/label layout，再尝试 50/25/25；record 必须携带用于重建训练 observation 的实际
+response capability15，兼容池不足不得混入旧合同 record。P3 父包历史 completed record 缺逐记录
+contract 时，只允许在 parent warm replay 路径按 aux/label shape、有限值、horizon/sequence、来源
+digest 格式和序列内部 `(digest,iteration)` 一致性做 `legacy_parent_structural_v1` 迁移。历史记录允许
+来自父训练的旧低层版本，不伪装为当前冻结低层 exact 数据；迁移记录保留 P3/P2 capability，当前 P4 记录
+缺 contract 仍拒绝，且该迁移不得用于 exact resume。父包 current/earlier lineage 必须保持独立
+连续池，不能把 32 条记录对半切成小于 `burn-in8+sequence16` 的不可采样窗口。`safety_cap` 从 delivered depth 与当前
+exec 命令的 0.8 秒 slew 弧线计算，Track eval 不加载 SafetyHead 也必须执行同一限速合同。
+
+P4 安全组最终 raw weight 与 `-0.05/tick` cap 不变。训练倍率合同为
+`p4_safety_reward_ramp_v2_continuous`：0-30 分钟为 0，30-60 分钟线性到 0.25，60-120 分钟线性到
+1.0，之后保持 1.0；2 小时边界必须连续。该公式进入 training digest，旧 ramp checkpoint 不能
+静默 exact resume。Goal 跳变/丢失故障必须使用独立 `goal_fault_multiplier`，不能因安全奖励权重
+调整而隐式改变 observation fault 分布。
+
+P4 Maze checkpoint 合同为 `p4_maze_soft_cruise_v2_training_clock`：10 分钟只读诊断使用独立
+`session_wall_seconds`，不计入正式 `session_effective_seconds=7200`；诊断结束的 rollout 边界是
+正式训练时钟零点。诊断期用 detached `nav_feat32` 训练风险/场景线性探针，并用 `goal4` 探针与
+随机基线验证视觉特征确实提供额外信息；探针不进入 Actor/Critic observation，也不进入部署。
+exact resume 同时恢复 wall/training clock origin、累计诊断统计、探针状态和已选择分支，
+旧合同只允许 warm start。阶段优先级为
+`mazefinal > mazefull > mazeprobe > mazediag > pnavstable > pnavfull > pnavrobust > pnavwarm`。
+`p4_standard_eval` 只加载低层；`p4_track_eval` 加载
+低层、NavigationEncoder、高层 Actor 与 Adapter。两次四小时训练的第二段必须 exact resume
+session/lifetime、optimizer、return statistics、Goal/相机/速度 RNG 与 Push 阶段；live hidden、
+EventManager timer、pending rollout 在新环境中重建。
+
+P4 R2 的 `p4_stuck_reset_v1` 只在 worker bridge 中维护世界坐标约束与非足端接触证据，不修改
+平台 BaseEnv。默认模式为 shadow；active 前必须在线确认既有 `nav_stuck_timeout` term、
+`time_out=true`、公开 get/set/readback 和 `dt=0.02s`。确认墙面卡滞使用 reason=4、独立一次性
+`-6`、`bootstrap_mask=continuation_mask=0`，同一 terminal tick 不再重复 collision、predictive
+collision 或 stagnation。live tracker、recurrent hidden、pending rollout 和未完成 Adapter history
+不进入 checkpoint，resume 后统一 reset。
+
 P3 评估候选标签优先级为 `stable > pushfull > pushwarm > repair > gaitfixcalib`，随后兼容
 `stairfinal/stairrobust/stairadapt/stairwarm/staircalib` 及
 旧 `highslow/highadapt/adaptercalib/lowfull/lowmedium/lowmild/lowbase`；无同 ID P3 文件时只允许

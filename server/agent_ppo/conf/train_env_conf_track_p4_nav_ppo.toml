@@ -1,0 +1,186 @@
+# P4 two-hour maze-only navigation attack over the frozen low level.
+
+[env]
+num_envs = 128
+episode_length_s = 75.0
+task = "track"
+
+[env_conf]
+task_name = "Unitree-Go2-Velocity-Camera"
+policy_entry = "p4_nav_ppo"
+seed = 0
+
+[custom_parameters]
+continuous_training = true
+
+[terrain]
+mode = "track"
+num_cols = 20
+difficulty_range = [0.0, 1.0]
+curriculum = false
+max_init_terrain_level = 0
+
+[terrain.track]
+track_length = 1
+sub_terrains = ["open_entry_maze"]
+num_parallel_tracks = 20
+
+[domain_rand]
+enable_domain_rand = true
+randomize_friction = true
+friction_range = [0.65, 1.25]
+randomize_base_mass = true
+added_mass_range = [-0.40, 0.40]
+restitution_range = [0.0, 0.05]
+# Keep the EventTerm materialized from process creation. P4 sets its velocity
+# to zero until the two-hour boundary through EventManager's public API.
+push_robots = true
+push_interval_s = 45.0
+min_push_interval_s = 30.0
+max_push_vel_xy = 0.0
+
+[noise]
+add_noise = true
+noise_level = 0.35
+
+[init_state]
+pos = [0.0, 0.0, 0.35]
+
+[commands]
+resampling_time = [300.0, 300.0]
+heading_command = false
+
+[commands.ranges]
+lin_vel_x = [0.0, 1.0]
+lin_vel_y = [-0.30, 0.30]
+ang_vel_yaw = [-0.90, 0.90]
+
+[commands.limit]
+lin_vel_x = [0.0, 1.0]
+lin_vel_y = [-0.30, 0.30]
+ang_vel_z = [-0.90, 0.90]
+
+[commands.worker_progressive]
+enabled = false
+
+[camera.depth_camera]
+offset_pos = [0.339871, 0.034697, 0.075010]
+offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
+max_depth = 5.0
+
+[camera.depth_camera.augmentation]
+enabled = false
+
+[p4_nav_ppo]
+run_name = "p4maze2h-attack"
+# Model ID selects the intended parent candidate; structure/spec/shape/finite
+# validation remains authoritative after selection.
+parent_model_id = 1207698
+parent_model_label = "p4nav8h-r3-pnavstable-1207698"
+load_mode = "p4_parent_or_exact_resume"
+task_end_hours = 2.0
+target_effective_seconds = 7200
+diagnostic_seconds = 600
+maze_training_branch = "auto"
+nav_rollout_ticks = 32
+nav_period_frames = 10
+tbptt_sequence_length = 16
+num_learning_epochs = 4
+num_mini_batches = 4
+cnn_microbatch_sequences = 4
+max_grad_norm = 1.0
+slew_rate = [0.30, 0.30, 1.00]
+slew_release_rate = [0.30, 0.60, 2.50]
+first_save_minutes = 5.0
+save_interval_minutes = 10.0
+log_interval = 1
+p4_seed = 4100
+adapter_seed = 4104
+ppo_seed = 4105
+neutral_seed = 4106
+action_seed = 4107
+vy_action_seed = 4108
+terrain_curriculum = false
+
+[p4_nav_ppo.stuck_reset]
+enabled = true
+mode = "active"
+confirmation_s = 7.0
+radius_m = 0.30
+min_goal_distance_m = 0.80
+body_collision_force_n = 30.0
+wall_evidence_latch_s = 2.0
+episode_grace_s = 5.0
+push_grace_s = 2.0
+terminal_penalty = -10.0
+
+[p4_nav_ppo.push_schedule]
+term_name = "push_robot"
+resume_offset_s = 0.0
+
+[p4_nav_ppo.response_adapter]
+learning_rate = 1.0e-5
+max_grad_norm = 0.5
+capacity_steps = 4096
+sequence_length = 16
+burn_in_steps = 8
+batch_envs = 64
+velocity_loss_weight = 1.0
+pose_loss_weight = 0.5
+stuck_loss_weight = 0.25
+nll_loss_weight = 0.1
+velocity_horizon_weights = [1.0, 0.75, 0.5]
+target_stability_tolerance = [0.05, 0.02, 0.08]
+
+[p4_nav_ppo.feedback_profile]
+version = "p15_feedback_v2"
+age_clip_s = 0.8
+complete_failure_probability = 0.015
+complete_failure_duration_s = [0.10, 0.60]
+short_horizon_velocity_sources = ["sport_mode_xy", "imu_gyro_z"]
+uwb_role = "long_horizon_only_not_in_response_observation"
+
+[p4_nav_ppo.feedback_profile.sport]
+rate_hz = [35.0, 50.0]
+delay_s = [0.0, 0.06]
+noise_std = [0.025, 0.025, 0.035]
+bias_std = [0.015, 0.015, 0.020]
+dropout_probability = [0.0, 0.08]
+freshness_timeout_s = [0.10, 0.22]
+
+[p4_nav_ppo.feedback_profile.uwb]
+rate_hz = [4.0, 6.0]
+delay_s = [0.08, 0.30]
+noise_std = [0.06, 0.06, 0.05]
+bias_std = [0.03, 0.03, 0.02]
+low_pass_tau_s = [0.18, 0.45]
+dropout_probability = [0.0, 0.18]
+freshness_timeout_s = [0.30, 0.70]
+
+[p4_nav_ppo.feedback_profile.imu]
+gyro_noise_std = [0.006, 0.006, 0.009]
+gyro_bias_std = [0.004, 0.004, 0.006]
+gravity_noise_std = 0.004
+
+[rewards.flat_orientation]
+weight = -0.05
+
+[rewards.energy]
+weight = -5.0e-6
+
+[rewards.undesired_contacts]
+weight = 0.0
+[rewards.undesired_contacts.params]
+threshold = 1
+
+[rewards.track_lin_vel_xy]
+weight = 0.0
+[rewards.track_lin_vel_xy.params]
+std = 0.25
+command_name = "base_velocity"
+
+[rewards.track_ang_vel_z]
+weight = 0.0
+[rewards.track_ang_vel_z.params]
+std = 0.25
+command_name = "base_velocity"

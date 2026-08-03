@@ -44,6 +44,29 @@ from agent_ppo.model.response_adapter import response_adapter_spec
 class AlgorithmP2NavPPO:
     STAGE_TYPE = "p2_nav_ppo"
 
+    @staticmethod
+    def _adapter_replay_counts(
+        metadata: dict,
+    ) -> tuple[float, float, float, float, float]:
+        """Return mutually exclusive replay-pool counts and their total."""
+        if "p4_current_batch_envs" in metadata:
+            latest = float(metadata.get("p4_current_batch_envs", 0.0))
+            recent = float(metadata.get("p35_parent_batch_envs", 0.0))
+            parent = float(metadata.get("earlier_lineage_batch_envs", 0.0))
+            track = latest + recent
+            return latest, recent, parent, track, track + parent
+        if "latest_batch_envs" in metadata or "recent_batch_envs" in metadata:
+            latest = float(metadata.get("latest_batch_envs", 0.0))
+            recent = float(metadata.get("recent_batch_envs", 0.0))
+            parent = float(metadata.get("parent_batch_envs", 0.0))
+            track = latest + recent
+            return latest, recent, parent, track, track + parent
+        latest = float(metadata.get("latest_batch_envs", 0.0))
+        recent = float(metadata.get("recent_batch_envs", 0.0))
+        track = float(metadata.get("track_batch_envs", latest + recent))
+        parent = float(metadata.get("parent_batch_envs", 0.0))
+        return latest, recent, parent, track, track + parent
+
     def __init__(
         self,
         *,
@@ -677,6 +700,56 @@ class AlgorithmP2NavPPO:
             raise AssertionError("P2 nav_nonvisual36 layout drift")
         return result
 
+    def _split_transport(self, critic_wire: torch.Tensor):
+        """Stage hook for a versioned training-only privileged tail."""
+        return split_p2_transport(critic_wire)
+
+    def _prepare_policy_parts(self, parts, critic_obs, aux, reset):
+        del critic_obs, aux, reset
+        return parts
+
+    def _map_policy_target(
+        self,
+        normalized: torch.Tensor,
+        legacy_target: torch.Tensor,
+        *,
+        goal4: torch.Tensor,
+        aux: torch.Tensor,
+    ) -> torch.Tensor:
+        del normalized, goal4, aux
+        return legacy_target
+
+    def _predictive_command(self, target: torch.Tensor) -> torch.Tensor:
+        return target
+
+    def _response_append_kwargs(self) -> dict[str, object]:
+        return {}
+
+    def _transition_extras(self) -> dict[str, torch.Tensor]:
+        return {}
+
+    def _update_policy_auxiliary_target(
+        self, *, parts, nav_feat, nav_nonvisual, profile, confidence, reset
+    ) -> None:
+        del parts, nav_feat, nav_nonvisual, profile, confidence, reset
+
+    def _extra_tick_diagnostics(self) -> dict[str, torch.Tensor]:
+        return {}
+
+    def _actor_auxiliary_loss(
+        self,
+        *,
+        normalized_mean: torch.Tensor,
+        batch: dict[str, torch.Tensor],
+        ppo_actor_loss: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        del batch, ppo_actor_loss
+        return normalized_mean.new_zeros(()), {}
+
+    def _actor_auxiliary_metric_names(self) -> tuple[str, ...]:
+        """Scalar auxiliary metrics that must survive PPO aggregation."""
+        return ()
+
     def _apply_external_reset(self, aux: torch.Tensor) -> None:
         reset = aux[:, 24] > 0.5
         if not bool(reset.any()):
@@ -696,7 +769,7 @@ class AlgorithmP2NavPPO:
 
     @torch.no_grad()
     def frame_begin(self, obs: torch.Tensor, critic_wire: torch.Tensor, *, deterministic=False):
-        critic_obs, aux = split_p2_transport(critic_wire)
+        critic_obs, aux = self._split_transport(critic_wire)
         self.curriculum_probe.observe(
             aux,
             logger=self.logger,
@@ -709,6 +782,9 @@ class AlgorithmP2NavPPO:
         critic_obs = critic_obs.clone()
         parts = self._split_policy(obs)
         parts["proprio"] = parts["proprio"].clone()
+        parts = self._prepare_policy_parts(
+            parts, critic_obs, aux, self.reset_since_tick.clone()
+        )
         p0, p1 = nav_contract.POLICY_CMD_SLICE
         c0, c1 = nav_contract.CRITIC_CMD_SLICE
         parts["proprio"][:, p0:p1] = self.command.exec_cmd.to(parts["proprio"])
@@ -790,6 +866,14 @@ class AlgorithmP2NavPPO:
                 profile = torch.where(neutral, torch.zeros_like(profile), profile)
                 confidence = torch.where(neutral, torch.zeros_like(confidence), confidence)
             nav_nonvisual = self._nav_nonvisual(parts["goal4"], aux)
+            self._update_policy_auxiliary_target(
+                parts=parts,
+                nav_feat=nav_feat,
+                nav_nonvisual=nav_nonvisual,
+                profile=profile,
+                confidence=confidence,
+                reset=reset,
+            )
             actor_input = assemble_actor_input(nav_feat, nav_nonvisual, profile, confidence)
             critic_input = None
             if deterministic:
@@ -810,6 +894,12 @@ class AlgorithmP2NavPPO:
                     vy_generator=self.vy_action_generator,
                     hard_abs_vy=self.current_vy_hard_limit,
                 )
+            target = self._map_policy_target(
+                normalized,
+                target,
+                goal4=parts["goal4"],
+                aux=aux,
+            )
             value = None
             if self.training_enabled:
                 if getattr(self, "track_safety_enabled", True):
@@ -897,7 +987,7 @@ class AlgorithmP2NavPPO:
                         predictive_collision_wallness,
                         predictive_collision_sector_risk,
                     ) = p2_contract.predictive_collision_risk_penalty(
-                        parts["depth"], target
+                        parts["depth"], self._predictive_command(target)
                     )
                     missed_safe_penalty, missed_safe_diagnostics = (
                         p2_contract.missed_safe_direction_penalty(
@@ -982,6 +1072,7 @@ class AlgorithmP2NavPPO:
                     "selected_safest_direction": missed_safe_diagnostics["selected_safest"].detach(),
                     "tick_penalty": command_penalty + missed_safe_penalty.reshape(-1, 1),
                     "target_cmd3": target.detach(),
+                    **self._transition_extras(),
                 }
             self.command.set_target(target)
             self.reset_since_tick.zero_()
@@ -1002,6 +1093,7 @@ class AlgorithmP2NavPPO:
             patched[:, : p2_contract.RESPONSE_AUX_DIM],
             dones,
             current_segment=patched[:, p2_contract.CURRENT_SEGMENT_INDEX],
+            **self._response_append_kwargs(),
         )
         dones = dones.to(self.device).bool()
         if bool(dones.any()):
@@ -1041,7 +1133,7 @@ class AlgorithmP2NavPPO:
     ) -> bool:
         if self.pending_tick is None:
             raise RuntimeError("P2 finish_tick called without a pending nav transition")
-        critic_obs, next_aux = split_p2_transport(next_critic_wire)
+        critic_obs, next_aux = self._split_transport(next_critic_wire)
         critic_obs = critic_obs.clone()
         c0, c1 = nav_contract.CRITIC_CMD_SLICE
         critic_obs[:, c0:c1] = self.command.exec_cmd.to(critic_obs)
@@ -1100,7 +1192,7 @@ class AlgorithmP2NavPPO:
             torch.isfinite(reason_raw)
             & (reason_raw == reason_rounded)
             & (reason_rounded >= 0.0)
-            & (reason_rounded <= 3.0)
+            & (reason_rounded <= 4.0)
         )
         reason = reason_rounded.long()
         reward_source_aux = next_aux if terminal_safe_aux is None else terminal_safe_aux
@@ -1258,6 +1350,8 @@ class AlgorithmP2NavPPO:
             settle_mask=settle_mask,
             terminal=terminal.reshape(-1),
             reason=reason,
+            reward_source_aux=reward_source_aux,
+            reward_exec_cmd=reward_exec_cmd,
         )
         component_names = tuple(components)
         component_stack = torch.stack(
@@ -1390,6 +1484,10 @@ class AlgorithmP2NavPPO:
                 -frontier_potential_before,
                 torch.zeros_like(frontier_potential_before),
             ).detach().reshape(-1, 1),
+            "reward_conservation_error": (
+                total_reward - torch.stack(tuple(components.values()), dim=0).sum(dim=0)
+            ).abs().detach().reshape(-1, 1),
+            **self._extra_tick_diagnostics(),
         }
         transition = dict(self.pending_tick)
         transition.pop("command_penalty")
@@ -1569,6 +1667,8 @@ class AlgorithmP2NavPPO:
                 "reset_mask",
                 "safety_target",
                 "safety_valid",
+                "clean_action_mean",
+                "camera_aux_mask",
             )
         }
         batch["advantages"] = (
@@ -1632,7 +1732,7 @@ class AlgorithmP2NavPPO:
         inputs = assemble_actor_input(
             feat, batch["nav_nonvisual"], batch["response_profile"], batch["confidence"]
         )
-        log_prob, entropy, _, _, _ = self.actor.evaluate_actions(
+        log_prob, entropy, mean, _, _ = self.actor.evaluate_actions(
             inputs,
             batch["pre_tanh_action"],
             batch["actor_hidden"],
@@ -1660,10 +1760,16 @@ class AlgorithmP2NavPPO:
         else:
             safety_loss = surrogate.new_zeros(())
             student_risk = torch.zeros(3, device=surrogate.device)
+        auxiliary_loss, auxiliary_metrics = self._actor_auxiliary_loss(
+            normalized_mean=torch.tanh(mean),
+            batch=batch,
+            ppo_actor_loss=surrogate,
+        )
         total_loss = (
             surrogate
             - self.entropy_coefficient * entropy.mean()
             + p2_contract.SAFETY_BCE_WEIGHT * safety_loss
+            + auxiliary_loss
         )
         with torch.no_grad():
             log_ratio = log_prob - batch["old_log_prob"]
@@ -1676,9 +1782,10 @@ class AlgorithmP2NavPPO:
             "clip_fraction": clip_fraction.detach(),
             "safety_bce": safety_loss.detach(),
             "scanner_valid_share": batch["safety_valid"].float().mean().detach(),
-            "student_risk_left": student_risk[0].detach(),
-            "student_risk_center": student_risk[1].detach(),
-            "student_risk_right": student_risk[2].detach(),
+            "safety_head_risk_left": student_risk[0].detach(),
+            "safety_head_risk_center": student_risk[1].detach(),
+            "safety_head_risk_right": student_risk[2].detach(),
+            **auxiliary_metrics,
         }
 
     def _critic_micro_loss(self, batch):
@@ -1702,6 +1809,7 @@ class AlgorithmP2NavPPO:
         minibatch_sequences = max(
             1, (len(refs) + self.num_mini_batches - 1) // self.num_mini_batches
         )
+        auxiliary_metric_names = self._actor_auxiliary_metric_names()
         totals = {
             "actor_loss": 0.0,
             "critic_loss": 0.0,
@@ -1710,12 +1818,13 @@ class AlgorithmP2NavPPO:
             "clip_fraction": 0.0,
             "entropy": 0.0,
             "scanner_valid_share": 0.0,
-            "student_risk_left": 0.0,
-            "student_risk_center": 0.0,
-            "student_risk_right": 0.0,
+            "safety_head_risk_left": 0.0,
+            "safety_head_risk_center": 0.0,
+            "safety_head_risk_right": 0.0,
             "updates": 0.0,
             "actor_update_time_s": 0.0,
             "critic_update_time_s": 0.0,
+            **{name: 0.0 for name in auxiliary_metric_names},
         }
         epoch_metrics = []
         for _epoch in range(self.num_learning_epochs):
@@ -1755,10 +1864,13 @@ class AlgorithmP2NavPPO:
                     totals["actor_loss"] += float(loss.detach()) * scale
                     for name in (
                         "safety_bce", "approx_kl", "clip_fraction", "entropy",
-                        "scanner_valid_share", "student_risk_left",
-                        "student_risk_center", "student_risk_right",
+                        "scanner_valid_share", "safety_head_risk_left",
+                        "safety_head_risk_center", "safety_head_risk_right",
                     ):
                         totals[name] += float(actor_metrics[name]) * scale
+                    for name in auxiliary_metric_names:
+                        if name in actor_metrics:
+                            totals[name] += float(actor_metrics[name]) * scale
                     epoch_totals["actor_loss"] += float(loss.detach()) * scale
                     for name in ("safety_bce", "approx_kl", "clip_fraction", "entropy"):
                         epoch_totals[name] += float(actor_metrics[name]) * scale
@@ -1823,9 +1935,11 @@ class AlgorithmP2NavPPO:
             totals["critic_loss"] /= totals["updates"]
             for name in (
                 "safety_bce", "approx_kl", "clip_fraction", "entropy",
-                "scanner_valid_share", "student_risk_left",
-                "student_risk_center", "student_risk_right",
+                "scanner_valid_share", "safety_head_risk_left",
+                "safety_head_risk_center", "safety_head_risk_right",
             ):
+                totals[name] /= totals["updates"]
+            for name in auxiliary_metric_names:
                 totals[name] /= totals["updates"]
         for index, metrics in enumerate(epoch_metrics):
             for name, value in metrics.items():
@@ -1935,13 +2049,9 @@ class AlgorithmP2NavPPO:
                 )
             )
         metadata = batch.metadata if isinstance(batch.metadata, dict) else {}
-        latest_batch = float(metadata.get("latest_batch_envs", 0.0))
-        recent_batch = float(metadata.get("recent_batch_envs", 0.0))
-        track_batch = float(
-            metadata.get("track_batch_envs", latest_batch + recent_batch)
+        latest_batch, recent_batch, parent_batch, track_batch, replay_total = (
+            self._adapter_replay_counts(metadata)
         )
-        parent_batch = float(metadata.get("parent_batch_envs", 0.0))
-        replay_total = track_batch + parent_batch
         zero_baseline = self._masked_mean(
             batch.velocity_labels.abs().mean(dim=-1), batch.horizon_mask
         )
@@ -2098,6 +2208,9 @@ class AlgorithmP2NavPPO:
             "adapter_latest_replay_ratio": latest_batch / replay_total if replay_total > 0.0 else 0.0,
             "adapter_recent_replay_ratio": recent_batch / replay_total if replay_total > 0.0 else 0.0,
             "adapter_low_level_version_lag": float(metadata.get("active_version_lag", 0.0)),
+            "adapter_compatible_current_records": float(metadata.get("compatible_current_records", 0.0)),
+            "adapter_compatible_parent_records": float(metadata.get("compatible_parent_records", 0.0)),
+            "adapter_compat_rejected_records": float(metadata.get("rejected_records", 0.0)),
             **{
                 f"adapter_{axis}_mae_{label}": float(axis_mae[horizon][axis_index].detach())
                 for horizon, label in enumerate(("02s", "06s", "10s"))

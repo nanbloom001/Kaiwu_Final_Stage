@@ -3366,3 +3366,287 @@
   `P3.5 低速楼梯与后期Push` 和中文面板名 `P3.5训练侧奖励`，错误为“面板名称非法”。
   根因是平台两类名称合同均不允许 `.`，与 metric key 和数据无关。显示名已改为
   `P35 低速楼梯与后期Push` / `P35训练侧奖励`，未改变面板 key、指标或训练行为。
+
+## BUG-20260802-009：P4 直接复用旧 mapper、Goal/相机链和 Push replay 会破坏导航鲁棒训练合同
+
+- 日期：2026-08-02；状态：本地已验证，开发容器、平台 smoke、评估和真机均待验证。
+- 影响范围：分支 `codex/p4-nav8h`、任务 `p4nav8h`、`p4_nav_ppo` 训练、P4 Standard/Track
+  双评估与两次四小时 exact resume。父模型要求为本轮 `p35gaitfix2h` 最终 checkpoint；模型 ID、
+  文件 SHA256 和模块 digest 尚未产生或未提供，不能用其父模型 `1013548` 冒充。
+- 症状与根因：旧 P2 action mapper 不消费 capability15，无法执行三档动态速度上限；旧
+  NavGoalChain 无 MAP 传播/jump/dropout 恢复；相机 fault、low feature 与 high input 没有共享
+  frame 合同；旧 Adapter future label 不识别随机 Push，且 replay 先混池再采样。首轮实现核验又
+  发现 rollout 尾帧会被下一 rollout 重读并重复累计 `push_epoch`、exact resume 时 worker Push
+  时钟未恢复、`fault-only` mask 永远为零、Goal 过期仍可横移，以及 P4 exact resume 未重置冻结
+  低层基准 digest。
+- 核心修复：新增版本化 P4 mapper、GoalBelief v2、共享 30Hz capture/50Hz recurrent 相机状态、
+  0.8 秒真实 slew/reversal 积分预测、exec/true yaw cancellation 与同比安全奖励 cap；低层仅复用
+  CNN feature32且每 tick 推进 LSTM。Push pulse 按 worker step 去重，resume session 通过
+  `env.reset(usr_conf)` 回填 EventManager 阶段；Adapter horizon/pose label 跨 Push 失效，records
+  先按八项合同过滤再按目标池比例采样。checkpoint 保存 mapper、Goal/camera/speed RNG、冻结
+  digest 与阶段，新增 P4 layered validator 和 Standard/Track loader。
+- 监控与防线：新增 Goal innovation/age、normalized/mapped cmd、速度档、yaw cancellation/flip/
+  overshoot、安全 raw/applied/scale、共享 frame/fault mask、Push delta/标签拒绝、Adapter兼容池、
+  low digest 与 TBPTT 指标，并按真实有限数据维护缺项与最长年龄。新增 `test_p4_nav.py` 覆盖 mapper、
+  Goal传播、相机三类 mask、Push 去重、Adapter horizon、冻结隔离、50Hz low LSTM、57905/493
+  tick、P4双评估 validator、Track loader和 exact-resume round-trip。
+- 最终独立审计更正：合法 segment/goal epoch 原先没有接入 learner/worker GoalBelief，目标切换可能
+  被当作 jump 拒绝，且 yaw cancellation 窗口不会清空；现统一接入并新增 MAP、传播、重获时间面板。
+  2-6 小时 severe-camera 行禁止长 Goal dropout，组合严重故障只在最终 stress 阶段开放。相机辅助
+  loss 的 scalar 指标原先未进入 PPO 汇总，现显式聚合 clean/live action MAE、latent cosine、梯度比
+  与三类 mask。另修复 P4 record 采样重建时错误使用 P2 capability15，以及 Track eval 因忽略
+  SafetyHead 而使 `safety_cap` 永远为 1 的部署闭环缺口；安全上限现由 delivered depth 与当前 exec
+  slew 弧线生成，训练与评估一致。
+- 验证：宿主 `PY311test` 完整回归为 `442 passed, 5 skipped, 3 subtests passed`；Python编译、
+  TOML解析、`git diff --check` 和 `server/isaac_env/base_env.py` 零差异通过。当前尚未在开发容器验证
+  EventManager `get/set/reset`、真实 Push delta、128 env 32-tick PPO/Safety/Adapter、显存与吞吐；
+  也未运行15-30分钟平台 smoke，不能升级为平台已验证。
+- 回滚与最短检查：若 P4 smoke 失败，继续使用 P3.5 最终包；依次检查父包 ID/SHA/digest、mapper
+  version、Goal age、low digest、共享 frame ID、Push telemetry、Adapter reject 与 reward
+  conservation。`BaseEnv`、policy/ONNX/deploy shape均未修改，回滚不需要部署端迁移。
+- 2026-08-02 快速回归更正（状态：本地已验证，开发容器与平台仍待验证）：固定 fault fixture
+  复现 delivered frame ID 从 `4 -> 0`、`15 -> 14` 回退。根因是 delay 在每个 control tick
+  重采样，且历史队列暂时找不到目标时间时错误回退到 newest frame；这既破坏“同一故障连续存在”
+  的合同，也会让 recurrent policy 看到时间倒流。现将 delay 固定在 fault event 创建时采样，历史
+  不足优先 hold 上一 delivered frame，并以显式 monotonic guard 禁止旧 frame replay。相机孔洞与
+  结构块增强同时从逐环境 Python 循环改为 128-env batch tensor 操作，减少 rollout 热路径开销。
+- 同次修复发现 exact resume 先恢复 generator state、随后调用 `reset()` 会消耗 RNG，导致恢复后
+  故障序列不可精确重现；现先清 live buffer、最后恢复保存的 generator state。监控 required contract
+  原先仅列 14 个样例指标，无法发现 Goal、Push、Adapter、reward、冻结状态和资源面板的大量缺项；
+  现扩展为完整 P4 关键指标集合，并为九类 Adapter 兼容拒绝原因统一输出零值或实际计数。定向
+  `test_p4_nav.py` 为 `19 passed`，覆盖 frame 单调性、相机 RNG exact resume 与监控合同；开发
+  容器 EventManager、128-env 性能和平台面板数据仍未验证，不得标记为平台已验证。
+- 2026-08-03 父包与容器测试更正（状态：开发容器结构验证通过，Isaac smoke 待完成）：操作者
+  改为选择 `p3stairmem8h` 最终 `stairfinal` 模型 `1013548`。容器对真实 checkpoint 验证
+  `format=kaiwu_train_v1/schema=2/stage_type=p3_standard_joint`，低层、NavigationEncoder、高层
+  Actor、SafetyHead 与 Adapter 的 spec/shape/finite 全部兼容；原 loader 唯一阻断是把
+  `phase_label=stable` 写成硬条件。现允许结构完整的 `stairfinal/stable`，默认候选改为
+  `1013548`，模型 ID仍不替代结构验证。另修复容器中 `agent_ppo -> /workspace/code` 符号链接导致
+  BaseEnv 零修改测试误找 `/workspace/code/isaac_env` 的路径假设；测试只读取平台 BaseEnv，未修改它。
+- 2026-08-03 首轮 Isaac smoke 更正（状态：代码已修复待容器复测）：1-env Track+Camera 已完成
+  P4 装配、父包预加载、Isaac reset/step，并推进至少 75 个低层帧；随后首次框架保存路径
+  `model.ckpt-p4warm-1013600.pkl` 被 `validate_probe_filename()` 拒绝。根因不是平台新模型 ID
+  `1013600` 与父 ID `1013548` 不同，而是 P4 phase 中的数字 `4` 违反探活正则的纯小写字母段。
+  现将 P4 四阶段标签原子改为 `pnavwarm/pnavrobust/pnavfull/pnavstable`，保留平台注入 ID 并新增
+  任意新 ID 的探活回归。同期平台监控校验发现
+  `adapter_compat_rejected_mismatch_response_capability_profile15` 超过 60 字符，导致整个用户监控
+  配置被跳过；展示 metric 已缩短为 `adapter_compat_rejected_mismatch_response_profile15`，底层
+  record rejection reason 保持不变，并新增全量 required-metric 长度断言。首轮进程组已精确停止；
+  修复后定向测试、checkpoint 保存、32-tick PPO/Adapter 与平台面板仍待复测。另发现旧 smoke
+  runner 的停止条件依赖 `iteration/platform_dump_boundary`，而 P4 分支没有发出这两个诊断事件，
+  导致训练已更新并保存仍不会自动停止；现补充仅在 `NAV_SMOKE_EVENT_LOG` 配置时落盘的原子事件，
+  生产环境未配置时为无 I/O 的 no-op。
+- 2026-08-03 容器复测结果（状态：开发容器已验证，平台正式任务待验证）：真实父包
+  `p3stairmem8h_1013548` 完成 1-env Track+Camera 全栈 smoke。首轮有效迭代包含 320 个低层帧、
+  32 个高层 tick、4 个 PPO epoch/8 次高层 gradient step 和一次 Adapter update；
+  `low_digest_drift=0`、`low_optimizer_steps=0`、`push_term_assembly_valid=1`，CUDA allocated/reserved
+  峰值约 `91.6/107.0 MiB`（不含 Isaac/相机进程显存）。新文件名成功保存为
+  `model.ckpt-pnavwarm-1013600.pkl`，随后平台注入 `1013760/1013868` 也均成功，证明新模型 ID
+  不会被父 ID 单点阻断。自定义 monitor 已进入逐 metric 表达式构建，未再出现配置校验失败。
+  smoke 事件最终满足 `iteration + platform_dump_boundary`，runner 触发自动停止；随后显式执行
+  `stop` 完成进程组收尾并复核无遗留进程；
+  SIGTERM 后 model-file-save 子进程短暂出现的 connection-refused 日志属于受控关停顺序，不是训练
+  update/save 失败。当前证据不替代 128-env 显存/吞吐或正式平台 15-30 分钟 smoke。
+
+## BUG-20260803-010：P4 首轮相机/Goal 单位污染、warm-up Adam 漂移与卡墙样本长期占用
+
+- 日期：2026-08-03；状态：本地已验证；卡墙 termination 子链已开发容器验证，
+  平台 smoke、其余 P4 联合训练、评估和真机均待验证。
+- 影响范围：`codex/p4-nav8h`、首轮约 50 分钟 `p4nav8h` 训练及下一任务 `p4nav8h-r2`。
+  首轮 checkpoint 只保留诊断，不作为 R2 父包；R2 仍从 `p3stairmem8h_1013548` 干净 warm start。
+- 用户可见症状：首轮监控出现 nominal delivered hole 明显高于 raw hole、Goal reject/age 异常且
+  卡滞占比很高；大量机器人接触墙后继续占用接近 120 秒 episode。该证据只能证明训练数据链异常，
+  不能据此认定原安全奖励权重不足。
+- 根因：`P4SharedCameraState` 将 `0.10-0.25m` 直接与 `[0,1]` depth 比较；learner 又从已逐维
+  clip 到 `+-10m` 的 Critic goal 编码反推米制目标，远目标传播后必然形成假 innovation。warm-up
+  只将 Actor/CNN LR 设为零，Adam `step/exp_avg/exp_avg_sq` 仍会变化。平台已有
+  `nav_stuck_timeout`，但 P4 未向其写入经墙面证据确认的 motion-stuck counter。
+- 修复：近裁剪比较改为 `near_clip_m/max_depth_m` 并拆分 raw/added/delivered hole；P4-only
+  training wire 从 493 扩为 507，附加 raw metric goal2 与 stuck diagnostics12，网络和 eval wire
+  不变。GoalBelief 升级为带过程协方差、五次一致重捕获和 stale-MAP 低速的 v3。warm-up 按 optimizer
+  group 设置 `requires_grad`，SafetyHead 继续训练而冻结参数及 Adam state 不动。新增 worker-owned
+  `MotionWallStuckTracker`，默认 shadow；active 时只经平台现有 termination manager 触发真实 reset，
+  reason=4 使用独立 `-6` 且不 bootstrap、不重复结算碰撞和停滞。首次 terminal 帧会冻结旧 episode
+  的 command、aux、raw goal 与 stuck diagnostics，自动 reset 后的新 episode 数据不得覆盖 507 维
+  transition tail；相机监控使用明确的 `camera_delivered_hole_rate`，旧 `camera_hole_rate` 仅保留为
+  兼容别名。
+- 验证：宿主 `PY311test` 的完整 `agent_ppo/tests` 回归为
+  `454 passed, 5 skipped, 3 subtests passed`；Python 编译、TOML 解析、required monitor 159 项覆盖、
+  144 个面板无 line 面板超过 20 指标，以及
+  `git diff --check` 通过。新增测试覆盖 0.10m 到 0.02 normalized、15m raw goal transport、冻结组
+  Adam moments 位级不变、reason=4 优先级/mask、single terminal penalty 与 fake termination manager
+  readback，并直接验证 terminal 后旧 raw goal/stuck tail 不被 reset 后的新值覆盖。
+  `server/isaac_env/base_env.py` 未修改。
+- 遗留风险与最短检查：本地镜像只证明平台历史源码存在该 term，不能替代当前容器动态对象。
+  容器必须打印 active term、time_out、get/set/readback、dt，并先做 1-env 物理 reset；平台依次跑
+  shadow、12 秒 active、再决定 10/12 秒。若映射无效、term readback 失败或误杀超过 1%，保持
+  shadow/120 秒 timeout。回滚只需关闭 `[p4_nav_ppo.stuck_reset].enabled/mode` 并回到 P3 父包。
+- 2026-08-03 容器连接补充：本地 RPC network dry-run 返回 `WEBIDE_RECORD_NOT_FOUND`，已登录的
+  Chrome IDE 标签随后返回 Remote Agent WebSocket 断开。此次未发生代码同步、Isaac reset 或
+  termination-manager 动态验证，故状态仍为“本地已验证”；重新打开开发容器后应先同步 R2 文件，
+  再执行 1-env shadow/active 物理 reset smoke。
+- 2026-08-03 审查修正：发现 P4 warm start 与 eval 仍把 `phase_label` 当成结构正确后的第二道
+  硬门禁；同时 checkpoint 虽保存运行时 `stuck_reset_contract`，exact resume 却只比较固定的
+  shadow/10 秒默认合同且不读取保存值。现将 P3/P4 phase label 降为 warning-only 身份元数据，
+  结构、spec、shape 与有限值继续硬校验；stuck-reset 配置统一经版本化规范函数供 worker、reward、
+  training contract 和 checkpoint state 使用，active/shadow、10/12 秒或 terminal penalty 不一致时
+  exact resume 明确报错，避免静默改变终止与奖励分布。新增未知标签通过结构验证、动态合同写入和
+  resume 配置漂移拒绝测试。状态保持“本地已验证”；容器与平台验证层级未因此自动升级。
+- 2026-08-03 监控口径更正（状态：本地已验证，容器待验证）：平台镜像的 Track 结果导出明确按
+  `_num_cols` 逐列生成 `track_l{col}`；20 列不会自动两两合并成旧 L0-L9。P4 面板此前仍只注册
+  10 个旧指标，因此遗漏 L10-L19。现新增 P4-only 20 列结果组，每个 line 面板恰好 20 项，未超过
+  平台限制。另修复 shadow tracker 在达到阈值后每帧重复产生 `would_reset/saved_seconds`、P4
+  Adapter 三池 batch 被旧 `track_batch_envs` 元数据重复计数导致比例大于 1，以及
+  `lifecycle_success` 容易被误读为完成数的问题。配置仍保持 `mode=shadow`：本轮平台指标显示
+  `wall_stuck_term_available=0`、`wall_stuck_term_config_valid=0`，直接切 active 不能形成真实 reset。
+  定向回归为 `61 passed`；容器仍须先核验 active term、time_out、get/set/readback 与 1-env 物理
+  reset，再以 12 秒 active smoke 判断是否启用，不能用配置文本替代运行时证据。
+- 2026-08-03 开发容器验证与修正：首次 1-env smoke 暴露 bridge 会在 Isaac
+  termination manager 完成装配前做一次预检，并将早期 `term_available=0`
+  永久保留；并非平台缺少 `nav_stuck_timeout`。现在 tracker 在首批真实 frame
+  内最多重试 8 次终止管理器配置。新增
+  `agent_ppo/tools/p4_stuck_runtime_smoke.py`，对当前容器做了 1-env Track+Camera
+  实测：active terms 包含 `nav_stuck_timeout`、`time_out=true`、`dt=0.02`，
+  临时 `confirmation=0.04s` 成功回读 `max_stuck=2`，episode length 从 1 被物理
+  auto-reset 为 0，worker snapshot 保留 `reset=true/reason=4`，smoke 输出
+  `P4_STUCK_RUNTIME_SMOKE_PASS`。平台 `BaseEnv` 在 trajectory recorder 未启用时仍会将
+  公开 `truncated` 清零，因此 P4 继续以 worker terminal snapshot 恢复 timeout 语义，
+  不修改平台覆盖的 `BaseEnv`。容器定向回归为 `167 passed`；下一轮平台
+  smoke 配置改为保守的 `mode=active, confirmation_s=12.0`，仍须以误杀率决定
+  正式长训保留 12 秒还是改为 10 秒。
+- 2026-08-03 开发容器联合 smoke 补充：修正后容器定向回归为
+  `168 passed`，生产 TOML 已确认为 `mode=active, confirmation_s=12.0`。使用真实父包
+  `p3stairmem8h_1013548` 完成 1-env 全链路 smoke：320 个低层帧保持冻结，
+  收集 32 个高层 tick，执行 4 个 PPO epoch（`high_updates=8`）、Adapter update
+  和 checkpoint 保存。父 records 兼容迁移 64 条、拒绝 0 条，低层 digest 无漂移；
+  CUDA 峰值 `max_memory_allocated=40,605,184` bytes、
+  `max_memory_reserved=52,428,800` bytes。smoke checkpoint 已成功生成并校验，
+  随后与上传父包、解包副本一并从容器清理。该证据将本条的开发容器
+  验证层级提升为已验证；128-env 显存/吞吐和平台 12 秒 active 误杀率
+  仍待 smoke，不将 1-env 结果外推为正式长训已验证。
+
+## BUG-20260803-011：P4 安全倍率边界突跳且父 Adapter 长时域记录表面兼容、实际不可采样
+
+- 日期：2026-08-03；状态：本地已验证，开发容器与平台待验证。
+- 影响范围：`codex/p4-nav8h`、`p4nav8h-r2` 安全奖励课程、ResponseAdapter 0.6/1.0 秒 velocity、
+  pose/stuck 长时域保护、checkpoint exact resume 与监控口径。父包为
+  `p3stairmem8h_1013548`；文件 SHA256 与新输出 checkpoint 尚未产生。
+- 用户可见症状：上一轮约 39 分钟有效训练中 `reward_multiplier` 仅约 0.052，安全项占比很低；代码
+  又会在 7200 秒从接近 0.5 直接跳到 1.0。Adapter 面板同时显示 0.2 秒标签约 99% 有效，但
+  0.6/1.0 秒、pose/stuck 基本为零；父包 32 条 completed records 全部计入
+  `rejected_missing_contract`。
+- 根因：P4 旧倍率在 30-120 分钟只线性到 0.5，进入 2 小时阶段时直接设为 1.0。P3 保存 completed
+  records 时尚未写逐记录 P4 contract，P4 过滤器因此全部拒绝；即使简单放行，旧采样器还会把
+  32 条连续父记录对半切成 16/16，而一个 Adapter 样本需要 `burn-in8+sequence16=24` 条连续记录，
+  两个父池仍永远无法采样。
+- 排除项：不是模型 ID `1013548` 不匹配，也不是应直接提高安全最终权重；BUG-20260803-010 已证明
+  首轮相机和 Goal 数据污染时不能据此判断基础权重不足。也不允许把缺 contract 的当前 P4 record
+  一并放宽。
+- 修复：安全倍率改为 0-30 分钟 0、30-60 分钟 0->0.25、60-120 分钟 0.25->1.0，最终权重和
+  `-0.05/tick` cap 不变；Goal fault 拆为独立 multiplier，避免奖励修改连带改变观测故障强度；ramp
+  版本进入 training digest 并升级 checkpoint contract。P4 warm start
+  在加载父 records 前建立当前 Adapter contract，仅对 parent record 验证完整 tensor shape、有限值、
+  horizon/sequence、来源 digest 格式与序列内部版本一致性，合格后标记
+  `legacy_parent_structural_v1`；历史记录明确作为 off-policy replay，不要求伪装成最终冻结低层 digest。P3 current 与嵌套
+  earlier lineage 按真实池保留，缺失层级从第一个可采样的兼容池补齐。新增 migrated/rejected 监控。
+- 验证：宿主 `PY311test` 定向回归
+  `test_p4_nav.py + test_p2_core.py + test_nav_stage_and_metrics.py` 为 `167 passed`；新增用例确认
+  32 条 legacy parent records 能形成 24 条连续窗口并产生有效 0.6/1.0 秒 mask，非法 digest、
+  NaN、shape drift 和当前 P4 缺 contract 均继续拒绝。修改 Python 文件编译、全部 TOML 解析和
+  `git diff --check` 通过。随后直接从本地真实
+  `p3stairmem8h_1013548.zip/model.ckpt-stairfinal-1013548.pkl` 只读加载父 buffer：32 条 P3 current
+  加 32 条 nested earlier-lineage 共 64 条全部通过结构迁移并可采样，8-env probe 的
+  0.2/0.6/1.0 秒有效 mask 为 `1.000/0.726562/0.625`，无 migration rejection。开发容器、平台
+  smoke、评估与真机均未执行，不能升级为平台已验证。
+- 防复发：测试必须覆盖 1800/3600/7200 秒 ramp 连续性；32 条 legacy parent record 能形成
+  24 条窗口并产生有效 0.6/1.0 秒 mask；非法 digest、NaN、shape drift 和当前 P4 缺 contract
+  必须继续拒绝；迁移条件不得引用模型 ID或标签。
+- 血缘：分支 `codex/p4-nav8h`；commit/PR、新任务 ID、新 checkpoint 和 SHA256 均待生成。
+- 回滚：回滚本条 ramp/legacy migration；不得回滚 BUG-20260803-010 的相机、Goal、冻结或 terminal
+  修复。若父记录无法通过结构验证，允许 Track-only Adapter 更新并明确告警，禁止伪造 compatible。
+- 再遇检查：`reward_multiplier@7199/7200` -> migrated/rejected parent counts -> parent pool连续长度 ->
+  `adapter_valid_06s/10s` -> low-level digest -> Adapter update/pose/stuck loss。
+
+## BUG-20260803-012：P4 Maze 继续训练缺少感知/决策/记忆归因且速度档硬限制干扰 warm start
+
+- 日期：2026-08-03；状态：本地已验证，开发容器与平台待验证。
+- 影响范围：分支 `codex/p4-maze2h-attack`、任务 `p4maze2h-attack`、`p4_nav_ppo` Maze-only
+  继续训练、P4 监控面板、checkpoint exact resume/warm start 合同。
+- 用户可见症状：上一轮 P4 长训后评估仍出现严重卡墙、S 型摆头和迷宫绕圈；同时用户希望用
+  `0.6-0.7m/s` 的稳定区间做软性引导，而不是把动作映射硬改成低速上限。旧实现的
+  slow/cruise/fast 随机速度档会把同一 Actor 输出映射成不同物理速度，且面板无法区分
+  “没看见墙/路口”“看见但 Actor 选错”“局部选对但记忆/路线失败”。
+- 根因：P4 旧 mapper 将随机 `user_speed_cap` 纳入 policy target 映射；PPO reward 和诊断只看到
+  一个混合后的 target，缺少 policy target、limited target、SafetyHead 风险、teacher scene、
+  Head 正确但 Actor 选错、风险后减速以及 zero-hidden shadow 的并列口径。`student_risk_*`
+  实际是 SafetyHead 输出，命名会被误读为 predictive sector risk。新任务还需要从旧
+  `p4nav8h` 最终包 warm start，不能因合同版本升级误走 exact resume 或静默拒绝。
+- 修复：训练合同升级为 `p4_maze_soft_cruise_v1`，任务改为 128 env、75 秒、单段
+  `open_entry_maze`、20 静态列、7200 秒。关闭速度档采样，Actor policy target 保持
+  `vx=[0,1.0]`，Goal stale 与 safety cap 作为 limited target 保护。新增 soft cruise 负奖励：
+  clear/Goal fresh 时轻罚 `vx<0.60` 和 `vx>0.75`，terminal tick 不结算。新增 teacher scene、
+  SafetyHead risk、Head-correct/Actor-wrong、风险到 policy/limited 减速、zero-hidden shadow
+  指标，并将 `student_risk_*` 更名为 `safety_head_risk_*`。新 checkpoint 使用
+  `mazeprobe/mazefull/mazefinal` 标签；同合同配置漂移仍 hard fail，旧 P4 合同结构通过时作为父包
+  warm start 并重置本轮 session/live state。
+- 验证：宿主 `PY311test` 定向回归
+  `agent_ppo/tests/test_p4_nav.py` 为 `39 passed`；
+  `agent_ppo/tests/test_p2_core.py + agent_ppo/tests/test_nav_stage_and_metrics.py`
+  为 `129 passed`。相关 Python 文件 `py_compile` 通过。由于未连接当前开发容器，尚未执行
+  真实父包加载、128-env rollout/backward、平台 10 分钟诊断或 2 小时训练 smoke，不能标为平台已验证。
+- 2026-08-03 审查修正：后续审查发现初版仍把 600 秒诊断计入 7200 秒 session，导致正式训练
+  少约 10 分钟并跳过 Actor 进攻分支首段；auto 分支只读取最后一帧 scanner/cosine，旧 P4
+  warm start 会在诊断前固定为 `visual_recovery`，`actor_attack` exact resume 则可能在恢复已选分支
+  前触发 optimizer phase mismatch。另有新 `maze*` checkpoint 排在旧 `pnav*` 后、风险减速在同一
+  帧同时要求 `vx>=0.50` 和 `vx<=0.35`、默认父包仍指向 P3 `1013548` 等问题。
+  现将合同升级为 `p4_maze_soft_cruise_v2_training_clock`：诊断 wall clock 与正式训练 clock 分离，
+  并以诊断完成的 rollout 边界作为 7200 秒正式训练起点；exact resume 在父类 phase 校验前恢复
+  saved branch，旧合同 warm start 清空 branch、诊断计数、线性探针和探针 optimizer。auto 选择
+  不再读取 SafetyHead 或最后一帧值，而是在 detached `nav_feat32` 上在线训练风险/场景线性探针，
+  用 held-out 样本累计 teacher coverage、wall AUROC/漏检率、安全方向 top-1、场景 macro-F1 与
+  clean/live cosine，并要求明显优于 `goal4` 探针和随机基线；样本不足保守进入
+  `visual_recovery`。探针状态随 exact resume 原样恢复。风险减速锁存风险出现时基准速度，并在
+  后续 5 tick 结算。checkpoint 优先级改为
+  `mazefinal > mazefull > mazeprobe > mazediag > legacy P4`，ID 未命中时仅允许唯一结构兼容 P4
+  discovery；P4 周期保存使用 wall clock，诊断第 5 分钟即可产出可恢复的 `mazediag`，但学习率、
+  阶段和 7200 秒结束条件仍只使用 training clock。父包更新为本地已核验的
+  `pnavstable-1207698`，checkpoint SHA256
+  `781022129ac17e564830c34570213a63f111b44d29b9d1bd247c3481c7b9ea55`。本地回归为
+  `198 passed, 5 skipped`，Python 编译、全 TOML 解析、P4 面板逐项 `<=20` 校验与
+  `git diff --check` 通过；开发容器、平台
+  smoke、正式训练和评估仍待验证，状态保持“本地已验证”。
+- 2026-08-03 开发容器更正：代码定向同步后，容器
+  `agent_ppo/tests/test_p4_nav.py` 为 `46 passed`，真实父包
+  `pnavstable-1207698` 的 CUDA 装配与权重加载成功。随后用 CPU 装配复核发现，旧 P4
+  合同 warm start 复用父类 exact loader 时会强制恢复父包 CUDA
+  `action_rng_state`，不同 generator 后端的状态长度不兼容，从而在新 session 启动前报
+  `Expected CPU Generator state size ... but input RNG state size 16`。修复仅针对旧合同
+  warm start：保留当前运行时确定性新种子，并记录 `p4_warm_start_rng`
+  迁移报告；同合同 exact resume 仍严格恢复并校验 RNG。回归测试故意注入
+  16-byte 不兼容状态，要求 warm start 使用新 session 种子而 exact resume 套件保持不变。
+- 2026-08-03 开发容器验证：修复后容器定向回归为 `46 passed`。新增的最小
+  `p4_maze_continue_smoke.py` 使用真实 `pnavstable-1207698`、8 env、CUDA 完成旧合同
+  warm start、32 tick rollout、4 epoch/16 次 PPO update、1 次 Adapter update、checkpoint 保存与
+  同合同 exact resume；低层 digest 全程不变。CUDA
+  `max_memory_allocated=231,538,176` bytes，`max_memory_reserved=287,309,824` bytes，
+  pinned depth 约 `29,491,200` bytes。按用户要求不再运行 128-env 规模测试；后续默认只跑
+  定向单测与 8-env 真实父包联合 smoke，仅当 storage shape、相机分辨率或环境装配改变时
+  单独启动规模/Isaac 测试。容器中本任务上传父包、解包目录和 smoke checkpoint 已精确清理。
+- 2026-08-03 平台首轮 smoke 更正（状态：代码已修复待平台复测）：任务在首次有效 teacher 样本上
+  报 `RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn`，调用链为
+  `finish_tick -> _extra_tick_diagnostics -> _accumulate_maze_diagnostic -> backward`。根因是父类
+  `finish_tick()` 使用 `torch.no_grad()`，而新增的训练前线性探针沿用了该上下文。现仅在四个
+  training-only probe 的 forward/loss/backward/step 区域使用 `torch.enable_grad()`，输入继续
+  `detach()`，因此不会给 NavigationEncoder、Actor 或 rollout 建图。回归测试明确在外层
+  `torch.no_grad()` 中调用该函数并验证 probe 权重更新、step 后梯度清空。该修复尚未取得新的平台
+  smoke 证据，不能把异常消失预先写成平台已验证。
+- 防复发：测试覆盖 Maze 配置、软巡航只在 clear/fresh 条件下生效、速度档关闭后 cap 恒为 1.0、
+  新 phase label 可保存/发现、同版本 stuck-reset 合同漂移拒绝、旧 P4 包只能 warm start。
+- 血缘：父包为 `p4nav8h-r3 pnavstable-1207698`，checkpoint SHA256 为
+  `781022129ac17e564830c34570213a63f111b44d29b9d1bd247c3481c7b9ea55`；新输出 checkpoint、
+  commit/PR 待生成。
+- 回滚：回滚本条 P4 maze 合同、软巡航和面板改名即可恢复 `p4nav8h-r2`；不要回滚
+  BUG-20260803-010/011 中相机、Goal、stuck reset、Adapter replay 的已验证修复。
+- 再遇检查：`policy_target_vx vs limited_target_vx` -> `soft_cruise_clear_factor` ->
+  `safety_head_risk_* vs teacher_risk_*` -> `head_correct_actor_wrong` -> `risk_no_deceleration` ->
+  `zero_hidden_action_mae` -> completion/stuck/collision。

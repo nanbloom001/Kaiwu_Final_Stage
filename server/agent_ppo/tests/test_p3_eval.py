@@ -234,10 +234,11 @@ class P3EvalValidatorTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_p3_eval_bundle(bundle, mode="standard")
 
-    def test_rejects_invalid_phase_label(self):
+    def test_unknown_phase_label_is_identity_metadata_only(self):
         bundle = _p3_fixture_bundle(mode="standard", phase_label="navfull")
-        with self.assertRaises(ValueError):
-            validate_p3_eval_bundle(bundle, mode="standard")
+        disposition = validate_p3_eval_bundle(bundle, mode="standard")
+        self.assertEqual(disposition["phase_label"], "navfull")
+        self.assertFalse(disposition["phase_label_known"])
 
     def test_rejects_missing_low_leaf(self):
         bundle = _p3_fixture_bundle(mode="standard", corrupt_leaf="locomotion_encoder")

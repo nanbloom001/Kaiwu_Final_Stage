@@ -1578,18 +1578,32 @@ def test_worker_reason_codes_prioritize_success_failure_and_timeout():
     assert reasons.tolist() == [1.0, 2.0, 3.0, 3.0]
 
 
+def test_worker_reason_code_four_is_below_success_and_failure_but_above_timeout():
+    manager = _TerminationManager(4)
+    manager.terminated[:] = torch.tensor((False, True, False, False))
+    manager.time_outs[:] = True
+    manager.goal[:] = torch.tensor((True, False, False, False))
+    env = SimpleNamespace(termination_manager=manager)
+    reasons = _termination_reason_codes(
+        env,
+        torch.ones(4, dtype=torch.bool),
+        wall_stuck=torch.tensor((True, True, True, False)),
+    )
+    assert reasons.tolist() == [1.0, 2.0, 4.0, 3.0]
+
+
 def test_terminal_reason_keeps_success_and_timeout_mutually_exclusive():
-    new_done = torch.tensor((True, True, True))
-    wrapper_timeout = torch.tensor((True, True, False))
-    raw_reason = torch.tensor((1, 0, 9))
+    new_done = torch.tensor((True, True, True, True))
+    wrapper_timeout = torch.tensor((True, True, False, True))
+    raw_reason = torch.tensor((1, 0, 9, 4))
     reason, hard, timeout = _resolve_terminal_outcome(
         new_done,
         wrapper_timeout,
         raw_reason,
     )
-    assert reason.tolist() == [1, 3, 2]
-    assert hard.tolist() == [True, False, True]
-    assert timeout.tolist() == [False, True, False]
+    assert reason.tolist() == [1, 3, 2, 4]
+    assert hard.tolist() == [True, False, True, False]
+    assert timeout.tolist() == [False, True, False, True]
     assert not bool((hard & timeout).any())
 
 

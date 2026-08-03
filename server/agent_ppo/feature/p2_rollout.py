@@ -60,6 +60,11 @@ class P2RolloutStorage:
         self.confidence = _cpu_tensor(*common, 1)
         self.safety_target = _cpu_tensor(*common, 3)
         self.safety_valid = _cpu_tensor(*common, 1)
+        # P4 reuses this storage without changing the policy interface. These
+        # training-only fields are zero for P2/P3 and therefore preserve their
+        # update semantics while allowing clean/live camera supervision.
+        self.clean_action_mean = _cpu_tensor(*common, 3)
+        self.camera_aux_mask = _cpu_tensor(*common, 3)
         self.critic_input = _cpu_tensor(*common, p2_contract.CRITIC_INPUT_DIM)
         self.pre_tanh_action = _cpu_tensor(*common, p2_contract.ACTION_DIM)
         self.old_log_prob = _cpu_tensor(*common, 1)
@@ -142,6 +147,20 @@ class P2RolloutStorage:
             ("reset_mask", "reset_mask"),
         ):
             self._copy(getattr(self, name)[index], transition[source])
+        self._copy(
+            self.clean_action_mean[index],
+            transition.get(
+                "clean_action_mean",
+                torch.zeros(self.num_envs, 3, device=transition["reward"].device),
+            ),
+        )
+        self._copy(
+            self.camera_aux_mask[index],
+            transition.get(
+                "camera_aux_mask",
+                torch.zeros(self.num_envs, 3, device=transition["reward"].device),
+            ),
+        )
         actor_h, actor_c = transition["actor_hidden"]
         critic_h, critic_c = transition["critic_hidden"]
         self._copy(self.actor_h[index], actor_h)

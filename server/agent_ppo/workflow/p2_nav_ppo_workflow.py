@@ -15,7 +15,8 @@ import torch
 
 from agent_ppo.checkpoint_io import CheckpointSaveError
 from agent_ppo.conf.conf import Config
-from agent_ppo.feature import nav_contract, p2_contract
+from agent_ppo.feature import nav_contract, p2_contract, p3_contract, p4_contract
+from agent_ppo.feature.nav_event_log import emit_nav_event
 
 
 class _CollisionTraceRecorder:
@@ -200,6 +201,14 @@ def _extract_step(step_data):
     return frame_no, next_obs, rewards, terminated, truncated, infos, privileged_obs
 
 
+def _expected_critic_wire_dim(*, is_p4: bool) -> int:
+    return (
+        p4_contract.P4_PRIVILEGED_WIRE_DIM
+        if is_p4
+        else p2_contract.PRIVILEGED_WIRE_DIM
+    )
+
+
 def _frame_done_masks(terminated, truncated, infos, device, *, worker_aux=None):
     terminated = torch.as_tensor(terminated, device=device).bool().reshape(-1)
     truncated = torch.as_tensor(truncated, device=device).bool().reshape(-1)
@@ -211,7 +220,7 @@ def _frame_done_masks(terminated, truncated, infos, device, *, worker_aux=None):
         worker_aux = torch.as_tensor(worker_aux, device=device)
         reset = worker_aux[:, 24] > 0.5
         reason = worker_aux[:, 25].round().long()
-        worker_timeout = reason == 3
+        worker_timeout = (reason == 3) | (reason == 4)
         worker_hard = (reason == 1) | (reason == 2)
         # Any reset not explained by a hard terminal is a timeout. This
         # recovers the platform wrapper's known truncated/time_outs erasure.
@@ -232,10 +241,12 @@ def _resolve_terminal_outcome(
         torch.full_like(raw_reason, 3),
         torch.full_like(raw_reason, 2),
     )
-    valid_reason = (raw_reason >= 1) & (raw_reason <= 3)
+    valid_reason = (raw_reason >= 1) & (raw_reason <= 4)
     reason = torch.where(valid_reason, raw_reason, fallback_reason)
     hard = new_done & ((reason == 1) | (reason == 2))
-    timeout = new_done & (reason == 3)
+    # Reason 4 is represented as a truncation by the platform, but it is a
+    # policy-caused terminal boundary and must not bootstrap like time limit 3.
+    timeout = new_done & ((reason == 3) | (reason == 4))
     return reason, hard, timeout
 
 
@@ -264,6 +275,30 @@ def _terminal_safe_tensor(
         raise ValueError("terminal-safe mask must match the tensor batch")
     mask = done.reshape((-1,) + (1,) * (live_value.ndim - 1))
     return torch.where(mask, terminal_value, live_value)
+
+
+def _terminal_safe_p4_critic_wire(
+    live_critic_wire: torch.Tensor,
+    terminal_p4_extra: torch.Tensor,
+    done: torch.Tensor,
+) -> torch.Tensor:
+    """Restore the old episode's P4-only tail after an automatic reset."""
+    if live_critic_wire.ndim != 2 or live_critic_wire.shape[1] != p4_contract.P4_PRIVILEGED_WIRE_DIM:
+        raise ValueError("P4 terminal-safe critic wire has an invalid shape")
+    if terminal_p4_extra.shape != (
+        live_critic_wire.shape[0],
+        p4_contract.P4_WORKER_EXTRA_DIM,
+    ):
+        raise ValueError("P4 terminal-safe extra has an invalid shape")
+    if done.numel() != live_critic_wire.shape[0]:
+        raise ValueError("P4 terminal-safe mask must match the wire batch")
+    result = live_critic_wire.clone()
+    done = done.reshape(-1).bool()
+    result[
+        done,
+        p3_contract.P3_PRIVILEGED_WIRE_DIM : p4_contract.P4_PRIVILEGED_WIRE_DIM,
+    ] = terminal_p4_extra[done]
+    return result
 
 
 def _curriculum_metrics(snapshot: dict[str, object]) -> dict[str, float]:
@@ -371,7 +406,8 @@ def _tick_diagnostic_values(
         "failure_rate": (
             (terminal_reason == 2) | (hard & (terminal_reason != 1))
         ).float(),
-        "timeout_rate": timeout.float(),
+        "timeout_rate": (done & (terminal_reason == 3)).float(),
+        "wall_stuck_reset_rate": (done & (terminal_reason == 4)).float(),
         "hard_termination": hard.float(),
         "early_end_rate": (
             done & (duration_frames < p2_contract.NAV_PERIOD_FRAMES)
@@ -527,10 +563,14 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     del args, kwargs
     agent = agents[0]
     env = envs[0]
-    if not getattr(agent, "is_p2_nav", False) or getattr(agent, "is_p2_nav_eval", False):
-        raise RuntimeError("p2_nav_ppo_workflow requires the P2 training assembly")
+    is_p4 = bool(getattr(agent, "is_p4_nav", False))
+    is_p2_training = bool(getattr(agent, "is_p2_nav", False)) and not bool(
+        getattr(agent, "is_p2_nav_eval", False)
+    )
+    if not (is_p2_training or is_p4):
+        raise RuntimeError("navigation PPO workflow requires a P2/P4 training assembly")
     usr_conf, conf_path, _, stage = Config.load_conf(logger)
-    p2_conf = usr_conf.get("p2_nav_ppo", {})
+    p2_conf = usr_conf.get("p4_nav_ppo" if is_p4 else "p2_nav_ppo", {})
     feedback_conf = p2_conf.get("feedback_profile", {})
     if not isinstance(feedback_conf, dict):
         feedback_conf = {}
@@ -540,8 +580,22 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         "[P2NavPPO] start "
         f"conf={conf_path} envs={agent.num_envs} parent={agent._p2_parent_model_id} "
         "rollout=32 ticks tbptt=16 minibatch=64seq microbatch=4seq "
-        f"target_hours={p2_contract.TRAINING_HOURS:.1f} performance_gates=none"
+        f"target_hours={(p4_contract.TRAINING_HOURS if is_p4 else p2_contract.TRAINING_HOURS):.1f} "
+        "performance_gates=none"
     )
+    if is_p4:
+        # The worker owns EventManager and receives its stage configuration in
+        # env.reset().  Feed the restored learner clock back into that config so
+        # an exact-resume task restores the current Push phase instead of
+        # replaying the initial two-hour no-Push phase.
+        push_schedule = p2_conf.setdefault("push_schedule", {})
+        push_schedule["resume_offset_s"] = float(
+            algorithm.session_effective_seconds
+        )
+        logger.info(
+            "[P4Resume] worker push resume_offset_s=%.3f",
+            push_schedule["resume_offset_s"],
+        )
     data = env.reset(usr_conf)
     if data is None:
         raise RuntimeError("P2 env.reset returned None")
@@ -550,21 +604,29 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     critic_wire = torch.as_tensor(critic_wire).to(agent.device).clone()
     if obs.shape != (agent.num_envs, nav_contract.POLICY_OBS_DIM):
         raise ValueError(f"P2 reset policy shape drift: {tuple(obs.shape)}")
-    if critic_wire.shape != (agent.num_envs, p2_contract.PRIVILEGED_WIRE_DIM):
-        raise ValueError(f"P2 reset critic wire shape drift: {tuple(critic_wire.shape)}")
+    expected_wire_dim = _expected_critic_wire_dim(is_p4=is_p4)
+    if critic_wire.shape != (agent.num_envs, expected_wire_dim):
+        raise ValueError(
+            f"navigation reset critic wire shape drift: {tuple(critic_wire.shape)}; "
+            f"expected=({agent.num_envs},{expected_wire_dim})"
+        )
     algorithm.reset_live_state()
 
     resumed_seconds = float(algorithm.session_effective_seconds)
+    resumed_clock_seconds = float(
+        getattr(algorithm, "session_wall_seconds", resumed_seconds)
+    )
     session_started = time.monotonic()
     first_save_s = float(p2_conf.get("first_save_minutes", 5.0)) * 60.0
     save_interval_s = float(p2_conf.get("save_interval_minutes", 10.0)) * 60.0
     if first_save_s <= 0.0 or save_interval_s <= 0.0:
         raise ValueError("P2 checkpoint intervals must be positive")
-    if resumed_seconds <= 0.0:
-        next_save_effective = first_save_s
+    resumed_save_clock = resumed_clock_seconds if is_p4 else resumed_seconds
+    if resumed_save_clock <= 0.0:
+        next_save_clock = first_save_s
     else:
-        next_save_effective = (
-            math.floor(resumed_seconds / save_interval_s) + 1
+        next_save_clock = (
+            math.floor(resumed_save_clock / save_interval_s) + 1
         ) * save_interval_s
     retry_save_at = None
     unfreeze_save_done = bool(algorithm.cnn_unfrozen)
@@ -573,8 +635,12 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     collision_traces = _CollisionTraceRecorder()
     goal_history = deque(maxlen=11)
     schedule_boundaries = (
-        p2_contract.SAFETY_WARM_END_SECONDS,
-        p2_contract.SAFETY_STABILIZE_SECONDS,
+        (*p4_contract.SCHEDULE_BOUNDARIES_SECONDS, 13_800.0)
+        if is_p4
+        else (
+            p2_contract.SAFETY_WARM_END_SECONDS,
+            p2_contract.SAFETY_STABILIZE_SECONDS,
+        )
     )
     saved_schedule_boundaries = {
         boundary for boundary in schedule_boundaries if boundary <= resumed_seconds
@@ -583,10 +649,17 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     agent._p2_training_started = True
     agent._p2_final_save_done = False
     last_log = time.monotonic()
-    target_seconds = p2_contract.TRAINING_HOURS * 3600.0
+    p4_metric_last_seen: dict[str, float] = {}
+    target_seconds = (
+        p4_contract.TARGET_EFFECTIVE_SECONDS
+        if is_p4
+        else p2_contract.TRAINING_HOURS * 3600.0
+    )
 
     try:
         while algorithm.session_effective_seconds < target_seconds:
+            if hasattr(algorithm, "begin_rollout"):
+                algorithm.begin_rollout()
             rollout_started = time.monotonic()
             env_step_time_s = 0.0
             diagnostic_sums: dict[str, torch.Tensor] = {}
@@ -665,6 +738,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     p2_contract.WORKER_AUX_DIM,
                     device=agent.device,
                 )
+                terminal_p4_extra = (
+                    torch.zeros(
+                        agent.num_envs,
+                        p4_contract.P4_WORKER_EXTRA_DIM,
+                        device=agent.device,
+                    )
+                    if is_p4
+                    else None
+                )
                 duration = torch.zeros(agent.num_envs, dtype=torch.long, device=agent.device)
                 hard = torch.zeros(agent.num_envs, dtype=torch.bool, device=agent.device)
                 timeout = torch.zeros_like(hard)
@@ -679,6 +761,11 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     frame_target = algorithm.command.active_target
                     frame_executed = algorithm.command.exec_cmd
                     frame_aux = aux
+                    frame_p4_extra = (
+                        algorithm._p4_worker_extra.detach().clone()
+                        if is_p4
+                        else None
+                    )
                     if frame > 0 and bool((~active).any()):
                         # Done envs stay on the reset zero-command path for the
                         # remainder of this transition; their rewards are masked.
@@ -691,7 +778,12 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     next_obs = torch.as_tensor(next_obs).to(agent.device)
                     next_critic = torch.as_tensor(next_critic).to(agent.device)
                     rewards = torch.as_tensor(rewards).to(agent.device).reshape(-1)
-                    next_aux = next_critic[:, p2_contract.CRITIC_OBS_DIM :]
+                    # P4 appends a training-only tail after the stable aux62.
+                    # Terminal/reset logic consumes only that stable prefix.
+                    next_aux = next_critic[
+                        :,
+                        p2_contract.CRITIC_OBS_DIM : p2_contract.PRIVILEGED_WIRE_DIM,
+                    ]
                     frame_done, frame_timeout = _frame_done_masks(
                         terminated,
                         truncated,
@@ -713,6 +805,17 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         terminal_target[new_done] = frame_target[new_done]
                         terminal_executed[new_done] = frame_executed[new_done]
                         terminal_aux[new_done] = frame_aux[new_done]
+                        if is_p4:
+                            terminal_p4_extra[
+                                new_done, p4_contract.RAW_GOAL_XY_SLICE
+                            ] = frame_p4_extra[
+                                new_done, p4_contract.RAW_GOAL_XY_SLICE
+                            ]
+                            terminal_p4_extra[new_done, 2:] = next_critic[
+                                new_done,
+                                p3_contract.P3_PRIVILEGED_WIRE_DIM + 2 :
+                                p4_contract.P4_PRIVILEGED_WIRE_DIM,
+                            ]
                         terminal_goal[new_done] = next_aux[
                             new_done, p2_contract.PRE_STEP_GOAL_DISTANCE_INDEX
                         ]
@@ -886,9 +989,16 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 add_segment(row_failure, values["failure_rate"])
                 add_segment(row_timeout, values["timeout_rate"])
                 diagnostic_count += agent.num_envs
+                finish_critic_wire = critic_wire
+                if is_p4 and bool(transition_done.any()):
+                    finish_critic_wire = _terminal_safe_p4_critic_wire(
+                        critic_wire,
+                        terminal_p4_extra,
+                        transition_done,
+                    )
                 full = algorithm.finish_tick(
                     obs,
-                    critic_wire,
+                    finish_critic_wire,
                     frame_safety_reward=frame_safety_reward,
                     start_goal_distance=start_goal,
                     end_goal_distance=end_goal,
@@ -975,9 +1085,19 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     raise RuntimeError("P2 rollout did not fill at the 32-tick boundary")
 
             metrics = algorithm.update()
+            if is_p4:
+                emit_nav_event(
+                    "iteration",
+                    role="aisrv",
+                    iteration=int(algorithm.current_iteration),
+                    valid_ticks=float(
+                        p2_contract.NAV_ROLLOUT_TICKS * agent.num_envs
+                    ),
+                    update_skipped_no_valid=0.0,
+                )
             now = time.monotonic()
             algorithm.update_training_clocks(
-                resumed_seconds + (now - session_started)
+                resumed_clock_seconds + (now - session_started)
             )
             curriculum_snapshot = algorithm.curriculum_probe.state_dict()
             agent.training_elapsed_h = algorithm.effective_training_seconds / 3600.0
@@ -985,7 +1105,8 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             if unfrozen_now and not unfreeze_save_done:
                 _request_periodic_save(agent, logger, "cnn_unfreeze_boundary")
                 unfreeze_save_done = True
-                saved_schedule_boundaries.add(p2_contract.SAFETY_WARM_END_SECONDS)
+                if not is_p4:
+                    saved_schedule_boundaries.add(p2_contract.SAFETY_WARM_END_SECONDS)
             for boundary in schedule_boundaries:
                 if (
                     boundary <= algorithm.session_effective_seconds
@@ -996,13 +1117,18 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     )
                     saved_schedule_boundaries.add(boundary)
 
-            due = algorithm.session_effective_seconds >= next_save_effective
+            save_clock = (
+                float(algorithm.session_wall_seconds)
+                if is_p4
+                else float(algorithm.session_effective_seconds)
+            )
+            due = save_clock >= next_save_clock
             retry_due = retry_save_at is not None and now >= retry_save_at
             if due or retry_due:
                 if _request_periodic_save(agent, logger, "wall_clock" if due else "retry"):
                     retry_save_at = None
-                    while next_save_effective <= algorithm.session_effective_seconds:
-                        next_save_effective += save_interval_s
+                    while next_save_clock <= save_clock:
+                        next_save_clock += save_interval_s
                 else:
                     retry_save_at = now + 60.0
 
@@ -1024,17 +1150,35 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         "timeout_rate", torch.zeros((), device=agent.device)
                     ).detach().cpu()
                 )
-                terminal_count = success_count + failure_count + timeout_count
+                wall_stuck_reset_count = float(
+                    diagnostic_sums.get(
+                        "wall_stuck_reset_rate",
+                        torch.zeros((), device=agent.device),
+                    ).detach().cpu()
+                )
+                terminal_count = (
+                    success_count
+                    + failure_count
+                    + timeout_count
+                    + wall_stuck_reset_count
+                )
                 metrics.update(
                     {
                         "rollout_success_count": success_count,
                         "rollout_failure_count": failure_count,
                         "rollout_timeout_count": timeout_count,
+                        "rollout_wall_stuck_reset_count": wall_stuck_reset_count,
                         "rollout_terminal_count": terminal_count,
                         "episode_success_fraction": success_count
                         / max(terminal_count, 1.0),
                         "episode_timeout_fraction": timeout_count
                         / max(terminal_count, 1.0),
+                        "rollout_wall_stuck_saved_seconds": float(
+                            diagnostic_sums.get(
+                                "wall_stuck_saved_seconds",
+                                torch.zeros((), device=agent.device),
+                            ).detach().cpu()
+                        ),
                     }
                 )
                 metrics.update(
@@ -1144,6 +1288,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     "session_effective_seconds": algorithm.session_effective_seconds,
                     "lifetime_effective_seconds": algorithm.lifetime_effective_seconds,
                     "lifecycle_success": float(lifecycle_success),
+                    "platform_lifecycle_callbacks": float(lifecycle_success),
                     "lifecycle_failures": float(lifecycle_failures),
                     "rollout_time_s": now - rollout_started,
                     "env_step_time_s": env_step_time_s,
@@ -1154,6 +1299,37 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     "cnn_unfrozen": float(algorithm.cnn_unfrozen),
                 }
             )
+            metrics["episode_starts_per_hour"] = (
+                float(metrics.get("rollout_terminal_count", 0.0))
+                * 3600.0
+                / max(now - rollout_started, 1.0e-6)
+            )
+            if is_p4:
+                for name in p4_contract.MONITOR_REQUIRED_METRICS:
+                    value = metrics.get(name)
+                    try:
+                        finite = math.isfinite(float(value))
+                    except (TypeError, ValueError):
+                        finite = False
+                    if finite:
+                        p4_metric_last_seen[name] = now
+                with_data = sum(
+                    name in p4_metric_last_seen
+                    for name in p4_contract.MONITOR_REQUIRED_METRICS
+                )
+                ages = [
+                    now - timestamp for timestamp in p4_metric_last_seen.values()
+                ]
+                metrics.update(
+                    p4_monitor_expected_metric_count=float(
+                        len(p4_contract.MONITOR_REQUIRED_METRICS)
+                    ),
+                    p4_monitor_metric_with_data_count=float(with_data),
+                    p4_monitor_empty_metric_count=float(
+                        len(p4_contract.MONITOR_REQUIRED_METRICS) - with_data
+                    ),
+                    p4_monitor_longest_data_age_s=max(ages, default=0.0),
+                )
             if now - last_log >= 60.0 or algorithm.current_iteration == 1:
                 logger.info(
                     "[P2NavPPO] "
@@ -1165,7 +1341,13 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 )
                 _monitor_put(monitor, metrics, logger)
                 last_log = now
-        _final_save(agent, logger, "four_session_hours_complete")
+        _final_save(
+            agent,
+            logger,
+            "p4_eight_session_hours_complete"
+            if is_p4
+            else "four_session_hours_complete",
+        )
     except (SystemExit, KeyboardInterrupt) as exc:
         _final_save(agent, logger, type(exc).__name__)
         raise

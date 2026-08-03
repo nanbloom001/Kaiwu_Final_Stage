@@ -14,8 +14,10 @@ import torch
 from agent_ppo.feature.feedback_emulator import FeedbackEmulator
 from agent_ppo.feature.p2_gait import P2GaitWindowProbe
 from agent_ppo.feature.p2_curriculum_probe import P2TrackCurriculumProbe
-from agent_ppo.feature import p2_contract, p3_contract
+from agent_ppo.feature import p2_contract, p3_contract, p4_contract
+from agent_ppo.feature.goal_features import build_track_goal_raw
 from agent_ppo.feature.p3_gait import validate_mirror_assembly
+from agent_ppo.feature.p4_stuck import MotionWallStuckTracker
 
 
 _STATE_ATTR = "_agent_ppo_p2_worker_bridge"
@@ -83,7 +85,11 @@ def _track_segment_index(
     return segment, f"track_length={track_length},size_x={size_x},boundaries={boundaries}"
 
 
-def _termination_reason_codes(env, reset: torch.Tensor) -> torch.Tensor:
+def _termination_reason_codes(
+    env,
+    reset: torch.Tensor,
+    wall_stuck: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Encode the worker-owned terminal cause into the existing aux30 wire."""
     result = torch.zeros(reset.shape[0], device=reset.device, dtype=torch.float32)
     if not bool(reset.any()):
@@ -115,14 +121,23 @@ def _termination_reason_codes(env, reset: torch.Tensor) -> torch.Tensor:
         if torch.is_tensor(terminated) and terminated.numel() == reset.numel()
         else torch.zeros_like(reset)
     )
+    wall_mask = (
+        wall_stuck.to(reset.device).reshape(-1).bool()
+        if torch.is_tensor(wall_stuck) and wall_stuck.numel() == reset.numel()
+        else torch.zeros_like(reset)
+    )
     success_mask &= reset
-    timeout_mask &= reset & ~success_mask
-    failure_mask &= reset & ~success_mask & ~timeout_mask
+    failure_mask &= reset & ~success_mask
+    wall_mask &= reset & ~success_mask & ~failure_mask
+    timeout_mask &= reset & ~success_mask & ~failure_mask & ~wall_mask
     # A reset with no retained termination term is a timeout at the public
     # wrapper boundary. This also recovers the known truncated/time_outs loss.
-    unknown_reset = reset & ~success_mask & ~timeout_mask & ~failure_mask
+    unknown_reset = (
+        reset & ~success_mask & ~failure_mask & ~wall_mask & ~timeout_mask
+    )
     result[success_mask] = 1.0
     result[failure_mask] = 2.0
+    result[wall_mask] = 4.0
     result[timeout_mask | unknown_reset] = 3.0
     return result
 
@@ -169,7 +184,7 @@ def _merge_worker_terminal_returns(
     reason = aux[:, 25].detach().round().long()
     reset = aux[:, 24].detach() > 0.5
     worker_hard = reset & ((reason == 1) | (reason == 2))
-    worker_timeout = reset & (reason == 3)
+    worker_timeout = reset & ((reason == 3) | (reason == 4))
     if not bool((worker_hard | worker_timeout).any()):
         return terminated, truncated
 
@@ -222,7 +237,7 @@ def install_p2_terminal_return_bridge(env) -> bool:
                 reset = aux[:, 24] > 0.5
                 reason = aux[:, 25].detach().round().long()
                 worker_hard = reset & ((reason == 1) | (reason == 2))
-                worker_timeout = reset & (reason == 3)
+                worker_timeout = reset & ((reason == 3) | (reason == 4))
                 if bool((worker_hard | worker_timeout).any()):
                     count = int(
                         getattr(
@@ -244,6 +259,7 @@ def install_p2_terminal_return_bridge(env) -> bool:
                             "[P2TerminalBridge] event "
                             f"worker_success={int((reset & (reason == 1)).sum())} "
                             f"worker_failure={int((reset & (reason == 2)).sum())} "
+                            f"worker_wall_stuck={int((reset & (reason == 4)).sum())} "
                             f"worker_timeout={int(worker_timeout.sum())} "
                             f"native_hard={int(native_hard.sum())} "
                             f"native_timeout={int(native_timeout.sum())} "
@@ -276,11 +292,9 @@ class P2WorkerBridge:
         self.env = env
         self.config = dict(config)
         live_usr_conf = getattr(env, "usr_conf", None)
-        live_stage = (
-            live_usr_conf.get("p3_standard_joint")
-            if isinstance(live_usr_conf, dict)
-            else None
-        )
+        stage_type = str(self.config.get("_worker_stage_type", "p2_nav_ppo"))
+        live_key = "p4_nav_ppo" if stage_type == "p4_nav_ppo" else "p3_standard_joint"
+        live_stage = live_usr_conf.get(live_key) if isinstance(live_usr_conf, dict) else None
         if isinstance(live_stage, dict):
             stage_type = self.config.get("_worker_stage_type")
             self.config.update(live_stage)
@@ -294,6 +308,8 @@ class P2WorkerBridge:
         self.track_diagnostics_enabled = self.runtime_stage_type in {
             "p2_nav_ppo",
             "p2_nav_eval",
+            "p4_nav_ppo",
+            "p4_track_eval",
         }
         robot = self._robot()
         self.num_envs = int(robot.data.root_lin_vel_b.shape[0])
@@ -308,6 +324,12 @@ class P2WorkerBridge:
         self.last_p3_extra = torch.zeros(
             self.num_envs,
             p3_contract.P3_WORKER_EXTRA_DIM,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        self.last_p4_extra = torch.zeros(
+            self.num_envs,
+            p4_contract.P4_WORKER_EXTRA_DIM,
             device=self.device,
             dtype=torch.float32,
         )
@@ -328,7 +350,7 @@ class P2WorkerBridge:
             num_envs=self.num_envs,
             device=self.device,
         )
-        if self.runtime_stage_type.startswith("p3_"):
+        if self.runtime_stage_type.startswith("p3_") or self.runtime_stage_type.startswith("p4_"):
             self._p3_mirror_assembly_valid, self._p3_mirror_assembly_checks = (
                 validate_mirror_assembly(robot, self.env)
             )
@@ -354,7 +376,7 @@ class P2WorkerBridge:
         self._p35_started_monotonic = time.monotonic()
         push_config = self.config.get("push_schedule") or {}
         self._p35_resume_offset_s = float(push_config.get("resume_offset_s", 0.0))
-        if self.runtime_stage_type == "p3_standard_joint":
+        if self.runtime_stage_type in {"p3_standard_joint", "p4_nav_ppo"}:
             self._p35_install_push_wrapper()
         self._collision_force_history = torch.zeros(
             p2_contract.NAV_PERIOD_FRAMES,
@@ -378,6 +400,30 @@ class P2WorkerBridge:
             (robot.data.root_pos_w[:, :2].detach(), initial_yaw.unsqueeze(-1)), dim=-1
         ).to(self.device)
         self._last_gait_log_step = -3000
+        self._p4_stuck_tracker = None
+        if self.runtime_stage_type == "p4_nav_ppo":
+            max_episode_length = getattr(self.env, "max_episode_length", None)
+            episode_length_s = (
+                float(max_episode_length) * p2_contract.CONTROL_DT_S
+                if max_episode_length is not None
+                else 120.0
+            )
+            self._p4_stuck_tracker = MotionWallStuckTracker(
+                self.env,
+                num_envs=self.num_envs,
+                device=self.device,
+                config=self.config.get("stuck_reset"),
+                episode_length_s=episode_length_s,
+            )
+            _print(
+                "[P4StuckResetPreflight] "
+                f"mode={self._p4_stuck_tracker.mode} "
+                f"confirmation_s={self._p4_stuck_tracker.confirmation_s:.2f} "
+                f"dt_s={self._p4_stuck_tracker.dt_s:.4f} "
+                f"dt_valid={int(self._p4_stuck_tracker.dt_valid)} "
+                f"term_available={int(self._p4_stuck_tracker.term_available)} "
+                f"term_config_valid={int(self._p4_stuck_tracker.term_config_valid)}"
+            )
         terrain = getattr(getattr(self.env, "scene", None), "terrain", None)
         initial_segment, segment_status = _track_segment_index(
             terrain, robot.data.root_pos_w[:, 0], describe=True
@@ -564,15 +610,20 @@ class P2WorkerBridge:
             original(env, env_ids, **kwargs)
             after = robot.data.root_vel_w[ids, :2].detach()
             delta = torch.nan_to_num(after - before)
-            bridge._p35_push_event_flag[ids] = True
-            bridge._p35_push_delta[ids] = delta
-            bridge._p35_seconds_since_push[ids] = 0.0
-            bridge._p35_push_event_count += int(ids.numel())
+            real_event = delta.abs().amax(dim=-1) > 1.0e-8
+            event_ids = ids[real_event]
+            if event_ids.numel() == 0:
+                return
+            event_delta = delta[real_event]
+            bridge._p35_push_event_flag[event_ids] = True
+            bridge._p35_push_delta[event_ids] = event_delta
+            bridge._p35_seconds_since_push[event_ids] = 0.0
+            bridge._p35_push_event_count += int(event_ids.numel())
             if bridge._p35_push_event_count <= 5 or bridge._p35_push_event_count % 50 == 0:
                 _print(
                     "[P35PushEvent] "
-                    f"count={bridge._p35_push_event_count} env_ids={ids[:8].tolist()} "
-                    f"delta_mean={delta.mean(dim=0).tolist()}"
+                    f"count={bridge._p35_push_event_count} env_ids={event_ids[:8].tolist()} "
+                    f"delta_mean={event_delta.mean(dim=0).tolist()}"
                 )
 
         cfg.func = _wrapped_push
@@ -594,7 +645,11 @@ class P2WorkerBridge:
     def _p35_update_push_phase(self) -> None:
         if not self._p35_push_telemetry_valid:
             return
-        phase = p3_contract.push_phase_config(self._p35_push_elapsed_s())
+        phase = (
+            p4_contract.push_phase_config(self._p35_push_elapsed_s())
+            if getattr(self, "runtime_stage_type", "") == "p4_nav_ppo"
+            else p3_contract.push_phase_config(self._p35_push_elapsed_s())
+        )
         if phase["name"] == self._p35_push_phase_name:
             return
         manager = self.env.event_manager
@@ -843,7 +898,22 @@ class P2WorkerBridge:
         robot = self._robot()
         data = robot.data
         reset = _reset_mask(self.env, self.num_envs, self.device)
-        if self.runtime_stage_type == "p3_standard_joint":
+        wall_stuck_term = (
+            self._p4_stuck_tracker.termination_mask(reset)
+            if self._p4_stuck_tracker is not None
+            else torch.zeros_like(reset)
+        )
+        terminal_reason = (
+            _termination_reason_codes(
+                self.env,
+                reset,
+                wall_stuck=wall_stuck_term,
+            )
+            if self.last_step is not None
+            else torch.zeros(self.num_envs, device=self.device)
+        )
+        seconds_since_push_for_stuck = self._p35_seconds_since_push.clone()
+        if self.runtime_stage_type in {"p3_standard_joint", "p4_nav_ppo"}:
             self._p35_seconds_since_push.add_(p2_contract.CONTROL_DT_S)
             self._p35_seconds_since_push[reset] = 1.0e6
             self._p35_update_push_phase()
@@ -886,7 +956,7 @@ class P2WorkerBridge:
             root_pose,
             self._previous_root_pose,
             reset,
-            enabled=self.runtime_stage_type == "p3_standard_joint",
+            enabled=self.runtime_stage_type in {"p3_standard_joint", "p4_nav_ppo"},
         )
         aux[:, 15:18] = root_pose
         aux[:, 18:21] = feedback.ang_vel
@@ -894,13 +964,10 @@ class P2WorkerBridge:
         # Evaluation does not receive frame_end(dones). Carry the worker-known
         # reset boundary so recurrent state and the 50 Hz command clock reset.
         aux[:, 24] = reset.to(torch.float32)
-        # 0=none, 1=success, 2=failure, 3=timeout. The wrapper can erase
+        # 0=none, 1=success, 2=failure, 3=timeout, 4=confirmed wall-stuck.
+        # The wrapper can erase
         # truncated/time_outs, so this worker-owned field is authoritative.
-        aux[:, 25] = (
-            _termination_reason_codes(self.env, reset)
-            if self.last_step is not None
-            else torch.zeros(self.num_envs, device=self.device)
-        )
+        aux[:, 25] = terminal_reason
         aux[:, 26] = float(step)
         aux[:, 27] = 0.0
         aux[:, 28] = family
@@ -916,9 +983,8 @@ class P2WorkerBridge:
         aux[:, p2_contract.PRE_STEP_GOAL_DISTANCE_INDEX] = torch.where(
             reset, self._previous_goal_distance, goal_distance
         )
-        aux[:, p2_contract.BODY_COLLISION_FORCE_INDEX] = self._body_collision_force(
-            reset
-        )
+        body_collision_force = self._body_collision_force(reset)
+        aux[:, p2_contract.BODY_COLLISION_FORCE_INDEX] = body_collision_force
         aux[:, p2_contract.CURRENT_SEGMENT_INDEX] = terminal_safe_segment.float()
         aux[:, p2_contract.GAIT_SENSOR_MAPPING_VALID_INDEX] = float(
             self._gait_window.valid
@@ -927,8 +993,37 @@ class P2WorkerBridge:
             self._gait_window.collision_valid
         )
         self.last_aux = aux
-        if self.runtime_stage_type == "p3_standard_joint":
+        if self.runtime_stage_type in {"p3_standard_joint", "p4_nav_ppo"}:
             self.last_p3_extra = self._p3_extra(robot, reset)
+        if self._p4_stuck_tracker is not None:
+            lengths = getattr(self.env, "episode_length_buf", None)
+            episode_age_s = (
+                lengths.to(self.device).reshape(-1).float()
+                * p2_contract.CONTROL_DT_S
+                if torch.is_tensor(lengths) and lengths.numel() == self.num_envs
+                else torch.zeros(self.num_envs, device=self.device)
+            )
+            stuck_diagnostics = self._p4_stuck_tracker.update(
+                root_xy=data.root_pos_w[:, :2],
+                goal_distance=goal_distance,
+                collision_force=body_collision_force,
+                mapping_valid=torch.full(
+                    (self.num_envs,),
+                    bool(self._gait_window.collision_valid),
+                    dtype=torch.bool,
+                    device=self.device,
+                ),
+                reset=reset,
+                terminal_reason=terminal_reason,
+                seconds_since_push=seconds_since_push_for_stuck,
+                episode_age_s=episode_age_s,
+            )
+            raw_goal_xy = build_track_goal_raw(self.env).to(self.device)
+            if not bool(torch.isfinite(raw_goal_xy).all()):
+                raise RuntimeError("P4 raw metric goal contains non-finite values")
+            self.last_p4_extra.zero_()
+            self.last_p4_extra[:, p4_contract.RAW_GOAL_XY_SLICE] = raw_goal_xy
+            self.last_p4_extra[:, 2:] = stuck_diagnostics
         if self.curriculum_probe is not None:
             self.curriculum_probe.observe(self.env)
         gait_metrics = {}
@@ -970,6 +1065,10 @@ class P2WorkerBridge:
         self.step()
         return self.last_p3_extra.clone()
 
+    def p4_extra(self) -> torch.Tensor:
+        self.step()
+        return self.last_p4_extra.clone()
+
 
 def _resolve_config() -> tuple[bool, dict[str, Any], int]:
     from agent_ppo.conf.conf import Config
@@ -987,15 +1086,17 @@ def _resolve_config() -> tuple[bool, dict[str, Any], int]:
         "p2_nav_eval",
         "p3_standard_joint",
         "p3_track_eval",
+        "p4_nav_ppo",
+        "p4_track_eval",
     }
     enabled = enabled and (
         not is_eval
-        or algorithm in {"p2_nav_eval", "p3_standard_joint", "p3_track_eval"}
+        or algorithm in {"p2_nav_eval", "p3_standard_joint", "p3_track_eval", "p4_track_eval"}
     )
     config_key = (
-        "p3_standard_joint"
-        if algorithm in {"p3_standard_joint", "p3_track_eval"}
-        else "p2_nav_ppo"
+        "p4_nav_ppo"
+        if algorithm in {"p4_nav_ppo", "p4_track_eval"}
+        else ("p3_standard_joint" if algorithm in {"p3_standard_joint", "p3_track_eval"} else "p2_nav_ppo")
     )
     stage_conf = usr_conf.get(config_key, {}) if isinstance(usr_conf, dict) else {}
     stage_conf = dict(stage_conf or {})
@@ -1026,6 +1127,13 @@ def p2_response_aux(env) -> torch.Tensor:
 
 def p3_training_extra(env) -> torch.Tensor:
     bridge = get_p2_worker_bridge(env)
-    if bridge is None or bridge.runtime_stage_type != "p3_standard_joint":
-        raise RuntimeError("P3 training extra requested while P3 worker bridge is disabled")
+    if bridge is None or bridge.runtime_stage_type not in {"p3_standard_joint", "p4_nav_ppo"}:
+        raise RuntimeError("P3/P4 training extra requested while worker bridge is disabled")
     return bridge.p3_extra()
+
+
+def p4_training_extra(env) -> torch.Tensor:
+    bridge = get_p2_worker_bridge(env)
+    if bridge is None or bridge.runtime_stage_type != "p4_nav_ppo":
+        raise RuntimeError("P4 training extra requested while worker bridge is disabled")
+    return bridge.p4_extra()

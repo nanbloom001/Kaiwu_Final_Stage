@@ -19,6 +19,43 @@
 
 ## 活动基线
 
+- **当前 P4 Maze 入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
+  `codex/p4-maze2h-attack`，任务 `p4maze2h-attack`，Track+Camera、128 env、75 秒 episode、
+  单段 `open_entry_maze`、20 个静态难度列、课程关闭，目标 7200 秒。父包为最新验证通过的
+  `p4nav8h-r3` 最终 checkpoint `pnavstable-1207698`（checkpoint SHA256
+  `781022129ac17e564830c34570213a63f111b44d29b9d1bd247c3481c7b9ea55`）；模型 ID只负责候选选择，加载后仍以 stage、模块 spec、
+  tensor shape、有限值和实际 SHA256 为准。
+  完整任务合同、验证证据和回滚边界见
+  [`docs/p4-maze2h-attack.md`](./docs/p4-maze2h-attack.md)。
+- P4 保持 policy 57905、低层 57901/Actor77/action12、高层 Actor85。完整低层、低层 Critic与
+  方差冻结；只训练 NavigationEncoder、高层 Actor/LSTM、新 Critic、SafetyHead 和 Adapter。
+  高层 rollout 为 32 个 5Hz tick，按两个 TBPTT16 序列更新；低层只缓存未变 delivered frame 的
+  CNN feature32，LSTM 仍在每个 50Hz tick 用当前 proprio 推进。
+- P4 mapper 保持 Actor policy target 的完整 `vx=[0,1.0]`、`vy=0.30a`、`wz=0.90a`；
+  旧 slow/cruise/fast 随机速度档在 Maze 强化中关闭。Goal 过期但有历史 MAP 时限制为 `vx<=0.20`、`|vy|<=0.10`、
+  `|wz|<=0.25` 谨慎前进；从未获得有效目标时停止平移。GoalBelief v3 从 507 维 P4 training wire
+  读取未裁剪米制 goal，episode reset 时立即重建，异常测量需连续五次一致才接管；
+  critic/reward/scorer 继续使用真值。动态 safety cap 由 delivered depth 和当前 exec 弧线的
+  可部署风险探针计算，Track eval 不依赖 training-only SafetyHead。
+- Maze 强化新增软巡航惩罚：前方 clear、Goal 新鲜且中心方向接近最安全方向时，低于
+  `0.60m/s` 或高于 `0.75m/s` 的 policy target 只受轻量负奖励，不产生正奖励；前方堵塞、
+  侧向明显更安全或 Goal 失效时允许降速/停止。面板同时展示 policy target、limited target、
+  exec 和 true velocity，避免把安全限幅误读为 Actor 输出。
+- 共享相机状态机在 capture 时只施加一次近裁剪/孔洞，低层和高层读取同一 delivered frame；
+  clean teacher 每 rollout 从当前高层策略刷新并保持独立 recurrent hidden。Push 在 0-2 小时
+  关闭、2-6 小时 `+-0.04m/s`、6-8 小时 `+-0.05m/s`，真实 delta 仅进入训练 tail/诊断，Actor
+  不读取 push flag。exact resume 会恢复 session 时钟并立即恢复正确 Push 阶段。
+- P4 R2 只在训练 wire 的 P3 493 维之后附加 raw goal2 与 wall-stuck diagnostics12；eval wire 仍为
+  385。当前 Maze 配置使用已经过开发容器动态验证的 `active + 7s` 墙面卡滞 reset；启动时仍须
+  在线确认平台 `nav_stuck_timeout`、`time_out=true`、公开 get/set/readback 和 `dt=0.02s`，验证
+  不通过时禁用真实 reset 并告警。reason=4 是无 bootstrap 的独立 terminal，不计作完成或普通超时。
+- P4 安全奖励最终权重和 `-0.05/tick` 组上限不变，但启用曲线改为连续的
+  `0-30m:0`、`30-60m:0->0.25`、`60-120m:0.25->1.0`，不再在 2 小时边界从约 0.5 突跳到 1.0。
+  Goal 跳变/丢失故障使用独立 multiplier，避免调整奖励时意外改变观测噪声分布。
+  P3 父包中缺少逐记录 contract 的 completed Adapter records 只在 aux/label shape、有限值、
+  horizon/sequence、来源 digest 格式和序列内部版本一致性全部通过时迁移为 training-only legacy
+  off-policy replay；当前 P4 记录缺 contract 仍会拒绝，模型 ID不参与放行。
+
 - **当前 P3 功能分支入口**：`P3StandardJointConfig`（`p3_standard_joint`），分支
   `codex/p35-gaitfix2h`，任务 `p35gaitfix2h`。128 env、25 秒 episode、课程关闭，总计
   7200 秒；父包固定为上一轮任务 235689 的最终 `stairfinal` checkpoint，模型 ID `1013548`。

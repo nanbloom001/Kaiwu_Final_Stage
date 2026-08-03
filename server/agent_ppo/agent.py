@@ -48,6 +48,9 @@ from agent_ppo.checkpoint_io import (
     p3_standard_joint_candidates,
     p3_standard_joint_eval_candidates,
     validate_p3_eval_bundle,
+    p4_nav_eval_candidates,
+    p4_nav_training_candidates,
+    validate_p4_eval_bundle,
     visual_command_parent_candidates,
     visual_eval_checkpoint_diagnostics,
     visual_eval_checkpoint_candidates,
@@ -148,11 +151,21 @@ class Agent(BaseAgent):
         self.is_p3_standard_eval = self.algorithm_name == "p3_standard_eval"
         self.is_p3_track_eval = self.algorithm_name == "p3_track_eval"
         self.is_p3_eval = self.is_p3_standard_eval or self.is_p3_track_eval
+        self.is_p4_nav = self.algorithm_name == "p4_nav_ppo"
+        self.is_p4_standard_eval = self.algorithm_name == "p4_standard_eval"
+        self.is_p4_track_eval = self.algorithm_name == "p4_track_eval"
+        self.is_p4_eval = self.is_p4_standard_eval or self.is_p4_track_eval
         self.is_visual_ppo = self.algorithm_name in {"visual_ppo", "p15_response"}
         self.is_nav_dagger = self.algorithm_name == "nav_dagger"
         self.is_nav_eval = self.algorithm_name == "nav_eval"
 
-        if self.is_p3_standard_eval:
+        if self.is_p4_standard_eval:
+            self._init_p3_standard_eval(stage, usr_conf)
+        elif self.is_p4_track_eval:
+            self._init_p3_track_eval(stage, usr_conf)
+        elif self.is_p4_nav:
+            self._init_p2_nav(stage, usr_conf)
+        elif self.is_p3_standard_eval:
             self._init_p3_standard_eval(stage, usr_conf)
         elif self.is_p3_track_eval:
             self._init_p3_track_eval(stage, usr_conf)
@@ -199,6 +212,8 @@ class Agent(BaseAgent):
             or self.is_p2_nav
             or self.is_p3_joint
             or self.is_p3_eval
+            or self.is_p4_nav
+            or self.is_p4_eval
         ):
             # Initialize storage
             # 初始化存储
@@ -546,7 +561,14 @@ class Agent(BaseAgent):
             return
         import torch.nn as _nn
 
-        from agent_ppo.algorithm.algorithm_p2_nav_ppo import AlgorithmP2NavPPO
+        if self.is_p4_nav:
+            from agent_ppo.algorithm.algorithm_p4_nav_ppo import (
+                AlgorithmP4NavPPO as NavigationAlgorithm,
+            )
+        else:
+            from agent_ppo.algorithm.algorithm_p2_nav_ppo import (
+                AlgorithmP2NavPPO as NavigationAlgorithm,
+            )
         from agent_ppo.feature.p2_response_buffer import P2ResponseAuxBuffer
         from agent_ppo.model.p2_high_level import (
             NavigationEncoder,
@@ -574,7 +596,8 @@ class Agent(BaseAgent):
         self.p2_actor = P2NavigationActor().to(self.device)
         self.p2_critic = P2NavigationCritic().to(self.device)
         self.response_adapter = CommandResponseAdapter().to(self.device)
-        p2_conf = usr_conf.get("p2_nav_ppo", {})
+        config_key = "p4_nav_ppo" if self.is_p4_nav else "p2_nav_ppo"
+        p2_conf = usr_conf.get(config_key, {})
         if not isinstance(p2_conf, dict):
             p2_conf = {}
         response_conf = p2_conf.get("response_adapter", {})
@@ -596,7 +619,7 @@ class Agent(BaseAgent):
                 "response_adapter": self.response_adapter,
             }
         )
-        self.algorithm = AlgorithmP2NavPPO(
+        self.algorithm = NavigationAlgorithm(
             low_level_encoder=self.low_level_encoder,
             low_level_actor=self.low_level_actor,
             navigation_encoder=self.navigation_encoder,
@@ -613,8 +636,10 @@ class Agent(BaseAgent):
         )
         self.training_elapsed_h = 0.0
         self._p2_parent_model_id = str(p2_conf.get("parent_model_id", 291713))
+        if self.is_p4_nav:
+            self._p4_parent_model_id = self._p2_parent_model_id
         self.logger.info(
-            "[P2NavPPO] dedicated high-level algorithm initialized; "
+            f"[{'P4NavPPO' if self.is_p4_nav else 'P2NavPPO'}] dedicated high-level algorithm initialized; "
             f"parent={self._p2_parent_model_id} num_envs={self.num_envs} "
             "low_level=inference_only adapter=online_auxiliary"
         )
@@ -623,7 +648,14 @@ class Agent(BaseAgent):
         """Build only the modules required by evaluate_full inference."""
         import torch.nn as _nn
 
-        from agent_ppo.algorithm.algorithm_p2_nav_ppo import AlgorithmP2NavPPO
+        if self.is_p4_track_eval:
+            from agent_ppo.algorithm.algorithm_p4_nav_ppo import (
+                AlgorithmP4NavPPO as EvaluationAlgorithm,
+            )
+        else:
+            from agent_ppo.algorithm.algorithm_p2_nav_ppo import (
+                AlgorithmP2NavPPO as EvaluationAlgorithm,
+            )
         from agent_ppo.model.p2_high_level import NavigationEncoder, P2NavigationActor
         from agent_ppo.model.response_adapter import CommandResponseAdapter
         from agent_ppo.model.vision_encoder import VisionEncoder
@@ -655,7 +687,7 @@ class Agent(BaseAgent):
         p2_conf = usr_conf.get("p2_nav_ppo", {})
         if not isinstance(p2_conf, dict):
             p2_conf = {}
-        self.algorithm = AlgorithmP2NavPPO(
+        self.algorithm = EvaluationAlgorithm(
             low_level_encoder=self.low_level_encoder,
             low_level_actor=self.low_level_actor,
             navigation_encoder=self.navigation_encoder,
@@ -726,7 +758,14 @@ class Agent(BaseAgent):
         """
         import torch.nn as _nn
 
-        from agent_ppo.algorithm.algorithm_p2_nav_ppo import AlgorithmP2NavPPO
+        if self.is_p4_track_eval:
+            from agent_ppo.algorithm.algorithm_p4_nav_ppo import (
+                AlgorithmP4NavPPO as EvaluationAlgorithm,
+            )
+        else:
+            from agent_ppo.algorithm.algorithm_p2_nav_ppo import (
+                AlgorithmP2NavPPO as EvaluationAlgorithm,
+            )
         from agent_ppo.model.p2_high_level import NavigationEncoder, P2NavigationActor
         from agent_ppo.model.response_adapter import CommandResponseAdapter
         from agent_ppo.model.vision_encoder import VisionEncoder
@@ -746,7 +785,9 @@ class Agent(BaseAgent):
         self.navigation_encoder = NavigationEncoder().to(self.device)
         self.p2_actor = P2NavigationActor().to(self.device)
         self.response_adapter = CommandResponseAdapter().to(self.device)
-        p3_conf = usr_conf.get("p3_standard_joint", {})
+        p3_conf = usr_conf.get(
+            "p4_nav_ppo" if self.is_p4_track_eval else "p3_standard_joint", {}
+        )
         if not isinstance(p3_conf, dict):
             p3_conf = {}
         p2_conf = usr_conf.get("p2_nav_ppo", {})
@@ -759,7 +800,7 @@ class Agent(BaseAgent):
                 "response_adapter": self.response_adapter,
             }
         )
-        self.algorithm = AlgorithmP2NavPPO(
+        self.algorithm = EvaluationAlgorithm(
             low_level_encoder=self.low_level_encoder,
             low_level_actor=self.low_level_actor,
             navigation_encoder=self.navigation_encoder,
@@ -779,7 +820,7 @@ class Agent(BaseAgent):
         self._p3_eval_checkpoint_path = None
         self._p3_eval_requested_model_id = None
         self.logger.info(
-            "[P3] Track eval-only assembly initialized; modules="
+            f"[{'P4' if self.is_p4_track_eval else 'P3'}] Track eval-only assembly initialized; modules="
             "low_level/navigation_encoder/actor/response_adapter "
             "critic=absent safety_head=absent optimizers=absent "
             "response_buffer=absent"
@@ -1212,6 +1253,17 @@ class Agent(BaseAgent):
                 f"obs_shape={getattr(obs, 'shape', None)}"
             )
         with torch.no_grad():
+            if getattr(self, "is_p4_standard_eval", False):
+                self._ensure_p4_eval_checkpoint_loaded()
+                return self._exploit_p3_standard_eval(list_obs_data)
+            if getattr(self, "is_p4_track_eval", False):
+                self._ensure_p4_eval_checkpoint_loaded()
+                obs, critic_wire = self._p2_eval_inputs(list_obs_data)
+                result, _, _ = self.algorithm.frame_begin(
+                    obs, critic_wire, deterministic=True
+                )
+                self.algorithm.eval_frame_advance()
+                return [ActData(action=result["actions"])]
             if self.is_p2_nav:
                 self._ensure_p2_eval_checkpoint_loaded()
                 obs, critic_wire = self._p2_eval_inputs(list_obs_data)
@@ -1330,6 +1382,28 @@ class Agent(BaseAgent):
             raise RuntimeError(
                 "P3 eval checkpoint was not loaded; refusing random inference"
             )
+
+    def _ensure_p4_eval_checkpoint_loaded(self) -> None:
+        if not self.is_p4_eval or self._p3_eval_checkpoint_path is not None:
+            return
+        from common_python.config.config_control import CONFIG
+
+        model_dir = getattr(CONFIG, "eval_model_dir", None)
+        model_id = getattr(CONFIG, "eval_model_id", None)
+        if not model_dir or model_id in (None, ""):
+            import toml
+
+            configure_path = os.path.abspath(
+                os.path.join(os.path.dirname(__file__), "..", "conf", "configure_app.toml")
+            )
+            app_conf = toml.load(configure_path).get("app", {})
+            model_dir = model_dir or app_conf.get("eval_model_dir")
+            model_id = model_id if model_id not in (None, "") else app_conf.get("eval_model_id")
+        if not model_dir or model_id in (None, ""):
+            raise RuntimeError("P4 eval checkpoint location is unavailable")
+        self._load_p4_eval(str(model_dir), str(model_id))
+        if self._p3_eval_checkpoint_path is None:
+            raise RuntimeError("P4 eval checkpoint was not loaded")
 
     def _log_visual_eval_runtime_diagnostics(self, obs, actions) -> None:
         """Print bounded input/output evidence for VisualPPO evaluation.
@@ -1461,9 +1535,11 @@ class Agent(BaseAgent):
             return None
         if self.is_p2_nav:
             return None
+        if self.is_p4_nav or self.is_p4_eval:
+            return None
         if self.is_p3_joint:
             return None
-        if self.is_p3_eval:
+        if self.is_p3_eval or self.is_p4_eval:
             # P3 评估装配不含训练算法/optimizer，任何 learn 调用都是 no-op。
             return None
         if self.is_nav_dagger or self.is_nav_eval:
@@ -1528,6 +1604,12 @@ class Agent(BaseAgent):
                 "agent.predict() is not used in P2; p2_nav_ppo_workflow owns "
                 "semi-MDP collection and recurrent PPO updates."
             )
+        if self.is_p4_nav:
+            raise RuntimeError(
+                "agent.predict() is not used in P4; navigation PPO workflow owns collection"
+            )
+        if self.is_p4_eval:
+            raise RuntimeError("agent.predict() is not used in P4 evaluation")
         if self.is_p3_joint:
             raise RuntimeError(
                 "agent.predict() is not used in P3; p3_standard_joint_workflow "
@@ -1697,7 +1779,7 @@ class Agent(BaseAgent):
                 )
                 return
             raise RuntimeError(
-                "[P3 eval] evaluation assembly must not write training checkpoints"
+                "[P3/P4 eval] evaluation assembly must not write training checkpoints"
             )
         if (self.is_nav_dagger or self.is_nav_eval) and not self._lifecycle_probe_save_logged:
             self._lifecycle_probe_save_logged = True
@@ -1725,7 +1807,32 @@ class Agent(BaseAgent):
         else:
             model_file_path = f"{path}/model.ckpt-{str(id)}.pkl"
 
-        if self.is_p3_joint:
+        if self.is_p4_nav:
+            if str(id) == "0" and self.algorithm.low_level_state_digest is None:
+                self.logger.warning(
+                    "[P4NavPPO] skip framework bootstrap save id=0 before parent preload"
+                )
+                return
+            phase_label = self.algorithm.current_phase
+            p4_path = f"{path}/model.ckpt-{phase_label}-{str(id)}.pkl"
+            if not validate_probe_filename(p4_path):
+                raise ValueError(f"P4 checkpoint filename not probe-compatible: {p4_path}")
+            checksum = self.algorithm.save_training_bundle(
+                p4_path, platform_model_id=id
+            )
+            self.logger.info(
+                f"[P4NavPPO] save bundle={p4_path} phase={phase_label} "
+                f"platform_id={id} sha256={checksum} deployable=false"
+            )
+            emit_nav_event(
+                "platform_dump_boundary",
+                role=self._process_role,
+                platform_model_id=str(id),
+                path=p4_path,
+                phase=phase_label,
+                sha256=checksum,
+            )
+        elif self.is_p3_joint:
             if str(id) == "0" and not getattr(
                 self.algorithm, "parent_loaded", False
             ):
@@ -1948,6 +2055,8 @@ class Agent(BaseAgent):
             or self.is_nav_eval
             or self.is_p2_nav
             or self.is_p3_joint
+            or self.is_p4_nav
+            or self.is_p4_eval
         ):
             self._save_side_locomotion(path, id)
 
@@ -2048,7 +2157,11 @@ class Agent(BaseAgent):
                 "[LifecycleProbe] nav_load_model inventory "
                 f"pid={os.getpid()} requested_id={id} same_id_files={same_id_files}"
             )
-        if self.is_p3_eval:
+        if self.is_p4_eval:
+            self._load_p4_eval(path, id)
+        elif self.is_p4_nav:
+            self._load_p4_nav(path, id)
+        elif self.is_p3_eval:
             self._load_p3_eval(path, id)
         elif self.is_p3_joint:
             self._load_p3_standard_joint(path, id)
@@ -2109,6 +2222,76 @@ class Agent(BaseAgent):
         self.logger.info(
             f"[P3] load complete mode={load_mode} requested_id={requested} "
             f"selected={selected} session_h={self.training_elapsed_h:.3f}"
+        )
+
+    def _load_p4_nav(self, path=None, id="1"):
+        if not path:
+            raise FileNotFoundError("[P4NavPPO] preload path is empty")
+        requested = str(id)
+        candidates = p4_nav_training_candidates(
+            path,
+            requested,
+            parent_model_id=self._p4_parent_model_id,
+        )
+        selected = next(
+            (candidate for candidate in candidates if os.path.isfile(candidate)), None
+        )
+        if selected is None:
+            raise FileNotFoundError(
+                f"[P4NavPPO] no P4 resume or configured P3.5 parent; tried={candidates}"
+            )
+        load_mode = self.algorithm.load_bundle(
+            selected, platform_model_id=requested
+        )
+        self.training_elapsed_h = self.algorithm.session_effective_seconds / 3600.0
+        self.cur_model_name = selected
+        self.logger.info(
+            f"[P4NavPPO] load complete mode={load_mode} requested_id={requested} "
+            f"selected={selected} session_h={self.training_elapsed_h:.3f}"
+        )
+
+    def _load_p4_eval(self, path=None, id="1"):
+        if not path:
+            raise FileNotFoundError("[P4 eval] preload path is empty")
+        requested = str(id)
+        candidates = p4_nav_eval_candidates(path, requested)
+        selected = next(
+            (candidate for candidate in candidates if os.path.isfile(candidate)), None
+        )
+        if selected is None:
+            raise FileNotFoundError(
+                f"[P4 eval] no P4 checkpoint for requested_id={requested}; tried={candidates}"
+            )
+        raw = torch.load(selected, weights_only=False, map_location="cpu")
+        mode = "standard" if self.is_p4_standard_eval else "track"
+        disposition = validate_p4_eval_bundle(raw, mode=mode)
+        if not disposition.get("phase_label_known", False):
+            self.logger.warning(
+                "[P4 eval] phase label is not recognized; continuing because "
+                "the checkpoint passed structural validation. phase=%r",
+                disposition.get("phase_label"),
+            )
+        if self.is_p4_standard_eval:
+            low = (raw.get("modules") or {}).get("low_level") or {}
+            encoder_state = (low.get("locomotion_encoder") or {}).get("state_dict")
+            actor_state = (low.get("actor") or {}).get("state_dict")
+            validate_state_dict_finite(encoder_state, "P4 standard eval low encoder")
+            validate_state_dict_finite(actor_state, "P4 standard eval low actor")
+            self.vision_encoder.load_state_dict(encoder_state, strict=True)
+            self.teacher_actor.load_state_dict(actor_state, strict=True)
+            self.vision_encoder.eval()
+            self.teacher_actor.eval()
+            self.vision_encoder.reset_hidden_state(self.num_envs, self.device)
+        else:
+            self.algorithm.load_evaluation_bundle(
+                selected, platform_model_id=requested
+            )
+        self._p3_eval_checkpoint_path = selected
+        self._p3_eval_phase_label = disposition["phase_label"]
+        self.cur_model_name = selected
+        self.logger.info(
+            f"[P4 eval] loaded mode={mode} phase={disposition['phase_label']} "
+            f"selected={selected}"
         )
 
     def _load_p3_eval(self, path=None, id="1"):

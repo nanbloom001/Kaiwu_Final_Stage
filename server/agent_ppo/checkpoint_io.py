@@ -111,6 +111,31 @@ P3_STANDARD_JOINT_PHASE_LABELS = (
     "stable",
 )
 
+P4_NAV_PHASE_LABELS = (
+    "mazediag",
+    "mazeprobe",
+    "mazefull",
+    "mazefinal",
+    "pnavwarm",
+    "pnavrobust",
+    "pnavfull",
+    "pnavstable",
+)
+
+# Explicit newest-stage-first selection.  P4_NAV_PHASE_LABELS remains the
+# complete validation set; candidate discovery must not infer priority by
+# reversing that mixed new/legacy tuple.
+P4_NAV_CHECKPOINT_PRIORITY = (
+    "mazefinal",
+    "mazefull",
+    "mazeprobe",
+    "mazediag",
+    "pnavstable",
+    "pnavfull",
+    "pnavrobust",
+    "pnavwarm",
+)
+
 _PROBE_NAME = re.compile(r"^model\.ckpt-[a-z]*-*[0-9]+\.[^.]+$")
 
 
@@ -424,10 +449,10 @@ def validate_p3_eval_bundle(bundle: dict[str, Any], *, mode: str) -> dict[str, A
     ResponseAdapter).  The P3 package is the authoritative module source for
     both entries; neither may fall back to an old P2/LBC payload.
 
-    Platform model ID, filename label and lineage are *not* structural
-    compatibility inputs -- the caller reports them as warning-only identity
-    metadata.  Format, stage, phase label, model_spec, module class/spec, state
-    dict shape and finite values are the correctness basis.
+    Platform model ID, filename label, phase label and lineage are *not*
+    structural compatibility inputs -- the caller reports them as warning-only
+    identity metadata. Format, stage, model_spec, module class/spec, state dict
+    shape and finite values are the correctness basis.
 
     Returns an eval disposition dict with the selected ``phase_label`` and the
     modules that must be loaded.
@@ -444,11 +469,10 @@ def validate_p3_eval_bundle(bundle: dict[str, Any], *, mode: str) -> dict[str, A
             f"{bundle.get('stage_type')!r}"
         )
     phase_label = bundle.get("phase_label")
-    if not isinstance(phase_label, str) or phase_label not in P3_STANDARD_JOINT_PHASE_LABELS:
-        raise ValueError(
-            "P3 evaluation requires a valid phase_label, got "
-            f"{phase_label!r}"
-        )
+    phase_label_known = (
+        isinstance(phase_label, str)
+        and phase_label in P3_STANDARD_JOINT_PHASE_LABELS
+    )
     validate_low_level_spec(
         bundle,
         {
@@ -514,6 +538,7 @@ def validate_p3_eval_bundle(bundle: dict[str, Any], *, mode: str) -> dict[str, A
     return {
         "stage_type": "p3_standard_joint",
         "phase_label": phase_label,
+        "phase_label_known": phase_label_known,
         "mode": mode,
         "loaded_modules": sorted(loaded),
     }
@@ -531,6 +556,106 @@ def _validate_p3_eval_leaf(leaf: Any, name: str, expected: dict[str, Any], *, co
         raise ValueError(f"{context}.{name} spec mismatch: {leaf.get('spec')!r}")
     if not isinstance(leaf.get("state_dict"), dict):
         raise KeyError(f"{context}.{name} missing state_dict")
+
+
+def p4_nav_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
+    model_id = str(model_id)
+    return [
+        os.path.join(path, f"model.ckpt-{label}-{model_id}.pkl")
+        for label in P4_NAV_CHECKPOINT_PRIORITY
+    ]
+
+
+def _p4_nav_discovery_candidates(path: str) -> list[str]:
+    discovered: list[str] = []
+    for label in P4_NAV_CHECKPOINT_PRIORITY:
+        discovered.extend(
+            sorted(glob.glob(os.path.join(path, f"model.ckpt-{label}-*.pkl")))
+        )
+    compatible: list[str] = []
+    for candidate in dict.fromkeys(discovered):
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            payload = torch.load(candidate, weights_only=False, map_location="cpu")
+            validate_p4_eval_bundle(payload, mode="track")
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            continue
+        compatible.append(candidate)
+    return compatible
+
+
+def p4_nav_training_candidates(
+    path: str,
+    model_id: str | int,
+    *,
+    parent_model_id: str | int,
+) -> list[str]:
+    """Prefer selected P4, then one structural P4 fallback, then P3 parent."""
+    result = p4_nav_checkpoint_candidates(path, model_id)
+    for candidate in p4_nav_checkpoint_candidates(path, parent_model_id):
+        if candidate not in result:
+            result.append(candidate)
+    discovered = _p4_nav_discovery_candidates(path)
+    selected_paths = {os.path.abspath(candidate) for candidate in result}
+    discovered = [
+        candidate
+        for candidate in discovered
+        if os.path.abspath(candidate) not in selected_paths
+    ]
+    if len(discovered) > 1:
+        raise RuntimeError(
+            "P4 training checkpoint discovery is ambiguous; configure the "
+            f"parent/model ID. candidates={discovered}"
+        )
+    result.extend(discovered)
+    for selected_id in (str(model_id), str(parent_model_id)):
+        for label in reversed(P3_STANDARD_JOINT_PHASE_LABELS):
+            candidate = os.path.join(
+                path, f"model.ckpt-{label}-{selected_id}.pkl"
+            )
+            if candidate not in result:
+                result.append(candidate)
+    return result
+
+
+def p4_nav_eval_candidates(path: str, model_id: str | int) -> list[str]:
+    candidates = p4_nav_checkpoint_candidates(path, model_id)
+    if any(os.path.isfile(candidate) for candidate in candidates):
+        return candidates
+    discovered = _p4_nav_discovery_candidates(path)
+    if len(discovered) > 1:
+        raise RuntimeError(
+            "P4 eval checkpoint discovery is ambiguous; configure model ID. "
+            f"candidates={discovered}"
+        )
+    return candidates + discovered
+
+
+def validate_p4_eval_bundle(bundle: dict[str, Any], *, mode: str) -> dict[str, Any]:
+    """Layered P3/P4 validator used by Standard and Track evaluation."""
+    if not isinstance(bundle, dict) or bundle.get("stage_type") != "p4_nav_ppo":
+        raise ValueError(
+            "P4 evaluation requires stage_type='p4_nav_ppo', got "
+            f"{getattr(bundle, 'get', lambda *_: None)('stage_type')!r}"
+        )
+    phase = bundle.get("phase_label")
+    phase_known = isinstance(phase, str) and phase in P4_NAV_PHASE_LABELS
+    command = (bundle.get("contracts", {}).get("command") or {})
+    if command.get("mapper_version") != "p4_capability_action_mapper_v1":
+        raise ValueError("P4 evaluation action mapper contract mismatch")
+    # Reuse the structural low/high leaf validator without making P4 pretend
+    # that P3 is the only accepted stage family.
+    structural = dict(bundle)
+    structural["stage_type"] = "p3_standard_joint"
+    structural["phase_label"] = P3_STANDARD_JOINT_PHASE_LABELS[-1]
+    disposition = validate_p3_eval_bundle(structural, mode=mode)
+    disposition.update(
+        stage_type="p4_nav_ppo",
+        phase_label=phase,
+        phase_label_known=phase_known,
+    )
+    return disposition
 
 
 def low_level_only_parent_candidates(path: str, model_id: str | int) -> list[str]:

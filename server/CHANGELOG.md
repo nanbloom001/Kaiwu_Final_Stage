@@ -4,6 +4,108 @@
 
 ## [未发布]
 
+- **[P4 Maze 感知诊断与软巡航两小时强化]** 新分支 `codex/p4-maze2h-attack`
+  将 P4 Track 训练入口切为 `p4maze2h-attack`：128 env、75 秒 episode、单段
+  `open_entry_maze`、20 个静态难度列、课程关闭，总计 7200 秒。旧 slow/cruise/fast
+  随机速度档不再限制 `vx`；Actor 仍输出完整 `vx=[0,1.0]`、`vy=+-0.30`、`wz=+-0.90`，
+  Goal stale 与 safety cap 只作为执行侧 limited target 保护。新增只产生负值的软巡航项，
+  在前方清晰且目标新鲜时轻微惩罚低于 `0.60m/s` 或高于 `0.75m/s` 的 policy target，
+  terminal tick 不结算。P4 保存/加载合同升级为 `p4_maze_soft_cruise_v1`，新标签为
+  `mazeprobe/mazefull/mazefinal`，同时旧 P4 包在结构通过但合同不同的情况下作为 warm start，
+  不再误走 exact resume。监控新增 maze 感知诊断、SafetyHead 风险、Head 正确但 Actor
+  选错、风险到减速链路和 zero-hidden shadow；`student_risk_*` 更名为
+  `safety_head_risk_*`。
+  审查修复后，10 分钟只读诊断使用独立 wall clock，正式 `session_effective_seconds`
+  在诊断完成的 rollout 边界从零开始并完整累计 7200 秒；auto 分支使用训练期独立的
+  `nav_feat32` 风险/场景线性探针，并以 `goal4` 探针和随机基线作对照，累计 held-out teacher
+  coverage、wall AUROC/漏检率、安全方向 top-1、场景 macro-F1 和 clean/live latent cosine 后
+  再选择，不再读取最后一个 tick。诊断探针及其优化器只服务分支选择，独立保存并在旧合同
+  warm start 时清零。风险减速指标改为锁存风险出现时的 policy vx，并在后续 5 个高层
+  tick 内判断 policy/limited target 是否下降。checkpoint 合同升级为
+  `p4_maze_soft_cruise_v2_training_clock`，优先级固定为
+  `mazefinal > mazefull > mazeprobe > mazediag > legacy P4`，同 ID 缺失时只允许唯一结构兼容
+  P4 discovery。P4 周期保存改用 wall clock，因此 10 分钟只读诊断期间仍会在 5 分钟保存
+  `mazediag`，正式训练进度与结束条件继续只看 training clock。父包明确切换为
+  `p4nav8h-r3 pnavstable-1207698`。旧合同 warm start 现在保留新 session 的确定性运行时 RNG，
+  不再强行向 CPU generator 恢复 CUDA 格式状态；同合同 exact resume 仍严格恢复全部 RNG。
+  新增 `p4_maze_continue_smoke.py`，固定以 8 env 验证真实父包 warm start、32-tick PPO、Adapter、
+  冻结低层 digest、保存和 exact resume；大规模环境测试改为显式按需执行。修复 Maze 诊断探针在
+  `finish_tick()` 的 `torch.no_grad()` 上下文中反向传播失败：仅对 detached `nav_feat32/goal4`
+  和四个 training-only 线性探针局部启用梯度，CNN、Actor 与 rollout 收集仍保持无图。
+
+- **[P4 卡墙 reset 容器验证]** `MotionWallStuckTracker` 在首批真实 worker
+  frame 重试 termination-manager 装配，不再把 observation 初始化期的暂时
+  unavailable 状态永久保留。新增 1-env 真实 Isaac smoke，已在开发容器
+  验证 `nav_stuck_timeout` 回读、物理 auto-reset 和 worker `reason=4`。下一轮
+  平台 smoke 从 shadow 进入保守的 `active + 12s`；不修改平台覆盖的
+  `BaseEnv`。
+
+- **[P4 安全奖励连续 ramp 与 Adapter 父记录迁移]** 保持 predictive collision、missed-safe、
+  yaw-cancellation 的最终权重及安全组 `-0.05/tick` 上限不变，将安全/鲁棒奖励倍率改为
+  `0-30m=0`、`30-60m 0->0.25`、`60-120m 0.25->1.0`，消除 2 小时边界约 `0.5->1.0` 的突跳，
+  并将 ramp 版本写入 training digest；Goal fault 使用独立 multiplier，奖励调度不再隐式改变目标
+  噪声分布。P3 父包的 32 条 current completed Adapter records 原先因缺少
+  逐记录 contract 全部被拒绝，嵌套的 32 条 earlier-lineage records 也未进入 P4；现在只对 parent warm replay 执行 shape、finite、horizon、sequence
+  与来源低层 digest/序列版本一致性验证后迁移，当前 P4 缺合同记录仍严格拒绝。历史 record 不要求
+  等于父包最终低层 digest，因为它们本来就是 P3 版本化 off-policy replay。父 checkpoint 的 current 与嵌套
+  earlier lineage 池不再被机械对半切成不足 24 条的不可采样窗口，而按真实池采样并从可用池补齐。
+  新增迁移/拒绝监控，未增加模型 ID 硬门禁。
+
+- **[P4 20列结果与 shadow 卡滞统计修复]** P4 自定义 Track 结果面板改为完整展示
+  `completed/abnormal/timeout/score` 的 L0-L19；平台 scorer 按实际 column 直接生成
+  `track_l{col}`，不存在两列自动合并为一个旧 L 档。shadow wall-stuck 达到确认阈值后现在每段
+  confinement 只上报一次 would-reset 事件和一次预计节省时间，避免把持续 level 信号重复累计为
+  数千秒。Adapter 50/25/25 replay 面板按互斥三池的实际 batch 数计算，比例不再可能大于 1；
+  lifecycle 面板改用明确的 `platform_lifecycle_callbacks`，不再被误读为任务完成数。stuck reset
+  已完成当前开发容器的 termination term 与 1-env 物理 reset 验证，下一轮平台
+  smoke 使用保守的 `active + 12s`。
+
+- **[P4 checkpoint 身份与 stuck-reset resume 合同]** P3/P4 phase label 在
+  stage/module/spec/shape/有限值校验通过后降为 warning-only 身份元数据，重命名但结构兼容的父包和
+  评估包不再被标签单点拒绝。P4 checkpoint 现在散列并保存实际 shadow/active/disabled
+  stuck-reset 配置，奖励使用同一合同中的 terminal penalty；exact resume 遇到模式、确认时长或
+  其他 reset 参数漂移时明确报错。
+
+- **[P4 R2 目标/相机热修复与墙面卡滞回收]** 任务改为 `p4nav8h-r2`，仍从
+  `p3stairmem8h_1013548` 重新 warm start。修复 P4 相机把米制近裁剪阈值直接与归一化 depth
+  比较的问题；GoalBelief 改为读取 P4 training-only wire 中未裁剪的米制 goal，并增加过程方差、
+  五次一致测量重捕获和 stale-MAP 低速行为。P4 训练 wire 由 493 扩为 507，但 Actor85、Critic
+  输入、57905 policy、385 eval wire 和低层接口均保持不变。前 30 分钟通过 `requires_grad` 真正
+  冻结 NavigationEncoder 与 Actor/LSTM，避免 LR=0 时 Adam moments 仍漂移。新增 P4-only
+  `MotionWallStuckTracker`：默认 shadow，通过平台既有 `nav_stuck_timeout` 的公开 term config 与
+  `_nav_motion_stuck` 完成物理 reset；确认后 reason=4 使用独立 `-6` impulse、无 bootstrap且同 tick
+  不重复收取 collision/predictive/stagnation。terminal 环境会冻结 507 维 wire 的 raw goal 与 stuck
+  diagnostics，避免自动 reset 后的新 episode 数据污染旧 transition；相机面板明确区分 raw、
+  near-clip-added 与 delivered hole。未修改平台覆盖的 `isaac_env/base_env.py`。
+
+- **[P4 Track 导航鲁棒八小时训练]** 新增 `p4_nav_ppo` / `p4nav8h`，以操作者选择的
+  `p3stairmem8h` 最终 `stairfinal` 包 `1013548` warm start，冻结完整低层并只训练 NavigationEncoder、高层
+  Actor/LSTM、新 Critic、SafetyHead 与 ResponseAdapter。新增版本化
+  `p4_capability_action_mapper_v1`、slow/cruise/fast 动态速度上限、GoalBelief v2、exec/true
+  yaw cancellation、安全奖励同比 `-0.05/tick` cap、共享 30Hz capture/50Hz low-LSTM 状态机及
+  rollout 刷新的 clean teacher。后 6 小时通过 EventManager 公共接口渐进启用温和 Push；真实
+  Push pulse 以 worker step 去重，并使相交的 Adapter 0.2/0.6/1.0 秒与 pose/stuck 标签失效。
+  Adapter replay 在 schema、低层/feedback/capability/mapper/布局合同兼容过滤后再尝试
+  50/25/25，不足只由兼容池回填。checkpoint 新增 P4 mapper、Goal、camera、速度 RNG 与冻结
+  digest，支持 P4 Standard 低层-only、Track 完整评估及两次四小时 exact resume；恢复时钟会在
+  `env.reset(usr_conf)` 前回填 worker Push offset。训练 wire 保持 493、policy 57905、低层
+  57901/Actor77/action12、高层 Actor85，不修改平台覆盖的 `isaac_env/base_env.py`。
+  最终审计补齐合法 track segment/goal epoch 对 GoalBelief 与 yaw 历史的原子 reset、Goal 重获时间、
+  2-6 小时严重相机故障与长 Goal dropout 的互斥，以及 clean/live action MAE 与 latent cosine 的
+  PPO 指标汇总。Adapter record 现在携带实际 P4 response capability15，采样重建不再回退 P2
+  常量；动态 safety cap 改由 delivered depth 与当前 exec 弧线计算，因此 Track eval 在忽略
+  training-only SafetyHead 后仍保持与训练一致的可部署限速闭环。
+  快速回归审计进一步将相机延迟改为每个 fault event 固定采样，并保证 delivered frame ID
+  单调不回放旧帧；128 环境的孔洞与结构块增强改为批量张量路径。exact resume 恢复相机 RNG
+  前不再由 live-buffer reset 消耗随机数；P4 监控健康合同扩展到 Goal、相机、Push、Adapter、
+  reward、冻结状态和资源指标，并补齐全部 Adapter 兼容拒绝原因，避免少量样例指标掩盖面板缺项。
+  开发容器首轮 Isaac smoke 进一步发现 `p4*` checkpoint phase 含数字，不满足平台探活文件名
+  的纯小写字母约束；现改为唯一的 `pnavwarm/pnavrobust/pnavfull/pnavstable`，平台注入的模型 ID
+  仍原样写入且不作为硬门禁。过长的 Adapter response-profile 拒绝指标同时缩短到 60 字符以内，
+  避免单个非法 metric 使整套 P4 自定义面板被平台跳过。
+  P4 迭代与平台 dump 现在也写入仅在 smoke 环境变量启用时生效的原子事件日志，使进程组 runner
+  能在首个完整 32-tick update 与成功 checkpoint 后自动停止，不改变正式训练热路径。
+
 - **[P3.5 两小时低速楼梯、相机时序与后期 Push]** 新分支
   `codex/p35-gaitfix2h`、任务 `p35gaitfix2h` 将 P3 训练收敛为 7200 秒低层专项修复。
   保持 policy `57905`、低层 `57901/Actor77/action12` 和高层 85 维合同不变；只训练低层

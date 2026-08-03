@@ -362,6 +362,38 @@ class P3TrackEvalConfig(P3StandardJointConfig):
     model_class = "P2NavigationActor"
 
 
+class P4NavPPOConfig(P2NavPPOConfig):
+    """P4 Track robustness training with a completely frozen P3.5 low level."""
+
+    name = "p4_nav_ppo"
+    task_type = "track"
+    algorithm = "p4_nav_ppo"
+    ckpt_name = "model.ckpt-mazefull"
+    num_steps_per_env = 320
+    tbptt_sequence_length = 16
+    num_learning_epochs = 4
+    num_mini_batches = 4
+
+
+class P4StandardEvalConfig(P4NavPPOConfig):
+    """P4 Standard evaluation loads only the unchanged low-level policy."""
+
+    name = "p4_standard_eval"
+    task_type = "standard"
+    algorithm = "p4_standard_eval"
+    num_goal_obs = 0
+    num_actor_observations = 57901
+    model_class = "ActorCriticEncoder"
+
+
+class P4TrackEvalConfig(P4NavPPOConfig):
+    """P4 Track evaluation loads the full deployable hierarchy."""
+
+    name = "p4_track_eval"
+    task_type = "track"
+    algorithm = "p4_track_eval"
+
+
 class NavDaggerConfig(StageConfig):
     """hier-nav 高层导航 DAgger 训练阶段（Track + Camera，冻结低层）。
 
@@ -479,6 +511,7 @@ def _configured_training_stage(logger):
         "p15_response": P15ResponseConfig,
         "p2_nav_ppo": P2NavPPOConfig,
         "p3_standard_joint": P3StandardJointConfig,
+        "p4_nav_ppo": P4NavPPOConfig,
         "lbc_loco": LBCLocoConfig,
         "locomotion": LocomotionConfig,
         "nav_dagger": NavDaggerConfig,
@@ -516,7 +549,7 @@ class Config:
     # Keep the literal default aligned with the branch's active training stage.
     # configure_app.toml remains authoritative for worker subprocesses and is
     # checked again below during module bootstrap.
-    CURRENT = P3StandardJointConfig
+    CURRENT = P4NavPPOConfig
 
     @staticmethod
     def load_conf(logger):
@@ -648,6 +681,9 @@ def _valid_explicit_policy_stage(usr_conf):
         "p3_standard_joint": P3StandardJointConfig,
         "p3_standard_eval": P3StandardEvalConfig,
         "p3_track_eval": P3TrackEvalConfig,
+        "p4_nav_ppo": P4NavPPOConfig,
+        "p4_standard_eval": P4StandardEvalConfig,
+        "p4_track_eval": P4TrackEvalConfig,
         "lbc_loco": LBCLocoConfig,
         "locomotion": LocomotionConfig,
         # hier-nav：训练与评估入口分离（评估类永不构造训练 Algorithm）。
@@ -751,6 +787,18 @@ def _infer_stage_from_task_name(usr_conf, logger):
                         if terrain_mode == "track"
                         else P3StandardEvalConfig
                     )
+                elif selected is P4NavPPOConfig:
+                    terrain_conf = usr_conf.get("terrain", {})
+                    terrain_mode = (
+                        str(terrain_conf.get("mode", "standard")).lower()
+                        if isinstance(terrain_conf, dict)
+                        else "standard"
+                    )
+                    selected = (
+                        P4TrackEvalConfig
+                        if terrain_mode == "track"
+                        else P4StandardEvalConfig
+                    )
                 logger.info(
                     "[eval] Explicit policy entry selected: "
                     f"{explicit_entry} -> {selected.name}"
@@ -782,7 +830,17 @@ def _infer_stage_from_task_name(usr_conf, logger):
         P3StandardEvalConfig,
         P3TrackEvalConfig,
     }
+    p4_lineage = Config.CURRENT in {
+        P4NavPPOConfig,
+        P4StandardEvalConfig,
+        P4TrackEvalConfig,
+    }
     if mode == "track" and "Camera" in task_name:
+        if p4_lineage:
+            logger.info(
+                "[eval] Track+Camera retained P4 lineage; selected p4_track_eval"
+            )
+            return P4TrackEvalConfig
         if p3_lineage:
             logger.info(
                 "[eval] Track+Camera task retained the P3 checkpoint lineage "
@@ -808,6 +866,11 @@ def _infer_stage_from_task_name(usr_conf, logger):
         return None
 
     has_camera = "Camera" in task_name
+    if has_camera and p4_lineage:
+        logger.info(
+            "[eval] Standard+Camera retained P4 lineage; selected p4_standard_eval"
+        )
+        return P4StandardEvalConfig
     if has_camera and p3_lineage:
         logger.info(
             "[eval] Standard+Camera task retained the P3 checkpoint lineage "
