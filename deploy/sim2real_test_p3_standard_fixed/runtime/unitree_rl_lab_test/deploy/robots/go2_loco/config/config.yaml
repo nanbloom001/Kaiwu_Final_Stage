@@ -1,0 +1,87 @@
+FSM:
+  _: # enabled fsms
+    Passive:
+      id: 1
+    FixStand:
+      id: 2
+    # Velocity 需要 logs/rsl_rl/unitree_go2_velocity 策略目录；本机没有，先禁用
+    # Velocity:
+    #   id: 3
+    #   type: RLBase
+    VisionLoco:
+      id: 4
+      type: VisionLoco
+  Passive:
+    transitions:
+      FixStand: LT + A.on_pressed
+    mode: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+    kd: [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]
+  FixStand:
+    transitions:
+      Passive: LT + B.on_pressed
+      VisionLoco: LT + X.on_pressed
+    kp: [60, 80, 80, 60, 80, 80, 60, 80, 80, 60, 80, 80]
+    kd: [5, 4, 4, 5, 4, 4, 5, 4, 4, 5, 4, 4]
+    ts: [0, 1, 2]
+    qs: [
+      [],
+      [0.0, 1.36, -2.65, 0.0, 1.36, -2.65, 0.0, 1.36, -2.65, 0.0, 1.36, -2.65],
+      # Hardware motor order mapped from the P3 policy default through joint_ids_map.
+      [-0.1, 0.8, -1.5, 0.1, 0.8, -1.5, -0.1, 1.0, -1.5, 0.1, 1.0, -1.5],
+    ]
+  Velocity:
+    transitions:
+      Passive: LT + B.on_pressed
+    policy_dir: ../../../logs/rsl_rl/unitree_go2_velocity
+  VisionLoco:
+    transitions:
+      Passive: LT + B.on_pressed
+    # 放 <policy_dir>/exported/policy.onnx + <policy_dir>/params/deploy.yaml
+    # loco 阶段 ONNX 由 export_loco_onnx.py 生成（8 入 8 出，nav 端口占位）。
+    policy_dir: ../../../logs/loco
+    # 深度源: realsense（D435i 直连）或 constant（仅用于链路检查）。
+    # loco 阶段仍需 depth：depth → cnn → loco_lstm → loco_latent → teacher_actor。
+    depth:
+      source: realsense
+      constant_value: 0.6
+      filters:
+        mode: light_spatial
+        spatial_magnitude: 2
+        spatial_smooth_alpha: 0.5
+        spatial_smooth_delta: 20
+        temporal_alpha: 0.25
+        temporal_delta: 20
+    # goal_position(4): orientation, pitch, distance(m), yaw。
+    # loco 阶段图内忽略 goal（仅为端口兼容传入），保留仅为诊断日志记录。
+    goal: [0.0, 0.0, 10.0, 0.0]
+
+    # loco 阶段命令来源：
+    #   fixed: 固定速度基础运控（loco 阶段默认）；
+    #   uwb  : 外层几何控制器生成受限 cmd（loco 阶段仍可用，走同一套 command_for_frame）；
+    #   nav  : loco 阶段无 learned nav actor（模型无 nav 分支），选 nav 等价零速度，
+    #          仅保留分支以复用 State；正式 loco 测试请用 fixed / uwb。
+    command_source: fixed
+    # Conservative first bring-up command; raise only after standing checks.
+    fixed_cmd: [0.0, 0.0, 0.0]   # first safe retest; vx, vy, wz
+    uwb:
+      topic: rt/uwbstate
+      sport_state_topic: rt/sportmodestate
+      max_vx: 0.70
+      max_vy: 0.00
+      max_wz: 0.40
+      yaw_kp: 0.80
+      stop_distance: 0.35
+      slow_distance: 1.00
+      turn_in_place_angle: 1.0472  # 60 deg
+      stale_timeout: 0.50
+      cmd_slew_rate: [0.70, 0.30, 1.00]  # 每秒最大 vx/vy/wz 变化量
+      # lowcmd 模式会关闭 SportModeState；用静止 UWB tag 的相对位姿差分估计实际 vx/vy。
+      # 仅用于日志，不参与 fixed/nav 命令生成。测试期间不要移动 tag。
+      diagnostic_feedback: true
+      velocity_filter_alpha: 0.20
+
+    # 每次进入 VisionLoco 都在 logs/loco/logs/ 创建一份逐帧 CSV。
+    logging:
+      enabled: true
+      flush_every: 50
+      max_consecutive_errors: 5
