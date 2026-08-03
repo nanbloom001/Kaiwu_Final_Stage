@@ -114,6 +114,8 @@ P3_STANDARD_JOINT_PHASE_LABELS = (
 P4_NAV_PHASE_LABELS = (
     "mazediag",
     "mazeprobe",
+    "mazeattack",
+    "mazehard",
     "mazefull",
     "mazefinal",
     "pnavwarm",
@@ -127,6 +129,8 @@ P4_NAV_PHASE_LABELS = (
 # reversing that mixed new/legacy tuple.
 P4_NAV_CHECKPOINT_PRIORITY = (
     "mazefinal",
+    "mazehard",
+    "mazeattack",
     "mazefull",
     "mazeprobe",
     "mazediag",

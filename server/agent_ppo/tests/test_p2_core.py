@@ -651,6 +651,29 @@ def test_track_segment_index_uses_world_x_and_not_spawn_row():
     assert "boundaries=[-12.0, -4.0, 4.0, 12.0]" in status
 
 
+def test_track_segment_metric_mapping_uses_configured_terrain_semantics():
+    assert p2_contract.canonical_track_segment_labels(()) == (
+        "slope_inv",
+        "stairs_inv",
+        "maze",
+    )
+    maze_labels = p2_contract.canonical_track_segment_labels(
+        ["open_entry_maze"]
+    )
+    assert maze_labels == ("maze",)
+    mapped = p2_contract.track_segment_metric_indices(
+        torch.tensor((0.0, -1.0, 1.0)), maze_labels
+    )
+    assert mapped.tolist() == [2, -1, -1]
+
+    p2_labels = p2_contract.canonical_track_segment_labels(
+        ["pyramid_slope_inv", "pyramid_stairs_inv", "open_entry_maze"]
+    )
+    assert p2_contract.track_segment_metric_indices(
+        torch.tensor((0.0, 1.0, 2.0)), p2_labels
+    ).tolist() == [0, 1, 2]
+
+
 def test_terminal_safe_segment_ignores_new_episode_position_after_reset():
     observed = _terminal_safe_segment(
         live_segment=torch.tensor((0.0, 1.0, 2.0)),
@@ -1064,6 +1087,7 @@ def test_finish_tick_attributes_tracking_penalty_to_end_feedback():
     algorithm = AlgorithmP2NavPPO.__new__(AlgorithmP2NavPPO)
     algorithm.device = torch.device("cpu")
     algorithm.num_envs = 1
+    algorithm.nav_period_frames = p2_contract.NAV_PERIOD_FRAMES
     algorithm.command = SimpleNamespace(
         active_target=torch.tensor([[1.0, 0.0, 0.0]]),
         exec_cmd=torch.tensor([[1.0, 0.0, 0.0]]),
@@ -1110,6 +1134,7 @@ def test_finish_tick_sanitizes_invalid_reward_rows_before_rollout_storage():
     algorithm = AlgorithmP2NavPPO.__new__(AlgorithmP2NavPPO)
     algorithm.device = torch.device("cpu")
     algorithm.num_envs = 1
+    algorithm.nav_period_frames = p2_contract.NAV_PERIOD_FRAMES
     algorithm.command = SimpleNamespace(
         active_target=torch.tensor([[0.5, 0.0, 0.0]]),
         exec_cmd=torch.tensor([[0.5, 0.0, 0.0]]),
@@ -1164,6 +1189,7 @@ def test_terminal_tick_preserves_episode_best_until_reward_is_settled():
     algorithm = AlgorithmP2NavPPO.__new__(AlgorithmP2NavPPO)
     algorithm.device = torch.device("cpu")
     algorithm.num_envs = 1
+    algorithm.nav_period_frames = p2_contract.NAV_PERIOD_FRAMES
     algorithm.command = SimpleNamespace(
         active_target=torch.tensor([[0.5, 0.0, 0.0]]),
         exec_cmd=torch.tensor([[0.5, 0.0, 0.0]]),
@@ -1333,6 +1359,7 @@ def test_timeout_never_bootstraps_from_post_reset_observation():
     algorithm = AlgorithmP2NavPPO.__new__(AlgorithmP2NavPPO)
     algorithm.device = torch.device("cpu")
     algorithm.num_envs = 1
+    algorithm.nav_period_frames = p2_contract.NAV_PERIOD_FRAMES
     algorithm.command = SimpleNamespace(
         active_target=torch.tensor([[0.5, 0.0, 0.0]]),
         exec_cmd=torch.tensor([[0.2, 0.0, 0.0]]),
@@ -2295,7 +2322,8 @@ def test_p2_checkpoint_leaf_contract_and_action_rng_exact_resume(tmp_path):
     assert torch.equal(actual_vy_noise, expected_vy_noise)
     assert restored.session_effective_seconds == 0.0
     assert restored.lifetime_effective_seconds == 0.0
-    assert restored.frame_count == 7
+    assert restored.frame_count == 10
+    assert restored.frame_count % restored.nav_period_frames == 0
 
     inference_payload = dict(payload)
     for training_key in (

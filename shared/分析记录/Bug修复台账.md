@@ -3037,6 +3037,15 @@
   检查不得把 401 等业务状态等同于 TCP 不可达。回滚可删除 `startKaiwuSyncService()`，不影响
   上传、终端 SHA256 或现有 RPC。当前分支 `codex/p3-sim2real-radial-nav`；无 commit/PR、训练
   task、模型或 checkpoint 变更，工具与协议文档仍未暂存。
+- 2026-08-04 更正：上述工具后来已由提交 `a6927b2` 正式保存，但当前
+  `codex/p4-maze8h-attack` 工作树尚未包含该提交；可核验副本位于
+  `/Users/nanbloom001/.codex/worktrees/793d/fwwb-Final/shared/tools/tencent_kaiwu_webide_upload.mjs`。
+  本次一度按旧的 `/Users/nanbloom001/codespace/fwwb-Final/...` 绝对路径导入失败，并错误判断为
+  “模块不存在”。正确最短检查路径是先用 `rg` 搜索全部工作树，再执行
+  `git log --all -- shared/tools/tencent_kaiwu_webide_upload.mjs`，区分路径变化、分支未合入和真实
+  缺失。使用真实路径后，冷启动分支返回 `started=true`、`healthy=true`，PID 1296；随后 RPC
+  `pwd` 与 37 文件 bundle 同步成功，二次 dry-run 为 0 差异。该证据同时补齐此前“冷启动待验证”
+  的运行证据，但不等同于训练或模型能力验证。
 
 ## BUG-20260801-004：P3 训练不可达负速度且稀疏步态基线跨地形误塑形
 
@@ -3650,3 +3659,160 @@
 - 再遇检查：`policy_target_vx vs limited_target_vx` -> `soft_cruise_clear_factor` ->
   `safety_head_risk_* vs teacher_risk_*` -> `head_correct_actor_wrong` -> `risk_no_deceleration` ->
   `zero_hidden_action_mae` -> completion/stuck/collision。
+
+## BUG-20260803-013：P4 Maze 长训仍缺少故障视觉对照，单段 Maze 被误记为坡面且事件率分母错误
+
+- 日期：2026-08-03；状态：本地已验证。
+- 影响范围：分支 `codex/p4-maze8h-attack`、任务 `p4maze8h-attack`、P4 Maze-only 八小时训练、
+  Adapter/Track 分段面板、安全决策面板、wall-stuck terminal 回报与 P4 exact resume。
+- 父模型/制品：配置父包 `p4nav8h-r3 pnavstable-1207698`，历史 SHA256
+  `781022129ac17e564830c34570213a63f111b44d29b9d1bd247c3481c7b9ea55`；本任务尚未生成新
+  checkpoint、模型 ID 或 SHA256。
+- 用户可见症状：两小时 Maze 强化不足以验证是否学会迷宫，且现有面板不能可靠区分 clean depth
+  可学、轻故障 depth 退化与 Actor 决策失败。单段 `open_entry_maze` 的 worker physical segment
+  恒为 0，但继承的 P2 指标固定解释为 `slope_inv`；Head-correct/Actor-wrong 与风险后减速指标又
+  除以所有导航 tick，使真实事件率被严重稀释。卡墙 reset 只显示 terminal impulse，无法判断该
+  episode 在前期 progress 后是否仍获得非负总回报。
+- 根因：P2 三段训练把 physical segment 0/1/2 与 slope/stairs/maze 绑定，P4 单段配置复用该硬编码；
+  诊断链只比较 clean/live，没有独立、不可操纵的轻故障对照。workflow 对所有逐环境诊断统一除以
+  `num_envs*ticks`，没有为 eligible safety event、resolved risk event 和 stuck terminal 使用各自
+  分母。旧两小时 schedule、checkpoint 标签和测试断言也仍散落在 P4 活动入口。
+- 排除项：不是通过修改平台覆盖的 `BaseEnv` 解决；不是把模型 ID、标签或 lineage 改成硬门禁；
+  不把故障 shadow 输入 Actor，也不通过增加 recurrent hidden 或改变网络 shape 掩盖感知问题。
+- 修复：新建 `p4maze8h-attack` 合同，600 秒只读诊断后完整训练 28800 秒；加入独立 RNG 的 10%
+  clean-depth 轻故障 shadow，只计算 latent/action 和线性探针指标。安全奖励使用连续 missed-safe
+  event ramp，predictive raw 放大 1.25 倍，安全组下限 -0.06；`frontier_stagnation` 实际 PPO 项
+  归零并保留 shadow。指标层从 TOML `sub_terrains` 动态把 physical segment 映射到稳定三类，
+  单段 Maze 的 index 0 进入 Maze bucket。workflow 使用 eligible/resolved/terminal 条件分母；
+  active wall-stuck impulse 为 -15，并额外记录 terminal episode return 和非负率。checkpoint
+  保存 fault RNG/统计/分支，并将 reward 合同纳入 exact resume 核验。
+- 2026-08-03 集成更正：初版在每个 50Hz 低层帧重采样 fault mask，但 fault feature 只在 5Hz
+  高层 tick 计算，tick 结束时可能出现 mask 与 feature 不属于同一帧，同时产生约十倍无效 shadow
+  复制。现已把 shadow 生成移动到 `_update_policy_auxiliary_target()` 的同一 5Hz 教师前向，保证
+  clean/fault depth、mask、latent 和 action 诊断一一对应，并降低诊断期开销。
+- 2026-08-03 事件归因更正：risk-to-deceleration tracker 现在把本 tick terminal 与下一 episode
+  reset 一并视为清理边界，terminal 样本不再计入 policy/limited/no-deceleration 条件分子。
+- 2026-08-03 独立审查更正：修复 `p2_contract` 错误局部导入导致真实 P2/P4 Agent 初始化
+  `NameError`；fault 鲁棒性统计改为只使用 `env_id % 5 == 0` 的 held-out probe 环境；onset tick
+  的 limiter 降速不再冒充后续响应。P4 启动核验 Maze-only segment 与实际 slew，exact resume
+  改为比较完整 command contract，而非只比较 mapper 版本。
+- 修改文件：`server/agent_ppo/feature/p2_contract.py`、`feature/p4_contract.py`、`feature/p4_camera.py`、
+  `algorithm/algorithm_p2_nav_ppo.py`、`algorithm/algorithm_p4_nav_ppo.py`、
+  `workflow/p2_nav_ppo_workflow.py`、`agent.py`、`checkpoint_io.py`、P4 TOML、监控配置、测试、
+  README/CHANGELOG、训练部署接口合同与本台账。未修改 `server/isaac_env/base_env.py`。
+- 当前验证：宿主 `PY311test` 定向回归 `test_p4_nav.py + test_p2_core.py +
+  test_nav_stage_and_metrics.py` 为 `185 passed`；修改模块 Python 编译、10 份活动 TOML 解析和
+  `git diff --check` 均通过。开发容器、平台 smoke、完整八小时训练、固定种子评估与真机均未验证，
+  因此状态只到“本地已验证”。
+- 防复发：测试覆盖单段 Maze index 0 动态映射、四阶段 8 小时 schedule、missed-safe 权重边界、
+  diagnostic fault 不修改 clean 输入且 RNG 可恢复、条件事件率、visual-recovery exact resume、
+  stuck-reset -15 与 fault 统计恢复。监控构建继续检查每个 line panel 不超过 20 指标。
+- 回滚：回滚本条八小时合同与 fault shadow即可回到 `codex/p4-maze2h-attack`；不得回滚既有相机
+  单位、GoalBelief、terminal snapshot、Adapter replay 和 low-level freeze 修复。若平台 fault 指标
+  异常，只关闭 diagnostic shadow，不得把它接入 Actor 或 reward。
+- 再遇检查：`maze_sample_share` -> `diagnostic_clean_fault_*` -> `diagnostic_fault_*` ->
+  `head_correct_actor_wrong_rate` -> `risk_no_deceleration_rate` -> `reward_frontier_stagnation`/shadow ->
+  `stuck_terminal_episode_return_mean/nonnegative_rate` -> checkpoint reward/training contract。
+
+## BUG-20260804-001：P4 Track 精简评估无条件调用缺失的 SafetyHead
+
+- 日期：2026-08-04；状态：本地已验证；影响范围：P4 Track eval-only 装配与后续 P4 训练包内代码。
+- 症状：任务 `600835` / 运行 `18612264` 在首次 `exploit()` 中止，首个致命错误为
+  `self.safety_head(nav_feat.detach())` 抛 `TypeError: 'NoneType' object is not callable`；外层
+  `act_data=None` 与 worker 终止均为连锁错误，未形成有效 episode 或评分。
+- 根因：`p4_track_eval` 为减小评估状态明确使用 `critic=absent safety_head=absent optimizers=absent`，
+  但 `_update_policy_auxiliary_target()` 复用训练路径，无条件调用 training-only SafetyHead。该异常
+  发生在相机、终止、scorer 和模型导航能力可验证之前，不能据此归因编码器或策略。
+- 修复：缺少 SafetyHead 时原地清零 `_last_safety_head_risk3` 并继续推理；训练装配存在 Head 时仍
+  计算 sigmoid 风险。不创建随机模块，不改变 Actor、NavigationEncoder、ResponseAdapter、网络
+  shape、checkpoint 或评估终止语义。旧模型最小修复包为
+  `p4nav2h_1256446-trackevalfix.zip`，ZIP SHA256
+  `4a8a51f38199de79b3cdd7255bcf9489f584bea95e2d9db488b6f9bccaaf545d`；checkpoint SHA256
+  `8aae0892664f2f263949f7e5f9f3b53ecd2936b44e80f3783091579bcf3d3461`，字节未变。
+- 修改与验证：当前分支直接修改活动 `algorithm_p4_nav_ppo.py` 并增加真实 eval-only Algorithm
+  回归；来源修复提交为 `codex/p4-eval-encoder-trace` 的 `c93dd11`。该旧 ZIP 已完成包内编译及
+  定向/邻近 `8 passed`；当前分支 P4/P2/装配邻近回归为 `186 passed`，修改算法与测试通过 Python
+  编译，`git diff --check` 通过。开发容器与平台 Track 复评尚未完成，因此不能升级为平台或评估
+  已验证。
+- 防复发：所有 training-only leaf 在 eval-only assembly 中均允许为 `None`，公共推理路径不得
+  无条件调用。模型 ID 只记录 lineage，不作为单点门禁。回滚为恢复原算法分支；再次遇到首帧
+  失败时先核对 eval assembly absent 模块与第一条调用栈。
+
+## BUG-20260804-002：P4 10Hz 迁移会重复放大连续奖励且八小时墙钟不足
+
+- 日期：2026-08-04；状态：开发容器已验证，待正式平台长训验证。
+- 影响范围：分支 `codex/p4-maze8h-attack`、任务 `p4maze8h-10hzroute`、P4 高层 10Hz rollout、
+  reward 分解、exact resume、平台任务时长和监控面板。父包为 `p4nav2h_1256446-F`，平台模型
+  ID `1256446`，checkpoint SHA256
+  `8aae0892664f2f263949f7e5f9f3b53ecd2936b44e80f3783091579bcf3d3461`。
+- 用户可见风险：将高层从 5Hz 提升到 10Hz 后，如果仍按每 tick 原权重结算 tracking、crawl、
+  predictive、missed-safe、yaw、soft-cruise 和持续卡墙，同一秒会得到约两倍负奖励；同时前 600 秒
+  只读诊断不计入 `session_effective_seconds`，平台任务若只设置 8 小时，实际梯度训练会少约
+  10 分钟。旧速度档测试和 RNG 又继续引用已经删除的运行时状态，不能证明新合同可恢复。
+- 根因：P2 reward 原始合同以 10 个 50Hz frame 为一个 5Hz tick，P4 只缩短 period 未同步区分
+  连续时间项、事件 impulse、按米路程项和每决策项；TOML 的 `task_end_hours=8.0` 与
+  `diagnostic_seconds=600 + target_effective_seconds=28800` 自相矛盾。P4 构造器在缺少显式 config
+  时也可能落回 P2 的 5Hz 默认。后续审查还发现 `configure_app.toml` 与容器 smoke 默认仍指向旧父
+  模型 `1207698`，且新增 goal-safe 奖励误用了带噪 GoalBelief，与“奖励只用仿真真值”的合同冲突。
+  独立审查继续发现：诊断结束时钟零点按首个 rollout 边界设置，使 29400 秒墙钟无法覆盖完整
+  28800 秒梯度训练；worker Push 直接使用进程墙钟，提前把 600 秒诊断计入 2 小时边界；10Hz
+  安全组先做 0.5 时间缩放再 cap，使 `-0.06` cap 永远无法触发；2 秒卡滞窗口仍硬编码 11 点，
+  在 10Hz deque 长到 21 点后失效；mid-tick checkpoint exact resume 恢复非整 tick `frame_count`，
+  会把新 episode 前几帧 reward 配给后创建的 action/log-prob；workflow 二次 live reset 又消耗已恢复的
+  camera RNG；风险减速指标还用 policy onset 速度充当 limited onset 基线，制造 limiter 减速假阳性。
+  风险事件年龄又在 onset tick 立即加一，使 1.0 秒响应窗口实际约 0.9 秒结束。
+- 修复：P4 构造器在父类初始化前注入 `nav_period_frames=5`，P2 默认仍为 10 frame。连续 tick
+  奖励统一乘 `duration_frames/10`，正常 10Hz tick 缩放为 0.5；success/failure/timeout/reset 等
+  事件 impulse、route-excess 按米项和 command-rate 每决策项不缩放，body collision 明确保留
+  10Hz 完整约束。成功 impulse 改为 `+200`，新增持续卡墙、目标一致安全选向和轻量额外路程惩罚。
+  旧 slow/cruise/fast 状态与 RNG 全部移除，exact resume 恢复诊断分支后重新应用对应 LR。
+  合同新增 `required_platform_wall_seconds=29400`，TOML 元数据改为 8 小时 10 分钟，梯度目标仍为
+  28800 秒。为保留干净 rollout 边界，再增加 300 秒 rollout/checkpoint/退出余量，平台最大墙钟改为
+  29700 秒，工作流达到有效训练目标后自行结束。worker Push 在诊断未完成时使用剩余诊断时间的负
+  offset，诊断完成后使用保存的有效训练时钟。安全组三项先在参考 5Hz 尺度 cap，再统一乘
+  `duration_frames/10`；卡滞历史按 deque 实际 `maxlen`；exact resume 将 `frame_count` 向上对齐到
+  下一导航 tick，camera live buffer reset 不消费恢复 RNG；policy/limited 分别保存风险 onset 基线。
+  风险年龄只累计 onset 后续 tick，严格在第 10 个 10Hz 后续 tick 结算 1.0 秒响应窗口。
+  活动预加载和 smoke fallback 统一为 `1256446`；goal-safe 奖励改读 terminal-safe
+  `raw_goal_xy_m2`，并用回归测试证明任意修改 GoalBelief estimate 不会改变该奖励。
+- 修改文件：`algorithm_p2_nav_ppo.py`、`algorithm_p4_nav_ppo.py`、
+  `workflow/p2_nav_ppo_workflow.py`、`feature/p4_contract.py`、P4 TOML、监控、测试、README、
+  CHANGELOG、接口合同和本台账。未修改平台覆盖的 `server/isaac_env/base_env.py`。
+- 当前验证：宿主 `PY311test` 的 P4 专项为 `65 passed`；P4/P2/监控/双评估合计
+  `219 passed, 5 skipped`，另有 checkpoint 邻近回归 `19 passed`；改动 Python 文件通过编译、
+  14 份 TOML 通过解析，
+  `git diff --check` 通过。新增用例覆盖 P4 默认 10Hz、P2 默认不变、连续奖励 0.5 缩放、成功
+  `+200`、卡墙 ramp、安全目标方向、route-excess、GoalBelief 不污染奖励、活动父包一致性、速度档
+  删除与 29700 秒墙钟合同。开发容器中定向测试为 `11 passed`；随后使用 checkpoint SHA256
+  `8aae0892664f2f263949f7e5f9f3b53ecd2936b44e80f3783091579bcf3d3461`、8 环境完成真实父包
+  联合 smoke：`p4_maze_warm_start`、32-tick rollout、16 次 PPO minibatch update、1 次 Adapter
+  update、低层 digest 不变、保存后 fresh instance 以 `p4_exact_resume_history_reset` 恢复。峰值
+  CUDA allocated/reserved 分别为 `231542784/287309824` bytes，pinned depth 为 `29491200` bytes。
+  测试 ZIP、解压父包、smoke checkpoint 和 `/tmp` 日志已经按精确路径清理。2026-08-04 在独立
+  审查修复后重新同步 37 个源码/测试文件，二次 dry-run 为 0 差异；容器正确 Isaac Python 路径下
+  9 项定向回归通过，覆盖 Push 时钟、10Hz safety cap、camera RNG、卡滞窗口、风险减速/完整 1 秒
+  响应窗口、P4/P2 exact resume。随后重新上传本地父包 ZIP，WebIDE 双 SHA256 校验为
+  `4a8a51f38199de79b3cdd7255bcf9489f584bea95e2d9db488b6f9bccaaf545d`，解压 checkpoint 校验为
+  `8aae0892664f2f263949f7e5f9f3b53ecd2936b44e80f3783091579bcf3d3461`；8 环境联合 smoke 再次
+  `PASS`，完成 32-tick rollout、16 次 PPO minibatch update、1 次 Adapter update、保存和
+  `p4_exact_resume_history_reset`，低层 digest 不变，峰值 CUDA allocated/reserved 为
+  `231543296/287309824` bytes，pinned depth 为 `29491200` bytes。父包和本轮输出暂时保留到正式
+  任务首轮更新稳定，随后按精确路径清理。正式平台训练尚待执行，因此不能升级为“平台已验证”。
+- 平台 UI 证据：已用父模型 `p4nav2h_1256446-F` 创建并手动释放 1 分钟试验任务
+  `p4create-stop-smoke`（任务 ID `236257`），仅证明任务表单、父模型选择和停止流程可用，不证明
+  代码、10Hz、checkpoint 或训练行为正确。正式任务第一次提交返回“训练任务创建失败”；容器清理
+  dry-run 发现 `10` 个可再生目标、`40149025` bytes，均为 `__pycache__`、`test_artifacts` 和
+  `/tmp/IsaacLab`，未包含 `conf/.env` 或凭证。执行 `conf/container_training_cleanup.py --apply`
+  后，同一表单成功创建 `p4maze8h-10hzroute`（任务 ID `236263`，平台时长 `8h10min`，父模型
+  `p4nav2h_1256446-F`）。任务启动后进入 `mazediag`，低层 digest 未漂移，worker lifecycle 未失败；
+  模型列表在 `5min25s` 和 `5min39s` 分别出现训练步数 `1259039/1259166`、大小 `28.49M` 的
+  checkpoint，证明 5 分钟首存和手动释放终存链路可用。按用户要求任务在约 6 分钟手动释放，状态为
+  `手动释放`，CPU/GPU 资源已归还。由于尚未越过 600 秒只读诊断边界，该证据不能证明训练分支选择、
+  首轮 PPO/Adapter 梯度更新或长期漂移；正式任务仍需重新创建并继续验证。
+- 防复发：定向测试必须同时断言 P4 period=5 frame、P2 period=10 frame、32 tick/TBPTT16、
+  连续奖励每秒尺度、事件 impulse 不缩放、旧 speed RNG 不再写入 checkpoint、exact resume LR
+  与诊断分支一致。正式任务页不得用 8 小时覆盖 10 分钟诊断加完整 8 小时训练。
+- 回滚：回滚本条 10Hz、三项新奖励和时钟合同即可恢复 5Hz Maze 版本；不得回滚 GoalBelief、
+  相机单位、terminal snapshot、active stuck reset 或 eval-only SafetyHead 已验证修复。
+- 再遇检查：`nav_period_frames` -> `reward_continuous_time_scale` -> reward conservation ->
+  `session_wall_seconds/session_effective_seconds` -> saved training/reward/command digest -> 首个 PPO update。

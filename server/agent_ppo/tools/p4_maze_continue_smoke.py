@@ -120,7 +120,7 @@ def _fill_rollout(algorithm: AlgorithmP4NavPPO) -> None:
             critic_hidden,
             reset,
         )
-    for tick in range(p2_contract.NAV_ROLLOUT_TICKS):
+    for tick in range(algorithm.nav_rollout_ticks):
         algorithm.rollout.add(
             depth=depth,
             nav_feat=nav_feat,
@@ -138,7 +138,7 @@ def _fill_rollout(algorithm: AlgorithmP4NavPPO) -> None:
             ),
             duration_frames=torch.full(
                 (num_envs, 1),
-                p2_contract.NAV_PERIOD_FRAMES,
+                algorithm.nav_period_frames,
                 dtype=torch.long,
                 device=device,
             ),
@@ -179,7 +179,7 @@ def main() -> int:
     checkpoint = Path(args.checkpoint).resolve()
     output = Path(args.output).resolve()
     raw = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    platform_model_id = raw.get("platform_model_id", 1207698)
+    platform_model_id = raw.get("platform_model_id", 1256446)
 
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()

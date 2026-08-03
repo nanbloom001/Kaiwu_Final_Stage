@@ -36,6 +36,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
 
     def __init__(self, *args, **kwargs):
         early_config = dict(kwargs.get("config") or {})
+        early_config.setdefault(
+            "nav_period_frames", p4_contract.P4_NAV_PERIOD_FRAMES
+        )
+        kwargs["config"] = early_config
         self.maze_training_branch = str(
             early_config.get("maze_training_branch", "actor_attack")
         )
@@ -44,6 +48,32 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self.diagnostic_elapsed_seconds = 0.0
         self._training_clock_origin_seconds = None
         super().__init__(*args, **kwargs)
+        runtime_segments = tuple(
+            self.config.get("track_segment_labels", ("maze",))
+        )
+        if runtime_segments != ("maze",):
+            raise ValueError(
+                "P4 Maze-only training requires track_segment_labels=['maze']; "
+                f"got {list(runtime_segments)!r}"
+            )
+        if self.nav_period_frames != p4_contract.P4_NAV_PERIOD_FRAMES:
+            raise ValueError(
+                "P4 runtime navigation period does not match the 10 Hz contract: "
+                f"runtime={self.nav_period_frames} "
+                f"contract={p4_contract.P4_NAV_PERIOD_FRAMES}"
+            )
+        runtime_slew = tuple(float(value) for value in self.command_slew_rate)
+        runtime_release = tuple(
+            float(value) for value in self.command_slew_release_rate
+        )
+        if (
+            runtime_slew != p4_contract.P4_SLEW_RATE
+            or runtime_release != p4_contract.P4_SLEW_RELEASE_RATE
+        ):
+            raise ValueError(
+                "P4 runtime slew does not match command contract: "
+                f"slew={runtime_slew!r} release={runtime_release!r}"
+            )
         seed = int(self.config.get("p4_seed", 4100))
         self.stuck_reset_contract = p4_contract.normalize_stuck_reset_contract(
             self.config.get("stuck_reset")
@@ -59,17 +89,6 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         )
         if not hasattr(self, "_resolved_maze_training_branch"):
             self._resolved_maze_training_branch = None
-        self.speed_generator = torch.Generator(device="cpu")
-        self.speed_generator.manual_seed(seed + 3)
-        self.speed_tier = torch.zeros(
-            self.num_envs, dtype=torch.long, device=self.device
-        )
-        self.speed_tier_sticky = torch.ones(
-            self.num_envs, dtype=torch.bool, device=self.device
-        )
-        self.speed_switch_remaining_s = torch.zeros(
-            self.num_envs, device=self.device
-        )
         self.user_speed_cap = torch.full(
             (self.num_envs,), p4_contract.P4_MAX_VX, device=self.device
         )
@@ -95,6 +114,9 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self.num_envs, dtype=torch.long, device=self.device
         )
         self._risk_event_baseline_policy_vx = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self._risk_event_baseline_limited_vx = torch.zeros(
             self.num_envs, device=self.device
         )
         self._risk_condition_previous = torch.zeros(
@@ -143,6 +165,22 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             (self.num_envs,), -1, dtype=torch.long, device=self.device
         )
         self._clean_depth = None
+        self._diagnostic_fault_depth = None
+        self._diagnostic_fault_mask = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._diagnostic_terminal_mask = torch.zeros_like(
+            self._diagnostic_fault_mask
+        )
+        self._diagnostic_fault_nav_feat = torch.zeros(
+            self.num_envs, 32, device=self.device
+        )
+        self._diagnostic_clean_fault_latent_cosine = torch.ones(
+            self.num_envs, device=self.device
+        )
+        self._diagnostic_clean_fault_action_mae = torch.zeros(
+            self.num_envs, device=self.device
+        )
         self._camera_diagnostics: dict[str, torch.Tensor] = {}
         self._clean_action_mean = torch.zeros(
             self.num_envs, 3, device=self.device
@@ -150,8 +188,14 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self._camera_aux_mask = torch.zeros(
             self.num_envs, 3, device=self.device
         )
+        self._yaw_window_ticks = max(
+            2, int(round(p4_contract.YAW_WINDOW_SECONDS / self.nav_dt_s))
+        )
+        self._risk_response_ticks = max(
+            1, int(round(p4_contract.RISK_RESPONSE_WINDOW_SECONDS / self.nav_dt_s))
+        )
         self._yaw_exec_history = torch.zeros(
-            p4_contract.YAW_WINDOW_TICKS, self.num_envs, device=self.device
+            self._yaw_window_ticks, self.num_envs, device=self.device
         )
         self._yaw_true_history = torch.zeros_like(self._yaw_exec_history)
         self._yaw_history_cursor = 0
@@ -168,6 +212,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self._goal_epoch_changed_since_tick = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
+        self._p4_episode_return = torch.zeros(self.num_envs, device=self.device)
         self._teacher_navigation_encoder = copy.deepcopy(self.navigation_encoder).to(
             self.device
         )
@@ -256,68 +301,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         )
         return critic, aux
 
-    def _sample_speed_tiers(
-        self, mask: torch.Tensor, *, sample_episode_mode: bool = True
-    ) -> None:
-        if not p4_contract.SPEED_TIERS_ENABLED:
-            del sample_episode_mode
-            mask = mask.bool().reshape(-1)
-            if bool(mask.any()):
-                self.speed_tier[mask] = 0
-                self.speed_tier_sticky[mask] = True
-                self.speed_switch_remaining_s[mask] = 1.0e9
-                self.user_speed_cap[mask] = p4_contract.P4_MAX_VX
-            return
-        mask = mask.bool().reshape(-1)
-        count = int(mask.sum())
-        if count <= 0:
-            return
-        draw = torch.rand(count, generator=self.speed_generator, device="cpu")
-        tier = torch.where(
-            draw < 0.25,
-            torch.zeros_like(draw, dtype=torch.long),
-            torch.where(
-                draw < 0.75,
-                torch.ones_like(draw, dtype=torch.long),
-                torch.full_like(draw, 2, dtype=torch.long),
-            ),
-        ).to(self.device)
-        sticky = self.speed_tier_sticky[mask]
-        if sample_episode_mode:
-            sticky = (
-                torch.rand(count, generator=self.speed_generator, device="cpu") < 0.80
-            ).to(self.device)
-        duration = (
-            5.0
-            + 10.0
-            * torch.rand(count, generator=self.speed_generator, device="cpu")
-        ).to(self.device)
-        self.speed_tier[mask] = tier
-        self.speed_tier_sticky[mask] = sticky
-        self.speed_switch_remaining_s[mask] = duration
-        caps = torch.tensor(
-            p4_contract.SPEED_CAPS_MPS, device=self.device
-        )
-        self.user_speed_cap[mask] = caps[tier]
-
-    def _advance_speed_tiers(self, reset: torch.Tensor) -> None:
-        if not p4_contract.SPEED_TIERS_ENABLED:
-            reset = reset.bool().reshape(-1)
-            if bool(reset.any()):
-                self._sample_speed_tiers(reset)
-            self.user_speed_cap.fill_(p4_contract.P4_MAX_VX)
-            self.speed_switch_remaining_s.fill_(1.0e9)
-            return
-        reset = reset.bool().reshape(-1)
-        self._sample_speed_tiers(reset)
-        if self.frame_count % p2_contract.NAV_PERIOD_FRAMES:
-            return
-        self.speed_switch_remaining_s -= p2_contract.NAV_DT_S
-
     def _prepare_policy_parts(self, parts, critic_obs, aux, reset):
         del reset
         worker_reset = aux[:, 24] > 0.5
-        self._advance_speed_tiers(worker_reset)
+        self.user_speed_cap.fill_(p4_contract.P4_MAX_VX)
         if self.training_enabled:
             true_xy = self._p4_worker_extra[:, p4_contract.RAW_GOAL_XY_SLICE]
             if true_xy.shape != (self.num_envs, 2):
@@ -334,17 +321,17 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self.goal_belief.set_fault_scale(
                 float(schedule["goal_fault_multiplier"])
             )
-            if self.session_effective_seconds < 1_800.0:
+            if self.session_effective_seconds < 3_600.0:
                 goal_fault_profile = "noise_only"
-            elif self.session_effective_seconds < 7_200.0:
+            elif self.session_effective_seconds < 18_000.0:
                 goal_fault_profile = "medium"
-            elif self.session_effective_seconds < 21_600.0:
+            elif self.session_effective_seconds < 25_200.0:
                 goal_fault_profile = "full"
             else:
                 goal_fault_profile = "stress"
             fault_allowed = torch.ones_like(xy_valid)
             if goal_fault_profile == "full":
-                # During 2-6h, keep the 5% severe-camera bucket from also
+                # During 5-7h, keep the 5% severe-camera bucket from also
                 # receiving a long Goal dropout. Combined severe faults are
                 # reserved for the final stress phase.
                 fault_allowed &= self.camera_state.sequence_kind != 3
@@ -369,7 +356,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         )
         self._clean_depth = self.camera_state.clean_capture.detach().clone()
         parts["depth"] = delivered
-        if self.frame_count % p2_contract.NAV_PERIOD_FRAMES == 0:
+        if self.frame_count % self.nav_period_frames == 0:
             with torch.inference_mode():
                 current_arc = self._predictive_command(
                     self.command.active_target
@@ -505,10 +492,6 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
     def begin_rollout(self) -> None:
         """Refresh the clean teacher from the current live policy."""
         self._push_rollout_count.zero_()
-        switch = (~self.speed_tier_sticky) & (
-            self.speed_switch_remaining_s <= 0.0
-        )
-        self._sample_speed_tiers(switch, sample_episode_mode=False)
         self.camera_state.begin_rollout(
             self.session_effective_seconds, training=self.training_enabled
         )
@@ -523,7 +506,27 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
     ) -> None:
         if self._clean_depth is None:
             return
+        diagnostic_active = (
+            self.maze_training_branch == "auto"
+            and self._resolved_maze_training_branch is None
+            and self.diagnostic_elapsed_seconds < p4_contract.DIAGNOSTIC_SECONDS
+        )
+        if diagnostic_active:
+            (
+                self._diagnostic_fault_depth,
+                self._diagnostic_fault_mask,
+            ) = self.camera_state.diagnostic_fault_shadow(
+                self._clean_depth, sample_share=0.10
+            )
+        else:
+            self._diagnostic_fault_depth = None
+            self._diagnostic_fault_mask.zero_()
         self._teacher_hidden = self._mask_hidden(self._teacher_hidden, reset)
+        teacher_hidden_before = (
+            tuple(item.clone() for item in self._teacher_hidden)
+            if self._teacher_hidden is not None
+            else None
+        )
         with torch.inference_mode():
             clean_feat = self._teacher_navigation_encoder(self._clean_depth)
             self._camera_clean_live_latent_cosine = F.cosine_similarity(
@@ -538,6 +541,40 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 reset,
                 hard_abs_vy=p4_contract.P4_MAX_ABS_VY,
             )
+            fault_normalized = normalized
+            self._diagnostic_fault_nav_feat.copy_(clean_feat)
+            if (
+                self._diagnostic_fault_depth is not None
+                and bool(self._diagnostic_fault_mask.any())
+            ):
+                selected = self._diagnostic_fault_mask
+                fault_feat = self._teacher_navigation_encoder(
+                    self._diagnostic_fault_depth[selected]
+                )
+                self._diagnostic_fault_nav_feat[selected] = fault_feat
+                fault_input = assemble_actor_input(
+                    self._diagnostic_fault_nav_feat,
+                    nav_nonvisual,
+                    profile,
+                    confidence,
+                )
+                _, fault_normalized, _, _, _ = self._teacher_actor.deterministic(
+                    fault_input,
+                    teacher_hidden_before,
+                    reset,
+                    hard_abs_vy=p4_contract.P4_MAX_ABS_VY,
+                )
+                self._diagnostic_clean_fault_latent_cosine = F.cosine_similarity(
+                    clean_feat,
+                    self._diagnostic_fault_nav_feat,
+                    dim=-1,
+                ).detach()
+                self._diagnostic_clean_fault_action_mae = (
+                    normalized - fault_normalized
+                ).abs().mean(dim=-1).detach()
+            else:
+                self._diagnostic_clean_fault_latent_cosine.fill_(1.0)
+                self._diagnostic_clean_fault_action_mae.zero_()
             zero_hidden = (
                 torch.zeros(
                     self._teacher_actor.num_layers,
@@ -561,9 +598,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 hard_abs_vy=p4_contract.P4_MAX_ABS_VY,
             )
         self._clean_action_mean = normalized.detach()
-        self._last_safety_head_risk3 = torch.sigmoid(
-            self.safety_head(nav_feat.detach())
-        ).detach()
+        if self.safety_head is None:
+            self._last_safety_head_risk3.zero_()
+        else:
+            self._last_safety_head_risk3 = torch.sigmoid(
+                self.safety_head(nav_feat.detach())
+            ).detach()
         zero_delta = (normalized - zero_normalized).abs()
         self._zero_hidden_action_mae = zero_delta.mean(dim=-1).detach()
         self._zero_hidden_direction_disagreement = (
@@ -609,9 +649,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         ).mean(dim=-1)
         raw = per_action[selected].mean()
         target_ratio = float(
-            p4_contract.training_schedule(self.session_effective_seconds)[
-                "camera_aux_ratio"
-            ]
+            p4_contract.training_schedule(
+                self.session_effective_seconds,
+                branch=self._effective_maze_branch(self.session_effective_seconds),
+            )["camera_aux_ratio"]
         )
         if target_ratio <= 0.0:
             coefficient = 0.0
@@ -669,13 +710,24 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         exec_cmd = context["reward_exec_cmd"]
         source_aux = context["reward_source_aux"]
         terminal = context["terminal"].bool()
+        duration_frames = torch.as_tensor(
+            context.get("duration_frames", self.nav_period_frames),
+            device=self.device,
+            dtype=torch.float32,
+        ).reshape(-1)
+        continuous_time_scale = torch.clamp(
+            duration_frames / float(p2_contract.NAV_PERIOD_FRAMES), 0.0, 1.0
+        )
+        for name in ("crawl", "tracking", "gait_symmetry"):
+            if name in components:
+                components[name] = components[name] * continuous_time_scale
         wall_stuck_terminal = context["reason"].reshape(-1) == 4
         history_reset = terminal | self._goal_epoch_changed_since_tick
         if bool(history_reset.any()):
             self._yaw_exec_history[:, history_reset] = 0.0
             self._yaw_true_history[:, history_reset] = 0.0
             self._yaw_history_count[history_reset] = 0
-        previous_index = (self._yaw_history_cursor - 1) % p4_contract.YAW_WINDOW_TICKS
+        previous_index = (self._yaw_history_cursor - 1) % self._yaw_window_ticks
         previous_exec_wz = self._yaw_exec_history[previous_index]
         previous_true_wz = self._yaw_true_history[previous_index]
         exec_sign_flip = (
@@ -691,25 +743,41 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self._yaw_history_count = torch.where(
             terminal,
             torch.zeros_like(self._yaw_history_count),
-            torch.clamp(self._yaw_history_count + 1, max=p4_contract.YAW_WINDOW_TICKS),
+            torch.clamp(self._yaw_history_count + 1, max=self._yaw_window_ticks),
         )
         self._yaw_history_cursor = (
             self._yaw_history_cursor + 1
-        ) % p4_contract.YAW_WINDOW_TICKS
-        exec_cancel = p4_contract.yaw_cancellation(self._yaw_exec_history)
-        true_cancel = p4_contract.yaw_cancellation(self._yaw_true_history)
-        enough = self._yaw_history_count >= p4_contract.YAW_WINDOW_TICKS
+        ) % self._yaw_window_ticks
+        exec_cancel = p4_contract.yaw_cancellation(
+            self._yaw_exec_history, dt_s=self.nav_dt_s
+        )
+        true_cancel = p4_contract.yaw_cancellation(
+            self._yaw_true_history, dt_s=self.nav_dt_s
+        )
+        enough = self._yaw_history_count >= self._yaw_window_ticks
         yaw_raw = torch.where(
             enough,
             p4_contract.YAW_EXEC_WEIGHT * exec_cancel
             + p4_contract.YAW_TRUE_WEIGHT * true_cancel,
             torch.zeros_like(exec_cancel),
         ).clamp_min(p4_contract.YAW_TOTAL_FLOOR)
-        predictive_raw = components["predictive_collision_risk"].clamp_min(
-            p4_contract.PREDICTIVE_RAW_FLOOR
+        predictive_raw = (
+            components["predictive_collision_risk"]
+            * p4_contract.PREDICTIVE_COLLISION_SCALE
+        ).clamp_min(p4_contract.PREDICTIVE_RAW_FLOOR)
+        safe3 = self.pending_tick.get(
+            "safe3", torch.zeros(self.num_envs, 3, device=self.device)
         )
-        missed_raw = components["missed_safe_direction"].clamp_min(
-            p4_contract.MISSED_SAFE_RAW_FLOOR
+        safety_valid = self.pending_tick.get(
+            "safety_valid", torch.zeros(self.num_envs, 1, device=self.device)
+        ).reshape(-1) > 0.5
+        missed_raw, missed_diagnostics = (
+            p4_contract.maze_missed_safe_direction_penalty(
+                safe3,
+                self._last_policy_command,
+                safety_valid,
+                self.session_effective_seconds,
+            )
         )
         schedule = p4_contract.training_schedule(
             self.session_effective_seconds,
@@ -722,9 +790,17 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         (predictive, missed, yaw), scale = p4_contract.proportional_negative_cap(
             predictive_raw, missed_raw, yaw_raw
         )
+        predictive *= continuous_time_scale
+        missed *= continuous_time_scale
+        yaw *= continuous_time_scale
         components["predictive_collision_risk"] = predictive
         components["missed_safe_direction"] = missed
         components["yaw_cancellation"] = yaw
+        components["success"] = (context["reason"].reshape(-1) == 1).float() * float(
+            p4_contract.SUCCESS_IMPULSE
+        )
+        stagnation_shadow = components["frontier_stagnation"].detach().clone()
+        components["frontier_stagnation"] = torch.zeros_like(stagnation_shadow)
         # A confirmed wall-stuck reset is a single terminal event. Recharging
         # collision/predictive/stagnation penalties on that same tick would
         # count the same failure twice and make the new terminal dominate PPO.
@@ -742,6 +818,42 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         components["stuck_reset"] = wall_stuck_terminal.float() * float(
             self.stuck_reset_contract["terminal_penalty"]
         )
+        stuck_sustained, stuck_sustained_diag = (
+            p4_contract.sustained_wall_stuck_penalty(
+                self._p4_worker_extra[:, p4_contract.STUCK_DURATION_S_INDEX],
+                self._p4_worker_extra[:, p4_contract.STUCK_CANDIDATE_INDEX] > 0.5,
+                self._p4_worker_extra[:, p4_contract.STUCK_MAPPING_VALID_INDEX] > 0.5,
+                terminal,
+                confirmation_s=float(self.stuck_reset_contract["confirmation_s"]),
+            )
+        )
+        components["stuck_sustained"] = (
+            stuck_sustained * continuous_time_scale
+        )
+        goal_safe, goal_safe_diag = p4_contract.goal_safe_direction_penalty(
+            safe3,
+            self._last_policy_command,
+            self._p4_worker_extra[:, p4_contract.RAW_GOAL_XY_SLICE],
+            safety_valid,
+            self._last_goal_freshness,
+            terminal,
+        )
+        components["goal_safe_preference"] = (
+            goal_safe * continuous_time_scale
+        )
+        path_length_m = context.get("path_length_m")
+        if path_length_m is None:
+            path_length_m = torch.zeros(self.num_envs, device=self.device)
+        route_excess, route_diag = p4_contract.route_excess_penalty(
+            torch.as_tensor(path_length_m, device=self.device).reshape(-1),
+            context["start_goal_distance"].reshape(-1),
+            context["end_goal_distance"].reshape(-1),
+            terminal,
+        )
+        grace = self.seconds_since_push < 0.30
+        components["route_excess"] = torch.where(
+            grace, torch.zeros_like(route_excess), route_excess
+        )
         soft_cruise, cruise_diag = p4_contract.soft_cruise_penalty(
             self._last_policy_command,
             self.pending_tick.get("safe3", torch.zeros(self.num_envs, 3, device=self.device)),
@@ -752,9 +864,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self._last_goal_freshness,
             terminal,
         )
-        soft_cruise *= float(schedule.get("cruise_multiplier", 1.0))
+        soft_cruise *= (
+            float(schedule.get("cruise_multiplier", 1.0))
+            * continuous_time_scale
+        )
         components["soft_cruise"] = soft_cruise
-        grace = self.seconds_since_push < 0.30
         components["tracking"] = torch.where(
             grace, components["tracking"] * 0.5, components["tracking"]
         )
@@ -773,7 +887,9 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "reward_predictive_raw": predictive_raw.detach(),
             "reward_missed_safe_raw": missed_raw.detach(),
             "reward_yaw_raw": yaw_raw.detach(),
+            "reward_continuous_time_scale": continuous_time_scale.detach(),
             "reward_safety_group_scale": scale.detach(),
+            "reward_frontier_stagnation_shadow": stagnation_shadow,
             "yaw_exec_cancellation": exec_cancel.detach(),
             "yaw_true_cancellation": true_cancel.detach(),
             "yaw_exec_sign_flip": exec_sign_flip.float(),
@@ -785,10 +901,45 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             ),
             "push_grace_active": grace.float(),
             "push_tracking_response_mae": response_mae,
+            **{name: value.detach() for name, value in stuck_sustained_diag.items()},
+            **{name: value.detach() for name, value in goal_safe_diag.items()},
+            **{name: value.detach() for name, value in route_diag.items()},
+            **{name: value.detach() for name, value in missed_diagnostics.items()},
             **{name: value.detach() for name, value in cruise_diag.items()},
         }
         self._goal_epoch_changed_since_tick.zero_()
         return components
+
+    @torch.no_grad()
+    def finish_tick(self, *args, **kwargs):
+        reason = torch.as_tensor(
+            kwargs["terminal_reason"], device=self.device
+        ).reshape(-1).round().long()
+        hard = torch.as_tensor(
+            kwargs["hard_terminated"], device=self.device
+        ).reshape(-1).bool()
+        timeout = torch.as_tensor(
+            kwargs["timeout"], device=self.device
+        ).reshape(-1).bool()
+        self._diagnostic_terminal_mask.copy_((reason != 0) | hard | timeout)
+        full = super().finish_tick(*args, **kwargs)
+        tick_reward = self.last_tick_penalties["decomposed_total"].reshape(-1)
+        self._p4_episode_return += tick_reward
+        stuck = reason == 4
+        stuck_return = torch.where(
+            stuck, self._p4_episode_return, torch.zeros_like(self._p4_episode_return)
+        )
+        self.last_tick_diagnostics.update(
+            {
+                "stuck_terminal_count": stuck.float().reshape(-1, 1),
+                "stuck_terminal_episode_return_sum": stuck_return.reshape(-1, 1),
+                "stuck_terminal_nonnegative_count": (
+                    stuck & (self._p4_episode_return >= 0.0)
+                ).float().reshape(-1, 1),
+            }
+        )
+        self._p4_episode_return[(reason != 0) | hard | timeout] = 0.0
+        return full
 
     def _reset_maze_diagnostic_state(self) -> None:
         self._maze_diag_total = torch.zeros((), device=self.device)
@@ -807,6 +958,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self._maze_diag_goal_top1_total = torch.zeros((), device=self.device)
         self._maze_diag_goal_top1_correct = torch.zeros((), device=self.device)
         self._maze_diag_goal_scene_confusion = torch.zeros(5, 6, device=self.device)
+        self._maze_diag_fault_risk_positive_hist = torch.zeros(20, device=self.device)
+        self._maze_diag_fault_risk_negative_hist = torch.zeros(20, device=self.device)
+        self._maze_diag_fault_top1_total = torch.zeros((), device=self.device)
+        self._maze_diag_fault_top1_correct = torch.zeros((), device=self.device)
+        self._maze_diag_fault_scene_confusion = torch.zeros(5, 6, device=self.device)
 
     def _reset_maze_diagnostic_probes(self) -> None:
         probes = (
@@ -851,6 +1007,8 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         teacher_valid: torch.Tensor,
         nav_feat: torch.Tensor,
         goal4: torch.Tensor,
+        fault_nav_feat: torch.Tensor | None = None,
+        fault_mask: torch.Tensor | None = None,
     ) -> None:
         if self.maze_training_branch != "auto":
             return
@@ -873,6 +1031,16 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         teacher_risk = (1.0 - safe3).clamp(0.0, 1.0)
         nav_feat = nav_feat.detach()
         goal4 = goal4.detach()
+        fault_nav_feat = (
+            fault_nav_feat.detach()
+            if torch.is_tensor(fault_nav_feat)
+            else nav_feat
+        )
+        fault_mask = (
+            fault_mask.reshape(-1).bool()
+            if torch.is_tensor(fault_mask)
+            else torch.zeros_like(valid)
+        )
         env_ids = torch.arange(self.num_envs, device=self.device)
         train_mask = valid & ((env_ids % 5) != 0)
         teacher_class = self._diagnostic_scene_class(safe3, valid)
@@ -927,6 +1095,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             ).clamp(0.0, 1.0)
             predicted_scene = self._diagnostic_nav_scene_probe(nav_feat).argmax(dim=-1)
             goal_predicted_scene = self._diagnostic_goal_scene_probe(goal4).argmax(dim=-1)
+            fault_predicted_risk = torch.sigmoid(
+                self._diagnostic_nav_risk_probe(fault_nav_feat)
+            ).clamp(0.0, 1.0)
+            fault_predicted_scene = self._diagnostic_nav_scene_probe(
+                fault_nav_feat
+            ).argmax(dim=-1)
 
         valid3 = eval_mask.unsqueeze(-1).expand_as(teacher_risk)
         positive = valid3 & (teacher_risk >= 0.65)
@@ -979,6 +1153,35 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self._maze_diag_goal_scene_confusion += torch.bincount(
                 goal_flat, minlength=30
             ).reshape(5, 6).to(self._maze_diag_goal_scene_confusion)
+        fault_eval = eval_mask & fault_mask
+        if bool(fault_eval.any()):
+            fault_valid3 = fault_eval.unsqueeze(-1).expand_as(teacher_risk)
+            fault_positive = fault_valid3 & (teacher_risk >= 0.65)
+            fault_negative = fault_valid3 & (teacher_risk <= 0.35)
+            fault_bins = torch.clamp((fault_predicted_risk * 20.0).long(), 0, 19)
+            if bool(fault_positive.any()):
+                self._maze_diag_fault_risk_positive_hist += torch.bincount(
+                    fault_bins[fault_positive], minlength=20
+                ).to(self._maze_diag_fault_risk_positive_hist)
+            if bool(fault_negative.any()):
+                self._maze_diag_fault_risk_negative_hist += torch.bincount(
+                    fault_bins[fault_negative], minlength=20
+                ).to(self._maze_diag_fault_risk_negative_hist)
+            fault_clear = (scene["teacher_safe_top1_clear"] > 0.5) & fault_eval
+            fault_top = (1.0 - fault_predicted_risk).argmax(dim=-1)
+            self._maze_diag_fault_top1_total += fault_clear.float().sum()
+            self._maze_diag_fault_top1_correct += (
+                fault_clear & (teacher_top == fault_top)
+            ).float().sum()
+            fault_labeled = (teacher_class < 5) & fault_eval
+            if bool(fault_labeled.any()):
+                fault_flat = (
+                    teacher_class[fault_labeled] * 6
+                    + fault_predicted_scene[fault_labeled]
+                )
+                self._maze_diag_fault_scene_confusion += torch.bincount(
+                    fault_flat, minlength=30
+                ).reshape(5, 6).to(self._maze_diag_fault_scene_confusion)
 
     def _maze_diagnostic_summary(self) -> dict[str, float]:
         def histogram_auc(positive: torch.Tensor, negative: torch.Tensor) -> torch.Tensor:
@@ -1014,6 +1217,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         confusion = self._maze_diag_scene_confusion
         macro_f1 = scene_macro_f1(confusion)
         goal_macro_f1 = scene_macro_f1(self._maze_diag_goal_scene_confusion)
+        fault_auc = histogram_auc(
+            self._maze_diag_fault_risk_positive_hist,
+            self._maze_diag_fault_risk_negative_hist,
+        )
+        fault_macro_f1 = scene_macro_f1(self._maze_diag_fault_scene_confusion)
         return {
             "teacher_coverage": float(
                 (self._maze_diag_valid / self._maze_diag_total.clamp_min(1.0))
@@ -1048,6 +1256,14 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 .cpu()
             ),
             "goal_scene_macro_f1": float(goal_macro_f1.detach().cpu()),
+            "fault_wall_auroc": float(fault_auc.detach().cpu()),
+            "fault_safe_top1_accuracy": float(
+                (
+                    self._maze_diag_fault_top1_correct
+                    / self._maze_diag_fault_top1_total.clamp_min(1.0)
+                ).detach().cpu()
+            ),
+            "fault_scene_macro_f1": float(fault_macro_f1.detach().cpu()),
             "clean_live_latent_cosine": float(
                 (
                     self._maze_diag_latent_cosine_sum
@@ -1059,6 +1275,9 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "wall_positive_samples": float(self._maze_diag_wall_positive.detach().cpu()),
             "safe_top1_samples": float(self._maze_diag_top1_total.detach().cpu()),
             "scene_samples": float(confusion.sum().detach().cpu()),
+            "fault_samples": float(
+                self._maze_diag_fault_scene_confusion.sum().detach().cpu()
+            ),
         }
 
     def _extra_tick_diagnostics(self) -> dict[str, torch.Tensor]:
@@ -1092,6 +1311,8 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                     device=self.device,
                 ),
             )[:, :4],
+            self._diagnostic_fault_nav_feat,
+            self._diagnostic_fault_mask,
         )
         teacher_top = safe3.argmax(dim=-1)
         head_top = (1.0 - self._last_safety_head_risk3).argmax(dim=-1)
@@ -1100,8 +1321,18 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         teacher_clear = scene_diag["teacher_safe_top1_clear"] > 0.5
         head_correct = teacher_clear & (head_top == teacher_top)
         actor_wrong = head_correct & (actor_top != teacher_top)
+        reset_now = pending.get(
+            "reset_mask", torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        ).reshape(-1).bool() | self._diagnostic_terminal_mask
+        if bool(reset_now.any()):
+            self._risk_event_active[reset_now] = False
+            self._risk_event_age_ticks[reset_now] = 0
+            self._risk_event_baseline_policy_vx[reset_now] = 0.0
+            self._risk_event_baseline_limited_vx[reset_now] = 0.0
+            self._risk_condition_previous[reset_now] = False
         center_risk_condition = (
-            teacher_valid
+            ~reset_now
+            & teacher_valid
             & ((1.0 - safe3[:, 1]) >= 0.65)
             & (self._last_policy_command[:, 0] >= 0.50)
             & (self._last_goal_freshness >= 0.50)
@@ -1112,20 +1343,23 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self._risk_event_baseline_policy_vx[new_risk_event] = (
             self._last_policy_command[new_risk_event, 0]
         )
+        self._risk_event_baseline_limited_vx[new_risk_event] = (
+            self._last_limited_command[new_risk_event, 0]
+        )
         self._risk_event_age_ticks[new_risk_event] = 0
         eligible_response = self._risk_event_active & ~new_risk_event
         policy_decel_mask = eligible_response & (
             self._last_policy_command[:, 0]
             <= self._risk_event_baseline_policy_vx - 0.15
         )
-        limited_decel_mask = self._risk_event_active & (
+        limited_decel_mask = eligible_response & (
             self._last_limited_command[:, 0]
-            <= self._risk_event_baseline_policy_vx - 0.15
+            <= self._risk_event_baseline_limited_vx - 0.15
         )
-        self._risk_event_age_ticks[self._risk_event_active] += 1
+        self._risk_event_age_ticks[eligible_response] += 1
         no_decel_mask = (
             self._risk_event_active
-            & (self._risk_event_age_ticks >= 5)
+            & (self._risk_event_age_ticks >= self._risk_response_ticks)
             & ~policy_decel_mask
             & ~limited_decel_mask
         )
@@ -1212,15 +1446,21 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 "goal_wall_auroc",
                 "goal_safe_top1_accuracy",
                 "goal_scene_macro_f1",
+                "fault_wall_auroc",
+                "fault_safe_top1_accuracy",
+                "fault_scene_macro_f1",
             }
         }
+        resolved_branch = self._effective_maze_branch(self.session_effective_seconds)
+        schedule = p4_contract.training_schedule(
+            self.session_effective_seconds, branch=resolved_branch
+        )
         values = {
             **goal_diagnostics,
             **goal_bucket_metrics,
             **self._camera_diagnostics,
             **self._p4_reward_diagnostics,
             "camera_clean_live_latent_cosine": self._camera_clean_live_latent_cosine,
-            "speed_tier": self.speed_tier.float(),
             "user_speed_cap": self.user_speed_cap,
             "effective_speed_cap": self.effective_speed_cap,
             "safety_speed_cap": self.safety_speed_cap,
@@ -1230,10 +1470,37 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "safety_head_risk_left": self._last_safety_head_risk3[:, 0],
             "safety_head_risk_center": self._last_safety_head_risk3[:, 1],
             "safety_head_risk_right": self._last_safety_head_risk3[:, 2],
-            "head_correct_actor_wrong": actor_wrong.float(),
-            "risk_decel_policy_vx": policy_decel,
-            "risk_decel_limited_vx": limited_decel,
-            "risk_no_deceleration": no_decel,
+            "head_correct_samples": head_correct.float(),
+            "head_correct_actor_wrong_count": actor_wrong.float(),
+            "risk_event_resolved_count": finished.float(),
+            "risk_decel_policy_count": policy_decel,
+            "risk_decel_limited_count": limited_decel,
+            "risk_no_deceleration_count": no_decel,
+            "diagnostic_fault_shadow_share": self._diagnostic_fault_mask.float(),
+            "diagnostic_clean_fault_latent_cosine": (
+                self._diagnostic_clean_fault_latent_cosine
+            ),
+            "diagnostic_clean_fault_action_mae": (
+                self._diagnostic_clean_fault_action_mae
+            ),
+            "maze_branch_actor_attack": raw_goal_distance.new_full(
+                (self.num_envs,), float(resolved_branch == "actor_attack")
+            ),
+            "maze_branch_visual_recovery": raw_goal_distance.new_full(
+                (self.num_envs,), float(resolved_branch == "visual_recovery")
+            ),
+            "maze_phase_probe": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "mazeprobe")
+            ),
+            "maze_phase_attack": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "mazeattack")
+            ),
+            "maze_phase_hard": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "mazehard")
+            ),
+            "maze_phase_final": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "mazefinal")
+            ),
             "zero_hidden_action_mae": self._zero_hidden_action_mae,
             "zero_hidden_direction_disagreement": self._zero_hidden_direction_disagreement,
             "push_epoch": self.push_epoch.float(),
@@ -1377,6 +1644,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 and summary["wall_auroc"] >= 0.55
                 and summary["safe_top1_accuracy"] >= (1.0 / 3.0) + 0.10
                 and summary["scene_macro_f1"] >= 0.30
+                and summary["fault_samples"] >= 50.0
+                and summary["fault_wall_auroc"]
+                >= summary["wall_auroc"] - 0.10
+                and summary["fault_safe_top1_accuracy"]
+                >= summary["safe_top1_accuracy"] - 0.15
             )
             self._resolved_maze_training_branch = (
                 "actor_attack" if perception_passed else "visual_recovery"
@@ -1386,7 +1658,8 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                     "[P4Maze] auto diagnostic selected branch=%s coverage=%.3f "
                     "wall_auroc=%.3f wall_miss=%.3f top1=%.3f scene_f1=%.3f "
                     "clean_live_cos=%.3f goal_auc=%.3f goal_top1=%.3f "
-                    "goal_scene_f1=%.3f sufficient_samples=%s",
+                    "goal_scene_f1=%.3f fault_auc=%.3f fault_top1=%.3f "
+                    "fault_scene_f1=%.3f sufficient_samples=%s",
                     self._resolved_maze_training_branch,
                     summary["teacher_coverage"],
                     summary["wall_auroc"],
@@ -1397,6 +1670,9 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                     summary["goal_wall_auroc"],
                     summary["goal_safe_top1_accuracy"],
                     summary["goal_scene_macro_f1"],
+                    summary["fault_wall_auroc"],
+                    summary["fault_safe_top1_accuracy"],
+                    summary["fault_scene_macro_f1"],
                     sufficient_samples,
                 )
         return self._resolved_maze_training_branch
@@ -1460,7 +1736,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             ):
                 # The diagnostic decision is applied at this rollout boundary.
                 # Start the gradient-training clock here so the diagnostic's
-                # final partial rollout cannot consume the 7200-second budget.
+                # final partial rollout cannot consume the 28800-second budget.
                 self._training_clock_origin_seconds = self.session_wall_seconds
             training_seconds = (
                 0.0
@@ -1514,14 +1790,22 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         if hasattr(self, "goal_belief"):
             mask = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
             self.goal_belief.reset(mask)
-            self.camera_state.reset(mask)
+            self.camera_state.reset(mask, randomize_capture_phase=False)
             self._cached_low_frame_id.fill_(-1)
             self._teacher_hidden = None
             self._goal_epoch_changed_since_tick.zero_()
             self._risk_event_active.zero_()
             self._risk_event_age_ticks.zero_()
             self._risk_event_baseline_policy_vx.zero_()
+            self._risk_event_baseline_limited_vx.zero_()
             self._risk_condition_previous.zero_()
+            self._p4_episode_return.zero_()
+            self._diagnostic_fault_depth = None
+            self._diagnostic_fault_mask.zero_()
+            self._diagnostic_terminal_mask.zero_()
+            self._diagnostic_fault_nav_feat.zero_()
+            self._diagnostic_clean_fault_latent_cosine.fill_(1.0)
+            self._diagnostic_clean_fault_action_mae.zero_()
 
     def _feedback_contract(self) -> tuple[dict[str, object], str]:
         contract = {
@@ -1552,8 +1836,13 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             exact_training_contract = p4_contract.training_contract(
                 self.stuck_reset_contract
             )
+            exact_reward_contract = p4_contract.reward_contract(
+                self.stuck_reset_contract
+            )
+            exact_command_contract = p4_contract.command_contract()
             saved_training = contracts.get("training")
-            exact_mapper = (contracts.get("command") or {}).get("mapper_version")
+            saved_reward = contracts.get("reward")
+            saved_command = contracts.get("command")
             if (
                 isinstance(saved_training, dict)
                 and saved_training.get("version")
@@ -1565,12 +1854,20 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 isinstance(saved_training, dict)
                 and saved_training.get("version")
                 == p4_contract.CHECKPOINT_CONTRACT_VERSION
-                and exact_mapper != p4_contract.ACTION_MAPPER_VERSION
+                and saved_reward != exact_reward_contract
             ):
-                raise ValueError("P4 exact resume action mapper mismatch")
+                raise ValueError("P4 exact resume reward contract mismatch")
+            if (
+                isinstance(saved_training, dict)
+                and saved_training.get("version")
+                == p4_contract.CHECKPOINT_CONTRACT_VERSION
+                and saved_command != exact_command_contract
+            ):
+                raise ValueError("P4 exact resume command contract mismatch")
             exact_compatible = (
                 saved_training == exact_training_contract
-                and exact_mapper == p4_contract.ACTION_MAPPER_VERSION
+                and saved_reward == exact_reward_contract
+                and saved_command == exact_command_contract
             )
             original_p4_state = copy.deepcopy(
                 bundle.get("training_states", {}).get("p4", {})
@@ -1681,7 +1978,6 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 self.frame_count = 0
                 self.nav_ticks = 0
                 self.current_iteration = 0
-                self.speed_generator.manual_seed(int(self.config.get("p4_seed", 4100)) + 3)
                 self._reset_maze_diagnostic_probes()
                 self._reset_maze_diagnostic_state()
                 self._apply_training_schedule(0.0)
@@ -1789,7 +2085,6 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         return {
             "goal_belief": self.goal_belief.state_dict(),
             "camera": self.camera_state.state_dict(),
-            "speed_rng_state": self.speed_generator.get_state(),
             "session_wall_seconds": self.session_wall_seconds,
             "diagnostic_elapsed_seconds": self.diagnostic_elapsed_seconds,
             "training_clock_origin_seconds": self._training_clock_origin_seconds,
@@ -1812,6 +2107,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 "goal_top1_total": self._maze_diag_goal_top1_total.detach().cpu(),
                 "goal_top1_correct": self._maze_diag_goal_top1_correct.detach().cpu(),
                 "goal_scene_confusion": self._maze_diag_goal_scene_confusion.detach().cpu(),
+                "fault_risk_positive_hist": self._maze_diag_fault_risk_positive_hist.detach().cpu(),
+                "fault_risk_negative_hist": self._maze_diag_fault_risk_negative_hist.detach().cpu(),
+                "fault_top1_total": self._maze_diag_fault_top1_total.detach().cpu(),
+                "fault_top1_correct": self._maze_diag_fault_top1_correct.detach().cpu(),
+                "fault_scene_confusion": self._maze_diag_fault_scene_confusion.detach().cpu(),
                 "nav_risk_probe": self._diagnostic_nav_risk_probe.state_dict(),
                 "nav_scene_probe": self._diagnostic_nav_scene_probe.state_dict(),
                 "goal_risk_probe": self._diagnostic_goal_risk_probe.state_dict(),
@@ -1894,6 +2194,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "goal_top1_total": self._maze_diag_goal_top1_total,
             "goal_top1_correct": self._maze_diag_goal_top1_correct,
             "goal_scene_confusion": self._maze_diag_goal_scene_confusion,
+            "fault_risk_positive_hist": self._maze_diag_fault_risk_positive_hist,
+            "fault_risk_negative_hist": self._maze_diag_fault_risk_negative_hist,
+            "fault_top1_total": self._maze_diag_fault_top1_total,
+            "fault_top1_correct": self._maze_diag_fault_top1_correct,
+            "fault_scene_confusion": self._maze_diag_fault_scene_confusion,
         }
         for name, target in diagnostic_targets.items():
             saved = diagnostic_state.get(name)
@@ -1917,10 +2222,6 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             raise ValueError("P4 exact resume missing diagnostic probe optimizer")
         self._diagnostic_probe_optimizer.load_state_dict(probe_optimizer)
         self.camera_state.load_state_dict(state.get("camera", {}))
-        speed_rng = state.get("speed_rng_state")
-        if not torch.is_tensor(speed_rng):
-            raise ValueError("P4 exact resume missing speed-tier RNG")
-        self.speed_generator.set_state(speed_rng.cpu())
         push_lifetime_count = state.get("push_lifetime_count")
         push_env_seen = state.get("push_env_seen")
         if torch.is_tensor(push_lifetime_count) and push_lifetime_count.numel() == self.num_envs:
@@ -1931,6 +2232,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self._push_env_seen.copy_(push_env_seen.reshape(-1).to(self.device).bool())
         self._camera_aux_coefficient = float(state.get("camera_aux_coefficient", 0.0))
         self._camera_aux_gradient_ratio = float(state.get("camera_aux_gradient_ratio", 0.0))
+        self._apply_training_schedule(self.session_effective_seconds)
 
     def save_training_bundle(self, path: str, *, platform_model_id) -> str:
         super().save_training_bundle(path, platform_model_id=platform_model_id)

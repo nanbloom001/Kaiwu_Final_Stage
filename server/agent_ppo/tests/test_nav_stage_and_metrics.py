@@ -53,6 +53,39 @@ class _Logger:
 
 
 class TestNavStageSelection(unittest.TestCase):
+    def test_p4_training_agent_init_resolves_single_maze_segment_contract(self):
+        kaiwu_mod = types.ModuleType("kaiwudrl")
+        interface_mod = types.ModuleType("kaiwudrl.interface")
+        agent_mod = types.ModuleType("kaiwudrl.interface.agent")
+        agent_mod.BaseAgent = type("BaseAgent", (), {})
+        interface_mod.agent = agent_mod
+        kaiwu_mod.interface = interface_mod
+        sys.modules.setdefault("kaiwudrl", kaiwu_mod)
+        sys.modules.setdefault("kaiwudrl.interface", interface_mod)
+        sys.modules.setdefault("kaiwudrl.interface.agent", agent_mod)
+        validate_mod = types.ModuleType("tools.train_env_conf_validate")
+        validate_mod.check_usr_conf = lambda *_args, **_kwargs: (True, "ok")
+        sys.modules.setdefault("tools.train_env_conf_validate", validate_mod)
+
+        from agent_ppo.agent import Agent
+
+        agent = Agent.__new__(Agent)
+        agent.is_p2_nav_eval = False
+        agent.is_p4_nav = True
+        agent.device = "cpu"
+        agent.num_envs = 1
+        agent.num_actions = 12
+        agent.logger = _Logger()
+        agent.monitor = None
+        agent._init_p2_nav(
+            P4NavPPOConfig,
+            {
+                "p4_nav_ppo": {"p4_seed": 1, "num_learning_epochs": 4},
+                "terrain": {"track": {"sub_terrains": ["open_entry_maze"]}},
+            },
+        )
+        self.assertEqual(agent.algorithm.config["track_segment_labels"], ["maze"])
+
     def test_active_branch_bootstraps_worker_and_aisrv_from_configure_app(self):
         config_path = pathlib.Path(__file__).resolve().parents[2] / "conf" / "configure_app.toml"
         policy_entry = toml.load(config_path)["app"]["policy_entry"]

@@ -89,6 +89,24 @@ class AlgorithmP2NavPPO:
         self.logger = logger
         self.monitor = monitor
         self.config = dict(config or {})
+        self.nav_period_frames = int(
+            self.config.get("nav_period_frames", p2_contract.NAV_PERIOD_FRAMES)
+        )
+        self.nav_rollout_ticks = int(
+            self.config.get("nav_rollout_ticks", p2_contract.NAV_ROLLOUT_TICKS)
+        )
+        self.tbptt_sequence_length = int(
+            self.config.get(
+                "tbptt_sequence_length", p2_contract.TBPTT_SEQUENCE_LENGTH
+            )
+        )
+        if self.nav_period_frames <= 0:
+            raise ValueError("nav_period_frames must be positive")
+        if self.nav_rollout_ticks <= 0 or self.tbptt_sequence_length <= 0:
+            raise ValueError("navigation rollout and TBPTT lengths must be positive")
+        if self.nav_rollout_ticks % self.tbptt_sequence_length:
+            raise ValueError("navigation rollout ticks must be divisible by TBPTT length")
+        self.nav_dt_s = p2_contract.CONTROL_DT_S * self.nav_period_frames
         self.load_mode = str(self.config.get("load_mode", "auto"))
         self.training_enabled = bool(training)
         self.num_envs = int(num_envs)
@@ -199,6 +217,8 @@ class AlgorithmP2NavPPO:
         self.rollout = (
             P2RolloutStorage(
                 self.num_envs,
+                num_ticks=self.nav_rollout_ticks,
+                sequence_length=self.tbptt_sequence_length,
                 store_depth=True,
                 pin_memory=True,
             )
@@ -813,7 +833,7 @@ class AlgorithmP2NavPPO:
             "tick_penalty": None,
             **low_metadata,
         }
-        if self.frame_count % p2_contract.NAV_PERIOD_FRAMES == 0:
+        if self.frame_count % self.nav_period_frames == 0:
             reset = self.reset_since_tick.clone()
             self.actor_hidden = self._mask_hidden(self.actor_hidden, reset)
             self.critic_hidden = self._mask_hidden(self.critic_hidden, reset)
@@ -1130,6 +1150,7 @@ class AlgorithmP2NavPPO:
         terminal_safe_aux: torch.Tensor | None = None,
         terminal_safe_exec_cmd: torch.Tensor | None = None,
         frontier_settle_mask: torch.Tensor | None = None,
+        path_length_m: torch.Tensor | None = None,
     ) -> bool:
         if self.pending_tick is None:
             raise RuntimeError("P2 finish_tick called without a pending nav transition")
@@ -1157,14 +1178,14 @@ class AlgorithmP2NavPPO:
         duration_valid = (
             torch.isfinite(duration_raw)
             & (duration_raw >= 1.0)
-            & (duration_raw <= float(p2_contract.NAV_PERIOD_FRAMES))
+            & (duration_raw <= float(self.nav_period_frames))
         )
         duration = torch.nan_to_num(
             duration_raw,
-            nan=float(p2_contract.NAV_PERIOD_FRAMES),
-            posinf=float(p2_contract.NAV_PERIOD_FRAMES),
+            nan=float(self.nav_period_frames),
+            posinf=float(self.nav_period_frames),
             neginf=1.0,
-        ).round().long().clamp(1, p2_contract.NAV_PERIOD_FRAMES)
+        ).round().long().clamp(1, self.nav_period_frames)
         start_goal_raw = start_goal_distance.reshape(-1).to(self.device)
         end_goal_raw = end_goal_distance.reshape(-1).to(self.device)
         goal_valid = (
@@ -1352,6 +1373,10 @@ class AlgorithmP2NavPPO:
             reason=reason,
             reward_source_aux=reward_source_aux,
             reward_exec_cmd=reward_exec_cmd,
+            start_goal_distance=start_goal,
+            end_goal_distance=end_goal,
+            duration_frames=duration,
+            path_length_m=path_length_m,
         )
         component_names = tuple(components)
         component_stack = torch.stack(
@@ -2091,7 +2116,11 @@ class AlgorithmP2NavPPO:
                     for axis in range(3)
                 ]
             )
-        grouped_metrics = {}
+        grouped_metrics = {
+            f"adapter_{label}_{suffix}": 0.0
+            for label in p2_contract.TRACK_SEGMENT_METRIC_LABELS
+            for suffix in ("sample_share", "mae")
+        }
         current_segment = metadata.get("current_segment")
         if (
             torch.is_tensor(current_segment)
@@ -2102,8 +2131,17 @@ class AlgorithmP2NavPPO:
             segment_horizon_mask = (
                 batch.horizon_mask & segment_valid.unsqueeze(-1)
             )
-            for row, label in enumerate(("slope_inv", "stairs_inv", "maze")):
-                group = current_segment == row
+            segment_labels = tuple(
+                self.config.get(
+                    "track_segment_labels",
+                    p2_contract.TRACK_SEGMENT_METRIC_LABELS,
+                )
+            )
+            metric_segment = p2_contract.track_segment_metric_indices(
+                current_segment, segment_labels
+            )
+            for row, label in enumerate(p2_contract.TRACK_SEGMENT_METRIC_LABELS):
+                group = metric_segment == row
                 grouped_metrics[f"adapter_{label}_sample_share"] = float(
                     self._masked_group_share(group, segment_horizon_mask)
                 )
@@ -3353,6 +3391,16 @@ class AlgorithmP2NavPPO:
         self.frame_count = int(high_state["frame_count"])
         if self.frame_count < 0:
             raise ValueError("P2 exact resume frame_count must be non-negative")
+        frame_remainder = self.frame_count % self.nav_period_frames
+        if frame_remainder:
+            alignment_delta = self.nav_period_frames - frame_remainder
+            self.frame_count += alignment_delta
+            if self.logger:
+                self.logger.warning(
+                    "[P2NavPPO] exact resume discarded an unfinished navigation "
+                    "tick and aligned frame_count by %d frames",
+                    alignment_delta,
+                )
         self.actor_gradient_steps = int(high_state["actor_gradient_steps"])
         self.critic_gradient_steps = int(high_state["critic_gradient_steps"])
         self.nav_ticks = int(high_state["nav_ticks"])

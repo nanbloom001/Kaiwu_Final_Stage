@@ -569,6 +569,7 @@ class Agent(BaseAgent):
             from agent_ppo.algorithm.algorithm_p2_nav_ppo import (
                 AlgorithmP2NavPPO as NavigationAlgorithm,
             )
+        from agent_ppo.feature import p2_contract
         from agent_ppo.feature.p2_response_buffer import P2ResponseAuxBuffer
         from agent_ppo.model.p2_high_level import (
             NavigationEncoder,
@@ -600,6 +601,14 @@ class Agent(BaseAgent):
         p2_conf = usr_conf.get(config_key, {})
         if not isinstance(p2_conf, dict):
             p2_conf = {}
+        else:
+            p2_conf = dict(p2_conf)
+        terrain_track = (usr_conf.get("terrain") or {}).get("track") or {}
+        p2_conf["track_segment_labels"] = list(
+            p2_contract.canonical_track_segment_labels(
+                terrain_track.get("sub_terrains", ())
+            )
+        )
         response_conf = p2_conf.get("response_adapter", {})
         if not isinstance(response_conf, dict):
             response_conf = {}
@@ -635,7 +644,10 @@ class Agent(BaseAgent):
             monitor=self.monitor,
         )
         self.training_elapsed_h = 0.0
-        self._p2_parent_model_id = str(p2_conf.get("parent_model_id", 291713))
+        default_parent_model_id = 1256446 if self.is_p4_nav else 291713
+        self._p2_parent_model_id = str(
+            p2_conf.get("parent_model_id", default_parent_model_id)
+        )
         if self.is_p4_nav:
             self._p4_parent_model_id = self._p2_parent_model_id
         self.logger.info(

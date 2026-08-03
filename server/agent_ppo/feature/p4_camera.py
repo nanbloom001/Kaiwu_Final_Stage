@@ -33,6 +33,8 @@ class P4SharedCameraState:
             raise ValueError("P4 camera max_depth_m must be positive")
         self.generator = torch.Generator(device="cpu")
         self.generator.manual_seed(int(seed))
+        self.diagnostic_generator = torch.Generator(device="cpu")
+        self.diagnostic_generator.manual_seed(int(seed) + 100_003)
         self.capture_accumulator = self._uniform((self.num_envs,))
         self.near_clip = self._sample_near_clip(self.num_envs)
         self.frames: list[torch.Tensor | None] = [None] * self.RING_SIZE
@@ -111,15 +113,71 @@ class P4SharedCameraState:
             low, high, shape, generator=self.generator, device="cpu"
         ).to(self.device)
 
+    def _diagnostic_uniform(self, shape) -> torch.Tensor:
+        return torch.rand(
+            shape, generator=self.diagnostic_generator, device="cpu"
+        ).to(self.device)
+
+    def _diagnostic_randint(self, low: int, high: int, shape) -> torch.Tensor:
+        return torch.randint(
+            low,
+            high,
+            shape,
+            generator=self.diagnostic_generator,
+            device="cpu",
+        ).to(self.device)
+
+    def diagnostic_fault_shadow(
+        self, clean_depth: torch.Tensor, *, sample_share: float = 0.10
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Create detached light-fault samples without changing delivered frames."""
+        clean = clean_depth.to(self.device)
+        if clean.shape != (
+            self.num_envs,
+            p2_contract.DEPTH_HEIGHT,
+            p2_contract.DEPTH_WIDTH,
+            1,
+        ):
+            raise ValueError(f"P4 diagnostic depth shape drift: {tuple(clean.shape)}")
+        share = max(0.0, min(float(sample_share), 1.0))
+        selected = self._diagnostic_uniform((self.num_envs,)) < share
+        shadow = clean.clone()
+        ids = selected.nonzero(as_tuple=False).reshape(-1)
+        if not ids.numel():
+            return shadow, selected
+        height, width = p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH
+        random_holes = self._diagnostic_uniform((ids.numel(), height, width)) < 0.05
+        y0 = self._diagnostic_randint(height // 3, height * 2 // 3, (ids.numel(),))
+        x0 = self._diagnostic_randint(width // 5, width * 4 // 5, (ids.numel(),))
+        block_h = max(4, height // 8)
+        block_w = max(4, width // 8)
+        y = torch.arange(height, device=self.device).reshape(1, height, 1)
+        x = torch.arange(width, device=self.device).reshape(1, 1, width)
+        block = (
+            (y >= y0.reshape(-1, 1, 1))
+            & (y < (y0 + block_h).reshape(-1, 1, 1))
+            & (x >= x0.reshape(-1, 1, 1))
+            & (x < (x0 + block_w).reshape(-1, 1, 1))
+        )
+        shadow[ids, :, :, 0] = shadow[ids, :, :, 0].masked_fill(
+            random_holes | block, 0.0
+        )
+        return shadow, selected
+
     def _sample_near_clip(self, count: int) -> torch.Tensor:
         u = self._uniform((count,))
         return 0.10 + 0.15 * (1.0 - torch.pow(1.0 - u, 0.25))
 
-    def reset(self, mask: torch.Tensor) -> None:
+    def reset(
+        self, mask: torch.Tensor, *, randomize_capture_phase: bool = True
+    ) -> None:
         mask = mask.to(self.device).bool().reshape(-1)
         if not bool(mask.any()):
             return
-        self.capture_accumulator[mask] = self._uniform((int(mask.sum()),))
+        if randomize_capture_phase:
+            self.capture_accumulator[mask] = self._uniform((int(mask.sum()),))
+        else:
+            self.capture_accumulator[mask] = 0.0
         self.delivered_frame_id[mask] = -1
         self.delivered_frame_time[mask] = -1.0e6
         self.fault_kind[mask] = 0
@@ -342,6 +400,7 @@ class P4SharedCameraState:
         return {
             "version": p4_contract.CAMERA_CONTRACT_VERSION,
             "generator_state": self.generator.get_state(),
+            "diagnostic_generator_state": self.diagnostic_generator.get_state(),
             "near_clip_contract": "0.10+0.15*Beta(1,4)",
             "max_depth_m": self.max_depth_m,
         }
@@ -352,8 +411,15 @@ class P4SharedCameraState:
         if abs(float(state.get("max_depth_m", self.max_depth_m)) - self.max_depth_m) > 1.0e-6:
             raise ValueError("P4 camera max-depth contract mismatch")
         generator_state = state.get("generator_state")
+        diagnostic_generator_state = state.get("diagnostic_generator_state")
         if not torch.is_tensor(generator_state):
             raise ValueError("P4 camera checkpoint missing RNG state")
+        if not torch.is_tensor(diagnostic_generator_state):
+            raise ValueError("P4 camera checkpoint missing diagnostic RNG state")
         # Rebuild live capture buffers without consuming the restored fault RNG.
-        self.reset(torch.ones(self.num_envs, dtype=torch.bool, device=self.device))
+        self.reset(
+            torch.ones(self.num_envs, dtype=torch.bool, device=self.device),
+            randomize_capture_phase=False,
+        )
         self.generator.set_state(generator_state.cpu())
+        self.diagnostic_generator.set_state(diagnostic_generator_state.cpu())

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-"""Stage-aware dashboards for P1.5, P2 and P3 while preserving Nav panels."""
+"""Stage-aware dashboards through the P4 Maze 8h run while preserving Nav panels."""
 
 from pathlib import Path
 
@@ -1239,7 +1239,7 @@ def _build_p2_monitor():
 
 def _build_p4_monitor():
     monitor = MonitorConfigBuilder()
-    monitor.title("P4 Maze感知诊断与软巡航训练")
+    monitor.title("P4 Maze 8h 10Hz安全选向与路径效率训练")
     _add_p4_track_outcome_panels(monitor)
     for group_name, group_name_en, panels in P2_MONITOR_GROUPS:
         monitor.add_group(group_name=group_name, group_name_en=group_name_en)
@@ -1258,6 +1258,8 @@ def _build_p4_monitor():
                 ("软巡航与动态上限", "p4_soft_cruise", ("policy_target_vx", "limited_target_vx", "effective_speed_cap", "safety_speed_cap", "safety_cap_predictive_risk", "soft_cruise_clear_factor", "soft_cruise_low_error", "soft_cruise_high_error", "reward_soft_cruise", "mapper_version_valid")),
                 ("动作映射", "p4_action_mapping", ("normalized_action_vx", "normalized_action_vy", "normalized_action_wz", "policy_target_vx", "policy_target_vy", "policy_target_wz", "limited_target_vx", "limited_target_vy", "limited_target_wz", "mapped_cmd_vx", "mapped_cmd_vy", "mapped_cmd_wz")),
                 ("转向抵消", "p4_yaw_cancellation", ("yaw_exec_cancellation", "yaw_true_cancellation", "yaw_exec_sign_flip", "yaw_true_sign_flip", "yaw_true_overshoot", "reward_yaw_raw")),
+                ("安全方向内目标偏好", "p4_goal_safe_preference", ("goal_safe_preference_eligible", "goal_safe_preference_gap", "goal_safe_preference_selected", "goal_safe_preference_best", "reward_goal_safe_preference")),
+                ("路径效率", "p4_route_efficiency", ("route_path_length_m", "route_positive_progress_m", "route_excess_distance_m", "route_efficiency", "reward_route_excess")),
             ),
         ),
         (
@@ -1265,8 +1267,10 @@ def _build_p4_monitor():
             "p4_maze_perception",
             (
                 ("视觉可分性", "p4_teacher_scene", ("teacher_scene_corridor", "teacher_scene_left_open", "teacher_scene_right_open", "teacher_scene_junction", "teacher_scene_dead_end", "teacher_scene_fuzzy", "teacher_safe_top1_clear", "scanner_valid_share", "safety_bce", "diagnostic_teacher_coverage", "diagnostic_wall_auroc", "diagnostic_wall_miss_rate", "diagnostic_safe_top1_accuracy", "diagnostic_scene_macro_f1", "diagnostic_clean_live_latent_cosine", "diagnostic_goal_wall_auroc", "diagnostic_goal_safe_top1_accuracy", "diagnostic_goal_scene_macro_f1")),
-                ("SafetyHead风险", "p4_safety_head_risk", ("teacher_risk_left", "teacher_risk_center", "teacher_risk_right", "safety_head_risk_left", "safety_head_risk_center", "safety_head_risk_right", "safe_alternative_available", "selected_safest_direction", "head_correct_actor_wrong")),
-                ("风险到减速", "p4_risk_deceleration", ("risk_decel_policy_vx", "risk_decel_limited_vx", "risk_no_deceleration", "predictive_collision_risk", "body_collision_onset", "wall_stuck_candidate_share", "wall_stuck_reset_triggered")),
+                ("Clean与诊断故障视觉", "p4_clean_diagnostic_fault", ("diagnostic_fault_shadow_share", "diagnostic_fault_wall_auroc", "diagnostic_fault_safe_top1_accuracy", "diagnostic_fault_scene_macro_f1", "diagnostic_clean_fault_latent_cosine", "diagnostic_clean_fault_action_mae")),
+                ("SafetyHead风险", "p4_safety_head_risk", ("teacher_risk_left", "teacher_risk_center", "teacher_risk_right", "safety_head_risk_left", "safety_head_risk_center", "safety_head_risk_right", "safe_alternative_available", "selected_safest_direction")),
+                ("安全决策条件率", "p4_safety_decision_rates", ("head_correct_samples", "head_correct_actor_wrong_count", "head_correct_actor_wrong_rate")),
+                ("风险到减速条件率", "p4_risk_deceleration", ("risk_event_resolved_count", "risk_decel_policy_count", "risk_decel_limited_count", "risk_no_deceleration_count", "risk_decel_policy_rate", "risk_decel_limited_rate", "risk_no_deceleration_rate", "predictive_collision_risk", "body_collision_onset", "wall_stuck_candidate_share", "wall_stuck_reset_triggered")),
                 ("LSTM记忆消融", "p4_zero_hidden_shadow", ("zero_hidden_action_mae", "zero_hidden_direction_disagreement", "camera_clean_live_action_mae", "camera_clean_live_latent_cosine")),
             ),
         ),
@@ -1275,7 +1279,8 @@ def _build_p4_monitor():
             "p4_safety_rewards",
             (
                 ("安全原始项", "p4_safety_raw", ("reward_predictive_raw", "reward_missed_safe_raw", "reward_yaw_raw")),
-                ("安全应用项", "p4_safety_applied", ("reward_predictive_collision_risk", "reward_missed_safe_direction", "reward_yaw_cancellation", "reward_safety_group_scale", "reward_stuck_reset")),
+                ("安全应用项", "p4_safety_applied", ("reward_predictive_collision_risk", "reward_missed_safe_direction", "reward_yaw_cancellation", "reward_safety_group_scale", "reward_stuck_sustained", "reward_goal_safe_preference", "reward_stuck_reset", "reward_continuous_time_scale")),
+                ("Frontier停滞实际与Shadow", "p4_frontier_stagnation", ("reward_frontier_stagnation", "reward_frontier_stagnation_shadow")),
                 ("奖励守恒", "p4_reward_conservation", ("reward_decomposed_total", "rollout_reward_mean", "reward_conservation_error")),
             ),
         ),
@@ -1293,7 +1298,9 @@ def _build_p4_monitor():
             "p4_stuck_reset",
             (
                 ("卡滞证据", "p4_stuck_evidence", ("motion_confined_share", "wall_evidence_share", "wall_stuck_candidate_share", "wall_stuck_duration_s", "wall_stuck_duration_p50_s", "wall_stuck_duration_p90_s", "wall_stuck_mapping_valid")),
+                ("持续卡墙惩罚", "p4_stuck_sustained", ("wall_stuck_sustained_active", "wall_stuck_sustained_severity", "reward_stuck_sustained")),
                 ("卡滞回收", "p4_stuck_outcome", ("wall_stuck_would_reset", "wall_stuck_reset_triggered", "wall_stuck_reset_rate", "rollout_wall_stuck_reset_count", "wall_stuck_saved_seconds", "rollout_wall_stuck_saved_seconds", "collision_to_stuck_reset_delay_s", "reset_after_push_share", "episode_starts_per_hour")),
+                ("卡滞终止回报", "p4_stuck_terminal_return", ("stuck_terminal_episode_return_mean", "stuck_terminal_nonnegative_rate")),
                 ("平台终止项", "p4_stuck_term", ("wall_stuck_term_available", "wall_stuck_term_config_valid")),
             ),
         ),
@@ -1315,6 +1322,7 @@ def _build_p4_monitor():
             "p4_runtime",
             (
                 ("监控合同健康度", "p4_monitor_contract", ("p4_monitor_expected_metric_count", "p4_monitor_metric_with_data_count", "p4_monitor_empty_metric_count", "p4_monitor_longest_data_age_s")),
+                ("8h分支与阶段", "p4_maze_8h_phase", ("maze_branch_actor_attack", "maze_branch_visual_recovery", "maze_phase_probe", "maze_phase_attack", "maze_phase_hard", "maze_phase_final")),
                 ("冻结合同", "p4_frozen_contract", ("low_digest_drift", "low_optimizer_steps", "high_updates", "p4_tbptt_sequences_per_env", "p4_tbptt_nav_ticks")),
                 ("资源与吞吐", "p4_resources", ("memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved", "samples_per_s")),
             ),

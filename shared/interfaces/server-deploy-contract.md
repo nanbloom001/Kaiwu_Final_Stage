@@ -525,7 +525,8 @@ checkpoint 明确记录 `seeded_fresh_after_environment_reset`，不得宣称该
 
 #### `p4_nav_ppo`：冻结 P3.5 低层的 Track 导航鲁棒包
 
-P4 Maze 强化当前父包选择为 `p4nav8h-r3` 最终 `pnavstable-1207698`。该 ID只用于候选选择；
+P4 Maze 强化当前父包选择为 `p4nav2h_1256446-F`（平台模型 ID `1256446`，checkpoint SHA256
+`8aae0892664f2f263949f7e5f9f3b53ecd2936b44e80f3783091579bcf3d3461`）。该 ID只用于候选选择；
 请求/配置 ID 不可用时只允许唯一结构兼容 P4 discovery，多个候选必须报歧义。选中包仍须通过
 stage、模块 spec、tensor shape 与有限值验证后才能 warm start。
 
@@ -535,7 +536,9 @@ wall-stuck diagnostics12；这些字段不进入 Actor/Critic。Track eval wire 
 评估和部署 I/O 不变。低层 CNN/LSTM/Actor/std/Critic
 全程冻结；P4 只更新 NavigationEncoder、高层 Actor/LSTM、新建 Critic、SafetyHead 和
 ResponseAdapter。低层可复用 delivered frame 对应的 feature32，但 recurrent hidden 必须在每个
-50Hz tick 使用当前 proprio 推进；高层 32 个 5Hz tick 必须拆成两个 TBPTT16 序列。
+50Hz tick 使用当前 proprio 推进；高层每 5 个低层帧决策一次，即 10Hz，32 个高层 tick 必须拆成
+两个 TBPTT16 序列。P2 及旧 P4 默认 5Hz 合同保持不变，只有新
+`p4_maze_attack10hz_v1` checkpoint 可以 exact resume。
 
 高层 normalized tanh-Gaussian 与 log-prob 不变，物理映射版本固定为
 `p4_capability_action_mapper_v1`：`vx=[0,effective_max_vx]`、`vy=+-0.30`、`wz=+-0.90`。
@@ -564,30 +567,49 @@ digest 格式和序列内部 `(digest,iteration)` 一致性做 `legacy_parent_st
 连续池，不能把 32 条记录对半切成小于 `burn-in8+sequence16` 的不可采样窗口。`safety_cap` 从 delivered depth 与当前
 exec 命令的 0.8 秒 slew 弧线计算，Track eval 不加载 SafetyHead 也必须执行同一限速合同。
 
-P4 安全组最终 raw weight 与 `-0.05/tick` cap 不变。训练倍率合同为
-`p4_safety_reward_ramp_v2_continuous`：0-30 分钟为 0，30-60 分钟线性到 0.25，60-120 分钟线性到
-1.0，之后保持 1.0；2 小时边界必须连续。该公式进入 training digest，旧 ramp checkpoint 不能
-静默 exact resume。Goal 跳变/丢失故障必须使用独立 `goal_fault_multiplier`，不能因安全奖励权重
-调整而隐式改变 observation fault 分布。
+P4 Maze 八小时 reward 合同为 `p4_maze_reward_v3_10hz_route`。predictive collision raw 按父项
+放大 1.25 倍并限制到不低于 `-0.03/tick`；missed-safe 仅在 scanner 有效、正在运动且存在明显
+安全替代时结算，方向 gap 归一化后按 0-30 分钟 `0->0.015`、30 分钟-2 小时
+`0.015->0.040`、2-6 小时保持 `0.040`、6-8 小时 `0.040->0.030`。predictive、missed-safe 和
+yaw-cancellation 合计按比例限制到不低于 `-0.06` 的原始 5Hz 等效尺度，再按实际 duration 缩放。
+连续 tick 项统一乘 `duration_frames/10`，因此 10Hz 下每个正常 tick 为原权重 0.5 倍；success、
+failure、timeout、stuck reset 等事件 impulse，按米计算的 route excess 和每次决策 command-rate
+不缩放。body collision 保持每个 10Hz tick 的完整约束，明确作为更强的碰撞治理。成功 impulse
+为 `+200`；卡墙候选持续 1 秒后从 `-0.02` 线性加深到 `-0.10`，安全方向内的目标偏好最多
+`-0.04`，额外路程按 `-0.05/m` 且每 tick 最多 0.20m。旧 `frontier_stagnation` 的 PPO 权重为零，
+只保留 shadow 诊断；Goal 跳变/丢失故障继续使用独立 `goal_fault_multiplier`。
 
-P4 Maze checkpoint 合同为 `p4_maze_soft_cruise_v2_training_clock`：10 分钟只读诊断使用独立
-`session_wall_seconds`，不计入正式 `session_effective_seconds=7200`；诊断结束的 rollout 边界是
-正式训练时钟零点。诊断期用 detached `nav_feat32` 训练风险/场景线性探针，并用 `goal4` 探针与
-随机基线验证视觉特征确实提供额外信息；探针不进入 Actor/Critic observation，也不进入部署。
-exact resume 同时恢复 wall/training clock origin、累计诊断统计、探针状态和已选择分支，
-旧合同只允许 warm start。阶段优先级为
-`mazefinal > mazefull > mazeprobe > mazediag > pnavstable > pnavfull > pnavrobust > pnavwarm`。
+P4 Maze checkpoint 合同为 `p4_maze_attack10hz_v1`：10 分钟只读诊断使用独立
+`session_wall_seconds`，不计入正式 `session_effective_seconds=28800`；诊断结束的 rollout 边界是
+正式训练时钟零点。诊断期除 clean/live 对照外，使用独立 RNG 对 10% clean depth 生成轻故障
+shadow；该 shadow 只用于 detached 线性探针和动作差异诊断，不进入 Actor observation、PPO
+reward 或 rollout storage；fault 鲁棒性验收只使用预留的 held-out probe 环境。P4 启动必须核验
+运行时 segment 语义为单段 `maze`，实际三轴 slew 与完整 command contract 一致。exact resume
+恢复 wall/training clock origin、clean/fault 累计统计、探针、fault RNG 和已选择分支，并同时核验
+完整 training/reward/command/stuck/camera 合同。阶段优先级为
+`mazefinal > mazehard > mazeattack > mazefull > mazeprobe > mazediag > legacy P4`。
 `p4_standard_eval` 只加载低层；`p4_track_eval` 加载
-低层、NavigationEncoder、高层 Actor 与 Adapter。两次四小时训练的第二段必须 exact resume
-session/lifetime、optimizer、return statistics、Goal/相机/速度 RNG 与 Push 阶段；live hidden、
+低层、NavigationEncoder、高层 Actor 与 Adapter，training-only SafetyHead 允许为 `None`；公共
+推理路径在该模块缺失时只清零风险诊断，不得实例化随机 Head 或中断首帧。正式平台任务配置
+29700 秒（8 小时 15 分钟），覆盖 600 秒诊断、28800 秒梯度训练和 300 秒 rollout/保存/退出余量；
+工作流达到有效训练目标后自行结束。完整八小时任务若因
+平台中断后续训，必须 exact
+resume session/lifetime、optimizer、return statistics、Goal/相机/速度 RNG 与 Push 阶段；live hidden、
 EventManager timer、pending rollout 在新环境中重建。
 
 P4 R2 的 `p4_stuck_reset_v1` 只在 worker bridge 中维护世界坐标约束与非足端接触证据，不修改
-平台 BaseEnv。默认模式为 shadow；active 前必须在线确认既有 `nav_stuck_timeout` term、
-`time_out=true`、公开 get/set/readback 和 `dt=0.02s`。确认墙面卡滞使用 reason=4、独立一次性
-`-6`、`bootstrap_mask=continuation_mask=0`，同一 terminal tick 不再重复 collision、predictive
-collision 或 stagnation。live tracker、recurrent hidden、pending rollout 和未完成 Adapter history
+平台 BaseEnv。active 前必须在线确认既有 `nav_stuck_timeout` term、`time_out=true`、公开
+get/set/readback 和 `dt=0.02s`。当前 Maze 八小时合同以 7 秒确认，reason=4 结算 `-15` terminal
+impulse 并回收该 episode 未结算的 frontier potential；因此完整 terminal tick 不保证恰好 -15，
+但必须通过 `stuck_terminal_episode_return_mean/nonnegative_rate` 验证 reset episode 的整体收益为负。
+reason=4 使用 `bootstrap_mask=continuation_mask=0`，同 tick 不重复 collision、predictive collision、
+missed-safe 或 stagnation。live tracker、recurrent hidden、pending rollout 和未完成 Adapter history
 不进入 checkpoint，resume 后统一 reset。
+
+Track physical segment index 与指标语义分离。运行时仍按世界坐标产生 `0..track_length-1`，指标层
+必须根据当前 TOML `sub_terrains` 映射到稳定的 `slope_inv/stairs_inv/maze` bucket。单段
+`open_entry_maze` 的 physical index 0 必须报告为 Maze；未配置的稳定 bucket 保持零，不能用固定
+`0=slope` 解释污染 Adapter 与 Track 面板。
 
 P3 评估候选标签优先级为 `stable > pushfull > pushwarm > repair > gaitfixcalib`，随后兼容
 `stairfinal/stairrobust/stairadapt/stairwarm/staircalib` 及

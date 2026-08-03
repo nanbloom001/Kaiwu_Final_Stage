@@ -13,21 +13,28 @@ import torch
 from agent_ppo.feature import p2_contract
 
 
-RUN_NAME = "p4maze2h-attack"
+RUN_NAME = "p4maze8h-10hzroute"
 STAGE_NAME = "p4_nav_ppo"
 STAGE_TYPE = "p4_nav_ppo"
-TRAINING_HOURS = 2.0
-TARGET_EFFECTIVE_SECONDS = 7_200.0
+TRAINING_HOURS = 8.0
+TARGET_EFFECTIVE_SECONDS = 28_800.0
 DIAGNOSTIC_SECONDS = 600.0
-SCHEDULE_BOUNDARIES_SECONDS = (600.0, 5_400.0)
+PLATFORM_WALL_MARGIN_SECONDS = 300.0
+PLATFORM_WALL_SECONDS = (
+    TARGET_EFFECTIVE_SECONDS
+    + DIAGNOSTIC_SECONDS
+    + PLATFORM_WALL_MARGIN_SECONDS
+)
+PLATFORM_WALL_HOURS = PLATFORM_WALL_SECONDS / 3_600.0
+SCHEDULE_BOUNDARIES_SECONDS = (3_600.0, 18_000.0, 25_200.0)
 
 LEGACY_ACTION_MAPPER_VERSION = "p2_legacy_action_mapper_v1"
 ACTION_MAPPER_VERSION = "p4_capability_action_mapper_v1"
 GOAL_BELIEF_VERSION = "p4_goal_belief_v3_metric_raw"
-CAMERA_CONTRACT_VERSION = "p4_shared_camera_v2_normalized_clip"
+CAMERA_CONTRACT_VERSION = "p4_shared_camera_v3_diagnostic_shadow"
 ADAPTER_RECORD_CONTRACT_VERSION = "p4_adapter_record_v1"
-SAFETY_REWARD_RAMP_VERSION = "p4_maze_safety_reward_ramp_v1"
-CHECKPOINT_CONTRACT_VERSION = "p4_maze_soft_cruise_v2_training_clock"
+SAFETY_REWARD_RAMP_VERSION = "p4_maze_safe_direction_ramp_v3_goal_safe"
+CHECKPOINT_CONTRACT_VERSION = "p4_maze_attack10hz_v1"
 WORKER_WIRE_VERSION = "p4_worker_wire_v2"
 STUCK_RESET_CONTRACT_VERSION = "p4_stuck_reset_v1"
 # Training-only transport appended after the stable P3 493-column wire.
@@ -48,10 +55,6 @@ STUCK_COLLISION_TO_RESET_S_INDEX = 11
 STUCK_TERM_AVAILABLE_INDEX = 12
 STUCK_TERM_CONFIG_VALID_INDEX = 13
 
-SPEED_TIERS_ENABLED = False
-SPEED_CAPS_MPS = (1.00,)
-SPEED_CAP_PROBABILITIES = (1.00,)
-SPEED_CAP_LABELS = ("full",)
 SOFT_CRUISE_MIN_VX = 0.60
 SOFT_CRUISE_MAX_VX = 0.75
 SOFT_CRUISE_LOW_WEIGHT = -0.03
@@ -60,6 +63,10 @@ SOFT_CRUISE_HIGH_WEIGHT = -0.02
 P4_MAX_ABS_VY = 0.30
 P4_MAX_ABS_WZ = 0.90
 P4_MAX_VX = 1.00
+P4_NAV_PERIOD_FRAMES = 5
+P4_NAV_DT_S = p2_contract.CONTROL_DT_S * P4_NAV_PERIOD_FRAMES
+P4_SLEW_RATE = (0.30, 0.30, 1.00)
+P4_SLEW_RELEASE_RATE = (0.30, 0.60, 2.50)
 STALE_GOAL_WAIT_MAX_ABS_VY = 0.10
 STALE_GOAL_WAIT_MAX_ABS_WZ = 0.25
 
@@ -73,7 +80,16 @@ GOAL_PROCESS_SIGMA_V_M_S = 0.03
 GOAL_PROCESS_SIGMA_WZ_RAD_S = 0.011
 GOAL_REACQUIRE_SAMPLES = 5
 
-STUCK_RESET_TERMINAL_PENALTY = -6.0
+STUCK_RESET_TERMINAL_PENALTY = -15.0
+SUCCESS_IMPULSE = 200.0
+STUCK_SUSTAINED_GRACE_S = 1.0
+STUCK_SUSTAINED_BASE = -0.02
+STUCK_SUSTAINED_FLOOR = -0.10
+GOAL_SAFE_PREFERENCE_WEIGHT = -0.04
+GOAL_SAFE_PREFERENCE_MARGIN = 0.08
+GOAL_SAFE_PREFERENCE_SCALE = 0.35
+ROUTE_EXCESS_WEIGHT = -0.05
+ROUTE_EXCESS_CAP_M = 0.20
 STUCK_RESET_DEFAULTS = {
     "enabled": True,
     "mode": "shadow",
@@ -133,14 +149,17 @@ def normalize_stuck_reset_contract(
         raise ValueError("P4 stuck-reset terminal_penalty must be non-positive")
     return result
 
-YAW_WINDOW_TICKS = 5
+YAW_WINDOW_SECONDS = 1.0
+RISK_RESPONSE_WINDOW_SECONDS = 1.0
 YAW_EXEC_WEIGHT = -0.012
 YAW_TRUE_WEIGHT = -0.008
 YAW_TOTAL_FLOOR = -0.020
-SAFETY_GROUP_FLOOR = -0.050
+SAFETY_GROUP_FLOOR = -0.060
 
-PREDICTIVE_RAW_FLOOR = -0.0225
-MISSED_SAFE_RAW_FLOOR = -0.0200
+PREDICTIVE_COLLISION_SCALE = 1.25
+PREDICTIVE_RAW_FLOOR = -0.0300
+MISSED_SAFE_RAW_FLOOR = -0.0400
+SAFE_DIRECTION_GAP_SCALE = 0.35
 
 NAVIGATION_ENCODER_LRS = {
     "conv1": 3.0e-6,
@@ -191,7 +210,6 @@ MONITOR_REQUIRED_METRICS = (
     "goal_accept_10_plus",
     "goal_clipped_10_plus",
     "goal_reject_10_plus",
-    "speed_tier",
     "user_speed_cap",
     "effective_speed_cap",
     "safety_speed_cap",
@@ -229,15 +247,30 @@ MONITOR_REQUIRED_METRICS = (
     "diagnostic_goal_wall_auroc",
     "diagnostic_goal_safe_top1_accuracy",
     "diagnostic_goal_scene_macro_f1",
+    "diagnostic_fault_wall_auroc",
+    "diagnostic_fault_safe_top1_accuracy",
+    "diagnostic_fault_scene_macro_f1",
+    "diagnostic_fault_shadow_share",
+    "diagnostic_clean_fault_latent_cosine",
+    "diagnostic_clean_fault_action_mae",
     "scanner_valid_share",
     "safety_bce",
     "safety_head_risk_left",
     "safety_head_risk_center",
     "safety_head_risk_right",
-    "head_correct_actor_wrong",
-    "risk_decel_policy_vx",
-    "risk_decel_limited_vx",
-    "risk_no_deceleration",
+    "head_correct_samples",
+    "head_correct_actor_wrong_count",
+    "head_correct_actor_wrong_rate",
+    "risk_event_resolved_count",
+    "risk_decel_policy_count",
+    "risk_decel_limited_count",
+    "risk_no_deceleration_count",
+    "risk_decel_policy_rate",
+    "risk_decel_limited_rate",
+    "risk_no_deceleration_rate",
+    "missed_safe_event_active",
+    "missed_safe_event_severity",
+    "missed_safe_weight",
     "body_collision_onset",
     "predictive_collision_risk",
     "zero_hidden_action_mae",
@@ -250,6 +283,7 @@ MONITOR_REQUIRED_METRICS = (
     "reward_predictive_raw",
     "reward_missed_safe_raw",
     "reward_yaw_raw",
+    "reward_continuous_time_scale",
     "reward_predictive_collision_risk",
     "reward_missed_safe_direction",
     "reward_yaw_cancellation",
@@ -290,6 +324,24 @@ MONITOR_REQUIRED_METRICS = (
     "wall_stuck_term_available",
     "wall_stuck_term_config_valid",
     "reward_stuck_reset",
+    "reward_stuck_sustained",
+    "reward_goal_safe_preference",
+    "reward_route_excess",
+    "wall_stuck_sustained_active",
+    "wall_stuck_sustained_severity",
+    "goal_safe_preference_eligible",
+    "goal_safe_preference_gap",
+    "goal_safe_preference_selected",
+    "goal_safe_preference_best",
+    "route_path_length_m",
+    "route_positive_progress_m",
+    "route_excess_distance_m",
+    "route_efficiency",
+    "reward_frontier_stagnation",
+    "reward_frontier_stagnation_shadow",
+    "stuck_terminal_count",
+    "stuck_terminal_episode_return_mean",
+    "stuck_terminal_nonnegative_rate",
     "episode_starts_per_hour",
     "camera_memory_loss",
     "camera_clean_live_action_mae",
@@ -354,6 +406,12 @@ MONITOR_REQUIRED_METRICS = (
     "max_memory_allocated",
     "max_memory_reserved",
     "samples_per_s",
+    "maze_branch_actor_attack",
+    "maze_branch_visual_recovery",
+    "maze_phase_probe",
+    "maze_phase_attack",
+    "maze_phase_hard",
+    "maze_phase_final",
 )
 
 ADAPTER_COMPATIBILITY_REJECTION_REASONS = (
@@ -530,7 +588,139 @@ def safety_scene_diagnostics(
     }
 
 
-def yaw_cancellation(x: torch.Tensor, *, dt_s: float = p2_contract.NAV_DT_S) -> torch.Tensor:
+def sustained_wall_stuck_penalty(
+    duration_s: torch.Tensor,
+    candidate: torch.Tensor,
+    mapping_valid: torch.Tensor,
+    terminal: torch.Tensor,
+    *,
+    confirmation_s: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Penalize confirmed wall confinement before the terminal reset fires."""
+    duration = torch.nan_to_num(duration_s.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    active = (
+        candidate.reshape(-1).bool()
+        & mapping_valid.reshape(-1).bool()
+        & ~terminal.reshape(-1).bool()
+        & (duration >= STUCK_SUSTAINED_GRACE_S)
+    )
+    ramp_span = max(float(confirmation_s) - STUCK_SUSTAINED_GRACE_S, 1.0e-6)
+    severity = torch.clamp(
+        (duration - STUCK_SUSTAINED_GRACE_S) / ramp_span, 0.0, 1.0
+    )
+    magnitude = abs(STUCK_SUSTAINED_BASE) + severity * (
+        abs(STUCK_SUSTAINED_FLOOR) - abs(STUCK_SUSTAINED_BASE)
+    )
+    penalty = torch.where(active, -magnitude, torch.zeros_like(magnitude))
+    return penalty, {
+        "wall_stuck_sustained_active": active.float(),
+        "wall_stuck_sustained_severity": severity,
+    }
+
+
+def goal_safe_direction_penalty(
+    safe3: torch.Tensor,
+    target_cmd3: torch.Tensor,
+    goal_xy_m: torch.Tensor,
+    teacher_valid: torch.Tensor,
+    goal_freshness: torch.Tensor,
+    terminal: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Prefer the goal-facing option only among directions the teacher deems safe."""
+    if safe3.ndim != 2 or safe3.shape[1] != 3:
+        raise ValueError("P4 goal-safe preference expects safe3=[N,3]")
+    if goal_xy_m.ndim != 2 or goal_xy_m.shape[1] != 2:
+        raise ValueError("P4 goal-safe preference expects goal_xy_m=[N,2]")
+    command_weights = p2_contract.command_direction_weights(target_cmd3)
+    goal = torch.nan_to_num(goal_xy_m.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    bearing = torch.atan2(goal[:, 1], goal[:, 0]).clamp(
+        min=math.radians(-80.0), max=math.radians(80.0)
+    )
+    centers = torch.deg2rad(
+        torch.tensor(
+            p2_contract.PREDICTIVE_COLLISION_SECTOR_CENTERS_DEG,
+            device=goal.device,
+            dtype=goal.dtype,
+        )
+    )
+    width = math.radians(p2_contract.PREDICTIVE_COLLISION_SECTOR_WIDTH_DEG)
+    goal_weights = torch.softmax(
+        -0.5 * ((bearing[:, None] - centers[None, :]) / width).square(), dim=-1
+    )
+    score3 = torch.clamp(safe3, 0.0, 1.0) * goal_weights
+    selected = (command_weights * score3).sum(dim=-1)
+    best = score3.max(dim=-1).values
+    gap = torch.relu(best - selected - GOAL_SAFE_PREFERENCE_MARGIN)
+    top2 = torch.topk(score3, k=2, dim=-1).values
+    distinct = (top2[:, 0] - top2[:, 1]) > GOAL_SAFE_PREFERENCE_MARGIN
+    speed_scale = target_cmd3.new_tensor(
+        (1.0, 1.0, p2_contract.CRAWL_BODY_RADIUS_M)
+    )
+    moving = torch.linalg.vector_norm(target_cmd3 * speed_scale, dim=-1) > 0.05
+    goal_distance = torch.linalg.vector_norm(goal, dim=-1)
+    eligible = (
+        teacher_valid.reshape(-1).bool()
+        & (goal_freshness.reshape(-1) >= 0.50)
+        & moving
+        & distinct
+        & (safe3.max(dim=-1).values >= p2_contract.SAFE_DIRECTION_MIN_BEST_SAFE)
+        & (goal_distance >= 0.60)
+        & ~terminal.reshape(-1).bool()
+        & (gap > 0.0)
+    )
+    normalized_gap = torch.clamp(
+        gap / GOAL_SAFE_PREFERENCE_SCALE, 0.0, 1.0
+    )
+    penalty = torch.where(
+        eligible,
+        GOAL_SAFE_PREFERENCE_WEIGHT * normalized_gap,
+        torch.zeros_like(normalized_gap),
+    )
+    return penalty, {
+        "goal_safe_preference_eligible": eligible.float(),
+        "goal_safe_preference_gap": gap,
+        "goal_safe_preference_selected": selected,
+        "goal_safe_preference_best": best,
+    }
+
+
+def route_excess_penalty(
+    path_length_m: torch.Tensor,
+    start_goal_distance_m: torch.Tensor,
+    end_goal_distance_m: torch.Tensor,
+    terminal: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Apply a small cost only to travelled distance not converted into progress."""
+    path = torch.nan_to_num(path_length_m.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    progress = torch.clamp(
+        start_goal_distance_m.float() - end_goal_distance_m.float(), min=0.0
+    )
+    excess = torch.clamp(path - progress, min=0.0, max=ROUTE_EXCESS_CAP_M)
+    valid = (
+        torch.isfinite(path_length_m)
+        & torch.isfinite(start_goal_distance_m)
+        & torch.isfinite(end_goal_distance_m)
+        & ~terminal.reshape(-1).bool()
+    )
+    penalty = torch.where(
+        valid,
+        ROUTE_EXCESS_WEIGHT * excess,
+        torch.zeros_like(excess),
+    )
+    efficiency = torch.where(
+        path > 1.0e-6,
+        torch.clamp(progress / path, 0.0, 1.0),
+        torch.ones_like(path),
+    )
+    return penalty, {
+        "route_path_length_m": path,
+        "route_positive_progress_m": progress,
+        "route_excess_distance_m": excess,
+        "route_efficiency": efficiency,
+    }
+
+
+def yaw_cancellation(x: torch.Tensor, *, dt_s: float = P4_NAV_DT_S) -> torch.Tensor:
     """Return cancellation in [0,1] for a [T,N] yaw-rate window."""
     if x.ndim != 2:
         raise ValueError("yaw cancellation expects [T,N]")
@@ -591,13 +781,64 @@ def push_phase_config(session_effective_seconds: float) -> dict[str, float | str
 
 def camera_mix(session_effective_seconds: float) -> dict[str, float]:
     seconds = max(0.0, float(session_effective_seconds))
-    if seconds < 1_800.0:
-        return {"nominal": 1.0, "light": 0.0, "delayed": 0.0, "severe": 0.0}
-    if seconds < 7_200.0:
+    if seconds < 3_600.0:
+        return {"nominal": 0.90, "light": 0.10, "delayed": 0.0, "severe": 0.0}
+    if seconds < 18_000.0:
         return {"nominal": 0.70, "light": 0.25, "delayed": 0.05, "severe": 0.0}
-    if seconds < 21_600.0:
-        return {"nominal": 0.55, "light": 0.25, "delayed": 0.15, "severe": 0.05}
-    return {"nominal": 0.50, "light": 0.35, "delayed": 0.10, "severe": 0.05}
+    return {"nominal": 0.60, "light": 0.25, "delayed": 0.10, "severe": 0.05}
+
+
+def safe_direction_weight(session_effective_seconds: float) -> float:
+    """Aggressive but continuous Maze-only safety-direction curriculum."""
+    seconds = max(0.0, min(float(session_effective_seconds), TARGET_EFFECTIVE_SECONDS))
+    if seconds <= 1_800.0:
+        return 0.015 * seconds / 1_800.0
+    if seconds <= 7_200.0:
+        ratio = (seconds - 1_800.0) / 5_400.0
+        return 0.015 + ratio * (0.040 - 0.015)
+    if seconds <= 21_600.0:
+        return 0.040
+    ratio = (seconds - 21_600.0) / 7_200.0
+    return 0.040 + ratio * (0.030 - 0.040)
+
+
+def maze_missed_safe_direction_penalty(
+    safe3: torch.Tensor,
+    target_cmd3: torch.Tensor,
+    teacher_valid: torch.Tensor,
+    session_effective_seconds: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Penalize a clear missed alternative with event-normalized severity."""
+    weights = p2_contract.command_direction_weights(target_cmd3)
+    selected_safe = (weights * safe3).sum(dim=-1)
+    best_safe = safe3.max(dim=-1).values
+    chosen_risk = torch.clamp(1.0 - selected_safe, 0.0, 1.0)
+    safe_gap = torch.relu(
+        best_safe - selected_safe - p2_contract.SAFE_DIRECTION_GAP_MARGIN
+    )
+    normalized_gap = torch.clamp(safe_gap / SAFE_DIRECTION_GAP_SCALE, 0.0, 1.0)
+    speed_scale = target_cmd3.new_tensor(
+        (1.0, 1.0, p2_contract.CRAWL_BODY_RADIUS_M)
+    )
+    moving = torch.linalg.vector_norm(target_cmd3 * speed_scale, dim=-1) > 0.05
+    active = (
+        teacher_valid.reshape(-1).bool()
+        & moving
+        & (best_safe >= p2_contract.SAFE_DIRECTION_MIN_BEST_SAFE)
+        & (safe_gap > 0.0)
+    )
+    weight = safe_direction_weight(session_effective_seconds)
+    severity = chosen_risk * normalized_gap
+    penalty = torch.where(
+        active,
+        torch.clamp(-weight * severity, min=-weight, max=0.0),
+        torch.zeros_like(severity),
+    )
+    return penalty, {
+        "missed_safe_event_active": active.float(),
+        "missed_safe_event_severity": severity,
+        "missed_safe_weight": severity.new_full(severity.shape, weight),
+    }
 
 
 def training_schedule(
@@ -626,95 +867,67 @@ def training_schedule(
         branch = "actor_attack"
     if branch not in {"actor_attack", "visual_recovery"}:
         branch = "actor_attack"
-    if branch == "visual_recovery":
-        if seconds < 1_800.0:
-            return {
-                "phase": "mazeprobe",
-                "training_branch": branch,
-                "navigation_multiplier": 0.75,
-                "actor_multiplier": 0.15,
-                "critic_multiplier": 1.0,
-                "safety_head_multiplier": 1.5,
-                "adapter_multiplier": 0.5,
-                "reward_multiplier": 1.0,
-                "goal_fault_multiplier": 0.25,
-                "camera_aux_ratio": 0.02,
-                "cruise_multiplier": 0.0,
-                "entropy_coefficient": 0.006,
-            }
-        if seconds < 5_400.0:
-            cruise = min(1.0, max(0.0, (seconds - 1_800.0) / 1_800.0))
-            return {
-                "phase": "mazefull",
-                "training_branch": branch,
-                "navigation_multiplier": 0.60,
-                "actor_multiplier": 0.35,
-                "critic_multiplier": 0.8,
-                "safety_head_multiplier": 1.0,
-                "adapter_multiplier": 0.5,
-                "reward_multiplier": 1.0,
-                "goal_fault_multiplier": 0.25,
-                "camera_aux_ratio": 0.015,
-                "cruise_multiplier": cruise,
-                "entropy_coefficient": 0.005,
-            }
-        return {
-            "phase": "mazefinal",
-            "training_branch": branch,
-            "navigation_multiplier": 0.30,
-            "actor_multiplier": 0.30,
-            "critic_multiplier": 0.5,
-            "safety_head_multiplier": 0.5,
-            "adapter_multiplier": 0.25,
-            "reward_multiplier": 1.0,
-            "goal_fault_multiplier": 0.25,
-            "camera_aux_ratio": 0.01,
-            "cruise_multiplier": 1.0,
-            "entropy_coefficient": 0.004,
-        }
-    if seconds < 600.0:
+    if seconds < 3_600.0:
+        visual = branch == "visual_recovery"
+        cruise = min(1.0, max(0.0, (seconds - 1_800.0) / 1_800.0))
         return {
             "phase": "mazeprobe",
             "training_branch": branch,
-            "navigation_multiplier": 0.25,
-            "actor_multiplier": 0.35,
+            "navigation_multiplier": 0.75 if visual else 0.35,
+            "actor_multiplier": 0.25 if visual else 0.70,
             "critic_multiplier": 1.0,
-            "safety_head_multiplier": 1.0,
+            "safety_head_multiplier": 1.5 if visual else 1.0,
             "adapter_multiplier": 0.5,
             "reward_multiplier": 1.0,
             "goal_fault_multiplier": 0.25,
-            "camera_aux_ratio": 0.01,
-            "cruise_multiplier": seconds / 600.0,
-            "entropy_coefficient": 0.006,
+            "camera_aux_ratio": 0.02 if visual else 0.01,
+            "cruise_multiplier": cruise,
+            "entropy_coefficient": 0.008,
         }
-    if seconds < 5_400.0:
+    if seconds < 18_000.0:
+        entropy_ratio = (seconds - 3_600.0) / 14_400.0
         return {
-            "phase": "mazefull",
+            "phase": "mazeattack",
             "training_branch": branch,
             "navigation_multiplier": 0.60,
-            "actor_multiplier": 0.75,
+            "actor_multiplier": 0.85,
             "critic_multiplier": 0.8,
             "safety_head_multiplier": 1.0,
             "adapter_multiplier": 0.5,
             "reward_multiplier": 1.0,
-            "goal_fault_multiplier": 0.25,
+            "goal_fault_multiplier": 0.60,
             "camera_aux_ratio": 0.015,
             "cruise_multiplier": 1.0,
-            "entropy_coefficient": 0.005,
+            "entropy_coefficient": 0.006 + entropy_ratio * (0.004 - 0.006),
+        }
+    if seconds < 25_200.0:
+        return {
+            "phase": "mazehard",
+            "training_branch": branch,
+            "navigation_multiplier": 0.40,
+            "actor_multiplier": 0.65,
+            "critic_multiplier": 0.6,
+            "safety_head_multiplier": 0.75,
+            "adapter_multiplier": 0.5,
+            "reward_multiplier": 1.0,
+            "goal_fault_multiplier": 0.80,
+            "camera_aux_ratio": 0.0125,
+            "cruise_multiplier": 1.0,
+            "entropy_coefficient": 0.004,
         }
     return {
         "phase": "mazefinal",
         "training_branch": branch,
-        "navigation_multiplier": 0.30,
-        "actor_multiplier": 0.40,
-        "critic_multiplier": 0.5,
-        "safety_head_multiplier": 0.25,
+        "navigation_multiplier": 0.20,
+        "actor_multiplier": 0.35,
+        "critic_multiplier": 0.4,
+        "safety_head_multiplier": 0.5,
         "adapter_multiplier": 0.25,
         "reward_multiplier": 1.0,
-        "goal_fault_multiplier": 0.25,
+        "goal_fault_multiplier": 0.80,
         "camera_aux_ratio": 0.01,
         "cruise_multiplier": 1.0,
-        "entropy_coefficient": 0.004,
+        "entropy_coefficient": 0.003,
     }
 
 
@@ -740,13 +953,17 @@ def command_contract() -> dict[str, Any]:
                 "freshness_floor": GOAL_FRESHNESS_FLOOR,
             },
         },
-        "speed_tiers_enabled": SPEED_TIERS_ENABLED,
+        "speed_tier_contract": "removed",
         "soft_cruise": {
             "preferred_vx": [SOFT_CRUISE_MIN_VX, SOFT_CRUISE_MAX_VX],
             "low_weight": SOFT_CRUISE_LOW_WEIGHT,
             "high_weight": SOFT_CRUISE_HIGH_WEIGHT,
             "clear_factor": "teacher_valid*goal_freshness*center_safe*center_safe/best_safe",
         },
+        "slew_rate": list(P4_SLEW_RATE),
+        "slew_release_rate": list(P4_SLEW_RELEASE_RATE),
+        "nav_period_frames": P4_NAV_PERIOD_FRAMES,
+        "nav_frequency_hz": 1.0 / P4_NAV_DT_S,
         "slew_semantics": p2_contract.command_contract()["slew_semantics"],
     }
 
@@ -756,17 +973,45 @@ def reward_contract(
 ) -> dict[str, Any]:
     stuck = normalize_stuck_reset_contract(stuck_reset)
     return {
-        "version": "p4_maze_reward_v1_soft_cruise",
+        "version": "p4_maze_reward_v3_10hz_route",
         "inherits": p2_contract.reward_contract()["version"],
+        "tick_time_scaling": {
+            "reference_period_frames": p2_contract.NAV_PERIOD_FRAMES,
+            "runtime_period_frames": P4_NAV_PERIOD_FRAMES,
+            "continuous_terms": "duration_frames/reference_period_frames",
+            "distance_terms": "per_meter_unscaled",
+            "command_rate": "per_policy_decision_unscaled",
+            "body_collision": "per_10hz_tick_unscaled_for_stronger_enforcement",
+        },
         "new_terms": {
             "predictive_collision_raw_floor": PREDICTIVE_RAW_FLOOR,
+            "predictive_collision_scale": PREDICTIVE_COLLISION_SCALE,
             "missed_safe_direction_raw_floor": MISSED_SAFE_RAW_FLOOR,
+            "missed_safe_direction_gap_scale": SAFE_DIRECTION_GAP_SCALE,
+            "frontier_stagnation": "shadow_only_zero_ppo_weight",
             "yaw_exec_weight": YAW_EXEC_WEIGHT,
             "yaw_true_weight": YAW_TRUE_WEIGHT,
             "yaw_total_floor": YAW_TOTAL_FLOOR,
             "safety_group_floor": SAFETY_GROUP_FLOOR,
             "cap_semantics": "proportional_no_hidden_adjustment",
             "confirmed_wall_stuck_reset": stuck["terminal_penalty"],
+            "success_impulse": SUCCESS_IMPULSE,
+            "sustained_wall_stuck": {
+                "grace_s": STUCK_SUSTAINED_GRACE_S,
+                "base": STUCK_SUSTAINED_BASE,
+                "floor": STUCK_SUSTAINED_FLOOR,
+            },
+            "goal_safe_preference": {
+                "weight": GOAL_SAFE_PREFERENCE_WEIGHT,
+                "margin": GOAL_SAFE_PREFERENCE_MARGIN,
+                "scale": GOAL_SAFE_PREFERENCE_SCALE,
+                "semantics": "goal_preference_only_among_privileged_safe_sectors",
+            },
+            "route_excess": {
+                "weight_per_m": ROUTE_EXCESS_WEIGHT,
+                "per_tick_cap_m": ROUTE_EXCESS_CAP_M,
+                "source": "simulation_true_velocity_integral",
+            },
             "soft_cruise": {
                 "preferred_vx": [SOFT_CRUISE_MIN_VX, SOFT_CRUISE_MAX_VX],
                 "low_weight": SOFT_CRUISE_LOW_WEIGHT,
@@ -788,26 +1033,40 @@ def training_contract(
         "training_hours": TRAINING_HOURS,
         "target_effective_seconds": int(TARGET_EFFECTIVE_SECONDS),
         "diagnostic_seconds": int(DIAGNOSTIC_SECONDS),
+        "required_platform_wall_seconds": int(PLATFORM_WALL_SECONDS),
+        "required_platform_wall_hours": PLATFORM_WALL_HOURS,
         "clock_semantics": {
             "diagnostic": "wall_seconds_before_training_not_counted_in_session",
             "session_effective_seconds": "gradient_training_seconds_only",
             "session_wall_seconds": "diagnostic_plus_training",
+            "platform_task": (
+                "must_cover diagnostic plus target effective seconds plus bounded "
+                "rollout/save shutdown margin"
+            ),
+            "platform_wall_margin_seconds": int(PLATFORM_WALL_MARGIN_SECONDS),
         },
         "schedule_boundaries_seconds": list(SCHEDULE_BOUNDARIES_SECONDS),
         "safety_reward_ramp": {
             "version": SAFETY_REWARD_RAMP_VERSION,
             "segments": [
-                {"seconds": [0, 7_200], "multiplier": [1.0, 1.0]},
+                {"seconds": [0, 1_800], "weight": [0.0, 0.015]},
+                {"seconds": [1_800, 7_200], "weight": [0.015, 0.040]},
+                {"seconds": [7_200, 21_600], "weight": [0.040, 0.040]},
+                {"seconds": [21_600, 28_800], "weight": [0.040, 0.030]},
             ],
         },
         "goal_fault_ramp": {
             "semantics": "independent_from_safety_reward_multiplier",
             "segments": [
-                {"seconds": [0, 7_200], "multiplier": [0.25, 0.25]},
+                {"seconds": [0, 3_600], "multiplier": [0.25, 0.25]},
+                {"seconds": [3_600, 18_000], "multiplier": [0.60, 0.60]},
+                {"seconds": [18_000, 28_800], "multiplier": [0.80, 0.80]},
             ],
         },
         "rollout_nav_ticks": 32,
         "tbptt_nav_ticks": 16,
+        "nav_period_frames": P4_NAV_PERIOD_FRAMES,
+        "nav_frequency_hz": 1.0 / P4_NAV_DT_S,
         "frozen_low_level": ["cnn", "lstm", "actor", "std", "critic"],
         "trainable": ["navigation_encoder", "high_actor_lstm", "high_critic", "safety_head", "response_adapter"],
         "goal_belief_version": GOAL_BELIEF_VERSION,
@@ -818,8 +1077,9 @@ def training_contract(
         "stuck_reset": stuck,
         "adapter_record_contract_version": ADAPTER_RECORD_CONTRACT_VERSION,
         "maze_only": True,
+        "track_segment_labels": ["maze"],
         "soft_cruise": command_contract()["soft_cruise"],
-        "exact_resume": "p4_maze_soft_cruise_v2_training_clock_only",
+        "exact_resume": "p4_maze_attack10hz_v1_only",
     }
 
 

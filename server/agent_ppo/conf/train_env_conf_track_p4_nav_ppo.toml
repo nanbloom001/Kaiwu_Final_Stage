@@ -1,4 +1,4 @@
-# P4 two-hour maze-only navigation attack over the frozen low level.
+# P4 eight-hour maze-only navigation attack over the frozen low level.
 
 [env]
 num_envs = 128
@@ -72,18 +72,22 @@ max_depth = 5.0
 enabled = false
 
 [p4_nav_ppo]
-run_name = "p4maze2h-attack"
+run_name = "p4maze8h-10hzroute"
 # Model ID selects the intended parent candidate; structure/spec/shape/finite
 # validation remains authoritative after selection.
-parent_model_id = 1207698
-parent_model_label = "p4nav8h-r3-pnavstable-1207698"
+parent_model_id = 1256446
+parent_model_label = "p4nav2h_1256446-F"
 load_mode = "p4_parent_or_exact_resume"
-task_end_hours = 2.0
-target_effective_seconds = 7200
+# The first 10 minutes are read-only diagnostics and do not count toward the
+# 28,800-second gradient-training target. Keep five minutes of bounded rollout,
+# checkpoint and shutdown margin after the 8h10m minimum; the workflow exits as
+# soon as the effective target is reached.
+task_end_hours = 8.25
+target_effective_seconds = 28800
 diagnostic_seconds = 600
 maze_training_branch = "auto"
 nav_rollout_ticks = 32
-nav_period_frames = 10
+nav_period_frames = 5
 tbptt_sequence_length = 16
 num_learning_epochs = 4
 num_mini_batches = 4
@@ -112,7 +116,7 @@ body_collision_force_n = 30.0
 wall_evidence_latch_s = 2.0
 episode_grace_s = 5.0
 push_grace_s = 2.0
-terminal_penalty = -10.0
+terminal_penalty = -15.0
 
 [p4_nav_ppo.push_schedule]
 term_name = "push_robot"

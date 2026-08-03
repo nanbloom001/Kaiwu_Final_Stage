@@ -38,6 +38,46 @@ PRIVILEGED_WIRE_DIM = CRITIC_OBS_DIM + WORKER_AUX_DIM
 CRITIC_INPUT_DIM = 341
 ACTION_DIM = 3
 TERRAIN_NUM_COLUMNS = 20
+TRACK_SEGMENT_METRIC_LABELS = ("slope_inv", "stairs_inv", "maze")
+TRACK_TERRAIN_TO_METRIC_LABEL = {
+    "pyramid_slope_inv": "slope_inv",
+    "pyramid_stairs_inv": "stairs_inv",
+    "open_entry_maze": "maze",
+}
+
+
+def canonical_track_segment_labels(sub_terrains) -> tuple[str, ...]:
+    """Map configured Track terrain names to stable metric bucket labels."""
+    if sub_terrains is None or sub_terrains == ():
+        return TRACK_SEGMENT_METRIC_LABELS
+    if not isinstance(sub_terrains, (list, tuple)) or not sub_terrains:
+        raise ValueError("Track sub_terrains must be a non-empty sequence")
+    labels = []
+    for terrain in sub_terrains:
+        terrain_name = str(terrain)
+        label = TRACK_TERRAIN_TO_METRIC_LABEL.get(terrain_name)
+        if label is None:
+            raise ValueError(
+                f"unsupported navigation Track terrain {terrain_name!r}; "
+                f"supported={sorted(TRACK_TERRAIN_TO_METRIC_LABEL)}"
+            )
+        labels.append(label)
+    return tuple(labels)
+
+
+def track_segment_metric_indices(
+    physical_segment: torch.Tensor,
+    segment_labels: tuple[str, ...] | list[str],
+) -> torch.Tensor:
+    """Translate physical Track segment indices into stable metric bucket IDs."""
+    labels = tuple(str(label) for label in segment_labels)
+    result = torch.full_like(physical_segment.round().long(), -1)
+    for physical_index, label in enumerate(labels):
+        if label not in TRACK_SEGMENT_METRIC_LABELS:
+            continue
+        metric_index = TRACK_SEGMENT_METRIC_LABELS.index(label)
+        result[physical_segment.round().long() == physical_index] = metric_index
+    return result
 
 # The first 30 worker-owned slots remain the stable ResponseAdapter contract.
 # P2-only diagnostics are appended so P1.5 completed records stay loadable.

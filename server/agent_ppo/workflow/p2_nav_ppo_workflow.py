@@ -19,10 +19,81 @@ from agent_ppo.feature import nav_contract, p2_contract, p3_contract, p4_contrac
 from agent_ppo.feature.nav_event_log import emit_nav_event
 
 
-class _CollisionTraceRecorder:
-    """Bounded 5 Hz event traces; aggregate every event, log few raw examples."""
+def _p4_worker_push_resume_offset(algorithm) -> float:
+    """Translate the restored learner clock to the worker's monotonic clock."""
+    if str(getattr(algorithm, "maze_training_branch", "")) == "auto":
+        diagnostic_elapsed = float(
+            getattr(algorithm, "diagnostic_elapsed_seconds", 0.0)
+        )
+        if diagnostic_elapsed < p4_contract.DIAGNOSTIC_SECONDS:
+            return diagnostic_elapsed - p4_contract.DIAGNOSTIC_SECONDS
+    return float(getattr(algorithm, "session_effective_seconds", 0.0))
 
-    def __init__(self, *, pre_ticks=5, post_ticks=10, max_raw_events=12):
+
+def _goal_history_stuck(
+    goal_history: deque, end_goal: torch.Tensor
+) -> torch.Tensor:
+    """Evaluate the configured full window at either 5 Hz or 10 Hz."""
+    if goal_history.maxlen is None or len(goal_history) != goal_history.maxlen:
+        return torch.zeros_like(end_goal, dtype=torch.bool)
+    window = torch.stack(tuple(goal_history))
+    progress = window[0] - window[-1]
+    history_valid = window.isfinite().all(dim=0)
+    return history_valid & (end_goal > 0.8) & (progress < 0.05)
+
+
+def _p4_conditional_metrics(
+    diagnostic_sums: dict[str, torch.Tensor], device: torch.device
+) -> dict[str, float]:
+    """Reduce P4 event counters using their actual eligible-event denominators."""
+
+    def count(name: str) -> float:
+        return float(
+            diagnostic_sums.get(name, torch.zeros((), device=device)).detach().cpu()
+        )
+
+    head_samples = count("head_correct_samples")
+    head_wrong = count("head_correct_actor_wrong_count")
+    resolved = count("risk_event_resolved_count")
+    policy_decel = count("risk_decel_policy_count")
+    limited_decel = count("risk_decel_limited_count")
+    no_decel = count("risk_no_deceleration_count")
+    stuck_terminal = count("stuck_terminal_count")
+    stuck_return_sum = count("stuck_terminal_episode_return_sum")
+    stuck_nonnegative = count("stuck_terminal_nonnegative_count")
+    return {
+        "head_correct_samples": head_samples,
+        "head_correct_actor_wrong_count": head_wrong,
+        "head_correct_actor_wrong_rate": head_wrong / max(head_samples, 1.0),
+        "risk_event_resolved_count": resolved,
+        "risk_decel_policy_count": policy_decel,
+        "risk_decel_limited_count": limited_decel,
+        "risk_no_deceleration_count": no_decel,
+        "risk_decel_policy_rate": policy_decel / max(resolved, 1.0),
+        "risk_decel_limited_rate": limited_decel / max(resolved, 1.0),
+        "risk_no_deceleration_rate": no_decel / max(resolved, 1.0),
+        "stuck_terminal_count": stuck_terminal,
+        "stuck_terminal_episode_return_mean": (
+            stuck_return_sum / max(stuck_terminal, 1.0)
+        ),
+        "stuck_terminal_nonnegative_rate": (
+            stuck_nonnegative / max(stuck_terminal, 1.0)
+        ),
+    }
+
+
+class _CollisionTraceRecorder:
+    """Bounded high-level event traces; aggregate every event, log few examples."""
+
+    def __init__(
+        self,
+        *,
+        nav_dt_s=p2_contract.NAV_DT_S,
+        pre_ticks=5,
+        post_ticks=10,
+        max_raw_events=12,
+    ):
+        self.nav_dt_s = float(nav_dt_s)
         self.history = deque(maxlen=int(pre_ticks))
         self.post_ticks = int(post_ticks)
         self.max_raw_events = int(max_raw_events)
@@ -158,35 +229,35 @@ class _CollisionTraceRecorder:
             "collision_onset_rate": float(rollout_onsets) / max(rollout_observations, 1),
             "collision_onset_total": float(self.total_onsets),
             "collision_wz_zero_latency_s": (
-                sum(zero_latencies) / len(zero_latencies) * p2_contract.NAV_DT_S
+                sum(zero_latencies) / len(zero_latencies) * self.nav_dt_s
                 if zero_latencies else 0.0
             ),
             "collision_wz_reverse_latency_s": (
-                sum(reverse_latencies) / len(reverse_latencies) * p2_contract.NAV_DT_S
+                sum(reverse_latencies) / len(reverse_latencies) * self.nav_dt_s
                 if reverse_latencies else 0.0
             ),
             "collision_progress_recovery_latency_s": (
-                sum(progress_latencies) / len(progress_latencies) * p2_contract.NAV_DT_S
+                sum(progress_latencies) / len(progress_latencies) * self.nav_dt_s
                 if progress_latencies else 0.0
             ),
             "collision_target_to_exec_wz_reverse_latency_s": (
-                sum(target_to_exec_wz_latencies) / len(target_to_exec_wz_latencies) * p2_contract.NAV_DT_S
+                sum(target_to_exec_wz_latencies) / len(target_to_exec_wz_latencies) * self.nav_dt_s
                 if target_to_exec_wz_latencies else 0.0
             ),
             "collision_exec_to_true_wz_zero_latency_s": (
-                sum(exec_to_true_wz_latencies) / len(exec_to_true_wz_latencies) * p2_contract.NAV_DT_S
+                sum(exec_to_true_wz_latencies) / len(exec_to_true_wz_latencies) * self.nav_dt_s
                 if exec_to_true_wz_latencies else 0.0
             ),
             "collision_target_to_exec_vy_reverse_latency_s": (
-                sum(target_to_exec_vy_latencies) / len(target_to_exec_vy_latencies) * p2_contract.NAV_DT_S
+                sum(target_to_exec_vy_latencies) / len(target_to_exec_vy_latencies) * self.nav_dt_s
                 if target_to_exec_vy_latencies else 0.0
             ),
             "collision_exec_to_true_vy_zero_latency_s": (
-                sum(exec_to_true_vy_latencies) / len(exec_to_true_vy_latencies) * p2_contract.NAV_DT_S
+                sum(exec_to_true_vy_latencies) / len(exec_to_true_vy_latencies) * self.nav_dt_s
                 if exec_to_true_vy_latencies else 0.0
             ),
             "collision_risk_lead_time_s": (
-                sum(risk_lead_times) / len(risk_lead_times) * p2_contract.NAV_DT_S
+                sum(risk_lead_times) / len(risk_lead_times) * self.nav_dt_s
                 if risk_lead_times else 0.0
             ),
             "collision_terminal_overlap_rate": terminal_overlaps / count,
@@ -356,6 +427,7 @@ def _tick_diagnostic_values(
     duration_frames: torch.Tensor,
     stuck: torch.Tensor,
     feedback_age_clip_s: float,
+    nav_period_frames: int = p2_contract.NAV_PERIOD_FRAMES,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], torch.Tensor]:
     """Return per-env P2 telemetry without changing training semantics."""
     measured = response_aux[:, 6:9]
@@ -410,7 +482,7 @@ def _tick_diagnostic_values(
         "wall_stuck_reset_rate": (done & (terminal_reason == 4)).float(),
         "hard_termination": hard.float(),
         "early_end_rate": (
-            done & (duration_frames < p2_contract.NAV_PERIOD_FRAMES)
+            done & (duration_frames < int(nav_period_frames))
         ).float(),
         "transition_duration_frames": duration_frames.float(),
         "goal_distance": end_goal,
@@ -571,6 +643,10 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         raise RuntimeError("navigation PPO workflow requires a P2/P4 training assembly")
     usr_conf, conf_path, _, stage = Config.load_conf(logger)
     p2_conf = usr_conf.get("p4_nav_ppo" if is_p4 else "p2_nav_ppo", {})
+    terrain_track = (usr_conf.get("terrain") or {}).get("track") or {}
+    segment_labels = p2_contract.canonical_track_segment_labels(
+        terrain_track.get("sub_terrains", ())
+    )
     feedback_conf = p2_conf.get("feedback_profile", {})
     if not isinstance(feedback_conf, dict):
         feedback_conf = {}
@@ -589,12 +665,11 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         # an exact-resume task restores the current Push phase instead of
         # replaying the initial two-hour no-Push phase.
         push_schedule = p2_conf.setdefault("push_schedule", {})
-        push_schedule["resume_offset_s"] = float(
-            algorithm.session_effective_seconds
-        )
+        push_schedule["resume_offset_s"] = _p4_worker_push_resume_offset(algorithm)
         logger.info(
-            "[P4Resume] worker push resume_offset_s=%.3f",
+            "[P4Resume] worker push resume_offset_s=%.3f diagnostic_elapsed_s=%.3f",
             push_schedule["resume_offset_s"],
+            float(getattr(algorithm, "diagnostic_elapsed_seconds", 0.0)),
         )
     data = env.reset(usr_conf)
     if data is None:
@@ -632,10 +707,17 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     unfreeze_save_done = bool(algorithm.cnn_unfrozen)
     lifecycle_success = 0
     lifecycle_failures = 0
-    collision_traces = _CollisionTraceRecorder()
-    goal_history = deque(maxlen=11)
+    nav_period_frames = int(algorithm.nav_period_frames)
+    nav_rollout_ticks = int(algorithm.nav_rollout_ticks)
+    nav_dt_s = float(algorithm.nav_dt_s)
+    collision_traces = _CollisionTraceRecorder(
+        nav_dt_s=nav_dt_s,
+        pre_ticks=max(1, int(round(1.0 / nav_dt_s))),
+        post_ticks=max(1, int(round(2.0 / nav_dt_s))),
+    )
+    goal_history = deque(maxlen=max(2, int(round(2.0 / nav_dt_s)) + 1))
     schedule_boundaries = (
-        (*p4_contract.SCHEDULE_BOUNDARIES_SECONDS, 13_800.0)
+        p4_contract.SCHEDULE_BOUNDARIES_SECONDS
         if is_p4
         else (
             p2_contract.SAFETY_WARM_END_SECONDS,
@@ -711,13 +793,13 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             )
             quantile_samples = {
                 name: torch.full(
-                    (p2_contract.NAV_ROLLOUT_TICKS, agent.num_envs),
+                    (nav_rollout_ticks, agent.num_envs),
                     float("nan"),
                     device=agent.device,
                 )
                 for name in quantile_names
             }
-            for _tick in range(p2_contract.NAV_ROLLOUT_TICKS):
+            for _tick in range(nav_rollout_ticks):
                 start_goal = (
                     critic_wire[:, nav_contract.CRITIC_GOAL3_START + 2]
                     * nav_contract.GOAL_DIST_SCALE_M
@@ -748,6 +830,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     else None
                 )
                 duration = torch.zeros(agent.num_envs, dtype=torch.long, device=agent.device)
+                path_length_m = torch.zeros(agent.num_envs, device=agent.device)
                 hard = torch.zeros(agent.num_envs, dtype=torch.bool, device=agent.device)
                 timeout = torch.zeros_like(hard)
                 terminal_reason = torch.zeros(
@@ -755,12 +838,20 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 )
                 active = torch.ones_like(hard)
                 result = None
-                for frame in range(p2_contract.NAV_PERIOD_FRAMES):
+                for frame in range(nav_period_frames):
                     result, _critic_obs, aux = algorithm.frame_begin(obs, critic_wire)
                     actions = torch.clamp(result["actions"], -6.0, 6.0)
                     frame_target = algorithm.command.active_target
                     frame_executed = algorithm.command.exec_cmd
                     frame_aux = aux
+                    frame_true_xy = torch.nan_to_num(
+                        frame_aux[:, 12:14], nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    path_length_m += (
+                        torch.linalg.vector_norm(frame_true_xy, dim=-1)
+                        * p2_contract.CONTROL_DT_S
+                        * active.float()
+                    )
                     frame_p4_extra = (
                         algorithm._p4_worker_extra.detach().clone()
                         if is_p4
@@ -855,16 +946,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     for previous_goal in goal_history:
                         previous_goal[transition_done] = float("nan")
                 goal_history.append(end_goal.detach().clone())
-                if len(goal_history) == 11:
-                    ten_tick_progress = goal_history[0] - goal_history[-1]
-                    history_valid = torch.stack(tuple(goal_history)).isfinite().all(dim=0)
-                    stuck = (
-                        history_valid
-                        & (end_goal > 0.8)
-                        & (ten_tick_progress < 0.05)
-                    )
-                else:
-                    stuck = torch.zeros_like(hard)
+                stuck = _goal_history_stuck(goal_history, end_goal)
                 pending = algorithm.pending_tick
                 if pending is None:
                     raise RuntimeError("P2 pending transition disappeared before finish_tick")
@@ -896,6 +978,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     duration_frames=duration,
                     stuck=stuck,
                     feedback_age_clip_s=feedback_age_clip_s,
+                    nav_period_frames=nav_period_frames,
                 )
                 for name, value in values.items():
                     diagnostic_sums[name] = diagnostic_sums.get(
@@ -967,8 +1050,10 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     terminal_segment,
                     transition_done,
                 )
-                segment_valid = raw_segment >= 0.0
-                row_index = raw_segment.round().long()
+                row_index = p2_contract.track_segment_metric_indices(
+                    raw_segment, segment_labels
+                )
+                segment_valid = row_index >= 0
                 segment_diagnostic_count += segment_valid.float().sum()
                 valid_row_index = row_index.clamp(0, 2)
                 def add_segment(target_buffer, source):
@@ -1008,6 +1093,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     timeout=timeout,
                     terminal_safe_aux=diagnostic_aux,
                     terminal_safe_exec_cmd=executed,
+                    path_length_m=path_length_m,
                 )
                 for component, value in algorithm.last_tick_penalties.items():
                     name = f"reward_{component}"
@@ -1079,9 +1165,9 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 add_segment(row_predictive_penalty, predictive_penalty)
                 add_segment(row_teacher_risk, teacher_risk)
                 add_segment(row_teacher_high_risk, teacher_risk >= 0.5)
-                if _tick < p2_contract.NAV_ROLLOUT_TICKS - 1 and full:
+                if _tick < nav_rollout_ticks - 1 and full:
                     raise RuntimeError("P2 rollout filled before the 32-tick boundary")
-                if _tick == p2_contract.NAV_ROLLOUT_TICKS - 1 and not full:
+                if _tick == nav_rollout_ticks - 1 and not full:
                     raise RuntimeError("P2 rollout did not fill at the 32-tick boundary")
 
             metrics = algorithm.update()
@@ -1091,7 +1177,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     role="aisrv",
                     iteration=int(algorithm.current_iteration),
                     valid_ticks=float(
-                        p2_contract.NAV_ROLLOUT_TICKS * agent.num_envs
+                        nav_rollout_ticks * agent.num_envs
                     ),
                     update_skipped_no_valid=0.0,
                 )
@@ -1187,6 +1273,10 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         for name, value in diagnostic_sums.items()
                     }
                 )
+                if is_p4:
+                    metrics.update(
+                        _p4_conditional_metrics(diagnostic_sums, agent.device)
+                    )
                 eligible_safe_choices = float(
                     diagnostic_sums.get(
                         "safe_alternative_available",
@@ -1257,7 +1347,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         metrics[f"{prefix}_{suffix}"] = float(
                             source[vx_index, wz_index]
                         ) / metric_denominator
-            for index, label in enumerate(("slope_inv", "stairs_inv", "maze")):
+            for index, label in enumerate(p2_contract.TRACK_SEGMENT_METRIC_LABELS):
                 denominator = max(1.0, float(row_counts[index]))
                 metrics[f"{label}_sample_share"] = float(row_counts[index]) / max(
                     1.0, float(segment_diagnostic_count)
@@ -1293,7 +1383,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     "rollout_time_s": now - rollout_started,
                     "env_step_time_s": env_step_time_s,
                     "samples_per_s": (
-                        p2_contract.NAV_ROLLOUT_TICKS * agent.num_envs
+                        nav_rollout_ticks * agent.num_envs
                         / max(now - rollout_started, 1.0e-6)
                     ),
                     "cnn_unfrozen": float(algorithm.cnn_unfrozen),

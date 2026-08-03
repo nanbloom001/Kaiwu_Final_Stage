@@ -2,6 +2,7 @@
 """Focused contracts for the P4 Track robustness stage."""
 
 import ast
+from collections import deque
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -34,15 +35,20 @@ from agent_ppo.model.response_adapter import CommandResponseAdapter
 from agent_ppo.model.vision_encoder import VisionEncoder
 from agent_ppo.workflow.p2_nav_ppo_workflow import (
     _expected_critic_wire_dim,
+    _goal_history_stuck,
+    _p4_conditional_metrics,
+    _p4_worker_push_resume_offset,
     _terminal_safe_p4_critic_wire,
 )
 
 
-def _p4_algorithm(num_envs=1):
+def _p4_algorithm(num_envs=1, config=None):
     low_actor = nn.Sequential(
         nn.Linear(77, 512), nn.ELU(), nn.Linear(512, 256), nn.ELU(),
         nn.Linear(256, 128), nn.ELU(), nn.Linear(128, 12),
     )
+    runtime_config = {"p4_seed": 17, "num_learning_epochs": 4}
+    runtime_config.update(config or {})
     return AlgorithmP4NavPPO(
         low_level_encoder=VisionEncoder(),
         low_level_actor=low_actor,
@@ -54,7 +60,7 @@ def _p4_algorithm(num_envs=1):
         response_buffer=P2ResponseAuxBuffer(num_envs, "cpu"),
         num_envs=num_envs,
         device="cpu",
-        config={"p4_seed": 17, "num_learning_epochs": 4},
+        config=runtime_config,
     )
 
 
@@ -83,9 +89,45 @@ def _p4_training_wire(num_envs=1):
     return torch.zeros(num_envs, p4_contract.P4_PRIVILEGED_WIRE_DIM)
 
 
+def _p4_reward_components(num_envs=1):
+    return {
+        "crawl": torch.full((num_envs,), -0.08),
+        "tracking": torch.full((num_envs,), -0.10),
+        "gait_symmetry": torch.full((num_envs,), -0.02),
+        "body_collision": torch.zeros(num_envs),
+        "predictive_collision_risk": torch.zeros(num_envs),
+        "missed_safe_direction": torch.zeros(num_envs),
+        "frontier_stagnation": torch.zeros(num_envs),
+    }
+
+
+def _p4_reward_context(num_envs=1, *, terminal=False, reason=0):
+    return {
+        "reward_exec_cmd": torch.zeros(num_envs, 3),
+        "reward_source_aux": torch.zeros(num_envs, p2_contract.WORKER_AUX_DIM),
+        "terminal": torch.full((num_envs,), terminal, dtype=torch.bool),
+        "reason": torch.full((num_envs,), reason, dtype=torch.long),
+        "duration_frames": torch.full(
+            (num_envs,), p4_contract.P4_NAV_PERIOD_FRAMES
+        ),
+        "start_goal_distance": torch.ones(num_envs),
+        "end_goal_distance": torch.ones(num_envs),
+        "path_length_m": torch.zeros(num_envs),
+    }
+
+
 def test_p4_workflow_requires_507_training_wire_without_changing_p2_eval_wire():
     assert _expected_critic_wire_dim(is_p4=True) == 507
     assert _expected_critic_wire_dim(is_p4=False) == 385
+
+
+def test_p4_defaults_to_10hz_without_changing_p2_default_period():
+    p4_algorithm = _p4_algorithm()
+    assert p4_algorithm.nav_period_frames == p4_contract.P4_NAV_PERIOD_FRAMES == 5
+    assert p4_algorithm.nav_dt_s == pytest.approx(0.1)
+    assert p4_algorithm.nav_rollout_ticks == 32
+    assert p4_algorithm.tbptt_sequence_length == 16
+    assert p2_contract.NAV_PERIOD_FRAMES == 10
 
 
 def test_p4_mapper_ranges_dynamic_cap_and_stale_goal_wait():
@@ -106,6 +148,37 @@ def test_p4_mapper_ranges_dynamic_cap_and_stale_goal_wait():
     )
 
 
+def test_p4_track_eval_without_training_only_safety_head_keeps_zero_risk():
+    algorithm = _p4_eval_algorithm()
+    algorithm._clean_depth = torch.ones(
+        1, p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH, 1
+    )
+    algorithm._camera_diagnostics = {
+        "camera_delay_only": torch.zeros(1),
+        "camera_fault_only": torch.zeros(1),
+        "camera_fault_delay_overlap": torch.zeros(1),
+    }
+    algorithm._update_policy_auxiliary_target(
+        parts={},
+        nav_feat=torch.zeros(1, 32),
+        nav_nonvisual=torch.zeros(1, p2_contract.NAV_NONVISUAL_DIM),
+        profile=torch.zeros(1, p2_contract.RESPONSE_PROFILE_DIM),
+        confidence=torch.ones(1, 1),
+        reset=torch.ones(1, dtype=torch.bool),
+    )
+    assert torch.equal(
+        algorithm._last_safety_head_risk3,
+        torch.zeros_like(algorithm._last_safety_head_risk3),
+    )
+
+
+def test_p4_runtime_rejects_non_maze_segment_and_slew_contract_drift():
+    with pytest.raises(ValueError, match="Maze-only training"):
+        _p4_algorithm(config={"track_segment_labels": ["slope_inv"]})
+    with pytest.raises(ValueError, match="runtime slew"):
+        _p4_algorithm(config={"slew_rate": [0.30, 0.30, 0.75]})
+
+
 def test_p4_yaw_cancellation_and_proportional_cap():
     one_direction = torch.full((5, 2), 0.5)
     alternating = torch.tensor((0.5, -0.5, 0.5, -0.5, 0.5)).reshape(5, 1)
@@ -113,8 +186,141 @@ def test_p4_yaw_cancellation_and_proportional_cap():
     assert p4_contract.yaw_cancellation(alternating).item() > 0.5
     raw = tuple(torch.tensor((-0.03,)) for _ in range(3))
     applied, scale = p4_contract.proportional_negative_cap(*raw)
-    assert sum(item.item() for item in applied) == pytest.approx(-0.05)
-    assert scale.item() == pytest.approx(5.0 / 9.0)
+    assert sum(item.item() for item in applied) == pytest.approx(-0.06)
+    assert scale.item() == pytest.approx(2.0 / 3.0)
+
+
+def test_p4_10hz_continuous_rewards_preserve_5hz_per_second_scale():
+    algorithm = _p4_algorithm()
+    algorithm.pending_tick = {"target_cmd3": torch.zeros(1, 3)}
+    result = algorithm._override_reward_components(
+        _p4_reward_components(), **_p4_reward_context()
+    )
+    assert result["crawl"].item() == pytest.approx(-0.04)
+    assert result["tracking"].item() == pytest.approx(-0.05)
+    assert result["gait_symmetry"].item() == pytest.approx(-0.01)
+    assert algorithm._p4_reward_diagnostics[
+        "reward_continuous_time_scale"
+    ].item() == pytest.approx(0.5)
+
+
+def test_p4_10hz_safety_cap_is_applied_before_time_scaling(monkeypatch):
+    algorithm = _p4_algorithm()
+    components = _p4_reward_components()
+    components["predictive_collision_risk"].fill_(-1.0)
+    algorithm.pending_tick = {
+        "target_cmd3": torch.zeros(1, 3),
+        "safe3": torch.zeros(1, 3),
+        "safety_valid": torch.ones(1, 1),
+    }
+    algorithm._yaw_history_count.fill_(algorithm._yaw_window_ticks)
+    monkeypatch.setattr(
+        p4_contract,
+        "maze_missed_safe_direction_penalty",
+        lambda *args, **kwargs: (
+            torch.full((1,), -0.04),
+            {
+                "safe_alternative_available": torch.zeros(1),
+                "selected_safest_direction": torch.zeros(1),
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        p4_contract, "yaw_cancellation", lambda *args, **kwargs: torch.ones(1)
+    )
+
+    result = algorithm._override_reward_components(
+        components, **_p4_reward_context()
+    )
+    applied = sum(
+        result[name].item()
+        for name in (
+            "predictive_collision_risk",
+            "missed_safe_direction",
+            "yaw_cancellation",
+        )
+    )
+    assert applied == pytest.approx(-0.03)
+    assert algorithm._p4_reward_diagnostics[
+        "reward_safety_group_scale"
+    ].item() == pytest.approx(2.0 / 3.0)
+
+
+def test_p4_success_is_a_single_unscaled_200_point_event():
+    algorithm = _p4_algorithm()
+    algorithm.pending_tick = {"target_cmd3": torch.zeros(1, 3)}
+    result = algorithm._override_reward_components(
+        _p4_reward_components(),
+        **_p4_reward_context(terminal=True, reason=1),
+    )
+    assert result["success"].item() == pytest.approx(200.0)
+
+
+def test_p4_stuck_goal_safe_and_route_rewards_have_bounded_semantics():
+    stuck, stuck_diag = p4_contract.sustained_wall_stuck_penalty(
+        torch.tensor((0.5, 1.0, 7.0, 7.0, 7.0)),
+        torch.ones(5, dtype=torch.bool),
+        torch.tensor((True, True, True, False, True)),
+        torch.tensor((False, False, False, False, True)),
+        confirmation_s=7.0,
+    )
+    assert stuck[0].item() == 0.0
+    assert stuck[1].item() == pytest.approx(-0.02)
+    assert stuck[2].item() == pytest.approx(-0.10)
+    assert stuck[3].item() == 0.0
+    assert stuck[4].item() == 0.0
+    assert stuck_diag["wall_stuck_sustained_active"].tolist() == [0, 1, 1, 0, 0]
+
+    safe3 = torch.tensor(((0.95, 0.20, 0.10), (0.95, 0.20, 0.10)))
+    goal_left = torch.tensor(((3.0, 3.0), (3.0, 3.0)))
+    commands = torch.tensor(((0.5, 0.25, 0.8), (0.5, -0.25, -0.8)))
+    goal_penalty, goal_diag = p4_contract.goal_safe_direction_penalty(
+        safe3,
+        commands,
+        goal_left,
+        torch.ones(2, dtype=torch.bool),
+        torch.ones(2),
+        torch.zeros(2, dtype=torch.bool),
+    )
+    assert -0.04 <= goal_penalty[1].item() < goal_penalty[0].item() <= 0.0
+    assert goal_diag["goal_safe_preference_eligible"].tolist() == [1, 1]
+
+    route_penalty, route_diag = p4_contract.route_excess_penalty(
+        torch.tensor((0.10, 0.20, 1.00)),
+        torch.tensor((2.0, 2.0, 2.0)),
+        torch.tensor((1.9, 1.9, 2.1)),
+        torch.tensor((False, False, True)),
+    )
+    assert route_penalty[0].item() == pytest.approx(0.0, abs=1.0e-7)
+    assert route_penalty[1].item() == pytest.approx(-0.005)
+    assert route_penalty[2].item() == 0.0
+    assert route_diag["route_excess_distance_m"][1].item() == pytest.approx(0.10)
+
+
+def test_p4_goal_safe_reward_uses_terminal_safe_true_goal_not_noisy_belief():
+    algorithm = _p4_algorithm()
+    algorithm.pending_tick = {
+        "target_cmd3": torch.zeros(1, 3),
+        "safe3": torch.tensor(((0.95, 0.20, 0.10),)),
+        "safety_valid": torch.ones(1, 1),
+    }
+    algorithm._last_policy_command[0] = torch.tensor((0.5, -0.25, -0.8))
+    algorithm._last_goal_freshness.fill_(1.0)
+    algorithm._p4_worker_extra[
+        :, p4_contract.RAW_GOAL_XY_SLICE
+    ] = torch.tensor(((3.0, 3.0),))
+    algorithm.goal_belief.estimate[0] = torch.tensor((3.0, -3.0))
+
+    first = algorithm._override_reward_components(
+        _p4_reward_components(), **_p4_reward_context()
+    )["goal_safe_preference"].clone()
+    algorithm.goal_belief.estimate[0] = torch.tensor((-8.0, -8.0))
+    second = algorithm._override_reward_components(
+        _p4_reward_components(), **_p4_reward_context()
+    )["goal_safe_preference"]
+
+    assert first.item() < 0.0
+    assert torch.equal(first, second)
 
 
 def test_goal_belief_propagates_with_feedback_and_resets_on_epoch():
@@ -307,6 +513,24 @@ def test_shared_camera_exact_resume_does_not_consume_restored_rng():
     assert torch.equal(restored.generator.get_state(), state["generator_state"])
 
 
+def test_p4_workflow_live_reset_does_not_advance_restored_camera_rng():
+    source = _p4_algorithm()
+    state = source.camera_state.state_dict()
+    restored = _p4_algorithm()
+    restored.camera_state.load_state_dict(state)
+    restored.reset_live_state()
+    assert torch.equal(restored.camera_state.generator.get_state(), state["generator_state"])
+
+
+def test_p4_10hz_stuck_history_remains_live_after_window_wraps():
+    history = deque(maxlen=21)
+    end_goal = torch.tensor((2.0,))
+    for _ in range(40):
+        history.append(end_goal.clone())
+        if len(history) == history.maxlen:
+            assert _goal_history_stuck(history, end_goal).item() is True
+
+
 def test_shared_camera_near_clip_is_converted_from_meters_to_normalized_depth():
     camera = P4SharedCameraState(1, "cpu", seed=19, max_depth_m=5.0)
     camera.near_clip.fill_(0.10)
@@ -324,6 +548,26 @@ def test_shared_camera_near_clip_is_converted_from_meters_to_normalized_depth():
     assert bool((delivered > 0.0).all())
     assert diagnostics["camera_near_clip_added_hole_rate"].item() == 0.0
     assert diagnostics["camera_delivered_hole_rate"].item() == 0.0
+
+
+def test_shared_camera_diagnostic_fault_shadow_is_detached_and_rng_resumable():
+    clean = torch.ones(
+        8, p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH, 1
+    )
+    camera = P4SharedCameraState(8, "cpu", seed=23)
+    state = camera.state_dict()
+    shadow, selected = camera.diagnostic_fault_shadow(clean, sample_share=1.0)
+    assert selected.all()
+    assert torch.equal(clean, torch.ones_like(clean))
+    assert not torch.equal(shadow, clean)
+
+    restored = P4SharedCameraState(8, "cpu", seed=999)
+    restored.load_state_dict(state)
+    replay, replay_selected = restored.diagnostic_fault_shadow(
+        clean, sample_share=1.0
+    )
+    assert torch.equal(replay_selected, selected)
+    assert torch.equal(replay, shadow)
 
 
 def test_push_pulse_is_counted_once_for_reused_transport():
@@ -456,19 +700,44 @@ def test_p4_missing_contract_current_records_remain_incompatible():
 def test_p4_maze_schedule_and_soft_cruise_are_explicit():
     warm = p4_contract.training_schedule(0.0)
     assert warm["phase"] == "mazeprobe"
-    assert warm["actor_multiplier"] == pytest.approx(0.35)
-    assert warm["navigation_multiplier"] == pytest.approx(0.25)
+    assert warm["actor_multiplier"] == pytest.approx(0.70)
+    assert warm["navigation_multiplier"] == pytest.approx(0.35)
     assert warm["cruise_multiplier"] == pytest.approx(0.0)
-    assert p4_contract.training_schedule(600.0)["phase"] == "mazefull"
-    assert p4_contract.training_schedule(5_400.0)["phase"] == "mazefinal"
+    assert p4_contract.training_schedule(1_800.0)["cruise_multiplier"] == 0.0
+    assert p4_contract.training_schedule(3_600.0)["phase"] == "mazeattack"
+    assert p4_contract.training_schedule(18_000.0)["phase"] == "mazehard"
+    assert p4_contract.training_schedule(25_200.0)["phase"] == "mazefinal"
     visual = p4_contract.training_schedule(0.0, branch="visual_recovery")
-    assert visual["actor_multiplier"] == pytest.approx(0.15)
+    assert visual["actor_multiplier"] == pytest.approx(0.25)
     assert visual["safety_head_multiplier"] == pytest.approx(1.5)
     assert (
         p4_contract.training_contract()["safety_reward_ramp"]["version"]
         == p4_contract.SAFETY_REWARD_RAMP_VERSION
     )
     assert p4_contract.command_contract()["soft_cruise"]["preferred_vx"] == [0.60, 0.75]
+    training = p4_contract.training_contract()
+    assert training["required_platform_wall_seconds"] == 29_700
+    assert training["clock_semantics"]["platform_wall_margin_seconds"] == 300
+    assert training["target_effective_seconds"] == 28_800
+    scaling = p4_contract.reward_contract()["tick_time_scaling"]
+    assert scaling["reference_period_frames"] == 10
+    assert scaling["runtime_period_frames"] == 5
+
+
+def test_p4_missed_safe_direction_ramp_and_event_normalization():
+    assert p4_contract.safe_direction_weight(0.0) == 0.0
+    assert p4_contract.safe_direction_weight(1_800.0) == pytest.approx(0.015)
+    assert p4_contract.safe_direction_weight(7_200.0) == pytest.approx(0.040)
+    assert p4_contract.safe_direction_weight(28_800.0) == pytest.approx(0.030)
+    penalty, diagnostics = p4_contract.maze_missed_safe_direction_penalty(
+        torch.tensor(((0.9, 0.2, 0.1),)),
+        torch.tensor(((0.6, 0.0, 0.0),)),
+        torch.ones(1, dtype=torch.bool),
+        7_200.0,
+    )
+    assert diagnostics["missed_safe_event_active"].item() == 1.0
+    assert 0.0 < diagnostics["missed_safe_event_severity"].item() <= 1.0
+    assert -0.04 <= penalty.item() < 0.0
 
 
 def test_p4_auto_diagnostic_does_not_consume_training_clock():
@@ -508,6 +777,12 @@ def test_p4_auto_branch_uses_accumulated_perception_metrics_not_last_tick():
         algorithm._maze_diag_goal_scene_confusion[index, 0] = 50.0
     algorithm._maze_diag_latent_cosine_sum.fill_(950.0)
     algorithm._maze_diag_latent_cosine_count.fill_(1_000.0)
+    algorithm._maze_diag_fault_risk_positive_hist[-1] = 100.0
+    algorithm._maze_diag_fault_risk_negative_hist[0] = 100.0
+    algorithm._maze_diag_fault_top1_total.fill_(100.0)
+    algorithm._maze_diag_fault_top1_correct.fill_(80.0)
+    for index in range(5):
+        algorithm._maze_diag_fault_scene_confusion[index, index] = 10.0
     algorithm.last_tick_diagnostics = {"scanner_available": torch.zeros(1, 1)}
     assert algorithm._effective_maze_branch(0.0) == "actor_attack"
 
@@ -515,7 +790,14 @@ def test_p4_auto_branch_uses_accumulated_perception_metrics_not_last_tick():
 def test_p4_checkpoint_priority_prefers_new_maze_labels():
     candidates = p4_nav_checkpoint_candidates("/models", 42)
     labels = [Path(candidate).stem.split("-")[-2] for candidate in candidates]
-    assert labels[:4] == ["mazefinal", "mazefull", "mazeprobe", "mazediag"]
+    assert labels[:6] == [
+        "mazefinal",
+        "mazehard",
+        "mazeattack",
+        "mazefull",
+        "mazeprobe",
+        "mazediag",
+    ]
     assert labels.index("mazefinal") < labels.index("pnavstable")
 
 
@@ -544,13 +826,23 @@ def test_p4_training_discovers_one_structurally_compatible_parent_before_p3():
 def test_p4_configuration_and_monitor_route_are_explicit():
     root = Path(__file__).resolve().parents[1]
     config = toml.load(root / "conf/train_env_conf_track_p4_nav_ppo.toml")
-    assert config["p4_nav_ppo"]["run_name"] == "p4maze2h-attack"
+    app_config = toml.load(root.parent / "conf/configure_app.toml")
+    assert config["p4_nav_ppo"]["run_name"] == "p4maze8h-10hzroute"
+    assert config["p4_nav_ppo"]["target_effective_seconds"] == 28_800
+    assert config["p4_nav_ppo"]["task_end_hours"] == pytest.approx(8.25)
+    assert p4_contract.PLATFORM_WALL_MARGIN_SECONDS == 300.0
+    assert p4_contract.PLATFORM_WALL_SECONDS == 29_700.0
     assert config["p4_nav_ppo"]["maze_training_branch"] == "auto"
+    assert config["p4_nav_ppo"]["nav_period_frames"] == 5
     assert config["env"]["num_envs"] == 128
     assert config["env"]["episode_length_s"] == 75.0
     assert config["terrain"]["track"]["track_length"] == 1
     assert config["terrain"]["track"]["sub_terrains"] == ["open_entry_maze"]
-    assert config["p4_nav_ppo"]["parent_model_id"] == 1207698
+    assert config["p4_nav_ppo"]["parent_model_id"] == 1256446
+    assert config["p4_nav_ppo"]["parent_model_label"] == "p4nav2h_1256446-F"
+    assert app_config["app"]["preload_model"] is True
+    assert app_config["app"]["preload_model_id"] == 1256446
+    assert app_config["app"]["policy_entry"] == "p4_nav_ppo"
     source = (root / "conf/monitor_builder.py").read_text()
     assert 'policy_entry == "p4_nav_ppo"' in source
     assert "p4_maze_perception" in source
@@ -560,7 +852,7 @@ def test_p4_configuration_and_monitor_route_are_explicit():
     for metric in (
         "camera_memory_loss",
         "reward_soft_cruise",
-        "head_correct_actor_wrong",
+        "head_correct_actor_wrong_rate",
         "push_actual_delta_vx_mean",
         "adapter_compat_rejected_mismatch_response_profile15",
         "adapter_compat_migrated_legacy_parent_records",
@@ -573,6 +865,36 @@ def test_p4_configuration_and_monitor_route_are_explicit():
         for phase in P4_NAV_PHASE_LABELS
     )
     assert "mazediag" in P4_NAV_PHASE_LABELS
+
+
+def test_p4_worker_push_clock_excludes_diagnostic_wall_time():
+    fresh = SimpleNamespace(
+        maze_training_branch="auto",
+        diagnostic_elapsed_seconds=0.0,
+        session_effective_seconds=0.0,
+    )
+    partial = SimpleNamespace(
+        maze_training_branch="auto",
+        diagnostic_elapsed_seconds=240.0,
+        session_effective_seconds=0.0,
+    )
+    trained = SimpleNamespace(
+        maze_training_branch="auto",
+        diagnostic_elapsed_seconds=p4_contract.DIAGNOSTIC_SECONDS,
+        session_effective_seconds=7_199.0,
+    )
+    explicit = SimpleNamespace(
+        maze_training_branch="actor_attack",
+        diagnostic_elapsed_seconds=0.0,
+        session_effective_seconds=123.0,
+    )
+
+    assert _p4_worker_push_resume_offset(fresh) == -600.0
+    assert _p4_worker_push_resume_offset(partial) == -360.0
+    assert _p4_worker_push_resume_offset(trained) == 7_199.0
+    assert _p4_worker_push_resume_offset(explicit) == 123.0
+    assert p4_contract.push_phase_config(7_199.0)["active"] is False
+    assert p4_contract.push_phase_config(7_200.0)["active"] is True
 
 
 def test_p4_monitor_panels_obey_platform_line_limits():
@@ -770,11 +1092,13 @@ def test_p4_soft_cruise_penalty_only_applies_on_clear_fresh_goal():
     assert abs(penalty[1].item()) < 1.0e-3
     assert diagnostics["soft_cruise_clear_factor"][0].item() > 0.0
     assert diagnostics["soft_cruise_clear_factor"][1].item() < 0.1
-    algorithm._sample_speed_tiers(torch.ones(algorithm.num_envs, dtype=torch.bool))
     assert torch.allclose(
         algorithm.user_speed_cap,
         torch.full_like(algorithm.user_speed_cap, p4_contract.P4_MAX_VX),
     )
+    assert not hasattr(algorithm, "speed_tier")
+    assert not hasattr(algorithm, "speed_generator")
+    assert p4_contract.command_contract()["speed_tier_contract"] == "removed"
 
 
 class _FakeTerminationManager:
@@ -907,8 +1231,12 @@ def test_p4_stuck_terminal_is_single_penalty_and_suppresses_duplicate_safety():
         reward_source_aux=torch.zeros(1, p2_contract.WORKER_AUX_DIM),
         terminal=torch.ones(1, dtype=torch.bool),
         reason=torch.full((1,), 4, dtype=torch.long),
+        duration_frames=torch.full((1,), p4_contract.P4_NAV_PERIOD_FRAMES),
+        start_goal_distance=torch.ones(1),
+        end_goal_distance=torch.ones(1),
+        path_length_m=torch.zeros(1),
     )
-    assert result["stuck_reset"].item() == pytest.approx(-6.0)
+    assert result["stuck_reset"].item() == pytest.approx(-15.0)
     for name in (
         "body_collision",
         "predictive_collision_risk",
@@ -930,16 +1258,75 @@ def test_p4_risk_deceleration_is_measured_after_the_risk_event():
         "goal_age_s": torch.zeros(1),
     }
     algorithm._last_policy_command[0] = torch.tensor([0.6, 0.0, 0.0])
-    algorithm._last_limited_command.copy_(algorithm._last_policy_command)
+    algorithm._last_limited_command[0] = torch.tensor([0.3, 0.0, 0.0])
     first = algorithm._extra_tick_diagnostics()
-    assert first["risk_decel_policy_vx"].item() == 0.0
-    assert first["risk_no_deceleration"].item() == 0.0
+    assert first["risk_decel_policy_count"].item() == 0.0
+    assert first["risk_decel_limited_count"].item() == 0.0
+    assert first["risk_no_deceleration_count"].item() == 0.0
 
     algorithm._last_policy_command[0, 0] = 0.4
     algorithm._last_limited_command[0, 0] = 0.4
     second = algorithm._extra_tick_diagnostics()
-    assert second["risk_decel_policy_vx"].item() == 1.0
-    assert second["risk_no_deceleration"].item() == 0.0
+    assert second["risk_decel_policy_count"].item() == 1.0
+    assert second["risk_decel_limited_count"].item() == 0.0
+    assert second["risk_no_deceleration_count"].item() == 0.0
+
+    algorithm._risk_event_active.fill_(False)
+    algorithm._risk_condition_previous.fill_(False)
+    algorithm._last_policy_command[0, 0] = 0.6
+    algorithm._last_limited_command[0, 0] = 0.3
+    algorithm._extra_tick_diagnostics()
+    algorithm._last_policy_command[0, 0] = 0.6
+    algorithm._last_limited_command[0, 0] = 0.1
+    third = algorithm._extra_tick_diagnostics()
+    assert third["risk_decel_policy_count"].item() == 0.0
+    assert third["risk_decel_limited_count"].item() == 1.0
+
+
+def test_p4_risk_response_window_uses_ten_full_followup_ticks():
+    algorithm = _p4_algorithm()
+    algorithm.pending_tick = {
+        "safe3": torch.tensor([[0.8, 0.2, 0.8]]),
+        "safety_valid": torch.ones(1, 1),
+    }
+    algorithm._last_goal_freshness.fill_(1.0)
+    algorithm.goal_belief.last_diagnostics = {
+        "goal_innovation_d2": torch.zeros(1),
+        "goal_age_s": torch.zeros(1),
+    }
+    algorithm._last_policy_command[0] = torch.tensor([0.6, 0.0, 0.0])
+    algorithm._last_limited_command[0] = torch.tensor([0.6, 0.0, 0.0])
+
+    onset = algorithm._extra_tick_diagnostics()
+    assert onset["risk_no_deceleration_count"].item() == 0.0
+    for _ in range(algorithm._risk_response_ticks - 1):
+        pending = algorithm._extra_tick_diagnostics()
+        assert pending["risk_no_deceleration_count"].item() == 0.0
+    settled = algorithm._extra_tick_diagnostics()
+    assert settled["risk_no_deceleration_count"].item() == 1.0
+
+
+def test_p4_conditional_metrics_do_not_divide_event_rates_by_all_ticks():
+    metrics = _p4_conditional_metrics(
+        {
+            "head_correct_samples": torch.tensor(10.0),
+            "head_correct_actor_wrong_count": torch.tensor(3.0),
+            "risk_event_resolved_count": torch.tensor(8.0),
+            "risk_decel_policy_count": torch.tensor(2.0),
+            "risk_decel_limited_count": torch.tensor(4.0),
+            "risk_no_deceleration_count": torch.tensor(2.0),
+            "stuck_terminal_count": torch.tensor(2.0),
+            "stuck_terminal_episode_return_sum": torch.tensor(-34.0),
+            "stuck_terminal_nonnegative_count": torch.tensor(0.0),
+        },
+        torch.device("cpu"),
+    )
+    assert metrics["head_correct_actor_wrong_rate"] == pytest.approx(0.3)
+    assert metrics["risk_decel_policy_rate"] == pytest.approx(0.25)
+    assert metrics["risk_decel_limited_rate"] == pytest.approx(0.5)
+    assert metrics["risk_no_deceleration_rate"] == pytest.approx(0.25)
+    assert metrics["stuck_terminal_episode_return_mean"] == pytest.approx(-17.0)
+    assert metrics["stuck_terminal_nonnegative_rate"] == 0.0
 
 
 def test_p4_exact_resume_round_trip_restores_stage_rng_and_clock():
@@ -954,6 +1341,7 @@ def test_p4_exact_resume_round_trip_restores_stage_rng_and_clock():
     algorithm._configure_adapter_contract()
     algorithm._diagnostic_nav_risk_probe.weight.data.fill_(0.125)
     algorithm._maze_diag_goal_top1_total.fill_(37.0)
+    algorithm._maze_diag_fault_top1_total.fill_(13.0)
     algorithm.update_training_clocks(600.0)
     algorithm.update_training_clocks(15_000.0)
     with tempfile.TemporaryDirectory() as directory:
@@ -965,14 +1353,44 @@ def test_p4_exact_resume_round_trip_restores_stage_rng_and_clock():
     assert resumed.session_effective_seconds == pytest.approx(14_400.0)
     assert resumed.session_wall_seconds == pytest.approx(15_000.0)
     assert resumed._resolved_maze_training_branch == "actor_attack"
-    assert resumed.current_phase == "mazefinal"
+    assert resumed.current_phase == "mazeattack"
     assert resumed._initial_low_digest == algorithm._initial_low_digest
-    assert resumed.speed_generator.get_state().equal(algorithm.speed_generator.get_state())
+    assert not hasattr(resumed, "speed_generator")
     assert torch.equal(
         resumed._diagnostic_nav_risk_probe.weight,
         algorithm._diagnostic_nav_risk_probe.weight,
     )
     assert resumed._maze_diag_goal_top1_total.item() == pytest.approx(37.0)
+    assert resumed._maze_diag_fault_top1_total.item() == pytest.approx(13.0)
+
+
+def test_p4_exact_resume_restores_visual_recovery_schedule_before_parent_load():
+    algorithm = _p4_algorithm()
+    algorithm.maze_training_branch = "auto"
+    algorithm._resolved_maze_training_branch = "visual_recovery"
+    algorithm.diagnostic_elapsed_seconds = p4_contract.DIAGNOSTIC_SECONDS
+    algorithm._initial_low_digest = algorithm._module_digest(
+        (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
+    )
+    algorithm.low_level_state_digest = algorithm._initial_low_digest
+    algorithm._configure_adapter_contract()
+    algorithm.update_training_clocks(600.0)
+    with tempfile.TemporaryDirectory() as directory:
+        path = str(Path(directory) / "model.ckpt-mazeprobe-42.pkl")
+        algorithm.save_training_bundle(path, platform_model_id="42")
+        resumed = _p4_algorithm()
+        mode = resumed.load_bundle(path, platform_model_id="42")
+    assert mode == "p4_exact_resume_history_reset"
+    assert resumed._resolved_maze_training_branch == "visual_recovery"
+    expected = p4_contract.training_schedule(0.0, branch="visual_recovery")
+    assert resumed.current_phase == expected["phase"]
+    actor_group = next(
+        group for group in resumed.actor_optimizer.param_groups
+        if group.get("name") == "actor_trunk"
+    )
+    assert actor_group["lr"] == pytest.approx(
+        p4_contract.ACTOR_LR * expected["actor_multiplier"]
+    )
 
 
 def test_p4_maze_diagnostic_probe_trains_inside_finish_tick_no_grad_context():
@@ -1007,6 +1425,45 @@ def test_p4_maze_diagnostic_probe_trains_inside_finish_tick_no_grad_context():
     )
 
 
+def test_p4_fault_diagnostic_uses_only_held_out_probe_environments():
+    algorithm = _p4_algorithm(num_envs=5)
+    algorithm.maze_training_branch = "auto"
+    algorithm._resolved_maze_training_branch = None
+    safe3 = torch.tensor(
+        [
+            [0.90, 0.20, 0.10],
+            [0.10, 0.90, 0.20],
+            [0.20, 0.10, 0.90],
+            [0.80, 0.75, 0.10],
+            [0.10, 0.15, 0.20],
+        ]
+    )
+    valid = torch.ones(5, dtype=torch.bool)
+    nav_feat = torch.randn(5, 32)
+    goal4 = torch.randn(5, 4)
+    fault_feat = torch.randn(5, 32)
+
+    algorithm._accumulate_maze_diagnostic(
+        safe3,
+        valid,
+        nav_feat,
+        goal4,
+        fault_feat,
+        torch.tensor([False, True, False, False, False]),
+    )
+    assert algorithm._maze_diag_fault_scene_confusion.sum().item() == 0.0
+
+    algorithm._accumulate_maze_diagnostic(
+        safe3,
+        valid,
+        nav_feat,
+        goal4,
+        fault_feat,
+        torch.tensor([True, False, False, False, False]),
+    )
+    assert algorithm._maze_diag_fault_scene_confusion.sum().item() == 1.0
+
+
 def test_p4_exact_resume_rejects_stuck_reset_contract_drift():
     algorithm = _p4_algorithm()
     algorithm._initial_low_digest = algorithm._module_digest(
@@ -1023,6 +1480,24 @@ def test_p4_exact_resume_rejects_stuck_reset_contract_drift():
         )
         with pytest.raises(ValueError, match="training contract mismatch"):
             resumed.load_bundle(path, platform_model_id="42")
+
+
+def test_p4_exact_resume_rejects_non_mapper_command_contract_drift():
+    algorithm = _p4_algorithm()
+    algorithm._initial_low_digest = algorithm._module_digest(
+        (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
+    )
+    algorithm.low_level_state_digest = algorithm._initial_low_digest
+    algorithm._configure_adapter_contract()
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "model.ckpt-mazeprobe-42.pkl"
+        algorithm.save_training_bundle(str(path), platform_model_id="42")
+        payload = torch.load(path, weights_only=False, map_location="cpu")
+        payload["contracts"]["command"]["soft_cruise"]["preferred_vx"][0] = 0.55
+        torch.save(payload, path)
+        resumed = _p4_algorithm()
+        with pytest.raises(ValueError, match="command contract mismatch"):
+            resumed.load_bundle(str(path), platform_model_id="42")
 
 
 def test_p4_previous_contract_loads_as_maze_warm_start():
@@ -1098,6 +1573,10 @@ def test_p4_runtime_stuck_reset_contract_controls_reward_and_metadata():
         reward_source_aux=torch.zeros(1, p2_contract.WORKER_AUX_DIM),
         terminal=torch.ones(1, dtype=torch.bool),
         reason=torch.full((1,), 4, dtype=torch.long),
+        duration_frames=torch.full((1,), p4_contract.P4_NAV_PERIOD_FRAMES),
+        start_goal_distance=torch.ones(1),
+        end_goal_distance=torch.ones(1),
+        path_length_m=torch.zeros(1),
     )
     metadata = p4_contract.contract_metadata(algorithm.stuck_reset_contract)
     assert result["stuck_reset"].item() == pytest.approx(-4.5)

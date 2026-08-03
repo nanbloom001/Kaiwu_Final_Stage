@@ -4,6 +4,38 @@
 
 ## [未发布]
 
+- **[P4 Maze 10Hz 路径效率强化]** 基于 `p4nav2h_1256446-F` 将 P4 高层控制由 5Hz 提升到
+  10Hz，同时保持 Actor85、三轴动作、32-tick rollout、TBPTT16、低层 50Hz 和部署接口不变。
+  成功 impulse 提高到 `+200`；新增持续卡墙、目标一致的安全选向和额外路程三项小幅负奖励。
+  连续 tick 奖励按 `duration_frames/10` 归一化，避免 10Hz 把原 5Hz 每秒权重翻倍；按米路程、
+  每次决策 command-rate 和 terminal impulse 保持原语义。旧 slow/cruise/fast 速度档运行时状态与
+  RNG 已删除，exact resume 会恢复已选择的诊断分支后重新应用对应 LR。前 10 分钟只读诊断不计入
+  28800 秒梯度训练，并保留 300 秒 rollout/保存/退出余量，平台墙钟合同因此为 29700 秒
+  （8 小时 15 分钟）。Push worker 在诊断阶段使用剩余诊断时间的负偏移，2 小时启用边界严格按
+  有效训练时间。活动入口和 smoke 默认父包
+  同步为 `1256446`；安全方向内的目标偏好使用 terminal-safe 米制真值，带噪 GoalBelief 不进入
+  PPO reward。
+
+- **[P4 Track eval-only SafetyHead 边界]** 将 `c93dd11` 已用于旧模型 ZIP 的最小保护补入
+  活动 P4 算法源码。`p4_track_eval` 省略 training-only `NavigationSafetyHead` 时，公共相机教师
+  诊断路径保持风险 tensor 为零，不再首帧调用 `None`；训练装配存在 SafetyHead 时仍执行原计算。
+  不改变网络、checkpoint、Actor action、Goal、终止或 scorer 合同。
+
+- **[P4 Maze 感知归因与进攻式八小时强化]** 新分支 `codex/p4-maze8h-attack` 将
+  `p4maze2h-attack` 扩展为诊断后完整训练 28800 秒的 `p4maze8h-attack`。训练改为
+  `mazeprobe/mazeattack/mazehard/mazefinal` 四阶段，保留 Actor85、三轴 mapper、低层冻结和
+  单段 Maze。新增 10% clean-depth 轻故障只读 shadow，用于区分视觉鲁棒性与 Actor 决策问题；
+  fault 在同一 5Hz 教师 tick 生成并与特征 mask 对齐，不进入 observation、reward 或 storage。
+  missed-safe 使用事件归一化严重度和连续 8 小时
+  权重课程，predictive collision 提升至 1.25 倍且安全组封顶 -0.06；实际
+  `frontier_stagnation` 归零，仅保留 shadow。active wall-stuck terminal impulse 改为 -15，并新增
+  episode return/非负率监控。单段 `open_entry_maze` 的 physical segment 0 现在按配置映射到
+  Maze 指标桶，不再误记为 slope。监控条件率以 eligible event 为分母，checkpoint 同时恢复
+  fault RNG/统计/分支并核验 reward 合同；风险减速事件在 terminal tick 立即作废，避免把 reset
+  后变化归因给旧 episode。fault 鲁棒性仅使用 held-out probe 环境，P4 启动同时核验 Maze-only
+  segment 与实际三轴 slew，exact resume 比较完整 command contract。旧 P4 仅 warm start，不增加
+  模型 ID 硬门禁。
+
 - **[P4 Maze 感知诊断与软巡航两小时强化]** 新分支 `codex/p4-maze2h-attack`
   将 P4 Track 训练入口切为 `p4maze2h-attack`：128 env、75 秒 episode、单段
   `open_entry_maze`、20 个静态难度列、课程关闭，总计 7200 秒。旧 slow/cruise/fast
