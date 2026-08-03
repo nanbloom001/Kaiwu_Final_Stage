@@ -3,6 +3,13 @@ set -euo pipefail
 
 TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+if [[ -f "$TOOL_DIR/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$TOOL_DIR/.env"
+  set +a
+fi
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -21,6 +28,7 @@ Examples:
 Environment:
   AGENT_BROWSER_SESSION       Default: tencent-arena
   AGENT_BROWSER_SESSION_NAME  Default: same as AGENT_BROWSER_SESSION
+  AGENT_BROWSER_PROFILE       Default: runtime/browser_profile (stores login locally)
   AGENT_BROWSER_HEADED        Default: 1
 EOF
 }
@@ -65,6 +73,10 @@ fi
 
 export AGENT_BROWSER_SESSION="${AGENT_BROWSER_SESSION:-tencent-arena}"
 export AGENT_BROWSER_SESSION_NAME="${AGENT_BROWSER_SESSION_NAME:-$AGENT_BROWSER_SESSION}"
+export AGENT_BROWSER_PROFILE="${AGENT_BROWSER_PROFILE:-$TOOL_DIR/runtime/browser_profile}"
+if [[ "$AGENT_BROWSER_PROFILE" != /* ]]; then
+  export AGENT_BROWSER_PROFILE="$TOOL_DIR/$AGENT_BROWSER_PROFILE"
+fi
 export AGENT_BROWSER_HEADED="${AGENT_BROWSER_HEADED:-1}"
 
 if ! command -v agent-browser >/dev/null 2>&1; then

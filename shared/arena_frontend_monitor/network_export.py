@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from browser_auth import agent_browser_env
+
 
 ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(
@@ -89,9 +91,7 @@ def decode_output(data: bytes) -> str:
 
 
 def run_agent_browser(args: list[str], session: str, session_name: str, timeout: int = 30) -> str:
-    env = os.environ.copy()
-    env["AGENT_BROWSER_SESSION"] = session
-    env["AGENT_BROWSER_SESSION_NAME"] = session_name
+    env = agent_browser_env(session, session_name)
     executable = shutil.which("agent-browser") or shutil.which("agent-browser.cmd") or "agent-browser"
     cmd = [executable] + args
     proc = subprocess.run(
