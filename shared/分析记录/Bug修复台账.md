@@ -3816,3 +3816,17 @@
   相机单位、terminal snapshot、active stuck reset 或 eval-only SafetyHead 已验证修复。
 - 再遇检查：`nav_period_frames` -> `reward_continuous_time_scale` -> reward conservation ->
   `session_wall_seconds/session_effective_seconds` -> saved training/reward/command digest -> 首个 PPO update。
+
+### 2026-08-04 正式任务阶段性追加
+
+- 正式任务 `p4maze8h10hz-r2` 已创建并运行，平台任务 ID `236264`，UUID
+  `7946801e-bf35-41b6-bd7a-63614d1960ee`，父模型为 `p4nav2h_1256446-F`，平台墙钟为
+  `8h15min`。任务已越过 600 秒只读诊断并自动选择 `visual_recovery`；前约 30 分钟未出现
+  OOM、非有限值、生命周期失败或低层 digest 漂移，PPO/Adapter 持续更新，10 分钟周期保存已成功。
+- 平台精确指标显示：诊断 teacher coverage 为 `1.0`，wall AUROC 约 `0.879`、墙面漏检率约
+  `0.329`、安全方向 top-1 约 `0.791`、scene macro-F1 约 `0.428`；clean/fault 指标接近，符合
+  视觉恢复分支选择。PPO KL 约 `0.004-0.010`、clip fraction 约 `0.04-0.09`，峰值 reserved
+  显存约 `1.10GB`，reward conservation error 为 `0`，低层 optimizer steps 为 `0`。
+- 发现平台 logger 不兼容 Python logging 的 printf 参数转发，导致自动分支和 exact-resume 对齐日志
+  显示未展开的 `%s/%d`。已改为调用前完成字符串格式化；这是可观测性修复，不改变正在运行任务的
+  数值行为，当前任务无需为此重启。待下一次任务或 exact resume smoke 验证新日志文本。

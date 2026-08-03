@@ -3398,8 +3398,7 @@ class AlgorithmP2NavPPO:
             if self.logger:
                 self.logger.warning(
                     "[P2NavPPO] exact resume discarded an unfinished navigation "
-                    "tick and aligned frame_count by %d frames",
-                    alignment_delta,
+                    f"tick and aligned frame_count by {alignment_delta} frames"
                 )
         self.actor_gradient_steps = int(high_state["actor_gradient_steps"])
         self.critic_gradient_steps = int(high_state["critic_gradient_steps"])

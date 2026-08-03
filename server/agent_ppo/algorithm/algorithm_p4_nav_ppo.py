@@ -1655,25 +1655,21 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             )
             if self.logger:
                 self.logger.info(
-                    "[P4Maze] auto diagnostic selected branch=%s coverage=%.3f "
-                    "wall_auroc=%.3f wall_miss=%.3f top1=%.3f scene_f1=%.3f "
-                    "clean_live_cos=%.3f goal_auc=%.3f goal_top1=%.3f "
-                    "goal_scene_f1=%.3f fault_auc=%.3f fault_top1=%.3f "
-                    "fault_scene_f1=%.3f sufficient_samples=%s",
-                    self._resolved_maze_training_branch,
-                    summary["teacher_coverage"],
-                    summary["wall_auroc"],
-                    summary["wall_miss_rate"],
-                    summary["safe_top1_accuracy"],
-                    summary["scene_macro_f1"],
-                    summary["clean_live_latent_cosine"],
-                    summary["goal_wall_auroc"],
-                    summary["goal_safe_top1_accuracy"],
-                    summary["goal_scene_macro_f1"],
-                    summary["fault_wall_auroc"],
-                    summary["fault_safe_top1_accuracy"],
-                    summary["fault_scene_macro_f1"],
-                    sufficient_samples,
+                    f"[P4Maze] auto diagnostic selected "
+                    f"branch={self._resolved_maze_training_branch} "
+                    f"coverage={summary['teacher_coverage']:.3f} "
+                    f"wall_auroc={summary['wall_auroc']:.3f} "
+                    f"wall_miss={summary['wall_miss_rate']:.3f} "
+                    f"top1={summary['safe_top1_accuracy']:.3f} "
+                    f"scene_f1={summary['scene_macro_f1']:.3f} "
+                    f"clean_live_cos={summary['clean_live_latent_cosine']:.3f} "
+                    f"goal_auc={summary['goal_wall_auroc']:.3f} "
+                    f"goal_top1={summary['goal_safe_top1_accuracy']:.3f} "
+                    f"goal_scene_f1={summary['goal_scene_macro_f1']:.3f} "
+                    f"fault_auc={summary['fault_wall_auroc']:.3f} "
+                    f"fault_top1={summary['fault_safe_top1_accuracy']:.3f} "
+                    f"fault_scene_f1={summary['fault_scene_macro_f1']:.3f} "
+                    f"sufficient_samples={sufficient_samples}"
                 )
         return self._resolved_maze_training_branch
 
