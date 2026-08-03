@@ -13,6 +13,7 @@ from unittest import mock
 TOOL_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = TOOL_ROOT / "network_export.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+sys.path.insert(0, str(TOOL_ROOT))
 SPEC = importlib.util.spec_from_file_location("arena_network_export_under_test", MODULE_PATH)
 MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None

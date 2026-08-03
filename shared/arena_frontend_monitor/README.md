@@ -6,7 +6,7 @@
 
 ## 适用范围
 
-- 复用已经登录腾讯竞技平台的 `agent-browser` 会话。
+- 复用已经登录腾讯竞技平台的 `agent-browser` 会话和本地持久化浏览器 profile。
 - 采集“监控总览”中按需加载的指标卡片。
 - 采集“训练日志”及重要错误、告警和训练状态记录。
 - 导出 `GetTrainMetricRange`、`GetTrainLog` 前端请求。
@@ -17,8 +17,8 @@
 
 - Python 3.9 或更高版本。
 - `agent-browser` 命令已经安装并位于 `PATH`。
-- `agent-browser` 中已有登录成功的腾讯竞技平台会话。
-- 当前标签页已经打开目标训练任务的监控页面。
+- 首次运行时在可视化 `agent-browser` 窗口中完成一次腾讯竞技平台登录。
+- 当前标签页已经打开目标训练任务的监控页面，或运行时显式传入监控 URL。
 
 默认会话名为 `tencent-arena`，也可以通过环境变量覆盖：
 
@@ -26,6 +26,34 @@
 export AGENT_BROWSER_SESSION=tencent-arena
 export AGENT_BROWSER_SESSION_NAME=tencent-arena
 ```
+
+### 登录状态持久化
+
+工具默认把独立 Chrome profile 保存在：
+
+```text
+shared/arena_frontend_monitor/runtime/browser_profile/
+```
+
+该目录会保存 Cookie、localStorage 等登录状态，并已被 Git 忽略。第一次使用
+`manual_metric_recorder.sh` 时正常登录一次；以后使用同一 profile 的采集命令会自动复用登录态，
+不需要再次输入密码。平台主动让会话过期时，才需要重新登录。
+
+如果升级前已经有一个未使用 profile 启动的 `tencent-arena` 窗口，请先正常关闭该窗口或执行
+`AGENT_BROWSER_SESSION=tencent-arena agent-browser close`，再运行一次手动采集入口并登录。这个
+迁移步骤只需要执行一次，不要在仍有采集任务控制该会话时强制关闭浏览器。
+
+需要自定义位置时，可创建仅保存在本机的配置：
+
+```bash
+cp shared/arena_frontend_monitor/.env.example \
+  shared/arena_frontend_monitor/.env
+```
+
+然后修改 `.env` 中的 `AGENT_BROWSER_PROFILE`。相对路径以本工具目录为基准，也可以使用仓库外
+的绝对路径。所有 Python 和 shell 入口都会自动读取该文件，已存在的进程环境变量优先于
+`.env`。不要在 `.env` 中保存密码或粘贴原始 Cookie；profile 本身已经负责安全地保存浏览器
+登录状态。
 
 先执行不会打开、切换或刷新网页的离线检查：
 
@@ -35,7 +63,7 @@ python3 shared/arena_frontend_monitor/network_export.py --check
 
 该检查只验证 Python、`agent-browser --version`、各配套 CLI 的 `--help`、固定
 HAR fixture 解析和输出目录可写性。
-它不验证腾讯登录态；真实采集前仍需人工打开并登录目标监控页面。
+它不验证腾讯登录态；首次真实采集仍需人工打开并登录目标监控页面，后续会复用本地 profile。
 
 ## 推荐用法
 
@@ -166,7 +194,8 @@ export ARENA_MONITOR_RUNTIME_DIR="$HOME/arena-monitor-runtime"
 
 - 不要把平台 Token、Cookie、HAR、训练日志或采集结果提交到 Git。
 - 监控 URL 可能包含任务标识或查询参数，只应通过命令行或环境变量临时传入。
-- 工具复用现有登录会话，不负责保存或分发登录凭据。
+- 工具在本机 Git 忽略目录中保存独立浏览器 profile，不保存明文密码，也不分发登录凭据。
+- `runtime/browser_profile/` 和 `.env` 都属于敏感本地状态，不要复制到共享目录或提交到 Git。
 - 页面结构变化后，自动点击和滚动选择器可能需要同步调整。
 - 采集过程中不要同时让其他程序控制同一个 `agent-browser` 会话。
 - 训练已停止时，页面可能需要先启用“每 5 秒自动刷新”才能重新请求历史指标。
