@@ -3189,11 +3189,8 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self.parent_phase_label = (bundle.get("lineage") or {}).get(
                 "p4_parent_phase"
             )
-            restore_stuck_head = (
-                exact_compatible or self.training_profile == "full_track"
-            )
-            if restore_stuck_head:
-                high = (bundle.get("modules") or {}).get("high_level") or {}
+            high = (bundle.get("modules") or {}).get("high_level") or {}
+            if exact_compatible:
                 self._load_leaf(
                     high,
                     "actor_stuck_head",
@@ -3202,9 +3199,20 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                     spec=p4_actor_stuck_head_spec(),
                     context="P4 exact resume high_level",
                 )
-                if exact_compatible:
-                    self._load_p4_state(original_p4_state)
+                self._load_p4_state(original_p4_state)
             else:
+                if (
+                    self.training_profile == "full_track"
+                    and isinstance(high.get("actor_stuck_head"), dict)
+                ):
+                    self._load_leaf(
+                        high,
+                        "actor_stuck_head",
+                        self.stuck_head,
+                        class_name="P4ActorStuckHead",
+                        spec=p4_actor_stuck_head_spec(),
+                        context="P4 legacy full-track warm start high_level",
+                    )
                 if self.training_profile == "maze_credit_repair":
                     self.critic.load_state_dict(
                         self._credit_fresh_critic_state, strict=True

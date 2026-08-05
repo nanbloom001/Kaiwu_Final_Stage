@@ -4270,8 +4270,10 @@
   28800 秒时钟和 `fullstabilize` 恢复；新增 fake platform builder 验证最终 full/credit dashboard
   的标题和 group 路由。复审补充了历史误标包保留 StuckHead leaf/optimizer group 的真实形状回归：
   同名组按参数名迁移并返回 `p4_full_track_legacy_contract_warm_start`，旧包缺组时才 fresh。
+  第二次复审进一步覆盖同时缺少 StuckHead leaf/group 的更旧包：不再强制读取不存在的 leaf，保持
+  初始化 head，并与含 head 的路径统一执行 warm-start session/live-state 重置和降级告警。
   历史误标 full-track 包按新 session 重置计数和 optimizer phase，不再把 28800 秒旧时钟带入
-  `fullwarm` 校验。最终 P4/P2 核心回归 `265 passed`，Python 编译、TOML、两项 UWB C++ 测试和
+  `fullwarm` 校验。最终 P4/P2 核心回归 `266 passed`，Python 编译、TOML、两项 UWB C++ 测试和
   `git diff --check` 通过。
 - 回滚：恢复固定 Maze metadata 会重新破坏 full-track exact resume；如需临时绕过，只能把旧包
   明确作为 warm start，不能放宽模型 ID 或 scope 门禁。监控可独立回滚为 Maze 面板，但会失去五段

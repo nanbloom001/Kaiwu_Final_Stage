@@ -1915,6 +1915,54 @@ def test_p4_mislabeled_full_track_checkpoint_degrades_to_warm_start():
     assert "actor_stuck_head" not in report["fresh_groups"]
 
 
+def test_p4_mislabeled_full_track_without_stuck_head_keeps_it_fresh():
+    algorithm = _p4_algorithm()
+    algorithm._initial_low_digest = algorithm._module_digest(
+        (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
+    )
+    algorithm.low_level_state_digest = algorithm._initial_low_digest
+    algorithm._configure_adapter_contract()
+    algorithm.update_training_clocks(28_800.0)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "model.ckpt-fullstabilize-42.pkl"
+        algorithm.save_training_bundle(str(path), platform_model_id="42")
+        payload = torch.load(path, weights_only=False, map_location="cpu")
+        mislabeled = p4_contract.contract_metadata(
+            algorithm.stuck_reset_contract,
+            "maze_credit_repair",
+        )
+        for key in (
+            "command", "command_digest", "reward", "reward_digest",
+            "training", "training_digest",
+        ):
+            payload["contracts"][key] = mislabeled[key]
+        payload["modules"]["high_level"].pop("actor_stuck_head")
+        actor_optimizer = payload["optimizers"]["high_level_actor"]
+        stuck_group_index = next(
+            index
+            for index, group in enumerate(actor_optimizer["param_groups"])
+            if group.get("name") == "actor_stuck_head"
+        )
+        stuck_group = actor_optimizer["param_groups"].pop(stuck_group_index)
+        for parameter_id in stuck_group["params"]:
+            actor_optimizer["state"].pop(parameter_id, None)
+        torch.save(payload, path)
+        resumed = _p4_algorithm()
+        expected = {
+            name: value.detach().clone()
+            for name, value in resumed.stuck_head.state_dict().items()
+        }
+        mode = resumed.load_bundle(str(path), platform_model_id="42")
+    assert mode == "p4_full_track_legacy_contract_warm_start"
+    assert all(
+        torch.equal(resumed.stuck_head.state_dict()[name], value)
+        for name, value in expected.items()
+    )
+    report = resumed.optimizer_migration_report["p4_actor_optimizer"]
+    assert "actor_stuck_head" in report["fresh_groups"]
+    assert "actor_stuck_head" not in report["restored_groups"]
+
+
 def test_p4_credit_repair_separates_wall_and_active_training_clocks():
     algorithm = _p4_algorithm(
         config={
