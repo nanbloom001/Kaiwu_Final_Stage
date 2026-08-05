@@ -2884,7 +2884,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
     def _migrate_previous_p4_actor_optimizer(
         self, old_state: dict
     ) -> tuple[dict, dict[str, object]]:
-        """Restore previous P4 Adam groups while leaving StuckHead fresh."""
+        """Restore compatible previous P4 Adam groups by stable group name."""
         if not isinstance(old_state, dict):
             raise KeyError("P4 warm start missing high-level actor optimizer")
         validate_state_dict_finite(old_state, "P4 previous actor optimizer")
@@ -2902,10 +2902,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self.actor_optimizer.param_groups, current_state["param_groups"]
         ):
             name = str(object_group.get("name", ""))
-            if name == "actor_stuck_head":
+            source_group = old_by_name.get(name)
+            if name == "actor_stuck_head" and source_group is None:
                 fresh_groups.append(name)
                 continue
-            source_group = old_by_name.get(name)
             if source_group is None:
                 raise ValueError(
                     f"P4 previous actor optimizer missing group {name!r}"
@@ -3102,27 +3102,26 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                         0.0,
                         branch=("credit_repair" if credit_repair else "actor_attack"),
                     )
-                    if credit_repair:
-                        inherited_seconds = max(
-                            0.0,
-                            float(high_state.get("lifetime_effective_seconds", 0.0)),
-                            float(high_state.get("effective_training_seconds", 0.0)),
-                            float(high_state.get("session_effective_seconds", 0.0)),
-                        )
-                        high_state.update(
-                            effective_training_seconds=0.0,
-                            session_effective_seconds=0.0,
-                            lifetime_effective_seconds=inherited_seconds,
-                            lifetime_base_seconds=inherited_seconds,
-                            frame_count=0,
-                            iteration=0,
-                            actor_gradient_steps=0,
-                            critic_gradient_steps=0,
-                            nav_ticks=0,
-                            skipped_nonfinite=0,
-                            nonfinite_action_fallbacks=0,
-                            invalid_transition_count=0,
-                        )
+                    inherited_seconds = max(
+                        0.0,
+                        float(high_state.get("lifetime_effective_seconds", 0.0)),
+                        float(high_state.get("effective_training_seconds", 0.0)),
+                        float(high_state.get("session_effective_seconds", 0.0)),
+                    )
+                    high_state.update(
+                        effective_training_seconds=0.0,
+                        session_effective_seconds=0.0,
+                        lifetime_effective_seconds=inherited_seconds,
+                        lifetime_base_seconds=inherited_seconds,
+                        frame_count=0,
+                        iteration=0,
+                        actor_gradient_steps=0,
+                        critic_gradient_steps=0,
+                        nav_ticks=0,
+                        skipped_nonfinite=0,
+                        nonfinite_action_fallbacks=0,
+                        invalid_transition_count=0,
+                    )
                     high_state["optimizer_phase"] = str(warm_schedule["phase"])
                     high_state["entropy_coefficient"] = float(
                         warm_schedule["entropy_coefficient"]
@@ -3161,7 +3160,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                         "p4_actor_optimizer": actor_optimizer_report,
                         "p4_critic_optimizer": {
                             "status": "reset",
-                            "reason": "maze_credit_reward_and_horizon_change",
+                            "reason": (
+                                "maze_credit_reward_and_horizon_change"
+                                if credit_repair
+                                else "legacy_full_track_contract_restart"
+                            ),
                         },
                         "p4_warm_start_rng": warm_rng_report,
                     }
@@ -3186,7 +3189,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self.parent_phase_label = (bundle.get("lineage") or {}).get(
                 "p4_parent_phase"
             )
-            if exact_compatible:
+            restore_stuck_head = (
+                exact_compatible or self.training_profile == "full_track"
+            )
+            if restore_stuck_head:
                 high = (bundle.get("modules") or {}).get("high_level") or {}
                 self._load_leaf(
                     high,
@@ -3196,7 +3202,8 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                     spec=p4_actor_stuck_head_spec(),
                     context="P4 exact resume high_level",
                 )
-                self._load_p4_state(original_p4_state)
+                if exact_compatible:
+                    self._load_p4_state(original_p4_state)
             else:
                 if self.training_profile == "maze_credit_repair":
                     self.critic.load_state_dict(
@@ -3235,12 +3242,24 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 self._apply_training_schedule(0.0)
                 self.reset_live_state()
                 if self.logger:
+                    warm_profile = (
+                        "Maze credit-repair"
+                        if self.training_profile == "maze_credit_repair"
+                        else "full-track legacy-contract"
+                    )
                     self.logger.warning(
-                        "[P4NavPPO] previous P4 contract loaded as Maze credit-repair "
-                        "warm start; Actor Adam, Critic and session state reset"
+                        f"[P4NavPPO] previous P4 contract loaded as {warm_profile} "
+                        "warm start; Critic and session state reset"
                     )
             self._configure_adapter_contract()
-            return f"p4_{mode if exact_compatible else 'maze_credit_repair_warm_start'}"
+            if exact_compatible:
+                return f"p4_{mode}"
+            warm_disposition = (
+                "maze_credit_repair_warm_start"
+                if self.training_profile == "maze_credit_repair"
+                else "full_track_legacy_contract_warm_start"
+            )
+            return f"p4_{warm_disposition}"
         disposition = validate_p3_eval_bundle(raw, mode="track")
         if self.logger and not disposition.get("phase_label_known", False):
             self.logger.warning(

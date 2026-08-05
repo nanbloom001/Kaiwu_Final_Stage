@@ -1878,6 +1878,43 @@ def test_p4_full_track_checkpoint_metadata_and_exact_resume_round_trip():
     assert resumed.current_phase == "fullstabilize"
 
 
+def test_p4_mislabeled_full_track_checkpoint_degrades_to_warm_start():
+    algorithm = _p4_algorithm()
+    algorithm._initial_low_digest = algorithm._module_digest(
+        (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
+    )
+    algorithm.low_level_state_digest = algorithm._initial_low_digest
+    algorithm._configure_adapter_contract()
+    algorithm.stuck_head.logit.bias.data.fill_(0.375)
+    algorithm.update_training_clocks(28_800.0)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "model.ckpt-fullstabilize-42.pkl"
+        algorithm.save_training_bundle(str(path), platform_model_id="42")
+        payload = torch.load(path, weights_only=False, map_location="cpu")
+        mislabeled = p4_contract.contract_metadata(
+            algorithm.stuck_reset_contract,
+            "maze_credit_repair",
+        )
+        for key in (
+            "command", "command_digest", "reward", "reward_digest",
+            "training", "training_digest",
+        ):
+            payload["contracts"][key] = mislabeled[key]
+        torch.save(payload, path)
+        resumed = _p4_algorithm()
+        mode = resumed.load_bundle(str(path), platform_model_id="42")
+    assert mode == "p4_full_track_legacy_contract_warm_start"
+    assert resumed.session_effective_seconds == 0.0
+    assert resumed.current_phase == "fullwarm"
+    assert torch.allclose(
+        resumed.stuck_head.logit.bias,
+        torch.full_like(resumed.stuck_head.logit.bias, 0.375),
+    )
+    report = resumed.optimizer_migration_report["p4_actor_optimizer"]
+    assert "actor_stuck_head" in report["restored_groups"]
+    assert "actor_stuck_head" not in report["fresh_groups"]
+
+
 def test_p4_credit_repair_separates_wall_and_active_training_clocks():
     algorithm = _p4_algorithm(
         config={

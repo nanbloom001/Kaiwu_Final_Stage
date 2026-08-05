@@ -10,7 +10,9 @@
   profile 对应的 `train_scope`；历史误标成 Maze 合同的 full-track 包只能结构化 warm start，
   不再伪装 exact resume。监控构建器读取活动 P4 TOML 的 profile，full-track 会真实装配
   `P4全赛道诊断` 面板，Maze credit-repair 不加载该组。新增两种 profile 的 save/load 与最终
-  dashboard 构建回归。
+  dashboard 构建回归。历史误标 full-track 包若包含 StuckHead leaf 与 Adam group，会按稳定组名
+  一并迁移并返回独立 `full_track_legacy_contract_warm_start` disposition；较旧且没有该组的包仍将
+  StuckHead 保持 fresh。
 
 - **[P4 creditwarm 空辅助批反传修复]** 首阶段 Actor/CNN 冻结且当前 minibatch 没有有效
   stuck 标签时，组合 Actor loss 可能是无计算图常量。公共 PPO 循环现在只在 loss 实际具有

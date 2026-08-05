@@ -4268,7 +4268,11 @@
   `train_env_conf_track_p4_nav_ppo.toml` 的 `training_profile`，只为 full-track 装配专用组。
 - 本地验证：新增 full-track save -> fresh algorithm `load_bundle()` round-trip，验证三套版本、scope、
   28800 秒时钟和 `fullstabilize` 恢复；新增 fake platform builder 验证最终 full/credit dashboard
-  的标题和 group 路由。定向回归 `82 passed`，完整 P4/P2 回归将在最终提交前重跑。
+  的标题和 group 路由。复审补充了历史误标包保留 StuckHead leaf/optimizer group 的真实形状回归：
+  同名组按参数名迁移并返回 `p4_full_track_legacy_contract_warm_start`，旧包缺组时才 fresh。
+  历史误标 full-track 包按新 session 重置计数和 optimizer phase，不再把 28800 秒旧时钟带入
+  `fullwarm` 校验。最终 P4/P2 核心回归 `265 passed`，Python 编译、TOML、两项 UWB C++ 测试和
+  `git diff --check` 通过。
 - 回滚：恢复固定 Maze metadata 会重新破坏 full-track exact resume；如需临时绕过，只能把旧包
   明确作为 warm start，不能放宽模型 ID 或 scope 门禁。监控可独立回滚为 Maze 面板，但会失去五段
   验收数据。
