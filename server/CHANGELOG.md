@@ -4,6 +4,14 @@
 
 ## [未发布]
 
+- **[P4 profile 合同与监控路由修复]** P4 checkpoint 的 command/reward/training 元数据现在按
+  `training_profile` 生成：Maze credit-repair 使用 `p4_maze_credit_repair_v1`，五段训练使用
+  `p4_full_track_v2` 和 `p4_full_track_reward_v2_potential_straight`。exact resume 同时校验
+  profile 对应的 `train_scope`；历史误标成 Maze 合同的 full-track 包只能结构化 warm start，
+  不再伪装 exact resume。监控构建器读取活动 P4 TOML 的 profile，full-track 会真实装配
+  `P4全赛道诊断` 面板，Maze credit-repair 不加载该组。新增两种 profile 的 save/load 与最终
+  dashboard 构建回归。
+
 - **[P4 creditwarm 空辅助批反传修复]** 首阶段 Actor/CNN 冻结且当前 minibatch 没有有效
   stuck 标签时，组合 Actor loss 可能是无计算图常量。公共 PPO 循环现在只在 loss 实际具有
   gradient graph 时执行 backward，并且只有真正产生 Actor 梯度时才 step optimizer 和递增

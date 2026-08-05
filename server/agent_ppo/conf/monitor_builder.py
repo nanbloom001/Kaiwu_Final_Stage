@@ -1399,6 +1399,19 @@ def _configured_policy_entry() -> str:
     return str(config.get("app", {}).get("policy_entry", "nav_dagger")).strip().lower()
 
 
+def _configured_p4_training_profile() -> str:
+    path = Path(__file__).resolve().with_name(
+        "train_env_conf_track_p4_nav_ppo.toml"
+    )
+    try:
+        config = toml.load(path)
+    except (OSError, TypeError, ValueError):
+        return "full_track"
+    return str(
+        config.get("p4_nav_ppo", {}).get("training_profile", "full_track")
+    ).strip().lower()
+
+
 def _add_line_panel(monitor, name, name_en, metric):
     (
         monitor.add_panel(name=name, name_en=name_en, type="line")
@@ -1509,10 +1522,21 @@ def _build_p2_monitor():
     return monitor.build()
 
 
-def _build_p4_monitor():
+def _build_p4_monitor(training_profile=None):
+    profile = str(
+        training_profile or _configured_p4_training_profile()
+    ).strip().lower()
+    if profile not in {"maze_credit_repair", "full_track"}:
+        raise ValueError(f"unsupported P4 monitor training profile {profile!r}")
     monitor = MonitorConfigBuilder()
-    monitor.title("P4迷宫归因修复训练")
+    monitor.title(
+        "P4迷宫归因修复训练"
+        if profile == "maze_credit_repair"
+        else "P4五段全赛道训练"
+    )
     _add_p4_track_outcome_panels(monitor)
+    if profile == "full_track":
+        _add_p4_full_track_panels(monitor)
     for group_name, group_name_en, panels in P2_MONITOR_GROUPS:
         monitor.add_group(group_name=group_name, group_name_en=group_name_en)
         for name, name_en, metrics in panels:

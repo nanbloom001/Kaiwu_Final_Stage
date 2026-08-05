@@ -1838,6 +1838,46 @@ def test_p4_credit_repair_checkpoint_exact_resume_round_trip():
     assert all(not parameter.requires_grad for parameter in resumed.response_adapter.parameters())
 
 
+def test_p4_full_track_checkpoint_metadata_and_exact_resume_round_trip():
+    algorithm = _p4_algorithm()
+    algorithm._initial_low_digest = algorithm._module_digest(
+        (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
+    )
+    algorithm.low_level_state_digest = algorithm._initial_low_digest
+    algorithm._configure_adapter_contract()
+    algorithm.update_training_clocks(28_800.0)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "model.ckpt-fullstabilize-42.pkl"
+        algorithm.save_training_bundle(str(path), platform_model_id="42")
+        payload = torch.load(path, weights_only=False, map_location="cpu")
+        assert payload["contracts"]["training"]["version"] == (
+            p4_contract.FULL_TRACK_CHECKPOINT_CONTRACT_VERSION
+        )
+        assert payload["contracts"]["training"]["training_profile"] == "full_track"
+        assert payload["contracts"]["training"]["target_effective_seconds"] == 28_800
+        assert payload["contracts"]["training"]["mirror"] == {
+            "requested_eligible_sequence_share": 0.10,
+            "eligibility": "episode_start_zero_hidden_no_reset_crossing",
+            "gradient_target_ratio": 0.005,
+            "gradient_hard_cap": 0.01,
+        }
+        assert payload["contracts"]["reward"]["version"] == (
+            p4_contract.FULL_TRACK_REWARD_CONTRACT_VERSION
+        )
+        assert payload["contracts"]["command"]["version"] == (
+            p4_contract.FULL_TRACK_COMMAND_CONTRACT_VERSION
+        )
+        assert payload["training_states"]["global"]["train_scope"] == (
+            "high_level_and_response_adapter"
+        )
+        resumed = _p4_algorithm()
+        mode = resumed.load_bundle(str(path), platform_model_id="42")
+    assert mode == "p4_exact_resume_history_reset"
+    assert resumed.training_profile == "full_track"
+    assert resumed.session_effective_seconds == pytest.approx(28_800.0)
+    assert resumed.current_phase == "fullstabilize"
+
+
 def test_p4_credit_repair_separates_wall_and_active_training_clocks():
     algorithm = _p4_algorithm(
         config={

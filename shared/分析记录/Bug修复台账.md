@@ -4247,3 +4247,29 @@
 - 回滚：恢复这两个 PPO loop 条件即可；不需要回滚父模型或训练合同。再次遇到同一异常时先检查
   当前 phase、trainable param group 和各 auxiliary valid mask，不要增加模型 ID 门禁或强行解冻 Actor。
 - 关联 commit/PR、新 checkpoint：待生成。
+
+## BUG-20260805-004：P4 full-track checkpoint 合同误标与专用面板未接线
+
+- 日期：2026-08-05；状态：本地已验证，开发容器和新平台任务待验证。
+- 影响范围：P4 `full_track` 的 checkpoint exact resume 与自定义监控装配；Maze credit-repair
+  训练算法、Actor85、三轴动作、worker wire、部署输入和平台 `BaseEnv` 不变。
+- 用户可见风险：五段训练保存包的全局 scope 是 `high_level_and_response_adapter`，但 contracts
+  被无条件写成 Maze credit-repair。fresh `load_bundle()` 会先把该包判为 exact-compatible，随后
+  因 scope 不是 `maze_actor_critic_stuck_only` 自我拒绝。与此同时 `P4全赛道诊断` 面板虽已定义，
+  `_build_p4_monitor()` 从未调用，full-track 任务无法看到五段出生、reason4 回退和分段结果。
+- 根因：P4 合同函数在 Maze 归因修复时改成固定单 profile 元数据，保存和加载没有传入算法实例的
+  `training_profile`；监控只按共享 `policy_entry=p4_nav_ppo` 路由，没有再读取活动 P4 TOML 的
+  profile。原测试只覆盖 Track eval load 和面板常量，没有执行 full-track train save/load 或最终
+  dashboard build。
+- 修复：command/reward/training/metadata 全部支持显式 profile。五段包写入
+  `p4_full_track_command_v2`、`p4_full_track_reward_v2_potential_straight` 和
+  `p4_full_track_v2`，exact resume 要求 `high_level_and_response_adapter`；Maze 包继续使用原
+  credit 合同和冻结 scope。历史误标 full-track 包因版本不同退化为 warm start。监控构建器读取
+  `train_env_conf_track_p4_nav_ppo.toml` 的 `training_profile`，只为 full-track 装配专用组。
+- 本地验证：新增 full-track save -> fresh algorithm `load_bundle()` round-trip，验证三套版本、scope、
+  28800 秒时钟和 `fullstabilize` 恢复；新增 fake platform builder 验证最终 full/credit dashboard
+  的标题和 group 路由。定向回归 `82 passed`，完整 P4/P2 回归将在最终提交前重跑。
+- 回滚：恢复固定 Maze metadata 会重新破坏 full-track exact resume；如需临时绕过，只能把旧包
+  明确作为 warm start，不能放宽模型 ID 或 scope 门禁。监控可独立回滚为 Maze 面板，但会失去五段
+  验收数据。
+- 关联 commit/PR、平台任务、新 checkpoint：待生成。

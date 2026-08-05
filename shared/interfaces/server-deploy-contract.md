@@ -553,6 +553,10 @@ reward 合同为 `p4_full_track_reward_v2_potential_straight`。success `+200`�
 timeout、reason4 均 `-25`。五段首次推进使用 terminal-clawed potential；global route-excess 权重
 为 0。开阔直行项只对正/逆坡的 teacher-confirmed straightaway 生效，总下限 `-0.0125/tick`，
 在楼梯、Maze、路口、dead-end、边界、碰撞、恢复、Goal stale 和 terminal 中严格为 0。
+checkpoint training 合同为 `p4_full_track_v2`、command 合同为 `p4_full_track_command_v2`，保存与
+fresh load 必须使用 `training_profile=full_track` 和 `train_scope=high_level_and_response_adapter`
+共同判定 exact resume。历史上被误写为 Maze credit-repair 元数据的 full-track 包不得 exact
+resume，只允许按结构 warm start。
 同一 checkpoint 仍支持 Standard 低层-only 评估与 Track 完整层级评估；training-only SafetyHead、
 出生调度和诊断状态均不得进入部署。
 

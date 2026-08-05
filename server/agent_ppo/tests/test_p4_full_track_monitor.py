@@ -1,8 +1,11 @@
 """Static UI contract for the P4 five-segment full-Track dashboard."""
 
 import ast
+import importlib.util
 from pathlib import Path
 import re
+import sys
+import types
 
 
 MONITOR_PATH = Path(__file__).resolve().parents[1] / "conf" / "monitor_builder.py"
@@ -112,3 +115,93 @@ def test_p4_full_track_outcomes_keep_spawn_and_current_segment_attribution_separ
             for outcome in ("success", "failure", "timeout", "reason4")
         )
     assert "level_count=20" in MONITOR_PATH.read_text(encoding="utf-8")
+
+
+class _FakeMonitorConfigBuilder:
+    def __init__(self):
+        self.payload = {"title": "", "groups": []}
+        self.group = None
+        self.panel = None
+
+    def title(self, value):
+        self.payload["title"] = value
+        return self
+
+    def add_group(self, *, group_name, group_name_en):
+        self.group = {
+            "group_name": group_name,
+            "group_name_en": group_name_en,
+            "panels": [],
+        }
+        self.payload["groups"].append(self.group)
+        return self
+
+    def add_panel(self, *, name, name_en, type):
+        self.panel = {
+            "name": name,
+            "name_en": name_en,
+            "type": type,
+            "metrics": [],
+        }
+        self.group["panels"].append(self.panel)
+        return self
+
+    def add_metric(self, *, metrics_name, expr):
+        self.panel["metrics"].append({"metrics_name": metrics_name, "expr": expr})
+        return self
+
+    def end_panel(self):
+        self.panel = None
+        return self
+
+    def end_group(self):
+        self.group = None
+        return self
+
+    def build(self):
+        return self.payload
+
+
+def _load_monitor_builder():
+    module_name = "_p4_monitor_builder_test"
+    kaiwu = types.ModuleType("kaiwudrl")
+    common = types.ModuleType("kaiwudrl.common")
+    monitor = types.ModuleType("kaiwudrl.common.monitor")
+    builder = types.ModuleType("kaiwudrl.common.monitor.monitor_config_builder")
+    builder.MonitorConfigBuilder = _FakeMonitorConfigBuilder
+    previous = {
+        name: sys.modules.get(name)
+        for name in (
+            "kaiwudrl",
+            "kaiwudrl.common",
+            "kaiwudrl.common.monitor",
+            "kaiwudrl.common.monitor.monitor_config_builder",
+        )
+    }
+    sys.modules["kaiwudrl"] = kaiwu
+    sys.modules["kaiwudrl.common"] = common
+    sys.modules["kaiwudrl.common.monitor"] = monitor
+    sys.modules["kaiwudrl.common.monitor.monitor_config_builder"] = builder
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, MONITOR_PATH)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
+    return module
+
+
+def test_p4_monitor_build_routes_full_track_and_credit_profiles():
+    module = _load_monitor_builder()
+    full = module._build_p4_monitor("full_track")
+    credit = module._build_p4_monitor("maze_credit_repair")
+    full_groups = {group["group_name_en"] for group in full["groups"]}
+    credit_groups = {group["group_name_en"] for group in credit["groups"]}
+    assert full["title"] == "P4五段全赛道训练"
+    assert "p4_full_track_diagnostics" in full_groups
+    assert credit["title"] == "P4迷宫归因修复训练"
+    assert "p4_full_track_diagnostics" not in credit_groups

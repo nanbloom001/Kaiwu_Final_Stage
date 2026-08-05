@@ -35,6 +35,9 @@ CAMERA_CONTRACT_VERSION = "p4_shared_camera_v4_recovery_nominal_light"
 ADAPTER_RECORD_CONTRACT_VERSION = "p4_adapter_record_v1"
 SAFETY_REWARD_RAMP_VERSION = "p4_maze_credit_repair_safety_group_v1"
 CHECKPOINT_CONTRACT_VERSION = "p4_maze_credit_repair_v1"
+FULL_TRACK_CHECKPOINT_CONTRACT_VERSION = "p4_full_track_v2"
+FULL_TRACK_REWARD_CONTRACT_VERSION = "p4_full_track_reward_v2_potential_straight"
+FULL_TRACK_COMMAND_CONTRACT_VERSION = "p4_full_track_command_v2"
 WORKER_WIRE_VERSION = "p4_worker_wire_v6_full_track_spawn"
 STUCK_RESET_CONTRACT_VERSION = "p4_stuck_reset_v3_sliding_window_10s"
 ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION = "p4_actor_mean_guidance_v1"
@@ -1697,9 +1700,23 @@ def training_schedule(
     }
 
 
-def command_contract() -> dict[str, Any]:
+def _normalized_training_profile(training_profile: str) -> str:
+    profile = str(training_profile).strip().lower()
+    if profile not in {"maze_credit_repair", "full_track"}:
+        raise ValueError(f"unsupported P4 training profile {training_profile!r}")
+    return profile
+
+
+def command_contract(
+    training_profile: str = "maze_credit_repair",
+) -> dict[str, Any]:
+    profile = _normalized_training_profile(training_profile)
     return {
-        "version": "p4_maze_credit_repair_command_v1",
+        "version": (
+            "p4_maze_credit_repair_command_v1"
+            if profile == "maze_credit_repair"
+            else FULL_TRACK_COMMAND_CONTRACT_VERSION
+        ),
         "mapper_version": ACTION_MAPPER_VERSION,
         "legacy_mapper_version": LEGACY_ACTION_MAPPER_VERSION,
         "normalized_action": "unchanged_tanh_gaussian_v2",
@@ -1753,10 +1770,16 @@ def command_contract() -> dict[str, Any]:
 
 def reward_contract(
     stuck_reset: dict[str, Any] | None = None,
+    training_profile: str = "maze_credit_repair",
 ) -> dict[str, Any]:
+    profile = _normalized_training_profile(training_profile)
     stuck = normalize_stuck_reset_contract(stuck_reset)
-    return {
-        "version": "p4_maze_credit_repair_reward_v1",
+    contract = {
+        "version": (
+            "p4_maze_credit_repair_reward_v1"
+            if profile == "maze_credit_repair"
+            else FULL_TRACK_REWARD_CONTRACT_VERSION
+        ),
         "inherits": p2_contract.reward_contract()["version"],
         "tick_time_scaling": {
             "reference_period_frames": p2_contract.NAV_PERIOD_FRAMES,
@@ -1836,20 +1859,46 @@ def reward_contract(
         "goal_truth_consumers": ["critic", "reward", "terminal", "scorer"],
         "goal_belief_consumers": ["actor", "speed_cap"],
     }
+    if profile == "full_track":
+        contract["new_terms"]["maze_new_best_credit"] = {
+            "status": "disabled_outside_maze_credit_repair",
+        }
+        contract["new_terms"]["segment_frontier"] = {
+            "weight": SEGMENT_FRONTIER_WEIGHT,
+            "semantics": "first_segment_progress_terminal_clawed_potential",
+        }
+        contract["new_terms"]["open_straight"]["status"] = (
+            "enabled_on_teacher_confirmed_slope_and_slope_inv_only"
+        )
+    return contract
 
 
 def training_contract(
     stuck_reset: dict[str, Any] | None = None,
+    training_profile: str = "maze_credit_repair",
 ) -> dict[str, Any]:
+    profile = _normalized_training_profile(training_profile)
+    credit_profile = profile == "maze_credit_repair"
     stuck = normalize_stuck_reset_contract(stuck_reset)
     return {
-        "version": CHECKPOINT_CONTRACT_VERSION,
-        "run_name": RUN_NAME,
-        "training_hours": TRAINING_HOURS,
-        "target_effective_seconds": int(TARGET_EFFECTIVE_SECONDS),
+        "version": (
+            CHECKPOINT_CONTRACT_VERSION
+            if credit_profile
+            else FULL_TRACK_CHECKPOINT_CONTRACT_VERSION
+        ),
+        "training_profile": profile,
+        "run_name": RUN_NAME if credit_profile else "p4full8h-r2",
+        "training_hours": TRAINING_HOURS if credit_profile else 8.0,
+        "target_effective_seconds": (
+            int(TARGET_EFFECTIVE_SECONDS) if credit_profile else 28_800
+        ),
         "diagnostic_seconds": int(DIAGNOSTIC_SECONDS),
-        "required_platform_wall_seconds": int(PLATFORM_WALL_SECONDS),
-        "required_platform_wall_hours": PLATFORM_WALL_HOURS,
+        "required_platform_wall_seconds": (
+            int(PLATFORM_WALL_SECONDS) if credit_profile else 29_700
+        ),
+        "required_platform_wall_hours": (
+            PLATFORM_WALL_HOURS if credit_profile else 8.25
+        ),
         "clock_semantics": {
             "diagnostic": "wall_seconds_before_training_not_counted_in_session",
             "session_effective_seconds": "gradient_training_seconds_only",
@@ -1862,26 +1911,58 @@ def training_contract(
             ),
             "platform_wall_margin_seconds": int(PLATFORM_WALL_MARGIN_SECONDS),
         },
-        "schedule_boundaries_seconds": list(SCHEDULE_BOUNDARIES_SECONDS),
+        "schedule_boundaries_seconds": (
+            list(SCHEDULE_BOUNDARIES_SECONDS)
+            if credit_profile
+            else [1_800.0, 7_200.0, 21_600.0, 28_800.0]
+        ),
         "safety_reward_ramp": {
-            "version": SAFETY_REWARD_RAMP_VERSION,
+            "version": (
+                SAFETY_REWARD_RAMP_VERSION
+                if credit_profile
+                else "p4_full_track_safety_group_v2"
+            ),
             "segments": [
-                {"seconds": [0, 7_200], "weight": [0.012, 0.012]},
+                {
+                    "seconds": [0, 7_200 if credit_profile else 28_800],
+                    "weight": [0.012, 0.012],
+                },
             ],
         },
         "goal_fault_ramp": {
-            "semantics": "disabled_for_credit_assignment_run",
-            "segments": [
-                {"seconds": [0, 7_200], "multiplier": [0.0, 0.0]},
-            ],
+            "semantics": (
+                "disabled_for_credit_assignment_run"
+                if credit_profile
+                else "ramp_after_30m_to_full_at_2h"
+            ),
+            "segments": (
+                [{"seconds": [0, 7_200], "multiplier": [0.0, 0.0]}]
+                if credit_profile
+                else [
+                    {"seconds": [0, 1_800], "multiplier": [0.0, 0.0]},
+                    {"seconds": [1_800, 7_200], "multiplier": [0.0, 1.0]},
+                    {"seconds": [7_200, 28_800], "multiplier": [1.0, 1.0]},
+                ]
+            ),
         },
         "rollout_nav_ticks": 32,
         "tbptt_nav_ticks": 16,
         "nav_period_frames": P4_NAV_PERIOD_FRAMES,
         "nav_frequency_hz": 1.0 / P4_NAV_DT_S,
         "frozen_low_level": ["cnn", "lstm", "actor", "std", "critic"],
-        "trainable": ["high_actor_lstm", "high_actor_head", "high_critic", "stuck_head"],
-        "frozen_high_level": ["navigation_encoder", "safety_head", "response_adapter"],
+        "trainable": (
+            ["high_actor_lstm", "high_actor_head", "high_critic", "stuck_head"]
+            if credit_profile
+            else [
+                "navigation_encoder", "high_actor_lstm", "high_actor_head",
+                "high_critic", "safety_head", "stuck_head", "response_adapter",
+            ]
+        ),
+        "frozen_high_level": (
+            ["navigation_encoder", "safety_head", "response_adapter"]
+            if credit_profile
+            else []
+        ),
         "goal_belief_version": GOAL_BELIEF_VERSION,
         "camera_contract_version": CAMERA_CONTRACT_VERSION,
         "worker_wire_version": WORKER_WIRE_VERSION,
@@ -1893,45 +1974,63 @@ def training_contract(
             "version": ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION,
             "minimum_valid_steps": TEACHER_MIN_VALID_STEPS,
             "weights": {"direction": 0.45, "speed": 0.20, "yaw": 0.35},
-            "gradient_target_ratio": [0.0, 0.035],
-            "gradient_hard_cap": 0.05,
+            "gradient_target_ratio": (
+                [0.0, 0.035] if credit_profile else [0.0, 0.0225]
+            ),
+            "gradient_hard_cap": 0.05 if credit_profile else 0.03,
             "nav_feat_detached": True,
             "rollout_time_labels_required": True,
         },
         "mirror": {
-            "requested_eligible_sequence_share": 0.0,
+            "requested_eligible_sequence_share": 0.0 if credit_profile else 0.10,
             "eligibility": "episode_start_zero_hidden_no_reset_crossing",
-            "gradient_target_ratio": 0.0,
-            "gradient_hard_cap": 0.0,
+            "gradient_target_ratio": 0.0 if credit_profile else 0.005,
+            "gradient_hard_cap": 0.0 if credit_profile else 0.01,
         },
         "stuck_aux": {
             "version": STUCK_AUX_CONTRACT_VERSION,
             "balanced_positive_negative": True,
             "classifier": "actor_lstm_to_stuck_logit_training_only",
         },
-        "maze_only": True,
-        "track_segment_labels": ["maze"],
-        "track_length": 1,
-        "episode_length_s": 75.0,
+        "maze_only": credit_profile,
+        "track_segment_labels": (
+            ["maze"] if credit_profile else list(FULL_TRACK_SEGMENT_LABELS)
+        ),
+        "track_length": 1 if credit_profile else 5,
+        "episode_length_s": 75.0 if credit_profile else 120.0,
         "spawn": {
-            "enabled": False,
-            "semantics": "platform_default_single_maze_spawn",
+            "enabled": not credit_profile,
+            "semantics": (
+                "platform_default_single_maze_spawn"
+                if credit_profile
+                else "full_track_static_quota_with_runtime_safe_hard_validation"
+            ),
         },
         "goal_jump": {
-            "enabled": False,
-            "semantics": "base_feedback_only_no_extra_goal_fault_course",
+            "enabled": not credit_profile,
+            "semantics": (
+                "base_feedback_only_no_extra_goal_fault_course"
+                if credit_profile
+                else "distance_scaled_zero_mean_elliptical_actor_belief_fault"
+            ),
         },
-        "soft_cruise": command_contract()["soft_cruise"],
-        "exact_resume": "p4_maze_credit_repair_v1_only",
+        "soft_cruise": command_contract(profile)["soft_cruise"],
+        "exact_resume": (
+            "p4_maze_credit_repair_v1_only"
+            if credit_profile
+            else "p4_full_track_v2_only_worker_spawn_rng_reseeded"
+        ),
     }
 
 
 def contract_metadata(
     stuck_reset: dict[str, Any] | None = None,
+    training_profile: str = "maze_credit_repair",
 ) -> dict[str, Any]:
-    command = command_contract()
-    reward = reward_contract(stuck_reset)
-    training = training_contract(stuck_reset)
+    profile = _normalized_training_profile(training_profile)
+    command = command_contract(profile)
+    reward = reward_contract(stuck_reset, profile)
+    training = training_contract(stuck_reset, profile)
     return {
         "stage": STAGE_NAME,
         "actor_input_dim": p2_contract.ACTOR_INPUT_DIM,

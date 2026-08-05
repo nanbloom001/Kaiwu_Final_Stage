@@ -2966,33 +2966,37 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             bundle, _ = normalize_kaiwu_train_bundle(raw)
             contracts = bundle.get("contracts", {})
             exact_training_contract = p4_contract.training_contract(
-                self.stuck_reset_contract
+                self.stuck_reset_contract,
+                self.training_profile,
             )
             exact_reward_contract = p4_contract.reward_contract(
-                self.stuck_reset_contract
+                self.stuck_reset_contract,
+                self.training_profile,
             )
-            exact_command_contract = p4_contract.command_contract()
+            exact_command_contract = p4_contract.command_contract(
+                self.training_profile
+            )
             saved_training = contracts.get("training")
             saved_reward = contracts.get("reward")
             saved_command = contracts.get("command")
             if (
                 isinstance(saved_training, dict)
                 and saved_training.get("version")
-                == p4_contract.CHECKPOINT_CONTRACT_VERSION
+                == exact_training_contract["version"]
                 and saved_training != exact_training_contract
             ):
                 raise ValueError("P4 exact resume training contract mismatch")
             if (
                 isinstance(saved_training, dict)
                 and saved_training.get("version")
-                == p4_contract.CHECKPOINT_CONTRACT_VERSION
+                == exact_training_contract["version"]
                 and saved_reward != exact_reward_contract
             ):
                 raise ValueError("P4 exact resume reward contract mismatch")
             if (
                 isinstance(saved_training, dict)
                 and saved_training.get("version")
-                == p4_contract.CHECKPOINT_CONTRACT_VERSION
+                == exact_training_contract["version"]
                 and saved_command != exact_command_contract
             ):
                 raise ValueError("P4 exact resume command contract mismatch")
@@ -3037,10 +3041,15 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             global_state = compatible.get("training_states", {}).get("global", {})
             if exact_compatible:
                 saved_scope = global_state.get("train_scope")
-                if saved_scope != "maze_actor_critic_stuck_only":
+                expected_scope = (
+                    "maze_actor_critic_stuck_only"
+                    if self.training_profile == "maze_credit_repair"
+                    else "high_level_and_response_adapter"
+                )
+                if saved_scope != expected_scope:
                     raise ValueError(
                         "P4 exact resume train_scope mismatch: "
-                        f"{saved_scope!r}"
+                        f"saved={saved_scope!r} expected={expected_scope!r}"
                     )
             # The inherited loader validates P2's historical scope string.
             # P4 has already validated its stricter scope above, so only the
@@ -3527,7 +3536,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         payload = torch.load(path, weights_only=False, map_location="cpu")
         feedback, feedback_digest = self._feedback_contract()
         payload["contracts"] = {
-            **p4_contract.contract_metadata(self.stuck_reset_contract),
+            **p4_contract.contract_metadata(
+                self.stuck_reset_contract,
+                self.training_profile,
+            ),
             "feedback": feedback,
             "feedback_digest": feedback_digest,
             "critic_transport": {
