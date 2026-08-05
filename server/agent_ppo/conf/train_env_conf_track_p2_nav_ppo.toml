@@ -1,0 +1,178 @@
+# P2 continuous high-level recurrent PPO on inverse slope -> inverse stairs -> maze.
+
+[env]
+num_envs = 128
+episode_length_s = 120.0
+task = "track"
+
+[env_conf]
+task_name = "Unitree-Go2-Velocity-Camera"
+policy_entry = "p2_nav_ppo"
+seed = 0
+
+[custom_parameters]
+continuous_training = true
+
+[terrain]
+mode = "track"
+num_cols = 20
+difficulty_range = [0.0, 1.0]
+curriculum = false
+max_init_terrain_level = 1
+
+[terrain.track]
+track_length = 3
+sub_terrains = ["pyramid_slope_inv", "pyramid_stairs_inv", "open_entry_maze"]
+num_parallel_tracks = 20
+
+[domain_rand]
+enable_domain_rand = false
+randomize_friction = false
+push_robots = false
+
+[noise]
+add_noise = false
+
+[init_state]
+pos = [0.0, 0.0, 0.35]
+
+# The native command is a validator/worker fallback. P2 owns target/exec in
+# aisrv and writes it into the low-level observations every frame.
+[commands]
+resampling_time = [300.0, 300.0]
+
+[commands.ranges]
+lin_vel_x = [0.0, 1.25]
+lin_vel_y = [-0.4, 0.4]
+ang_vel_yaw = [-1.0, 1.0]
+
+[commands.limit]
+lin_vel_x = [0.0, 1.25]
+lin_vel_y = [-0.4, 0.4]
+ang_vel_z = [-1.0, 1.0]
+
+[commands.worker_progressive]
+enabled = false
+
+[camera.depth_camera]
+offset_pos = [0.339871, 0.034697, 0.075010]
+offset_rot = [0.982631, -0.007085, 0.184337, -0.020153]
+max_depth = 5.0
+
+[camera.depth_camera.augmentation]
+enabled = false
+
+[p2_nav_ppo]
+run_name = "p2nav2hsafedir"
+parent_model_id = 291713
+parent_model_label = "p2nav10hvyavoid2"
+load_mode = "p2_safe_direction_continue_warm_start"
+standard_low_level_only_eval = true
+train_scope = "high_level_and_response_adapter"
+task_end_hours = 2.0
+nav_rollout_ticks = 32
+nav_period_frames = 10
+tbptt_sequence_length = 16
+num_learning_epochs = 4
+num_mini_batches = 4
+cnn_microbatch_sequences = 4
+max_grad_norm = 1.0
+slew_rate = [0.30, 0.30, 1.00]
+slew_release_rate = [0.30, 0.60, 2.50]
+first_save_minutes = 5.0
+save_interval_minutes = 10.0
+log_interval = 1
+adapter_seed = 2501
+ppo_seed = 2502
+neutral_seed = 2503
+action_seed = 2504
+vy_action_seed = 2505
+terrain_curriculum = false
+
+[p2_nav_ppo.gait_baseline]
+version = "p2_gait_parent_baseline_v2"
+source_parent_model_id = 37953
+source_parent_label = "p15resp8h-r1_37953-F"
+source = "fixed_versioned_parent_envelope"
+window_seconds = 1.5
+calibration_seconds = 0.0
+prolonged_air_seconds = 0.60
+penalty_cap = 0.0
+duty_imbalance = 0.30
+swing_imbalance_s = 0.20
+prolonged_air_ratio = 0.10
+step_frequency_imbalance_hz = 1.50
+
+[p2_nav_ppo.response_adapter]
+learning_rate = 3.0e-5
+max_grad_norm = 0.5
+capacity_steps = 4096
+sequence_length = 16
+burn_in_steps = 8
+batch_envs = 64
+parent_replay_ratio = 0.25
+track_replay_ratio = 0.75
+velocity_loss_weight = 1.0
+pose_loss_weight = 0.5
+stuck_loss_weight = 0.25
+nll_loss_weight = 0.1
+velocity_horizon_weights = [1.0, 0.75, 0.5]
+target_stability_tolerance = [0.05, 0.02, 0.08]
+
+[p2_nav_ppo.feedback_profile]
+version = "p15_feedback_v2"
+age_clip_s = 0.8
+complete_failure_probability = 0.015
+complete_failure_duration_s = [0.10, 0.60]
+short_horizon_velocity_sources = ["sport_mode_xy", "imu_gyro_z"]
+uwb_role = "long_horizon_only_not_in_response_observation"
+
+[p2_nav_ppo.feedback_profile.sport]
+rate_hz = [35.0, 50.0]
+delay_s = [0.0, 0.06]
+noise_std = [0.025, 0.025, 0.035]
+bias_std = [0.015, 0.015, 0.020]
+dropout_probability = [0.0, 0.08]
+freshness_timeout_s = [0.10, 0.22]
+
+[p2_nav_ppo.feedback_profile.uwb]
+rate_hz = [4.0, 6.0]
+delay_s = [0.08, 0.30]
+noise_std = [0.06, 0.06, 0.05]
+bias_std = [0.03, 0.03, 0.02]
+low_pass_tau_s = [0.18, 0.45]
+dropout_probability = [0.0, 0.18]
+freshness_timeout_s = [0.30, 0.70]
+
+[p2_nav_ppo.feedback_profile.imu]
+gyro_noise_std = [0.006, 0.006, 0.009]
+gyro_bias_std = [0.004, 0.004, 0.006]
+gravity_noise_std = 0.004
+
+[rewards.flat_orientation]
+weight = -0.05
+
+[rewards.energy]
+weight = -5.0e-6
+
+[rewards.undesired_contacts]
+weight = 0.0
+[rewards.undesired_contacts.params]
+threshold = 1
+
+# Compatibility-only terms required by the platform's bundled command
+# curriculum whenever terrain.curriculum=true.  Isaac RewardManager retains
+# zero-weight terms, so the curriculum can resolve their configs while these
+# terms contribute exactly zero reward and never expand the native fallback
+# command ranges (episode sum and the 0.8 * weight threshold are both zero).
+[rewards.track_lin_vel_xy]
+weight = 0.0
+[rewards.track_lin_vel_xy.params]
+std = 0.25
+command_name = "base_velocity"
+
+[rewards.track_ang_vel_z]
+weight = 0.0
+[rewards.track_ang_vel_z.params]
+std = 0.25
+command_name = "base_velocity"

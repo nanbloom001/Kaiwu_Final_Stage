@@ -302,8 +302,17 @@ class CommandSchedule:
             )
 
         probability = self.target_probability
-        draws = torch.rand(expired_ids.numel(), device=self.device)
-        requested_target = draws < probability
+        if probability >= 1.0:
+            requested_target = torch.ones(
+                expired_ids.numel(), dtype=torch.bool, device=self.device
+            )
+        elif probability <= 0.0:
+            requested_target = torch.zeros(
+                expired_ids.numel(), dtype=torch.bool, device=self.device
+            )
+        else:
+            draws = torch.rand(expired_ids.numel(), device=self.device)
+            requested_target = draws < probability
         requested_ids = expired_ids[requested_target]
         self.requested_samples += int(expired_ids.numel())
         self.requested_target_samples += int(requested_ids.numel())

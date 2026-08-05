@@ -9,6 +9,7 @@
 """
 
 import math
+import time
 
 import torch
 import torch.nn.functional as F
@@ -127,7 +128,7 @@ def depth_camera_image(env) -> torch.Tensor:
     return depth.reshape(N, -1)  # [N, H*W]
 
 
-def nav_scanner_privileged_features(env) -> torch.Tensor:
+def nav_scanner_privileged_features(env, *, return_diagnostics: bool = False):
     """Return worker-only maze wall features from ``nav_scanner``.
 
     Layout is ``[available, front_score, left_score, right_score]``.  The
@@ -141,7 +142,8 @@ def nav_scanner_privileged_features(env) -> torch.Tensor:
     try:
         sensor = env.scene.sensors["nav_scanner"]
         data = sensor.data
-        raw = data.pos_w[:, 2:3] - data.ray_hits_w[..., 2]
+        ray_hits = data.ray_hits_w
+        raw = data.pos_w[:, 2:3] - ray_hits[..., 2]
     except (AttributeError, KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(
             "nav_scanner is required for nav DAgger privileged Oracle features"
@@ -150,29 +152,119 @@ def nav_scanner_privileged_features(env) -> torch.Tensor:
         raise ValueError(
             f"nav_scanner ray tensor must be [N,R], got {tuple(raw.shape)}"
         )
-    # RayCaster may encode a legitimate "no hit" ray as non-finite. Treat it
-    # as open space, matching the repository's existing terrain-gate sensor
-    # conversion; malformed shape/missing sensor still hard-stop below.
-    raw = torch.nan_to_num(raw, nan=0.0, posinf=0.0, neginf=0.0)
+    if ray_hits.ndim != 3 or ray_hits.shape[:2] != raw.shape or ray_hits.shape[2] != 3:
+        raise ValueError(
+            f"nav_scanner hit tensor must be [N,R,3], got {tuple(ray_hits.shape)}"
+        )
+
+    finite_hit = torch.isfinite(ray_hits).all(dim=-1)
+    positive_no_hit = torch.isposinf(ray_hits).all(dim=-1)
+    well_formed = finite_hit | positive_no_hit
+    well_formed_ratio = well_formed.float().mean(dim=1)
+    finite_hit_ratio = finite_hit.float().mean(dim=1)
+    available = (
+        (well_formed_ratio >= 0.95)
+        & (finite_hit_ratio >= 0.80)
+    )
+    strict = not bool(getattr(env, "_p2_allow_scanner_gaps", False))
+    if strict and not bool(available.all()):
+        raise RuntimeError(
+            "nav_scanner strict Oracle validity failed: "
+            f"available={int(available.sum())}/{available.numel()} "
+            f"well_formed_min={float(well_formed_ratio.min()):.4f} "
+            f"finite_hit_min={float(finite_hit_ratio.min()):.4f}"
+        )
 
     rows, cols = _nav_scanner_grid_shape(sensor, raw.shape[1])
 
     grid = (-raw).view(raw.shape[0], rows, cols)
-    floor = torch.quantile(grid.flatten(1), 0.20, dim=1).view(-1, 1, 1)
-    relative = torch.clamp(grid - floor, min=0.0)
+    finite_grid = finite_hit.view(raw.shape[0], rows, cols)
+    well_formed_grid = well_formed.view(raw.shape[0], rows, cols)
+    quantile_source = torch.where(finite_grid, grid, torch.full_like(grid, float("nan")))
+    floor = torch.nanquantile(quantile_source.flatten(1), 0.20, dim=1).view(-1, 1, 1)
+    floor = torch.nan_to_num(floor, nan=0.0, posinf=0.0, neginf=0.0)
+    relative = torch.where(
+        finite_grid,
+        torch.clamp(grid - floor, min=0.0),
+        torch.zeros_like(grid),
+    )
     body_start = max(0, rows // 2 - 3)
     body_end = min(rows, rows // 2 + 3)
     front_cols = min(6, cols)
     side_width = max(1, min(3, rows // 2))
 
-    def _wall_score(sector):
-        return torch.sigmoid((sector - 0.24) / 0.08).mean(dim=(1, 2))
+    def _wall_score(sector, valid_sector, finite_sector):
+        score = torch.where(
+            finite_sector,
+            torch.sigmoid((sector - 0.24) / 0.08),
+            torch.zeros_like(sector),
+        )
+        denominator = valid_sector.float().sum(dim=(1, 2)).clamp_min(1.0)
+        return (score * valid_sector.float()).sum(dim=(1, 2)) / denominator
 
-    front = _wall_score(relative[:, body_start:body_end, :front_cols])
-    left = _wall_score(relative[:, :side_width, :front_cols])
-    right = _wall_score(relative[:, -side_width:, :front_cols])
-    available = torch.ones_like(front)
-    return torch.stack((available, front, left, right), dim=-1)
+    def _sector(row_slice):
+        return _wall_score(
+            relative[:, row_slice, :front_cols],
+            well_formed_grid[:, row_slice, :front_cols],
+            finite_grid[:, row_slice, :front_cols],
+        )
+
+    front = _sector(slice(body_start, body_end))
+    # ordering="xy" uses lateral y as the outer dimension, ordered -y to +y.
+    # In the robot body frame +y is left, so low rows are right and high rows
+    # are left.
+    right = _sector(slice(0, side_width))
+    left = _sector(slice(rows - side_width, rows))
+    features = torch.stack((available.float(), front, left, right), dim=-1)
+    features[:, 1:] = torch.where(available[:, None], features[:, 1:], torch.zeros_like(features[:, 1:]))
+    pattern = getattr(getattr(sensor, "cfg", None), "pattern_cfg", None)
+    diagnostics = {
+        "available": available,
+        "well_formed_ratio": well_formed_ratio,
+        "finite_hit_ratio": finite_hit_ratio,
+        "rows": rows,
+        "cols": cols,
+        "ordering": str(getattr(pattern, "ordering", "xy")),
+        "pattern_size": tuple(getattr(pattern, "size", ()) or ()),
+        "resolution_x": getattr(pattern, "resolution_x", None),
+        "resolution_y": getattr(pattern, "resolution_y", None),
+    }
+    if not bool(getattr(env, "_p2_nav_scanner_contract_logged", False)):
+        logger = getattr(env, "logger", None)
+        message = (
+            "[P2Scanner] rays=%d rows=%d lateral-y cols=%d forward-x ordering=%s "
+            "size=%s resolution_x=%s resolution_y=%s right=low-row left=high-row"
+            % (
+                raw.shape[1], rows, cols, diagnostics["ordering"],
+                diagnostics["pattern_size"], diagnostics["resolution_x"],
+                diagnostics["resolution_y"],
+            )
+        )
+        if logger is not None and hasattr(logger, "info"):
+            logger.info(message)
+        setattr(env, "_p2_nav_scanner_contract_logged", True)
+    setattr(env, "_p2_nav_scanner_diagnostics", diagnostics)
+    now = time.monotonic()
+    last_log = float(getattr(env, "_p2_nav_scanner_ratio_log_at", 0.0))
+    if now - last_log >= 120.0:
+        message = (
+            "[P2Scanner] available_share=%.4f well_formed_ratio=%.4f "
+            "finite_hit_ratio=%.4f"
+            % (
+                float(available.float().mean()),
+                float(well_formed_ratio.mean()),
+                float(finite_hit_ratio.mean()),
+            )
+        )
+        logger = getattr(env, "logger", None)
+        if logger is not None and hasattr(logger, "info"):
+            logger.info(message)
+        elif bool(getattr(env, "_is_training", False)):
+            print(message, flush=True)
+        setattr(env, "_p2_nav_scanner_ratio_log_at", now)
+    if return_diagnostics:
+        return features, diagnostics
+    return features
 
 
 def _nav_scanner_grid_shape(sensor, num_rays: int) -> tuple[int, int]:

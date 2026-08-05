@@ -36,6 +36,22 @@ def _resolve_policy_observation_process():
 
     algorithm = _current_algorithm()
 
+    if algorithm in {"p4_nav_ppo", "p4_track_eval"}:
+        from agent_ppo.feature.p4_observation_process import (
+            P4PolicyObservationProcess as _Policy,
+        )
+        return _Policy
+    if algorithm in {
+        "p2_nav_ppo", "p2_nav_eval", "p3_track_eval",
+    }:
+        from agent_ppo.feature.p2_observation_process import (
+            P2PolicyObservationProcess as _Policy,
+        )
+        return _Policy
+    if algorithm == "p3_standard_joint":
+        from agent_ppo.feature.p3_observation_process import P3PolicyObservationProcess as _Policy
+        return _Policy
+
     if algorithm in {"nav_dagger", "nav_eval"}:
         from agent_ppo.feature.nav_observation_process import (
             NavPolicyObservationProcess as _Policy,
@@ -48,7 +64,9 @@ def _resolve_policy_observation_process():
         )
         return _Policy
 
-    if algorithm in {"lbc_loco", "visual_ppo"}:
+    if algorithm in {
+        "lbc_loco", "visual_ppo", "p3_standard_eval", "p4_standard_eval"
+    }:
         from agent_ppo.feature.lbc_observation_process import (
             LBCObservationProcess as _Policy,
         )
@@ -68,6 +86,18 @@ def _resolve_critic_observation_process():
     """
 
     algorithm = _current_algorithm()
+
+    if algorithm in {
+        "p2_nav_ppo", "p2_nav_eval", "p3_track_eval",
+        "p4_nav_ppo", "p4_track_eval",
+    }:
+        from agent_ppo.feature.p2_observation_process import (
+            P2CriticObservationProcess as _Critic,
+        )
+        return _Critic
+    if algorithm == "p3_standard_joint":
+        from agent_ppo.feature.p3_observation_process import P3CriticObservationProcess as _Critic
+        return _Critic
 
     if algorithm in {"nav_dagger", "nav_eval"}:
         from agent_ppo.feature.nav_observation_process import (

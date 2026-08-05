@@ -110,6 +110,9 @@ class AlgorithmPPO:
         self.num_learning_epochs = num_learning_epochs
         self.desired_kl = desired_kl
         self.schedule = schedule
+        self.min_learning_rate = float(kwargs.get("min_learning_rate", 1.0e-5))
+        self.max_learning_rate = float(kwargs.get("max_learning_rate", 1.0e-2))
+        self._fixed_learning_rate = float(learning_rate)
 
         # Minimum std clamp (prevents std from going negative / too small)
         # 标准差下限（防止标准差变为负值或过小）
@@ -221,6 +224,8 @@ class AlgorithmPPO:
             tuple: (mean_surrogate_loss, mean_value_loss, mean_entropy_loss)
             返回值：(平均替代损失, 平均价值损失, 平均熵损失)
         """
+        self._validate_fixed_lr()
+
         # Initialize loss accumulators
         # 初始化损失累加器
         mean_value_loss = 0
@@ -357,7 +362,25 @@ class AlgorithmPPO:
         self._report_training_metrics(mean_surrogate_loss, mean_value_loss, mean_entropy_loss)
 
         self.train_step += 1
+        self._validate_fixed_lr()
         return mean_surrogate_loss, mean_value_loss, mean_entropy_loss
+
+    def _validate_fixed_lr(self) -> None:
+        if self.schedule != "fixed":
+            return
+        expected = self._fixed_learning_rate
+        if abs(float(self.learning_rate) - expected) > 1.0e-12:
+            raise RuntimeError(
+                "Fixed PPO learning-rate contract violated: "
+                f"algorithm lr={self.learning_rate} expected={expected}"
+            )
+        for index, param_group in enumerate(self.optimizer.param_groups):
+            current = float(param_group["lr"])
+            if abs(current - expected) > 1.0e-12:
+                raise RuntimeError(
+                    "Fixed PPO learning-rate contract violated: "
+                    f"optimizer lr={current} expected={expected} group={index}"
+                )
 
     def _update_learning_rate(
         self,
@@ -384,9 +407,13 @@ class AlgorithmPPO:
             kl_mean = torch.mean(kl)
 
             if kl_mean > self.desired_kl * 2.0:
-                self.learning_rate = max(1e-5, self.learning_rate / 1.5)
+                self.learning_rate = max(
+                    self.min_learning_rate, self.learning_rate / 1.5
+                )
             elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-                self.learning_rate = min(1e-2, self.learning_rate * 1.5)
+                self.learning_rate = min(
+                    self.max_learning_rate, self.learning_rate * 1.5
+                )
 
             for param_group in self.optimizer.param_groups:
                 param_group["lr"] = self.learning_rate

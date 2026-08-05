@@ -10,6 +10,7 @@
 | `分析记录/` | 团队分析报告（迁移审计、Sim2Real 部署问题追踪等，按日期归档） |
 | `interfaces/` | 跨目录接口契约 |
 | `project-context/` | 仓库布局与分支迁移登记 |
+| `container_source_mirror/` | 平台托管源码本地镜像的刷新工具与读取规则；生成数据不入库 |
 | `arena_frontend_monitor/` | 腾讯竞技平台网页端训练日志与监控曲线采集工具 |
 
 ## 接口契约
@@ -24,6 +25,12 @@
 - [`project-context/repository-layout.md`](./project-context/repository-layout.md)：四层目录结构说明。
 - [`project-context/branch-migration-register.md`](./project-context/branch-migration-register.md)：旧分支源 SHA 锚点 + 迁移分类登记（回滚锚点）。
 - [`分析记录/版本训练演进与改动规模详解.md`](./分析记录/版本训练演进与改动规模详解.md)：复赛、决赛、蒸馏/Sim2Real 与导航训练分支的版本演进记录。
+
+## 当前 P2 监控优化计划
+
+- [`分析记录/2026-07-30_P2监控面板精简与方向速度统计优化方案.md`](./分析记录/2026-07-30_P2监控面板精简与方向速度统计优化方案.md)：
+  保留 5×4 核心联合分桶，补齐 `vy/wz` 正负方向统计，精简重复面板，并通过
+  GPU 窗口聚合和单次 CPU 快照降低监控同步开销。
 
 ## 当前 Standard 深度训练计划
 

@@ -264,6 +264,471 @@ Standard 若要从 `response*` 包继续训练，必须显式设置 `low_level_o
 loader 只恢复视觉 Encoder、Actor、Critic、动作方差及可选 PPO optimizer，并明确忽略
 `modules.high_level`。默认 Standard candidate 顺序不得静默偏向 `response*`。
 
+#### `p2_nav_ppo`：P2 Track 连续高层训练包
+
+`p2nav2hsafedir` 显式使用最新验证通过的 `p2nav10hvyavoid2` 完整三轴 P2 schema 2 包执行
+`p2_safe_direction_continue_warm_start`。NavigationEncoder、三轴 Actor/LSTM、Critic、
+ResponseAdapter、return statistics、RNG 与兼容 optimizer moments 保留；新增
+training-only `NavigationSafetyHead`，其 Adam state 从空状态开始。
+本阶段 checkpoint 标签为 `safewarm`、`safefull`、`safestable`，候选优先级固定为
+`safestable > safefull > safewarm >` 旧 P2 标签。同 ID 续训和评估必须先发现新标签，不能因
+候选表遗漏而回退到旧 `navfull`。
+旧 P2 reward-v1 包仍可作为显式 warm start：保留低层、NavigationEncoder、Actor/LSTM 与
+ResponseAdapter 权重，重建 Critic、return statistics、高层 optimizer/scheduler 和 rollout；
+reward-v3 P2 包按完整训练合同 exact resume；旧 P2 reward-v1/v2 包只允许按显式 warm start
+重建 Critic、return statistics 和高层优化状态。平台请求 ID、文件名 ID、payload ID 和 lineage
+仅用于候选优先级与追溯，不得因不一致单点拒绝；候选最终仍必须通过 stage、module、spec、shape
+和 finite 校验。
+低层 VisionEncoder/Actor 全程冻结；高层是会直接产生 `[vx,vy,wz]` 的动作组件，因此不能沿用
+P1.5 的 `adapter_only` 评估降级路径：
+
+Standard 低层评估是唯一例外，但必须由 `low_level_only_eval=true` 或 P2 的
+`standard_low_level_only_eval=true` 且当前 terrain mode 为 Standard 显式启用。该路径只读取
+`modules.low_level.locomotion_encoder/actor`，不创建或执行完整高层；未显式启用时仍硬拒绝忽略
+action-producing high-level。Track 评估始终加载完整 P2。
+
+```text
+format = "kaiwu_train_v1"
+schema_version = 2
+bundle_kind = "hierarchical_control_v3"
+stage_type = "p2_nav_ppo"
+deployable = false
+modules.low_level.locomotion_encoder / actor / critic / action_distribution / s0_anchor
+modules.high_level.component_status = "complete"
+modules.high_level.navigation_encoder / navigation_safety_head(training_only) / actor / critic / response_adapter
+each learnable leaf = class_name / spec / state_dict
+optimizers.high_level_actor / high_level_critic / response_adapter
+schedulers.high_level_actor / high_level_critic / response_adapter
+transparent_parent_optimizers / transparent_parent_schedulers
+transparent_parent_training_states.global / low_level
+training_states.high_level.iteration / nav_ticks / effective_training_seconds
+training_states.high_level.frame_count / session_effective_seconds / lifetime_effective_seconds
+training_states.high_level.actor_gradient_steps / critic_gradient_steps
+training_states.global.train_scope = "high_level_and_response_adapter"
+training_states.high_level.shuffle_rng_state / action_rng_state / vy_action_rng_state / neutral_rng_state
+training_states.response_adapter.gradient_steps / rng_state / buffer
+contracts.command / confidence / feedback / reward / training / critic_transport
+lineage.source_parent_model_id / parent_checkpoint_sha256 / low_level_state_digest
+curriculum_diagnostics
+```
+
+运行时维度固定为：
+
+```text
+policy observation = proprio45 | scan256 | goal4 | depth57600 = 57905
+worker privileged wire = critic323 | response_aux30 | diagnostic_aux32 = 385
+NavigationEncoder(depth57600) = nav_feat32
+nav_nonvisual = goal4 | target3 | exec3 | measured3 | valid1 | age1 | IMU6 |
+                nav_capability15 = 36
+actor input = nav_feat32 | nav_nonvisual36 | response_profile16 | confidence1 = 85
+critic input = critic323 | active_target3 | nav_capability15 = 341
+policy action distribution = incremental diagonal tanh-squashed Gaussian heads over [vx,wz] + [vy]
+mapped target = [vx, vy, wz]
+vy trusted core = [-0.20,0.20], exploration hard boundary = [-0.40,0.40] from first rollout
+response_aux[24] = reset boundary
+response_aux[25] = terminal reason code (0 none / 1 success / 2 failure / 3 timeout)
+response_aux[28:30] = terrain column / row
+diagnostic_aux[30:55] = gait duty / swing / air / frequency / slip / valid
+diagnostic_aux[55:58] = pre-step terrain column / row / goal distance
+diagnostic_aux[58] = max non-foot contact force over the latest 0.2 seconds
+diagnostic_aux[59] = terminal-safe current Track segment from root_pos_w.x (-1 invalid)
+diagnostic_aux[60] = gait ContactSensor name/shape mapping valid
+diagnostic_aux[61] = full-body collision mapping valid
+```
+
+当前训练合同固定为 `run_name=p2nav2hsafedir`、本轮 `target_effective_seconds=7200` 和三段 Track
+`pyramid_slope_inv -> pyramid_stairs_inv -> open_entry_maze`。导航
+训练使用 128 环境、20 个静态 difficulty column 与 `curriculum=false`；列 difficulty 为
+`col/20=0.00..0.95`，reset 不重采样 column，出生 row 在两个非迷宫段随机。出生 row、当前物理段
+和难度列是三个独立字段。
+`p2_track_reward_v9_safe_direction_teacher` 只在 5 Hz transition 结算。局部正负 progress 与
+new-best 不再直接进入 PPO；稠密导航信号改为
+`gamma_frame^duration * phi_after - phi_before`，其中
+`phi=2*(episode_start_distance-best_distance)`，所有 terminal 的 `phi_after=0`。因此历史最佳距离
+允许迷宫绕行，但失败或超时会结清此前势函数，前两段进展不能补贴未完成 episode。timeout 为
+`-22.5`、hard failure 为 `-25`、success 为 `+50`。保留非足端 collision 与基于单调 best-distance frontier 的 stagnation，删除
+可刷取的 recovery bonus。`predictive_collision_risk` 只读取部署可得的归一化深度和三轴
+target command，使用 left/center/right 三个方向与 upper/middle/lower 三个高度带的 20% 稳健
+低分位；通过上下带一致性抑制缓坡和仅下部接近的台阶误报，再按 `[vx,vy,wz]` 的预测运动方向
+平滑选择扇区，单 tick 最低 `-0.02`。零/无效深度按 5m 超量程处理，零命令严格不处罚，也不奖励远离障碍；旧中央
+ROI 风险只保留 shadow diagnostic。`gait_symmetry` 的 PPO 权重为零，四足 excess 仅用于诊断。
+training-only SafetyHead 从 `nav_feat32` 预测三方向 risk；标签只由 scanner wall risk 与
+`height_scan256` 地形连续性生成，不含 goal/heading。错过明显安全替代方向时才产生渐进负奖励，
+scanner 或 height scan 无效、静止、全部堵塞或方向近似等价时严格为零。网格按
+`ordering=xy` 解释：低 row 是 body `-y` 右侧，高 row 是 body `+y` 左侧；对外向量顺序仍固定为
+`[left,center,right]`。安全选向正确率只在非并列且 `safe_gap` 超过 margin 的条件样本上计算。
+Track/Standard eval 与 exporter 忽略该 Head。
+Adapter/UWB/heading 或地形门控不得进入 PPO reward。terminal outcome、命令链、速度、步态和
+碰撞诊断必须使用首次 done 前冻结快照；reset 后数据只属于下一 episode，terminal tracking 无效。
+两小时 LR/entropy 阶段、session/lifetime 时钟、50 Hz `frame_count`、return statistics、gait baseline 与 training contract digest 是 exact
+resume 必需状态。
+
+平台标准评估回调只转发 policy observation，不转发 critic group。`p2_nav_eval` 因此在 worker
+侧把 `response_aux30` 写入 P2 未消费的 `scan256` 前 30 槽，并在下一槽写入固定 transport
+marker；总维度仍为 57905。aisrv 只在 marker 存在时拆出 aux30，并构造仅供
+`AlgorithmP2NavPPO.frame_begin()` 运输的零值 critic323 前缀。该 eval-only wire 不进入 Critic，
+不改变训练 observation、网络输入、checkpoint 或部署接口。缺 marker 时拒绝推理，禁止把真实
+height scan 误读成反馈字段。
+
+P2 为 ResponseAdapter 保留 P1.5 的 `piecewise_union_profile_v1` capability 语义；
+Actor/Critic 使用独立的 active-mask/min/max/slew capability15。两种 15 维向量虽然维度相同，
+禁止互换。`adapter_confidence` 只由部署可得的 velocity valid/age、Adapter log-sigma 和
+超出可信核心域的幅度计算；训练态 10% neutral dropout 不进入 eval。
+
+P2 文件标签固定为：
+
+```text
+model.ckpt-navwarm-<平台ID>.pkl
+model.ckpt-navadapt-<平台ID>.pkl
+model.ckpt-navfull-<平台ID>.pkl
+```
+
+平台路径和数字 ID 仅由无参数 `agent.save_model()` 的框架 wrapper 注入。exact resume
+必须同时具备完整高层模块、三套 optimizer/scheduler、独立 action/shuffle/neutral/Adapter
+RNG、计数和兼容 completed-record buffer；缺失或非有限状态必须拒绝伪装成 exact resume。
+live hidden、未完成 rollout、
+未完成 future history和 per-env terrain 状态不保存，resume 后强制 reset。当前 deploy
+目录没有 P2 高层导出器或 runtime，因此 `component_status="complete"` 仍必须按
+`deployable=false` 拒绝部署。
+
+平台 wrapper 在未启用 trajectory recorder 时会丢弃公开 `truncated/time_outs`。P2 因此以
+worker-owned `response_aux[24:25]` 恢复 reset 和终止原因；reset 且不是 success/failure
+时按 timeout 处理。当前 wrapper 不能提供 terminal critic observation，所以 timeout 的
+`continuation_mask=0` 且 `bootstrap_mask=0`，禁止使用 auto-reset 后新 episode 的 observation
+为旧 transition bootstrap。若未来平台显式提供 terminal observation，才允许恢复 timeout
+单次 bootstrap。
+
+`p2_nav_eval` 使用 `evaluate_full` 的模块-only 装配：只实例化低层 Encoder/Actor、
+NavigationEncoder、高层 Actor 与 ResponseAdapter；Critic、PPO storage、ResponseBuffer、
+optimizer 和 scheduler 均不创建、不恢复。首次推理前必须由平台 runtime 的
+`eval_model_dir/eval_model_id`（缺失时回退包内 `configure_app.toml`）优先选择同 ID P2 文件，
+同 ID 不存在时允许发现同目录的 P2 候选并告警后继续结构校验；没有
+`evaluate_full_modules_only` 加载结果时拒绝随机参数评分。模块权重仍按
+`class_name/spec/state_dict` 严格校验。
+P1.5 父包顶层的 legacy `action_distribution` 与 `s0_anchor` 在 P2 首存时迁移进
+`modules.low_level` 的规范 leaf，不能因 P2 低层只做 inference 就丢弃；这是后续
+`resume_low` 恢复动作方差和 S0 anchor 的必要透明状态。
+
+#### `p3_standard_joint`：Standard 高低层联合恢复包
+
+P3 从完整 P2 schema-2 包显式 warm start，在单个 Standard+Camera 任务内维护两条独立
+recurrent rollout 时间轴。外部 policy observation 与 P2 相同，低层仅通过输入适配器删除
+goal4；这不是低层网络结构变化：
+
+```text
+policy observation = proprio45 | scan256 | goal4 | depth57600 = 57905
+low input adapter  = proprio45 | scan256 | depth57600 = 57901
+low PPO storage    = proprio45 | frozen_cnn_feat32 = 77 (training-only)
+high actor input   = nav_feat32 | nav_nonvisual36 | response16 | confidence1 = 85
+low action         = joint12 at 50Hz
+high action        = [vx,vy,wz] at 5Hz
+environment step   = joint12 (platform contract unchanged)
+training worker wire = critic323 | response+diagnostic62 | p3_training_extra108 = 493
+
+The P3.5 training-only tail retains the original runtime/gait/command/Sim2Real
+fields and appends joint-acc12, contact force/onset/over-threshold-duration14,
+mapping-valid flags, and Push event/delta/age/active/telemetry fields.
+These fields are excluded from policy observations,
+evaluation inputs, exported models, and deployment interfaces.
+```
+
+平台会覆盖 `isaac_env/base_env.py`，P3 不依赖该文件的本地补丁。低层恢复阶段由 P3 worker
+采样器通过公开 `base_velocity` tensor 写入并 readback 2-8 秒三轴命令，低层 observation、worker
+reward 与实际执行保持一致；高层开始拥有命令后低层
+冻结，worker 低层 reward 不进入任何低层更新。P3 的
+`_p3_goal_positions` 是训练 worker 私有局部目标，不替换平台 Standard scorer 的任务定义。
+局部目标使用相对真实出生点的径向里程碑：M1 `1.3-1.6m`、M2 `2.5-2.9m`；M3 使用
+`terrain_width/2-0.1m` 的平台完成公式。默认 8m 地块对应 proxy `3.90m`、控制目标 `3.93m`
+与边界 `4.00m`。M1/M2 进入 0.5m 只结算一次事件奖励，不终止或 reset Standard episode；
+M3 达到 proxy 后命令归零等待平台 scorer。正常晋级保持方向，timeout 只允许相对 episode
+初始方向左右 30/60 度重规划。正式 Standard success 仍由平台 scorer 产生；proxy/platform
+一致率和 joint success 仅作监控，不能反向改变 scorer。
+
+```text
+format = "kaiwu_train_v1"
+schema_version = 2
+stage_type = "p3_standard_joint"
+deployable = false
+modules.low_level.locomotion_encoder / actor / critic / p3_critic / p3_anchor / action_distribution
+modules.high_level.navigation_encoder / navigation_safety_head(training_only)
+modules.high_level.actor / critic / response_adapter
+optimizers.low_level / high_level_actor / high_level_critic / response_adapter
+training_states.low_level / high_level / response_adapter / global
+training_states.low_level.gait_baseline / mirror_rng_state / mirror_training_fraction (training_only)
+training_states.low_level.depth_fault / memory_auxiliary / camera_timing / memory_training_fraction (training_only)
+training_states.low_level.p35_reward_baseline (training_only)
+training_states.global.session_effective_seconds / lifetime_effective_seconds
+training_states.global.low_updates / high_updates / compound_schedule_phase
+training_states.global.p3_anchor_digest / low_level_version
+training_states.global.domain_randomization_phase / domain_randomization_realized
+training_states.global.runtime_m3_contract
+contracts.p3_standard_joint.name = "p35_low_speed_gait_push_v1"
+```
+
+当前两小时 P3.5 session 的阶段标签固定为 `gaitfixcalib`、`repair`、`pushwarm`、
+`pushfull`、`stable`。候选文件缺失时可继续查找配置父包；一旦选中文件，格式、模块、
+spec/shape、optimizer exact-resume 状态或有限值不兼容必须停止。平台模型 ID、文件名 ID 和
+lineage 只用于选择、告警与追溯，不得形成单点硬门禁。live hidden、未完成 rollout、未完成
+future history和每环境局部目标状态不保存，resume 后统一 reset。
+
+本轮父包选择固定为任务 `235689` 的最终 `stairfinal` checkpoint（模型 ID `1013548`）；实际文件
+SHA256 与模块 digest 必须由加载器在下载并解析真实制品后记录。训练命令中所有含 `vx` 的类型
+共用 `0.10-0.35/0.35-0.70/0.70-1.00m/s` 三档和 `55/30/15` 概率。ResponseAdapter replay
+按 session 阶段使用 `50/25/25`、`60/25/15`、`75/15/10` 的最新/近期/父 records 比例；最后
+15 分钟低层冻结不代表 Adapter 冻结，仍每 rollout 更新一次。
+
+当前 7200 秒 session 只执行低层 recurrent PPO 和 ResponseAdapter：`0-900s gaitfixcalib`、
+`900-4500s repair`、`4500-5400s pushwarm`、`5400-6300s pushfull`、
+`6300-7200s stable`。低层 rollout 与 TBPTT 均为 128 帧；低层 CNN、高层
+NavigationEncoder/Actor/Critic/SafetyHead 全程冻结，高层 rollout、PPO 和 optimizer/scheduler
+step 均不执行，`high_updates` 必须保持 0。P3.5 另外冻结低层 Actor body/std，只允许 LSTM、
+RNN output、最终 action head 和 Critic 更新；`stable` 阶段低层全部冻结。从旧 P3 合同 warm
+start 时保留高层模块及 optimizer 状态，仅重置本轮 session clock、rollout 与 live hidden。
+
+训练期 depth contract 不改变模型输入布局。每环境 `near_clip` 保持父包合同；冻结 CNN feature32
+通过随机 phase 的 30Hz capture、50Hz hold 和 10 帧 FP16 队列模拟相机时序，主动延迟上限
+150ms，150-250ms 只作 shadow。完整 128 帧 sequence 继续使用父包末段 50% 深度故障强度。
+clean 路径使用冻结父模型 anchor，fault/delayed 路径只允许 memory auxiliary 更新低层 LSTM、
+RNN output 与最终 action head；eval/export/deploy 忽略这些 training-only state，且不运行人工增强。
+memory auxiliary 的选择 mask 是像素故障与实际交付 feature age 大于零的并集，必须分别报告
+fault-only、delay-only 与交集占比，不能把纯 sample-and-hold/延迟帧排除在教师监督之外。
+
+同一个 P3 包支持两种独立评估入口，二者共用同一份候选发现与结构验证器
+（`p3_standard_joint_eval_candidates` + `validate_p3_eval_bundle`），绝不回退
+P2/LBC/随机权重：
+
+- **`p3_standard_eval`（Standard+Camera）**：只从 P3 包加载
+  `modules.low_level.locomotion_encoder` + `modules.low_level.actor`（冻结
+  VisionEncoder + Actor77）。policy observation 为低层合同 57901（proprio45 |
+  scan256 | depth57600，goal0），输出 12 维关节动作；使用平台 Standard 原生命令、
+  reward、termination 与 scorer。不创建/执行高层 Actor、NavigationEncoder、
+  ResponseAdapter、SafetyHead、Critic、optimizer 或训练 buffer，不使用 P3 局部目标、
+  goal4 或训练命令覆盖。
+- **`p3_track_eval`（Track+Camera）**：从同一 P3 包加载完整层级：冻结低层
+  VisionEncoder/Actor、NavigationEncoder、三轴 Actor/LSTM、ResponseAdapter。
+  policy observation 保持 57905，高层 5Hz / 低层 50Hz，高层发布 `[vx,vy,wz]`，低层
+  最终输出 12 维关节动作。reset/termination/timeout 正确清空 recurrent hidden，
+  保留已验证的 Track goal-reached→scorer 链（完成数不再恒为 0）。
+SafetyHead/Critic/optimizer/scheduler/训练 buffer 一律不创建。
+
+P3 训练专属步态状态不改变 57901 低层输入、12 维动作或部署接口。镜像训练只在 joint order、
+action scale、PD stiffness/damping、effort limit 和 `contact_forces` 足端映射均明确左右一致时启用；
+异常只关闭 training-only mirror/gait 奖励并告警。交叉落脚使用完整 root quaternion 逆旋转后的
+body-y；P2 共享诊断继续报告接触帧平均滑移速度，P3 私有 tail 只在 stance 结束帧报告一次累计
+世界 XY 滑移距离，训练奖励不会在后续窗口重复扣分。镜像合同固定为
+`FL<->FR`、`RL<->RR`，`vy/wz` 与左右相关轴取反，Hip 按机械轴交换并取反、Thigh/Calf 仅交换；
+depth 水平翻转，scan 置换由真实 lateral ray 坐标生成。前 15 分钟采集 4 类地形 × 3 类运动健康
+基线；样本不足按同地形、全局逐级回退，全局仍不足时对应接触/交叉/饥饿奖励归零。镜像和步态
+baseline/RNG 仅写入 training state，`p3_standard_eval` 与 `p3_track_eval` 必须忽略它们。
+worker command sampler 位于独立环境 worker，当前公开 transport 不回传其 live RNG/hold 状态；
+checkpoint 明确记录 `seeded_fresh_after_environment_reset`，不得宣称该部分 exact resume。
+
+#### `p4_nav_ppo`：冻结 P3.5 低层的 Track 导航鲁棒包
+
+##### 当前 `p4_full_track_v2` 合同
+
+活动训练入口为 `p4full8h-r2`，父包 `p4maze8h10hz_1416926`。Actor observation 仍为 85，
+Critic、三轴动作、10Hz 高层/50Hz 低层和冻结低层接口不变。Track 顺序固定为
+`pyramid_slope -> pyramid_slope_inv -> pyramid_stairs -> pyramid_stairs_inv -> open_entry_maze`，
+20 列、课程关闭、120 秒 episode。训练专属 wire 为
+`p4_worker_wire_v6_full_track_spawn=519`：P3 493 后附加 raw goal2、卡滞诊断、raw wall term，
+以及出生 full/segment/quartile/safe 和 reason4/fallback 累计诊断。Track eval 继续使用稳定 eval wire，
+training-only tail 不进入 Actor、ONNX 或部署。
+
+P4 训练 Goal XY 使用方向保持 v2：`d<=10m` 继续 `xy/10`，`d>10m` 使用单位方位；距离通道为
+`min(d/20,1)`，shape 不变。部署 `UwbGoal` 以 `ActorGoalEncoding` 显式版本化：当前稳定 Actor80
+调用不传版本并保持 legacy 逐轴 clamp，只有未来与 P4 v2 spec/digest 匹配的可部署制品才能显式
+选择 `DirectionPreservingV2`。当前 P4 bundle 为 `deployable=false`，不得静默改变稳定部署入口。
+训练期椭圆跳变只作用于 Actor GoalBelief，Critic/reward/scorer 使用干净真值；径向轴为
+`capture*clamp(0.04+0.004d,0.04,0.20)`，切向轴为
+`capture*clamp(0.10+0.05d,0.10,1.00)`，`capture=smoothstep((d-1.5)/1.5)`。
+
+出生调度为三阶段整轨比例 70/60/75%，随机段权重 15/15/20/20/30%，四分位和 70/30
+safe-hard。Maze 困难位置必须有运行时表面 hit 与八方向 0.35m clearance；验证不可用时退回同段
+入口。reason 4 同桶最多重试两次，之后仍只退回同段入口。learner checkpoint 不包含 worker
+EventManager 的 live quota/RNG，fresh-process resume 后该部分按 seed 重启；不得将其描述为完整
+位级 exact resume。
+
+reward 合同为 `p4_full_track_reward_v2_potential_straight`。success `+200`，hard failure、normal
+timeout、reason4 均 `-25`。五段首次推进使用 terminal-clawed potential；global route-excess 权重
+为 0。开阔直行项只对正/逆坡的 teacher-confirmed straightaway 生效，总下限 `-0.0125/tick`，
+在楼梯、Maze、路口、dead-end、边界、碰撞、恢复、Goal stale 和 terminal 中严格为 0。
+checkpoint training 合同为 `p4_full_track_v2`、command 合同为 `p4_full_track_command_v2`，保存与
+fresh load 必须使用 `training_profile=full_track` 和 `train_scope=high_level_and_response_adapter`
+共同判定 exact resume。历史上被误写为 Maze credit-repair 元数据的 full-track 包不得 exact
+resume，只允许按结构 warm start。
+同一 checkpoint 仍支持 Standard 低层-only 评估与 Track 完整层级评估；training-only SafetyHead、
+出生调度和诊断状态均不得进入部署。
+
+##### 历史 `p4_maze_recovery_v1` 合同
+
+活动入口为 `p4maze3h-recovery-r2`，父包 `p4maze8h10hz_1416926` 的 checkpoint SHA256 为
+`0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`。模型 ID `1416926` 和标签只
+用于候选定位；stage、模块 class/spec、tensor shape、有限值和合同 digest 才决定是否可加载。
+`p4maze3h-recovery-r1` 仅指平台任务 `236388` 的 FP16 mirror auxiliary 失败证据，不能作为活动
+训练入口或有效 checkpoint lineage。
+
+部署形状不变：worker policy 57905、低层输入 57901、Actor77、joint12、高层 Actor85。训练保持
+10Hz 高层、50Hz 低层、32-tick rollout 和 TBPTT16，低层全冻结。新增的 `P4ActorStuckHead` 是
+training-only leaf，Track/Standard eval 均不创建；rollout-time safe3 教师、mirror labels 和
+worker stuck diagnostics 不进入 Actor/Critic observation。
+
+活动训练 wire 为 `p4_worker_wire_v5_raw_wall_term=509`：P3 493 维后附加 raw metric goal2、
+stuck diagnostics13 和独立 raw wall term1。运动意图诊断仍表示经过验证的 worker-local 高层运动意图
+hook 是否可用；raw wall term 不进入网络，只用于检测同帧 success 优先级覆盖 wall-stuck 的归因冲突。原生
+`base_velocity` 不得替代 P4 exec command。当前平台无该 transport，活动 TOML 保持 `mode=shadow`，
+active reset 在 motion intent 缺失时 fail-closed。该训练尾部不进入 Track eval 385 维 wire、Actor85、
+Critic、ONNX 或部署接口。
+
+三轴 mapper 仍为 `vx=[0,1.0]`、`vy=+-0.30`、`wz=+-0.90`；slew 合同改为
+`increase=[0.30,0.40,1.50]`、`release=[0.30,0.80,3.00]`，保持先归零后反向。部署可得 depth risk
+只同比例缩放 `(vx,vy)`，不修改 `wz`；近终点 capture 仅在 Goal freshness >=0.90、距离
+`0.65-1.20m` 且 policy 朝向目标时限制平移速度，不修改动作方向、不提前 terminal。
+
+reward 合同为 `p4_maze_reward_v4_recovery`。predictive、missed-safe、yaw cancellation、yaw-exit、
+goal-safe preference 共用原 5Hz 等效 `-0.06` 安全预算；success 为 `+200`。reason 4 的 `-15`、
+不计 completion、不 bootstrap 和 terminal 去重语义只在未来 active reset 合同满足时生效；当前
+shadow 配置不会生成 reason 4。训练侧卡滞标签额外要求 policy/exec 意图，worker 侧只输出物理
+候选诊断，不能在缺少已验证 motion intent 时触发真实 reset。
+
+旧 P4 包只允许 continuation warm start。`1416926` 的 8 个同名 Actor/CNN/SafetyHead Adam 组按
+参数组名称和组内参数顺序迁移；新增 `actor_stuck_head` 保持空 optimizer state。只有完整匹配
+`p4_maze_recovery_v1` training/reward/command/stuck/camera 合同的包可以 exact resume，并恢复新
+leaf、mirror RNG、auxiliary calibration、optimizer、return statistics、Adapter completed records
+以及 recovery 60 秒窗口时间戳和 lifetime 计数。镜像序列从 rollout 内任意真实 reset 起点构造，
+不得依赖 PPO 固定 chunk 恰好与 episode 边界对齐。
+
+##### 当前 `p4_maze_credit_repair_v1` 合同
+
+当前训练入口为 `p4maze2h-credit-repair`，从 `p4maze8h10hz_1416926` 的 Maze 最终包做
+结构 warm start。网络和部署 I/O 不变：低层 57901/12、Track worker 385、高层 Actor85；
+`NavigationEncoder`、`SafetyHead`、低层和 `ResponseAdapter` 全程冻结，只训练已有高层
+Actor/LSTM、新建 Critic 和 training-only `StuckHead`。
+
+训练环境固定为单段 `open_entry_maze`、20 个静态难度列、课程关闭、75 秒 episode。P4
+session 只累计 rollout collection 与 PPO update 的活跃秒数；checkpoint、监控和日志耗时只进入
+`session_wall_seconds`，不能消耗 7200 秒有效训练预算。平台任务墙钟必须至少覆盖 7200 秒训练和
+900 秒保存/关闭余量。
+
+reward/command/checkpoint 版本分别为 `p4_maze_credit_repair_reward_v1`、
+`p4_maze_credit_repair_command_v1` 和 `p4_maze_credit_repair_v1`。Maze 进展仅按 episode
+历史最短目标距离发放不可重复 credit（`2.0/m`，累计上限 `+12`），terminal 不再 clawback；
+success/failure/timeout 为 `+200/-25/-25`。平移 limiter 只在 risk `>0.75` 时收紧，risk=1
+仍保留 60% `(vx,vy)` 且不缩放 `wz`。卡滞 reset 固定为 shadow，只产生候选诊断和持续卡滞
+轻罚，不生成 reason4 terminal。
+
+Actor mean teacher 是固定合同而非 TOML 可调旋钮：direction/speed/yaw 权重为
+`0.45/0.20/0.35`，最少 64 个有效 step，阶段梯度目标最高 3.5%，总硬上限 5%。旧 P4 包只允许
+warm start；只有完整匹配本节 command/reward/training/stuck/camera digest 的新包才能 exact
+resume。保存标签优先级为 `creditfinal > credittrain > creditadapt > creditwarm >` 历史 P4 标签。
+Standard eval 继续只抽取低层，Track eval 加载完整 P4；training-only `StuckHead` 与
+`SafetyHead` 均不进入部署执行。
+
+##### 历史 `p4_maze_attack10hz_v1` 合同（非活动入口）
+
+历史 P4 Maze 八小时强化父包为 `p4nav2h_1256446-F`（平台模型 ID `1256446`，checkpoint SHA256
+`8aae0892664f2f263949f7e5f9f3b53ecd2936b44e80f3783091579bcf3d3461`）。该 ID只用于候选选择；
+请求/配置 ID 不可用时只允许唯一结构兼容 P4 discovery，多个候选必须报歧义。选中包仍须通过
+stage、模块 spec、tensor shape 与有限值验证后才能 warm start。
+
+P4 不改变部署形状：worker policy 仍为 57905、低层输入 57901、Actor77、joint12，高层 Actor85。
+R2 训练 wire 为 `p4_worker_wire_v2=507`：稳定 P3.5 的 493 维之后仅附加未裁剪米制 goal2 与
+wall-stuck diagnostics12；这些字段不进入 Actor/Critic。Track eval wire 仍为 385，Standard/Track
+评估和部署 I/O 不变。低层 CNN/LSTM/Actor/std/Critic
+全程冻结；P4 只更新 NavigationEncoder、高层 Actor/LSTM、新建 Critic、SafetyHead 和
+ResponseAdapter。低层可复用 delivered frame 对应的 feature32，但 recurrent hidden 必须在每个
+50Hz tick 使用当前 proprio 推进；高层每 5 个低层帧决策一次，即 10Hz，32 个高层 tick 必须拆成
+两个 TBPTT16 序列。P2 及旧 P4 默认 5Hz 合同保持不变，只有新
+`p4_maze_attack10hz_v1` checkpoint 可以 exact resume。
+
+高层 normalized tanh-Gaussian 与 log-prob 不变，物理映射版本固定为
+`p4_capability_action_mapper_v1`：`vx=[0,effective_max_vx]`、`vy=+-0.30`、`wz=+-0.90`。
+checkpoint 与 Track eval 必须携带并核验 mapper 版本；`p2_legacy_action_mapper_v1` 只用于父策略
+逐值迁移验证。GoalBelief v3 直接取代旧 Actor Goal 链，训练时只从 P4 tail 读取未裁剪米制目标，
+并用 SportMode `vx/vy` 与 IMU `wz` 传播；episode reset 立即重建，普通 segment 变化不伪装成目标
+变化。critic、reward、terminal 和 scorer 仍读取干净真值。反馈 xy 无效时不使用伪零平移，过程
+方差放大四倍；短跳变不会立即接管，持续五次一致的 5Hz 测量可重捕获。历史目标 stale 时保留
+0.05 freshness 下限并限制 `vx<=0.20, |vy|<=0.10, |wz|<=0.25`；从未获得有效目标时停止平移。
+
+共享相机链只缓存 raw/captured/delivered depth 与冻结低层 CNN feature，不缓存最终 recurrent
+latent。clean teacher 每 rollout 从当前高层策略刷新，使用相同 Goal/capability/Adapter/reset 与
+独立 hidden；训练 storage 只增加 clean action mean 和 delay-only/fault-only/overlap mask。
+人工 fault、clean teacher、SafetyHead、Critic、Push wrapper、optimizer 和 storage 均不进入
+eval/export。
+
+Push pulse 由 EventManager 原函数 wrapper 回传的 worker step 去重；`push_epoch` 变化或
+`seconds_since_push<horizon` 会使 Adapter 0.2/0.6/1.0 秒标签失效，pose/stuck 使用 1.0 秒合同。
+Adapter replay 必须先同时核验 record schema、低层 digest、feedback digest、capability/mapper 与
+observation/label layout，再尝试 50/25/25；record 必须携带用于重建训练 observation 的实际
+response capability15，兼容池不足不得混入旧合同 record。P3 父包历史 completed record 缺逐记录
+contract 时，只允许在 parent warm replay 路径按 aux/label shape、有限值、horizon/sequence、来源
+digest 格式和序列内部 `(digest,iteration)` 一致性做 `legacy_parent_structural_v1` 迁移。历史记录允许
+来自父训练的旧低层版本，不伪装为当前冻结低层 exact 数据；迁移记录保留 P3/P2 capability，当前 P4 记录
+缺 contract 仍拒绝，且该迁移不得用于 exact resume。父包 current/earlier lineage 必须保持独立
+连续池，不能把 32 条记录对半切成小于 `burn-in8+sequence16` 的不可采样窗口。`safety_cap` 从 delivered depth 与当前
+exec 命令的 0.8 秒 slew 弧线计算，Track eval 不加载 SafetyHead 也必须执行同一限速合同。
+
+历史 P4 Maze 八小时 reward 合同为 `p4_maze_reward_v3_10hz_route`。predictive collision raw 按父项
+放大 1.25 倍并限制到不低于 `-0.03/tick`；missed-safe 仅在 scanner 有效、正在运动且存在明显
+安全替代时结算，方向 gap 归一化后按 0-30 分钟 `0->0.015`、30 分钟-2 小时
+`0.015->0.040`、2-6 小时保持 `0.040`、6-8 小时 `0.040->0.030`。predictive、missed-safe 和
+yaw-cancellation 合计按比例限制到不低于 `-0.06` 的原始 5Hz 等效尺度，再按实际 duration 缩放。
+连续 tick 项统一乘 `duration_frames/10`，因此 10Hz 下每个正常 tick 为原权重 0.5 倍；success、
+failure、timeout、stuck reset 等事件 impulse，按米计算的 route excess 和每次决策 command-rate
+不缩放。body collision 保持每个 10Hz tick 的完整约束，明确作为更强的碰撞治理。成功 impulse
+为 `+200`；卡墙候选持续 1 秒后从 `-0.02` 线性加深到 `-0.10`，安全方向内的目标偏好最多
+`-0.04`，额外路程按 `-0.05/m` 且每 tick 最多 0.20m。旧 `frontier_stagnation` 的 PPO 权重为零，
+只保留 shadow 诊断；Goal 跳变/丢失故障继续使用独立 `goal_fault_multiplier`。
+
+历史 P4 Maze checkpoint 合同为 `p4_maze_attack10hz_v1`：10 分钟只读诊断使用独立
+`session_wall_seconds`，不计入正式 `session_effective_seconds=28800`；诊断结束的 rollout 边界是
+正式训练时钟零点。诊断期除 clean/live 对照外，使用独立 RNG 对 10% clean depth 生成轻故障
+shadow；该 shadow 只用于 detached 线性探针和动作差异诊断，不进入 Actor observation、PPO
+reward 或 rollout storage；fault 鲁棒性验收只使用预留的 held-out probe 环境。P4 启动必须核验
+运行时 segment 语义为单段 `maze`，实际三轴 slew 与完整 command contract 一致。exact resume
+恢复 wall/training clock origin、clean/fault 累计统计、探针、fault RNG 和已选择分支，并同时核验
+完整 training/reward/command/stuck/camera 合同。阶段优先级为
+`mazefinal > mazehard > mazeattack > mazefull > mazeprobe > mazediag > legacy P4`。
+`p4_standard_eval` 只加载低层；`p4_track_eval` 加载
+低层、NavigationEncoder、高层 Actor 与 Adapter，training-only SafetyHead 允许为 `None`；公共
+推理路径在该模块缺失时只清零风险诊断，不得实例化随机 Head 或中断首帧。正式平台任务配置
+29700 秒（8 小时 15 分钟），覆盖 600 秒诊断、28800 秒梯度训练和 300 秒 rollout/保存/退出余量；
+工作流达到有效训练目标后自行结束。完整八小时任务若因
+平台中断后续训，必须 exact
+resume session/lifetime、optimizer、return statistics、Goal/相机/速度 RNG 与 Push 阶段；live hidden、
+EventManager timer、pending rollout 在新环境中重建。
+
+P4 R2 的 `p4_stuck_reset_v1` 只在 worker bridge 中维护世界坐标约束与非足端接触证据，不修改
+平台 BaseEnv。active 前必须在线确认既有 `nav_stuck_timeout` term、`time_out=true`、公开
+get/set/readback 和 `dt=0.02s`。历史 Maze 八小时合同以 7 秒确认，reason=4 结算 `-15` terminal
+impulse 并回收该 episode 未结算的 frontier potential；因此完整 terminal tick 不保证恰好 -15，
+但必须通过 `stuck_terminal_episode_return_mean/nonnegative_rate` 验证 reset episode 的整体收益为负。
+reason=4 使用 `bootstrap_mask=continuation_mask=0`，同 tick 不重复 collision、predictive collision、
+missed-safe 或 stagnation。live tracker、recurrent hidden、pending rollout 和未完成 Adapter history
+不进入 checkpoint，resume 后统一 reset。
+
+Track physical segment index 与指标语义分离。运行时仍按世界坐标产生 `0..track_length-1`，指标层
+必须根据当前 TOML `sub_terrains` 映射到稳定的 `slope_inv/stairs_inv/maze` bucket。单段
+`open_entry_maze` 的 physical index 0 必须报告为 Maze；未配置的稳定 bucket 保持零，不能用固定
+`0=slope` 解释污染 Adapter 与 Track 面板。
+
+P3 评估候选标签优先级为 `stable > pushfull > pushwarm > repair > gaitfixcalib`，随后兼容
+`stairfinal/stairrobust/stairadapt/stairwarm/staircalib` 及
+旧 `highslow/highadapt/adaptercalib/lowfull/lowmedium/lowmild/lowbase`；无同 ID P3 文件时只允许
+唯一 discovery，多个候选明确报歧义。请求 ID、
+文件名标签与 lineage 不一致只告警；选中文件的反序列化、必需模块、spec/shape 或非有限值
+错误必须硬失败，禁止继续用随机参数评分。
+
+每个阶段边界先保存 checkpoint，再通过平台公开 `env.reset(config)` 开始新 episode并清理 live
+recurrent 状态；该调用不会重建平台 create-once 的 Isaac 环境。friction `[0.65,1.25]`、base mass
+`+-0.4kg`、restitution `[0,0.05]`、noise `0.35` 在首次 reset 装配。`push_robot` EventTerm 同时
+以零 XY 速度保留；75 分钟通过 EventManager `get_term_cfg/set_term_cfg/reset` 切到
+`+-0.05m/s`，90 分钟切到 `+-0.08m/s`，间隔 12-18 秒。wrapper 必须先调用 Isaac 原
+`push_by_setting_velocity`，再记录推前/推后的真实 root velocity delta；配置值不得冒充实测值。
+checkpoint session 时间经 reset `usr_conf` 传给 worker，断点恢复立即恢复对应 Push 阶段。
+未验证的 COM、PD、action gain/delay 不属于运行合同。低层 optimizer 成功后先推进 low-level
+digest/version 并清除未完成 future history，再执行一次 Adapter update。
+
 文件数字 ID 完全使用开悟框架传入值，不由业务代码从 iteration 或父模型 ID
 计算。R2 每次保存同一 payload 的阶段文件和评估兼容别名：
 

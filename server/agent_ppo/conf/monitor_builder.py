@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-"""Stage-aware dashboard for P1.5 while preserving the Nav monitor."""
+"""Stage-aware dashboards for the active P4 Maze credit-repair run."""
 
 from pathlib import Path
 
@@ -37,14 +37,1289 @@ P15_PANEL_SPECS = (
     ("指令课程阶段", "p15_phase", "command_phase"),
 )
 
+P2_MONITOR_GROUPS = (
+    (
+        "训练收敛",
+        "p2_optimization",
+        (
+            ("损失趋势", "p2_losses", ("actor_loss", "critic_loss", "adapter_loss")),
+            (
+                "回报统计",
+                "p2_returns",
+                ("rollout_reward_mean", "rollout_reward_std", "rollout_return_mean"),
+            ),
+            (
+                "价值优势统计",
+                "p2_value_advantage",
+                ("rollout_value_mean", "rollout_advantage_mean", "rollout_advantage_std"),
+            ),
+            (
+                "动作探索标准差",
+                "p2_action_std",
+                ("action_std_vx", "action_std_vy", "action_std_wz"),
+            ),
+            (
+                "优化器学习率",
+                "p2_learning_rates",
+                (
+                    "navigation_learning_rate",
+                    "actor_learning_rate",
+                    "vy_actor_learning_rate",
+                    "safety_head_learning_rate",
+                    "critic_learning_rate",
+                    "adapter_learning_rate",
+                ),
+            ),
+            (
+                "PPO逐轮质量",
+                "p2_epoch_quality",
+                (
+                    "approx_kl", "clip_fraction", "entropy", "safety_bce",
+                    "epoch_1_approx_kl", "epoch_2_approx_kl",
+                    "epoch_3_approx_kl", "epoch_4_approx_kl",
+                ),
+            ),
+            ("熵课程", "p2_entropy_schedule", ("entropy_coefficient",)),
+            (
+                "更新与跳过",
+                "p2_update_health",
+                (
+                    "updates",
+                    "adapter_updates",
+                    "ppo_rollout_skipped_nonfinite",
+                    "skipped_nonfinite_total",
+                    "adapter_oom_skips",
+                ),
+            ),
+            (
+                "训练时钟",
+                "p2_training_clocks",
+                (
+                    "session_effective_seconds",
+                    "lifetime_effective_seconds",
+                ),
+            ),
+            (
+                "横向能力边界",
+                "p2_vy_limits",
+                ("vy_trusted_limit", "vy_hard_limit"),
+            ),
+            ("网络训练状态", "p2_network_state", ("cnn_unfrozen", "microbatch_frames")),
+            (
+                "生命周期回调",
+                "p2_lifecycle",
+                ("platform_lifecycle_callbacks", "lifecycle_failures"),
+            ),
+        ),
+    ),
+    (
+        "奖励贡献",
+        "p2_rewards",
+        (
+            (
+                "终点势函数",
+                "p2_progress_rewards",
+                (
+                    "reward_frontier_shaping",
+                    "frontier_potential_before",
+                    "frontier_potential_after",
+                    "terminal_potential_clawback",
+                ),
+            ),
+            (
+                "终止事件",
+                "p2_terminal_rewards",
+                ("reward_success", "reward_failure", "reward_timeout"),
+            ),
+            (
+                "持续代价",
+                "p2_tick_costs",
+                (
+                    "reward_time",
+                    "reward_crawl",
+                    "reward_command_rate",
+                    "reward_tracking",
+                ),
+            ),
+            (
+                "避障与脱困",
+                "p2_obstacle_recovery_rewards",
+                (
+                    "reward_body_collision",
+                    "reward_predictive_collision_risk",
+                    "reward_missed_safe_direction",
+                    "reward_frontier_stagnation",
+                ),
+            ),
+            (
+                "步态诊断不计奖励",
+                "p2_gait_reward",
+                (
+                    "reward_gait_symmetry",
+                    "gait_duty_excess",
+                    "gait_swing_excess",
+                    "gait_prolonged_excess",
+                    "gait_frequency_excess",
+                ),
+            ),
+            ("50Hz安全小计", "p2_frame_safety", ("reward_frame_safety",)),
+            (
+                "奖励守恒",
+                "p2_reward_totals",
+                (
+                    "reward_positive_total",
+                    "reward_negative_total",
+                    "reward_decomposed_total",
+                    "rollout_reward_mean",
+                ),
+            ),
+        ),
+    ),
+    (
+        "导航成效",
+        "p2_navigation_effect",
+        (
+            (
+                "即时结果率",
+                "p2_outcome_rates",
+                ("success_rate", "failure_rate", "timeout_rate"),
+            ),
+            (
+                "窗口结束结果",
+                "p2_terminal_outcomes",
+                (
+                    "rollout_success_count",
+                    "rollout_failure_count",
+                    "rollout_timeout_count",
+                    "rollout_terminal_count",
+                    "episode_success_fraction",
+                    "episode_timeout_fraction",
+                ),
+            ),
+            (
+                "结束时机",
+                "p2_episode_timing",
+                ("early_end_rate", "transition_duration_frames"),
+            ),
+            ("目标距离", "p2_goal_distance", ("goal_distance",)),
+            (
+                "目标推进效率",
+                "p2_goal_progress",
+                ("goal_progress", "goal_progress_m_per_s", "goal_progress_positive_rate"),
+            ),
+            (
+                "卡滞与终止",
+                "p2_termination",
+                (
+                    "stuck",
+                    "reward_frontier_stagnation",
+                    "reward_body_collision",
+                    "reward_predictive_collision_risk",
+                    "hard_termination",
+                    "timeout_rate",
+                ),
+            ),
+            (
+                "方向探索率",
+                "p2_turn_distribution",
+                ("target_left", "target_right", "target_straight"),
+            ),
+            (
+                "探索域使用率",
+                "p2_domain_usage",
+                (
+                    "command_core_overflow_rate",
+                    "vx_near_hard_boundary_rate",
+                    "wz_near_hard_boundary_rate",
+                ),
+            ),
+        ),
+    ),
+    (
+        "控制与反馈",
+        "p2_control_feedback",
+        (
+            (
+                "前进速度链",
+                "p2_vx_response",
+                ("target_vx", "exec_vx", "measured_vx", "true_vx"),
+            ),
+            (
+                "转向速度链",
+                "p2_wz_response",
+                ("target_wz", "exec_wz", "measured_wz", "true_wz"),
+            ),
+            (
+                "横向速度链",
+                "p2_vy_response",
+                ("target_vy", "exec_vy", "measured_vy", "true_vy"),
+            ),
+            (
+                "Slew跟随误差",
+                "p2_slew_error",
+                (
+                    "target_exec_vx_error", "target_exec_vy_error",
+                    "target_exec_wz_error", "slew_saturation_rate",
+                ),
+            ),
+            (
+                "执行跟踪误差",
+                "p2_tracking_error",
+                (
+                    "vx_tracking_abs_error", "vy_tracking_abs_error",
+                    "wz_tracking_abs_error",
+                ),
+            ),
+            (
+                "反馈来源比例",
+                "p2_feedback_sources",
+                (
+                    "feedback_source_invalid",
+                    "feedback_source_sport",
+                    "feedback_source_contact",
+                ),
+            ),
+            (
+                "反馈质量",
+                "p2_feedback_quality",
+                ("feedback_valid", "feedback_age_s", "feedback_true_velocity_error"),
+            ),
+            ("响应器可信度", "p2_adapter_confidence", ("adapter_confidence",)),
+            (
+                "前进速度分位数",
+                "p2_vx_quantiles",
+                (
+                    "target_vx_p10", "target_vx_p50", "target_vx_p90",
+                    "exec_vx_p10", "exec_vx_p50", "exec_vx_p90",
+                    "measured_vx_p10", "measured_vx_p50", "measured_vx_p90",
+                    "true_vx_p10", "true_vx_p50", "true_vx_p90",
+                ),
+            ),
+            (
+                "转向速度分位数",
+                "p2_wz_quantiles",
+                (
+                    "target_wz_p10", "target_wz_p50", "target_wz_p90",
+                    "exec_wz_p10", "exec_wz_p50", "exec_wz_p90",
+                    "measured_wz_p10", "measured_wz_p50", "measured_wz_p90",
+                    "true_wz_p10", "true_wz_p50", "true_wz_p90",
+                ),
+            ),
+            (
+                "横向速度分位数",
+                "p2_vy_quantiles",
+                (
+                    "target_vy_p10", "target_vy_p50", "target_vy_p90",
+                    "exec_vy_p10", "exec_vy_p50", "exec_vy_p90",
+                    "measured_vy_p10", "measured_vy_p50", "measured_vy_p90",
+                    "true_vy_p10", "true_vy_p50", "true_vy_p90",
+                ),
+            ),
+            (
+                "指令速度区域",
+                "p2_command_speed_regions",
+                ("zero_command_rate", "creep_command_rate", "stable_command_rate"),
+            ),
+            (
+                "横向指令使用率",
+                "p2_vy_usage",
+                (
+                    "vy_nonzero_rate",
+                    "vy_positive_rate",
+                    "vy_negative_rate",
+                    "vy_over_core_rate",
+                    "vy_over_specialty_rate",
+                    "vy_near_hard_boundary_rate",
+                ),
+            ),
+            (
+                "指令组合类型",
+                "p2_command_modes",
+                (
+                    "target_straight", "target_left", "target_right",
+                    "target_pure_yaw", "target_joint_turn",
+                ),
+            ),
+        ),
+    ),
+    (
+        "运动安全",
+        "p2_motion_safety",
+        (
+            (
+                "机身稳定性",
+                "p2_body_stability",
+                ("tilt_xy_norm", "true_lateral_speed_abs"),
+            ),
+            (
+                "机身碰撞事件",
+                "p2_body_collision_events",
+                (
+                    "body_collision_force",
+                    "body_collision_force_max",
+                    "body_collision_contact",
+                    "body_collision_onset",
+                    "body_collision_mapping_valid",
+                ),
+            ),
+            (
+                "预测碰撞风险",
+                "p2_predictive_collision",
+                (
+                    "predictive_collision_clearance_m",
+                    "predictive_collision_stopping_distance_m",
+                    "predictive_collision_risk",
+                    "predictive_collision_legacy_risk",
+                    "predictive_collision_wallness_left",
+                    "predictive_collision_wallness_center",
+                    "predictive_collision_wallness_right",
+                    "predictive_collision_risk_left",
+                    "predictive_collision_risk_center",
+                    "predictive_collision_risk_right",
+                    "reward_predictive_collision_risk",
+                ),
+            ),
+            (
+                "特权安全教师",
+                "p2_safe_direction_teacher",
+                (
+                    "scanner_available",
+                    "teacher_risk_left", "teacher_risk_center", "teacher_risk_right",
+                    "selected_safe", "best_safe", "safe_gap",
+                    "safe_alternative_available",
+                    "selected_safest_direction",
+                    "selected_safest_direction_rate",
+                    "safety_head_risk_left", "safety_head_risk_center", "safety_head_risk_right",
+                    "reward_missed_safe_direction",
+                ),
+            ),
+            (
+                "碰撞恢复当前上报窗口",
+                "p2_collision_recovery",
+                (
+                    "collision_onset_count",
+                    "collision_onset_rate",
+                    "collision_trace_events",
+                    "collision_wz_zero_latency_s",
+                    "collision_wz_reverse_latency_s",
+                    "collision_progress_recovery_latency_s",
+                    "collision_target_to_exec_wz_reverse_latency_s",
+                    "collision_exec_to_true_wz_zero_latency_s",
+                    "collision_target_to_exec_vy_reverse_latency_s",
+                    "collision_exec_to_true_vy_zero_latency_s",
+                    "collision_risk_lead_time_s",
+                    "collision_terminal_overlap_rate",
+                ),
+            ),
+            (
+                "碰撞事件生命周期累计",
+                "p2_collision_lifetime",
+                ("collision_onset_total",),
+            ),
+            (
+                "低层动作负载",
+                "p2_low_action_load",
+                ("low_level_action_abs_mean", "low_level_action_peak_mean"),
+            ),
+            (
+                "低层动作饱和",
+                "p2_low_action_saturation",
+                ("low_level_action_saturation_rate",),
+            ),
+            (
+                "四足接触占空比",
+                "p2_gait_duty",
+                ("fl_duty_factor", "fr_duty_factor", "rl_duty_factor", "rr_duty_factor"),
+            ),
+            (
+                "四足平均摆动时间",
+                "p2_gait_swing",
+                (
+                    "fl_mean_swing_time", "fr_mean_swing_time",
+                    "rl_mean_swing_time", "rr_mean_swing_time",
+                ),
+            ),
+            (
+                "四足最长悬空",
+                "p2_gait_max_air",
+                ("fl_max_air_time", "fr_max_air_time", "rl_max_air_time", "rr_max_air_time"),
+            ),
+            (
+                "四足长期悬空比例",
+                "p2_gait_prolonged",
+                (
+                    "fl_prolonged_air_ratio", "fr_prolonged_air_ratio",
+                    "rl_prolonged_air_ratio", "rr_prolonged_air_ratio",
+                ),
+            ),
+            (
+                "四足步频",
+                "p2_gait_frequency",
+                ("fl_step_frequency", "fr_step_frequency", "rl_step_frequency", "rr_step_frequency"),
+            ),
+            (
+                "四足接触滑移",
+                "p2_gait_slip",
+                ("fl_slip_speed", "fr_slip_speed", "rl_slip_speed", "rr_slip_speed"),
+            ),
+            (
+                "步态基线状态",
+                "p2_gait_baseline",
+                (
+                    "gait_window_valid",
+                    "gait_sensor_mapping_valid",
+                    "body_collision_mapping_valid",
+                    "gait_baseline_finalized",
+                    "gait_baseline_samples",
+                ),
+            ),
+        ),
+    ),
+    (
+        "响应预测",
+        "p2_response",
+        (
+            (
+                "速度预测误差",
+                "p2_adapter_mae",
+                (
+                    "adapter_velocity_mae_02s",
+                    "adapter_velocity_mae_06s",
+                    "adapter_velocity_mae_10s",
+                ),
+            ),
+            (
+                "标签有效率",
+                "p2_adapter_valid",
+                ("adapter_valid_02s", "adapter_valid_06s", "adapter_valid_10s"),
+            ),
+            (
+                "长期预测质量",
+                "p2_adapter_quality",
+                (
+                    "adapter_nll_10s", "adapter_sigma_mean",
+                    "adapter_coverage_1sigma", "adapter_coverage_2sigma",
+                ),
+            ),
+            (
+                "响应损失分解",
+                "p2_adapter_losses",
+                (
+                    "adapter_velocity_loss", "adapter_pose_loss",
+                    "adapter_stuck_loss", "adapter_nll_10s",
+                ),
+            ),
+            (
+                "响应基线提升",
+                "p2_adapter_baselines",
+                (
+                    "adapter_zero_baseline_mae", "adapter_copy_exec_baseline_mae",
+                    "adapter_gain_vs_zero", "adapter_gain_vs_copy_exec",
+                ),
+            ),
+            (
+                "卡滞分类质量",
+                "p2_adapter_stuck",
+                (
+                    "adapter_stuck_prevalence", "adapter_stuck_precision",
+                    "adapter_stuck_recall", "adapter_stuck_f1",
+                ),
+            ),
+            (
+                "响应样本与梯度",
+                "p2_adapter_samples",
+                (
+                    "adapter_track_records", "adapter_parent_records",
+                    "adapter_parent_replay_ratio", "adapter_gradient_norm",
+                    "adapter_reset_mask_ratio",
+                ),
+            ),
+            (
+                "分赛段响应误差",
+                "p2_adapter_rows",
+                (
+                    "adapter_slope_inv_mae", "adapter_slope_inv_sample_share",
+                    "adapter_stairs_inv_mae", "adapter_stairs_inv_sample_share",
+                    "adapter_maze_mae", "adapter_maze_sample_share",
+                ),
+            ),
+            (
+                "分能力域响应误差",
+                "p2_adapter_domains",
+                (
+                    "adapter_core_mae", "adapter_core_sample_share",
+                    "adapter_outer_mae", "adapter_outer_sample_share",
+                ),
+            ),
+            (
+                "横向联合域响应",
+                "p2_adapter_vy_domains",
+                (
+                    "adapter_vy_specialty_mae",
+                    "adapter_vy_specialty_sample_share",
+                    "adapter_joint_outer_mae",
+                    "adapter_joint_outer_sample_share",
+                ),
+            ),
+            (
+                "分可信度响应误差",
+                "p2_adapter_confidence_bins",
+                (
+                    "adapter_confidence_low_mae", "adapter_confidence_low_share",
+                    "adapter_confidence_mid_mae", "adapter_confidence_mid_share",
+                    "adapter_confidence_high_mae", "adapter_confidence_high_share",
+                ),
+            ),
+        ),
+    ),
+    (
+        "课程诊断",
+        "p2_curriculum",
+        (
+            (
+                "赛道行变化",
+                "p2_row_moves",
+                (
+                    "curriculum_row_promotions",
+                    "curriculum_row_demotions",
+                    "curriculum_row_unchanged",
+                ),
+            ),
+            (
+                "难度列变化",
+                "p2_column_moves",
+                ("curriculum_column_changed", "curriculum_column_unchanged"),
+            ),
+            (
+                "课程结果累计",
+                "p2_curriculum_outcomes",
+                ("curriculum_successes", "curriculum_failures", "curriculum_timeouts"),
+            ),
+            (
+                "重置起点累计",
+                "p2_curriculum_starts",
+                (
+                    "curriculum_slope_inv_starts",
+                    "curriculum_stairs_inv_starts",
+                    "curriculum_maze_entry_starts",
+                ),
+            ),
+            (
+                "20列静态覆盖",
+                "p2_static_columns",
+                (
+                    "terrain_column_l0_share", "terrain_column_l1_share",
+                    "terrain_column_l2_share", "terrain_column_l3_share",
+                    "terrain_column_l4_share", "terrain_column_l5_share",
+                    "terrain_column_l6_share", "terrain_column_l7_share",
+                    "terrain_column_l8_share", "terrain_column_l9_share",
+                    "terrain_column_l10_share", "terrain_column_l11_share",
+                    "terrain_column_l12_share", "terrain_column_l13_share",
+                    "terrain_column_l14_share", "terrain_column_l15_share",
+                    "terrain_column_l16_share", "terrain_column_l17_share",
+                    "terrain_column_l18_share", "terrain_column_l19_share",
+                ),
+            ),
+            (
+                "出生行分布",
+                "p2_spawn_rows",
+                (
+                    "terrain_spawn_row_0_share",
+                    "terrain_spawn_row_1_share",
+                    "terrain_spawn_row_2_share",
+                ),
+            ),
+        ),
+    ),
+    (
+        "指令联合域",
+        "p2_command_bins",
+        (
+            (
+                "vx分桶0覆盖",
+                "p2_cmd_v0_coverage",
+                (
+                    "cmd_v0_w0_count", "cmd_v0_w0_share",
+                    "cmd_v0_w1_count", "cmd_v0_w1_share",
+                    "cmd_v0_w2_count", "cmd_v0_w2_share",
+                    "cmd_v0_w3_count", "cmd_v0_w3_share",
+                ),
+            ),
+            (
+                "vx分桶1覆盖",
+                "p2_cmd_v1_coverage",
+                (
+                    "cmd_v1_w0_count", "cmd_v1_w0_share",
+                    "cmd_v1_w1_count", "cmd_v1_w1_share",
+                    "cmd_v1_w2_count", "cmd_v1_w2_share",
+                    "cmd_v1_w3_count", "cmd_v1_w3_share",
+                ),
+            ),
+            (
+                "vx分桶2覆盖",
+                "p2_cmd_v2_coverage",
+                (
+                    "cmd_v2_w0_count", "cmd_v2_w0_share",
+                    "cmd_v2_w1_count", "cmd_v2_w1_share",
+                    "cmd_v2_w2_count", "cmd_v2_w2_share",
+                    "cmd_v2_w3_count", "cmd_v2_w3_share",
+                ),
+            ),
+            (
+                "vx分桶3覆盖",
+                "p2_cmd_v3_coverage",
+                (
+                    "cmd_v3_w0_count", "cmd_v3_w0_share",
+                    "cmd_v3_w1_count", "cmd_v3_w1_share",
+                    "cmd_v3_w2_count", "cmd_v3_w2_share",
+                    "cmd_v3_w3_count", "cmd_v3_w3_share",
+                ),
+            ),
+            (
+                "vx分桶4覆盖",
+                "p2_cmd_v4_coverage",
+                (
+                    "cmd_v4_w0_count", "cmd_v4_w0_share",
+                    "cmd_v4_w1_count", "cmd_v4_w1_share",
+                    "cmd_v4_w2_count", "cmd_v4_w2_share",
+                    "cmd_v4_w3_count", "cmd_v4_w3_share",
+                ),
+            ),
+            (
+                "vx分桶0横向",
+                "p2_cmd_v0_vy",
+                (
+                    "cmd_v0_w0_vy_nonzero_share", "cmd_v0_w0_target_abs_vy", "cmd_v0_w0_vy_outer_share",
+                    "cmd_v0_w1_vy_nonzero_share", "cmd_v0_w1_target_abs_vy", "cmd_v0_w1_vy_outer_share",
+                    "cmd_v0_w2_vy_nonzero_share", "cmd_v0_w2_target_abs_vy", "cmd_v0_w2_vy_outer_share",
+                    "cmd_v0_w3_vy_nonzero_share", "cmd_v0_w3_target_abs_vy", "cmd_v0_w3_vy_outer_share",
+                ),
+            ),
+            (
+                "vx分桶1横向",
+                "p2_cmd_v1_vy",
+                (
+                    "cmd_v1_w0_vy_nonzero_share", "cmd_v1_w0_target_abs_vy", "cmd_v1_w0_vy_outer_share",
+                    "cmd_v1_w1_vy_nonzero_share", "cmd_v1_w1_target_abs_vy", "cmd_v1_w1_vy_outer_share",
+                    "cmd_v1_w2_vy_nonzero_share", "cmd_v1_w2_target_abs_vy", "cmd_v1_w2_vy_outer_share",
+                    "cmd_v1_w3_vy_nonzero_share", "cmd_v1_w3_target_abs_vy", "cmd_v1_w3_vy_outer_share",
+                ),
+            ),
+            (
+                "vx分桶2横向",
+                "p2_cmd_v2_vy",
+                (
+                    "cmd_v2_w0_vy_nonzero_share", "cmd_v2_w0_target_abs_vy", "cmd_v2_w0_vy_outer_share",
+                    "cmd_v2_w1_vy_nonzero_share", "cmd_v2_w1_target_abs_vy", "cmd_v2_w1_vy_outer_share",
+                    "cmd_v2_w2_vy_nonzero_share", "cmd_v2_w2_target_abs_vy", "cmd_v2_w2_vy_outer_share",
+                    "cmd_v2_w3_vy_nonzero_share", "cmd_v2_w3_target_abs_vy", "cmd_v2_w3_vy_outer_share",
+                ),
+            ),
+            (
+                "vx分桶3横向",
+                "p2_cmd_v3_vy",
+                (
+                    "cmd_v3_w0_vy_nonzero_share", "cmd_v3_w0_target_abs_vy", "cmd_v3_w0_vy_outer_share",
+                    "cmd_v3_w1_vy_nonzero_share", "cmd_v3_w1_target_abs_vy", "cmd_v3_w1_vy_outer_share",
+                    "cmd_v3_w2_vy_nonzero_share", "cmd_v3_w2_target_abs_vy", "cmd_v3_w2_vy_outer_share",
+                    "cmd_v3_w3_vy_nonzero_share", "cmd_v3_w3_target_abs_vy", "cmd_v3_w3_vy_outer_share",
+                ),
+            ),
+            (
+                "vx分桶4横向",
+                "p2_cmd_v4_vy",
+                (
+                    "cmd_v4_w0_vy_nonzero_share", "cmd_v4_w0_target_abs_vy", "cmd_v4_w0_vy_outer_share",
+                    "cmd_v4_w1_vy_nonzero_share", "cmd_v4_w1_target_abs_vy", "cmd_v4_w1_vy_outer_share",
+                    "cmd_v4_w2_vy_nonzero_share", "cmd_v4_w2_target_abs_vy", "cmd_v4_w2_vy_outer_share",
+                    "cmd_v4_w3_vy_nonzero_share", "cmd_v4_w3_target_abs_vy", "cmd_v4_w3_vy_outer_share",
+                ),
+            ),
+            (
+                "vx分桶0效果",
+                "p2_cmd_v0_effect",
+                (
+                    "cmd_v0_w0_progress", "cmd_v0_w0_tracking_mae", "cmd_v0_w0_gait_penalty",
+                    "cmd_v0_w1_progress", "cmd_v0_w1_tracking_mae", "cmd_v0_w1_gait_penalty",
+                    "cmd_v0_w2_progress", "cmd_v0_w2_tracking_mae", "cmd_v0_w2_gait_penalty",
+                    "cmd_v0_w3_progress", "cmd_v0_w3_tracking_mae", "cmd_v0_w3_gait_penalty",
+                ),
+            ),
+            (
+                "vx分桶1效果",
+                "p2_cmd_v1_effect",
+                (
+                    "cmd_v1_w0_progress", "cmd_v1_w0_tracking_mae", "cmd_v1_w0_gait_penalty",
+                    "cmd_v1_w1_progress", "cmd_v1_w1_tracking_mae", "cmd_v1_w1_gait_penalty",
+                    "cmd_v1_w2_progress", "cmd_v1_w2_tracking_mae", "cmd_v1_w2_gait_penalty",
+                    "cmd_v1_w3_progress", "cmd_v1_w3_tracking_mae", "cmd_v1_w3_gait_penalty",
+                ),
+            ),
+            (
+                "vx分桶2效果",
+                "p2_cmd_v2_effect",
+                (
+                    "cmd_v2_w0_progress", "cmd_v2_w0_tracking_mae", "cmd_v2_w0_gait_penalty",
+                    "cmd_v2_w1_progress", "cmd_v2_w1_tracking_mae", "cmd_v2_w1_gait_penalty",
+                    "cmd_v2_w2_progress", "cmd_v2_w2_tracking_mae", "cmd_v2_w2_gait_penalty",
+                    "cmd_v2_w3_progress", "cmd_v2_w3_tracking_mae", "cmd_v2_w3_gait_penalty",
+                ),
+            ),
+            (
+                "vx分桶3效果",
+                "p2_cmd_v3_effect",
+                (
+                    "cmd_v3_w0_progress", "cmd_v3_w0_tracking_mae", "cmd_v3_w0_gait_penalty",
+                    "cmd_v3_w1_progress", "cmd_v3_w1_tracking_mae", "cmd_v3_w1_gait_penalty",
+                    "cmd_v3_w2_progress", "cmd_v3_w2_tracking_mae", "cmd_v3_w2_gait_penalty",
+                    "cmd_v3_w3_progress", "cmd_v3_w3_tracking_mae", "cmd_v3_w3_gait_penalty",
+                ),
+            ),
+            (
+                "vx分桶4效果",
+                "p2_cmd_v4_effect",
+                (
+                    "cmd_v4_w0_progress", "cmd_v4_w0_tracking_mae", "cmd_v4_w0_gait_penalty",
+                    "cmd_v4_w1_progress", "cmd_v4_w1_tracking_mae", "cmd_v4_w1_gait_penalty",
+                    "cmd_v4_w2_progress", "cmd_v4_w2_tracking_mae", "cmd_v4_w2_gait_penalty",
+                    "cmd_v4_w3_progress", "cmd_v4_w3_tracking_mae", "cmd_v4_w3_gait_penalty",
+                ),
+            ),
+            (
+                "vx分桶0前进链",
+                "p2_cmd_v0_vx_chain",
+                (
+                    "cmd_v0_w0_target_vx", "cmd_v0_w0_exec_vx", "cmd_v0_w0_true_vx",
+                    "cmd_v0_w1_target_vx", "cmd_v0_w1_exec_vx", "cmd_v0_w1_true_vx",
+                    "cmd_v0_w2_target_vx", "cmd_v0_w2_exec_vx", "cmd_v0_w2_true_vx",
+                    "cmd_v0_w3_target_vx", "cmd_v0_w3_exec_vx", "cmd_v0_w3_true_vx",
+                ),
+            ),
+            (
+                "vx分桶0转向链",
+                "p2_cmd_v0_wz_chain",
+                (
+                    "cmd_v0_w0_target_abs_wz", "cmd_v0_w0_exec_abs_wz", "cmd_v0_w0_true_abs_wz",
+                    "cmd_v0_w1_target_abs_wz", "cmd_v0_w1_exec_abs_wz", "cmd_v0_w1_true_abs_wz",
+                    "cmd_v0_w2_target_abs_wz", "cmd_v0_w2_exec_abs_wz", "cmd_v0_w2_true_abs_wz",
+                    "cmd_v0_w3_target_abs_wz", "cmd_v0_w3_exec_abs_wz", "cmd_v0_w3_true_abs_wz",
+                ),
+            ),
+            (
+                "vx分桶0结果",
+                "p2_cmd_v0_outcomes",
+                (
+                    "cmd_v0_w0_success", "cmd_v0_w0_failure", "cmd_v0_w0_timeout",
+                    "cmd_v0_w1_success", "cmd_v0_w1_failure", "cmd_v0_w1_timeout",
+                    "cmd_v0_w2_success", "cmd_v0_w2_failure", "cmd_v0_w2_timeout",
+                    "cmd_v0_w3_success", "cmd_v0_w3_failure", "cmd_v0_w3_timeout",
+                ),
+            ),
+            (
+                "vx分桶1前进链",
+                "p2_cmd_v1_vx_chain",
+                (
+                    "cmd_v1_w0_target_vx", "cmd_v1_w0_exec_vx", "cmd_v1_w0_true_vx",
+                    "cmd_v1_w1_target_vx", "cmd_v1_w1_exec_vx", "cmd_v1_w1_true_vx",
+                    "cmd_v1_w2_target_vx", "cmd_v1_w2_exec_vx", "cmd_v1_w2_true_vx",
+                    "cmd_v1_w3_target_vx", "cmd_v1_w3_exec_vx", "cmd_v1_w3_true_vx",
+                ),
+            ),
+            (
+                "vx分桶1转向链",
+                "p2_cmd_v1_wz_chain",
+                (
+                    "cmd_v1_w0_target_abs_wz", "cmd_v1_w0_exec_abs_wz", "cmd_v1_w0_true_abs_wz",
+                    "cmd_v1_w1_target_abs_wz", "cmd_v1_w1_exec_abs_wz", "cmd_v1_w1_true_abs_wz",
+                    "cmd_v1_w2_target_abs_wz", "cmd_v1_w2_exec_abs_wz", "cmd_v1_w2_true_abs_wz",
+                    "cmd_v1_w3_target_abs_wz", "cmd_v1_w3_exec_abs_wz", "cmd_v1_w3_true_abs_wz",
+                ),
+            ),
+            (
+                "vx分桶1结果",
+                "p2_cmd_v1_outcomes",
+                (
+                    "cmd_v1_w0_success", "cmd_v1_w0_failure", "cmd_v1_w0_timeout",
+                    "cmd_v1_w1_success", "cmd_v1_w1_failure", "cmd_v1_w1_timeout",
+                    "cmd_v1_w2_success", "cmd_v1_w2_failure", "cmd_v1_w2_timeout",
+                    "cmd_v1_w3_success", "cmd_v1_w3_failure", "cmd_v1_w3_timeout",
+                ),
+            ),
+            (
+                "vx分桶2前进链",
+                "p2_cmd_v2_vx_chain",
+                (
+                    "cmd_v2_w0_target_vx", "cmd_v2_w0_exec_vx", "cmd_v2_w0_true_vx",
+                    "cmd_v2_w1_target_vx", "cmd_v2_w1_exec_vx", "cmd_v2_w1_true_vx",
+                    "cmd_v2_w2_target_vx", "cmd_v2_w2_exec_vx", "cmd_v2_w2_true_vx",
+                    "cmd_v2_w3_target_vx", "cmd_v2_w3_exec_vx", "cmd_v2_w3_true_vx",
+                ),
+            ),
+            (
+                "vx分桶2转向链",
+                "p2_cmd_v2_wz_chain",
+                (
+                    "cmd_v2_w0_target_abs_wz", "cmd_v2_w0_exec_abs_wz", "cmd_v2_w0_true_abs_wz",
+                    "cmd_v2_w1_target_abs_wz", "cmd_v2_w1_exec_abs_wz", "cmd_v2_w1_true_abs_wz",
+                    "cmd_v2_w2_target_abs_wz", "cmd_v2_w2_exec_abs_wz", "cmd_v2_w2_true_abs_wz",
+                    "cmd_v2_w3_target_abs_wz", "cmd_v2_w3_exec_abs_wz", "cmd_v2_w3_true_abs_wz",
+                ),
+            ),
+            (
+                "vx分桶2结果",
+                "p2_cmd_v2_outcomes",
+                (
+                    "cmd_v2_w0_success", "cmd_v2_w0_failure", "cmd_v2_w0_timeout",
+                    "cmd_v2_w1_success", "cmd_v2_w1_failure", "cmd_v2_w1_timeout",
+                    "cmd_v2_w2_success", "cmd_v2_w2_failure", "cmd_v2_w2_timeout",
+                    "cmd_v2_w3_success", "cmd_v2_w3_failure", "cmd_v2_w3_timeout",
+                ),
+            ),
+            (
+                "vx分桶3前进链",
+                "p2_cmd_v3_vx_chain",
+                (
+                    "cmd_v3_w0_target_vx", "cmd_v3_w0_exec_vx", "cmd_v3_w0_true_vx",
+                    "cmd_v3_w1_target_vx", "cmd_v3_w1_exec_vx", "cmd_v3_w1_true_vx",
+                    "cmd_v3_w2_target_vx", "cmd_v3_w2_exec_vx", "cmd_v3_w2_true_vx",
+                    "cmd_v3_w3_target_vx", "cmd_v3_w3_exec_vx", "cmd_v3_w3_true_vx",
+                ),
+            ),
+            (
+                "vx分桶3转向链",
+                "p2_cmd_v3_wz_chain",
+                (
+                    "cmd_v3_w0_target_abs_wz", "cmd_v3_w0_exec_abs_wz", "cmd_v3_w0_true_abs_wz",
+                    "cmd_v3_w1_target_abs_wz", "cmd_v3_w1_exec_abs_wz", "cmd_v3_w1_true_abs_wz",
+                    "cmd_v3_w2_target_abs_wz", "cmd_v3_w2_exec_abs_wz", "cmd_v3_w2_true_abs_wz",
+                    "cmd_v3_w3_target_abs_wz", "cmd_v3_w3_exec_abs_wz", "cmd_v3_w3_true_abs_wz",
+                ),
+            ),
+            (
+                "vx分桶3结果",
+                "p2_cmd_v3_outcomes",
+                (
+                    "cmd_v3_w0_success", "cmd_v3_w0_failure", "cmd_v3_w0_timeout",
+                    "cmd_v3_w1_success", "cmd_v3_w1_failure", "cmd_v3_w1_timeout",
+                    "cmd_v3_w2_success", "cmd_v3_w2_failure", "cmd_v3_w2_timeout",
+                    "cmd_v3_w3_success", "cmd_v3_w3_failure", "cmd_v3_w3_timeout",
+                ),
+            ),
+            (
+                "vx分桶4前进链",
+                "p2_cmd_v4_vx_chain",
+                (
+                    "cmd_v4_w0_target_vx", "cmd_v4_w0_exec_vx", "cmd_v4_w0_true_vx",
+                    "cmd_v4_w1_target_vx", "cmd_v4_w1_exec_vx", "cmd_v4_w1_true_vx",
+                    "cmd_v4_w2_target_vx", "cmd_v4_w2_exec_vx", "cmd_v4_w2_true_vx",
+                    "cmd_v4_w3_target_vx", "cmd_v4_w3_exec_vx", "cmd_v4_w3_true_vx",
+                ),
+            ),
+            (
+                "vx分桶4转向链",
+                "p2_cmd_v4_wz_chain",
+                (
+                    "cmd_v4_w0_target_abs_wz", "cmd_v4_w0_exec_abs_wz", "cmd_v4_w0_true_abs_wz",
+                    "cmd_v4_w1_target_abs_wz", "cmd_v4_w1_exec_abs_wz", "cmd_v4_w1_true_abs_wz",
+                    "cmd_v4_w2_target_abs_wz", "cmd_v4_w2_exec_abs_wz", "cmd_v4_w2_true_abs_wz",
+                    "cmd_v4_w3_target_abs_wz", "cmd_v4_w3_exec_abs_wz", "cmd_v4_w3_true_abs_wz",
+                ),
+            ),
+            (
+                "vx分桶4结果",
+                "p2_cmd_v4_outcomes",
+                (
+                    "cmd_v4_w0_success", "cmd_v4_w0_failure", "cmd_v4_w0_timeout",
+                    "cmd_v4_w1_success", "cmd_v4_w1_failure", "cmd_v4_w1_timeout",
+                    "cmd_v4_w2_success", "cmd_v4_w2_failure", "cmd_v4_w2_timeout",
+                    "cmd_v4_w3_success", "cmd_v4_w3_failure", "cmd_v4_w3_timeout",
+                ),
+            ),
+        ),
+    ),
+    (
+        "三段赛道",
+        "p2_track_segments",
+        (
+            (
+                "各段推进速度",
+                "p2_segment_progress",
+                ("slope_inv_progress_mps", "stairs_inv_progress_mps", "maze_progress_mps"),
+            ),
+            (
+                "各段真实前进速度",
+                "p2_segment_true_vx",
+                ("slope_inv_true_vx", "stairs_inv_true_vx", "maze_true_vx"),
+            ),
+            (
+                "各段目标与执行速度",
+                "p2_segment_command_vx",
+                (
+                    "slope_inv_target_vx", "slope_inv_exec_vx",
+                    "stairs_inv_target_vx", "stairs_inv_exec_vx",
+                    "maze_target_vx", "maze_exec_vx",
+                ),
+            ),
+            (
+                "各段结果率",
+                "p2_segment_outcomes",
+                (
+                    "slope_inv_success", "slope_inv_failure", "slope_inv_timeout",
+                    "stairs_inv_success", "stairs_inv_failure", "stairs_inv_timeout",
+                    "maze_success", "maze_failure", "maze_timeout",
+                ),
+            ),
+            (
+                "各段样本占比",
+                "p2_segment_share",
+                (
+                    "slope_inv_sample_share",
+                    "stairs_inv_sample_share",
+                    "maze_sample_share",
+                    "current_segment_valid",
+                ),
+            ),
+            (
+                "各段低速与旋转",
+                "p2_segment_motion_modes",
+                (
+                    "slope_inv_stop_ratio", "slope_inv_creep_ratio", "slope_inv_spin_ratio",
+                    "stairs_inv_stop_ratio", "stairs_inv_creep_ratio", "stairs_inv_spin_ratio",
+                    "maze_stop_ratio", "maze_creep_ratio", "maze_spin_ratio",
+                ),
+            ),
+            (
+                "各段步态代价",
+                "p2_segment_gait",
+                ("slope_inv_gait_penalty", "stairs_inv_gait_penalty", "maze_gait_penalty"),
+            ),
+            (
+                "各段预测碰撞",
+                "p2_segment_predictive_collision",
+                (
+                    "slope_inv_predictive_clearance_m",
+                    "stairs_inv_predictive_clearance_m",
+                    "maze_predictive_clearance_m",
+                    "slope_inv_predictive_risk",
+                    "stairs_inv_predictive_risk",
+                    "maze_predictive_risk",
+                    "slope_inv_predictive_penalty",
+                    "stairs_inv_predictive_penalty",
+                    "maze_predictive_penalty",
+                ),
+            ),
+            (
+                "各段安全教师风险",
+                "p2_segment_teacher_risk",
+                (
+                    "slope_inv_teacher_risk", "slope_inv_teacher_high_risk_rate",
+                    "stairs_inv_teacher_risk", "stairs_inv_teacher_high_risk_rate",
+                    "maze_teacher_risk", "maze_teacher_high_risk_rate",
+                ),
+            ),
+        ),
+    ),
+    (
+        "性能资源",
+        "p2_runtime",
+        (
+            (
+                "阶段耗时",
+                "p2_stage_timing",
+                ("rollout_time_s", "update_time_s", "env_step_time_s"),
+            ),
+            (
+                "更新耗时",
+                "p2_update_timing",
+                ("actor_update_time_s", "critic_update_time_s", "adapter_update_time_s"),
+            ),
+            ("采样吞吐", "p2_throughput", ("samples_per_s",)),
+            ("图像传输耗时", "p2_h2d", ("h2d_time_s",)),
+            (
+                "显存当前值",
+                "p2_memory_current",
+                ("memory_allocated", "memory_reserved"),
+            ),
+            (
+                "显存峰值",
+                "p2_memory_peak",
+                ("max_memory_allocated", "max_memory_reserved"),
+            ),
+            (
+                "显存与深度缓存",
+                "p2_memory_guard",
+                ("max_memory_reserved_ratio", "pinned_depth_bytes"),
+            ),
+        ),
+    ),
+)
+
 TRACK_PANEL_SPECS = (
-    ("赛道完成数", "track_completed", "completed_count_track_l", "sum"),
+    ("赛道窗口完成数", "track_completed", "completed_count_track_l", "sum"),
     ("赛道失败数", "track_abnormal", "abnormal_count_track_l", "sum"),
     ("赛道超时数", "track_timeout", "timeout_count_track_l", "sum"),
     ("赛道总分", "track_total_score", "total_score_track_l", "avg"),
     ("赛道能耗分", "track_energy_score", "energy_score_track_l", "avg"),
     ("赛道姿态分", "track_pose_score", "pose_score_track_l", "avg"),
     ("赛道时间分", "track_time_score", "time_score_track_l", "avg"),
+)
+
+# Full Track P4 keeps its segment dimensions distinct from the legacy three-row
+# P2 panels.  The producer and P4 health contract own these keys; this monitor
+# declaration is intentionally a compact, reviewable UI contract.
+P4_FULL_TRACK_SEGMENT_LABELS = (
+    "slope",
+    "slope_inv",
+    "stairs",
+    "stairs_inv",
+    "maze",
+)
+P4_FULL_TRACK_PANEL_SPECS = (
+    (
+        "当前五段覆盖",
+        "p4_full_current_segments",
+        (
+            "current_segment_slope_share",
+            "current_segment_slope_inv_share",
+            "current_segment_stairs_share",
+            "current_segment_stairs_inv_share",
+            "current_segment_maze_share",
+        ),
+    ),
+    (
+        "出生五段重置覆盖",
+        "p4_full_spawn_segments",
+        (
+            "spawn_segment_slope_event_share",
+            "spawn_segment_slope_inv_event_share",
+            "spawn_segment_stairs_event_share",
+            "spawn_segment_stairs_inv_event_share",
+            "spawn_segment_maze_event_share",
+        ),
+    ),
+    (
+        "出生位置与四分位",
+        "p4_full_spawn_column_quartiles",
+        (
+            "spawn_reset_event_count",
+            "spawn_full_start_event_share",
+            "spawn_segment_start_event_share",
+            "spawn_position_q1_event_share",
+            "spawn_position_q2_event_share",
+            "spawn_position_q3_event_share",
+            "spawn_position_q4_event_share",
+        ),
+    ),
+    (
+        "静态难度列覆盖",
+        "p4_full_safe_hard_coverage",
+        (
+            "difficulty_l0_l9_share",
+            "difficulty_l10_l19_share",
+            "spawn_safe_point_event_share",
+            "spawn_hard_position_event_share",
+        ),
+    ),
+    (
+        "Reason4重试退回",
+        "p4_full_reason4_retry_fallback",
+        (
+            "spawn_reason4_retry_count",
+            "spawn_reason4_exhausted_count",
+            "spawn_reason4_fallback_applied_count",
+            "spawn_all_position_applied_count",
+            "spawn_validation_failure_count",
+            "spawn_write_failure_count",
+        ),
+    ),
+    (
+        "目标方位Clean故障",
+        "p4_full_goal_bearing_clean_fault",
+        (
+            "goal_bearing_clean_0_5_abs_rad",
+            "goal_bearing_fault_0_5_abs_rad",
+            "goal_bearing_clean_5_10_abs_rad",
+            "goal_bearing_fault_5_10_abs_rad",
+            "goal_bearing_clean_10_plus_abs_rad",
+            "goal_bearing_fault_10_plus_abs_rad",
+        ),
+    ),
+    (
+        "目标跳变径向切向",
+        "p4_full_goal_jump_components",
+        (
+            "goal_jump_active",
+            "goal_jump_radial_offset_m",
+            "goal_jump_tangent_offset_m",
+        ),
+    ),
+    (
+        "合法侧向目标灵敏度",
+        "p4_full_legitimate_side_goal",
+        (
+            "legitimate_side_goal_candidate_count",
+            "legitimate_side_goal_selected_count",
+            "legitimate_side_goal_selection_rate",
+            "legitimate_side_goal_bearing_abs_rad",
+        ),
+    ),
+    (
+        "五段Frontier势函数",
+        "p4_full_segment_frontier_potential",
+        (
+            "frontier_potential_before_slope",
+            "frontier_potential_after_slope",
+            "frontier_potential_before_slope_inv",
+            "frontier_potential_after_slope_inv",
+            "frontier_potential_before_stairs",
+            "frontier_potential_after_stairs",
+            "frontier_potential_before_stairs_inv",
+            "frontier_potential_after_stairs_inv",
+            "frontier_potential_before_maze",
+            "frontier_potential_after_maze",
+        ),
+    ),
+    (
+        "开阔直行门控",
+        "p4_full_open_straight_gate",
+        (
+            "open_straight_eligible",
+            "open_straight_goal_bearing_abs_rad",
+            "open_straight_boundary_distance_m",
+        ),
+    ),
+    (
+        "开阔直行逐项惩罚",
+        "p4_full_open_straight_penalties",
+        (
+            "open_straight_lateral_penalty",
+            "open_straight_s_turn_penalty",
+            "open_straight_extra_path_penalty",
+            "reward_open_straight",
+        ),
+    ),
+    (
+        "横向正向控制链",
+        "p4_full_vy_positive_chain",
+        (
+            "policy_target_vy_positive_mean",
+            "limited_target_vy_positive_mean",
+            "mapped_cmd_vy_positive_mean",
+            "exec_vy_positive_mean",
+            "true_vy_positive_mean",
+        ),
+    ),
+    (
+        "横向负向控制链",
+        "p4_full_vy_negative_chain",
+        (
+            "policy_target_vy_negative_mean",
+            "limited_target_vy_negative_mean",
+            "mapped_cmd_vy_negative_mean",
+            "exec_vy_negative_mean",
+            "true_vy_negative_mean",
+        ),
+    ),
+    (
+        "转向正向控制链",
+        "p4_full_wz_positive_chain",
+        (
+            "policy_target_wz_positive_mean",
+            "limited_target_wz_positive_mean",
+            "mapped_cmd_wz_positive_mean",
+            "exec_wz_positive_mean",
+            "true_wz_positive_mean",
+        ),
+    ),
+    (
+        "转向负向控制链",
+        "p4_full_wz_negative_chain",
+        (
+            "policy_target_wz_negative_mean",
+            "limited_target_wz_negative_mean",
+            "mapped_cmd_wz_negative_mean",
+            "exec_wz_negative_mean",
+            "true_wz_negative_mean",
+        ),
+    ),
+    (
+        "卡滞滑窗证据和重置",
+        "p4_full_stuck_sliding_window",
+        (
+            "motion_confined_share",
+            "wall_evidence_share",
+            "wall_stuck_candidate_share",
+            "wall_stuck_would_reset",
+            "wall_stuck_reset_triggered",
+            "wall_stuck_reset_rate",
+            "wall_stuck_duration_p50_s",
+            "wall_stuck_duration_p90_s",
+        ),
+    ),
+    (
+        "Episode起点五段",
+        "p4_full_episode_starts",
+        (
+            "episode_start_count",
+            "episode_start_slope_count",
+            "episode_start_slope_inv_count",
+            "episode_start_stairs_count",
+            "episode_start_stairs_inv_count",
+            "episode_start_maze_count",
+        ),
+    ),
+    (
+        "按出生段结果",
+        "p4_full_spawn_segment_outcomes",
+        (
+            "spawn_segment_slope_success_rate",
+            "spawn_segment_slope_failure_rate",
+            "spawn_segment_slope_timeout_rate",
+            "spawn_segment_slope_reason4_rate",
+            "spawn_segment_slope_inv_success_rate",
+            "spawn_segment_slope_inv_failure_rate",
+            "spawn_segment_slope_inv_timeout_rate",
+            "spawn_segment_slope_inv_reason4_rate",
+            "spawn_segment_stairs_success_rate",
+            "spawn_segment_stairs_failure_rate",
+            "spawn_segment_stairs_timeout_rate",
+            "spawn_segment_stairs_reason4_rate",
+            "spawn_segment_stairs_inv_success_rate",
+            "spawn_segment_stairs_inv_failure_rate",
+            "spawn_segment_stairs_inv_timeout_rate",
+            "spawn_segment_stairs_inv_reason4_rate",
+            "spawn_segment_maze_success_rate",
+            "spawn_segment_maze_failure_rate",
+            "spawn_segment_maze_timeout_rate",
+            "spawn_segment_maze_reason4_rate",
+        ),
+    ),
+    (
+        "按当前段结果",
+        "p4_full_current_segment_outcomes",
+        (
+            "current_segment_slope_success_rate",
+            "current_segment_slope_failure_rate",
+            "current_segment_slope_timeout_rate",
+            "current_segment_slope_reason4_rate",
+            "current_segment_slope_inv_success_rate",
+            "current_segment_slope_inv_failure_rate",
+            "current_segment_slope_inv_timeout_rate",
+            "current_segment_slope_inv_reason4_rate",
+            "current_segment_stairs_success_rate",
+            "current_segment_stairs_failure_rate",
+            "current_segment_stairs_timeout_rate",
+            "current_segment_stairs_reason4_rate",
+            "current_segment_stairs_inv_success_rate",
+            "current_segment_stairs_inv_failure_rate",
+            "current_segment_stairs_inv_timeout_rate",
+            "current_segment_stairs_inv_reason4_rate",
+            "current_segment_maze_success_rate",
+            "current_segment_maze_failure_rate",
+            "current_segment_maze_timeout_rate",
+            "current_segment_maze_reason4_rate",
+        ),
+    ),
 )
 
 NAV_PANEL_SPECS = (
@@ -124,6 +1399,19 @@ def _configured_policy_entry() -> str:
     return str(config.get("app", {}).get("policy_entry", "nav_dagger")).strip().lower()
 
 
+def _configured_p4_training_profile() -> str:
+    path = Path(__file__).resolve().with_name(
+        "train_env_conf_track_p4_nav_ppo.toml"
+    )
+    try:
+        config = toml.load(path)
+    except (OSError, TypeError, ValueError):
+        return "full_track"
+    return str(
+        config.get("p4_nav_ppo", {}).get("training_profile", "full_track")
+    ).strip().lower()
+
+
 def _add_line_panel(monitor, name, name_en, metric):
     (
         monitor.add_panel(name=name, name_en=name_en, type="line")
@@ -132,9 +1420,11 @@ def _add_line_panel(monitor, name, name_en, metric):
     )
 
 
-def _add_track_panel(monitor, name, name_en, metric_prefix, aggregation):
+def _add_track_panel(
+    monitor, name, name_en, metric_prefix, aggregation, *, level_count=10
+):
     monitor.add_panel(name=name, name_en=name_en, type="line")
-    for level in range(10):
+    for level in range(level_count):
         metric = f"{metric_prefix}{level}"
         monitor.add_metric(metrics_name=metric, expr=f"{aggregation}({metric}{{}})")
     monitor.end_panel()
@@ -203,7 +1493,332 @@ def _build_nav_monitor():
     return monitor.build()
 
 
+def _add_p4_track_outcome_panels(monitor):
+    monitor.add_group(
+        group_name="Track 20列窗口结果", group_name_en="p4_track_outcomes"
+    )
+    for panel in TRACK_PANEL_SPECS:
+        _add_track_panel(monitor, *panel, level_count=20)
+    monitor.end_group()
+
+
+def _add_p4_full_track_panels(monitor):
+    monitor.add_group(
+        group_name="P4全赛道诊断", group_name_en="p4_full_track_diagnostics"
+    )
+    for panel in P4_FULL_TRACK_PANEL_SPECS:
+        _add_multi_line_panel(monitor, *panel)
+    monitor.end_group()
+
+
+def _build_p2_monitor():
+    monitor = MonitorConfigBuilder()
+    monitor.title("P2连续导航训练")
+    for group_name, group_name_en, panels in P2_MONITOR_GROUPS:
+        monitor.add_group(group_name=group_name, group_name_en=group_name_en)
+        for name, name_en, metrics in panels:
+            _add_multi_line_panel(monitor, name, name_en, metrics)
+        monitor.end_group()
+    return monitor.build()
+
+
+def _build_p4_monitor(training_profile=None):
+    profile = str(
+        training_profile or _configured_p4_training_profile()
+    ).strip().lower()
+    if profile not in {"maze_credit_repair", "full_track"}:
+        raise ValueError(f"unsupported P4 monitor training profile {profile!r}")
+    monitor = MonitorConfigBuilder()
+    monitor.title(
+        "P4迷宫归因修复训练"
+        if profile == "maze_credit_repair"
+        else "P4五段全赛道训练"
+    )
+    _add_p4_track_outcome_panels(monitor)
+    if profile == "full_track":
+        _add_p4_full_track_panels(monitor)
+    for group_name, group_name_en, panels in P2_MONITOR_GROUPS:
+        monitor.add_group(group_name=group_name, group_name_en=group_name_en)
+        for name, name_en, metrics in panels:
+            _add_multi_line_panel(monitor, name, name_en, metrics)
+        monitor.end_group()
+    groups = (
+        (
+            "P4目标与动作",
+            "p4_goal_mapper",
+            (
+                ("目标滤波", "p4_goal_belief", ("goal_innovation_d2", "goal_measurement_accepted", "goal_measurement_clipped", "goal_measurement_rejected", "goal_age_s", "goal_dropout_active", "goal_jump_active", "goal_process_variance_m2", "goal_candidate_count")),
+                ("目标滤波分位", "p4_goal_quantiles", ("goal_innovation_d2_p50", "goal_innovation_d2_p90", "goal_innovation_d2_p99", "goal_age_s_p50", "goal_age_s_p90")),
+                ("目标距离分桶", "p4_goal_distance_buckets", ("goal_distance_0_5_share", "goal_accept_0_5", "goal_clipped_0_5", "goal_reject_0_5", "goal_distance_5_10_share", "goal_accept_5_10", "goal_clipped_5_10", "goal_reject_5_10", "goal_distance_10_plus_share", "goal_accept_10_plus", "goal_clipped_10_plus", "goal_reject_10_plus")),
+                ("目标状态", "p4_goal_state", ("goal_map_x_m", "goal_map_y_m", "goal_map_distance_m", "goal_propagated", "goal_epoch_changed", "goal_reacquire_pending", "goal_reacquisition_time_s", "goal_fault_allowed", "goal_freshness", "goal_stale_low_speed_active", "raw_goal_distance_gt10_share")),
+                ("软巡航与动态上限", "p4_soft_cruise", ("policy_target_vx", "limited_target_vx", "effective_speed_cap", "safety_speed_cap", "safety_cap_predictive_risk", "soft_cruise_clear_factor", "soft_cruise_low_error", "soft_cruise_high_error", "reward_soft_cruise", "mapper_version_valid")),
+                ("平移安全限制", "p4_translation_limiter", ("translation_safety_risk", "translation_safety_alpha_raw", "translation_safety_alpha", "near_goal_final_translation_alpha", "policy_target_vx", "policy_target_vy", "limited_target_vx", "limited_target_vy")),
+                ("近终点软捕获", "p4_near_goal_capture", ("near_goal_capture_candidate", "near_goal_capture_active", "near_goal_capture_distance_m", "near_goal_capture_alignment", "near_goal_capture_cap_m_s", "near_goal_capture_alpha")),
+                ("近终点捕获当前上报窗口", "p4_near_goal_capture_window", ("near_goal_capture_candidate_count", "near_goal_capture_entry_count", "near_goal_capture_exit_count", "near_goal_capture_zone_success_count", "near_goal_capture_zone_collision_count", "near_goal_capture_zone_timeout_count", "near_goal_capture_zone_reset_count", "near_goal_capture_reset_counted_as_completion_error")),
+                ("近终点捕获至平台成功时延", "p4_near_goal_capture_platform_latency", ("near_goal_capture_entry_to_platform_success_latency_s",)),
+                ("动作映射", "p4_action_mapping", ("normalized_action_vx", "normalized_action_vy", "normalized_action_wz", "policy_target_vx", "policy_target_vy", "policy_target_wz", "limited_target_vx", "limited_target_vy", "limited_target_wz", "mapped_cmd_vx", "mapped_cmd_vy", "mapped_cmd_wz")),
+                ("转向抵消", "p4_yaw_cancellation", ("yaw_exec_cancellation", "yaw_true_cancellation", "yaw_exec_sign_flip", "yaw_true_sign_flip", "yaw_true_overshoot", "reward_yaw_raw")),
+                ("安全方向内目标偏好", "p4_goal_safe_preference", ("goal_safe_preference_eligible", "goal_safe_preference_gap", "goal_safe_preference_selected", "goal_safe_preference_best", "reward_goal_safe_preference")),
+                ("路径效率", "p4_route_efficiency", ("route_path_length_m", "route_positive_progress_m", "route_excess_distance_m", "route_efficiency", "reward_route_excess")),
+            ),
+        ),
+        (
+            "P4感知诊断",
+            "p4_maze_perception",
+            (
+                ("视觉可分性", "p4_teacher_scene", ("teacher_scene_corridor", "teacher_scene_left_open", "teacher_scene_right_open", "teacher_scene_junction", "teacher_scene_dead_end", "teacher_scene_fuzzy", "teacher_safe_top1_clear", "scanner_valid_share", "safety_bce", "diagnostic_teacher_coverage", "diagnostic_wall_auroc", "diagnostic_wall_miss_rate", "diagnostic_safe_top1_accuracy", "diagnostic_scene_macro_f1", "diagnostic_clean_live_latent_cosine", "diagnostic_goal_wall_auroc", "diagnostic_goal_safe_top1_accuracy", "diagnostic_goal_scene_macro_f1")),
+                ("Clean与诊断故障视觉", "p4_clean_diagnostic_fault", ("diagnostic_fault_shadow_share", "diagnostic_fault_wall_auroc", "diagnostic_fault_safe_top1_accuracy", "diagnostic_fault_scene_macro_f1", "diagnostic_clean_fault_latent_cosine", "diagnostic_clean_fault_action_mae")),
+                ("SafetyHead风险", "p4_safety_head_risk", ("teacher_risk_left", "teacher_risk_center", "teacher_risk_right", "safety_head_risk_left", "safety_head_risk_center", "safety_head_risk_right", "safe_alternative_available", "selected_safest_direction")),
+                ("安全决策当前上报窗口", "p4_safety_decision_window", ("head_correct_samples", "head_correct_actor_wrong_count", "head_correct_actor_wrong_rate")),
+                ("风险减速当前上报窗口", "p4_risk_deceleration_window", ("risk_event_resolved_count", "risk_decel_policy_count", "risk_decel_limited_count", "risk_no_deceleration_count", "risk_decel_policy_rate", "risk_decel_limited_rate", "risk_no_deceleration_rate", "predictive_collision_risk", "body_collision_onset", "wall_stuck_candidate_share", "wall_stuck_reset_triggered")),
+                ("LSTM记忆消融", "p4_zero_hidden_shadow", ("zero_hidden_action_mae", "zero_hidden_direction_disagreement", "camera_clean_live_action_mae", "camera_clean_live_latent_cosine")),
+                ("Actor教师与辅助梯度", "p4_actor_auxiliary", ("teacher_guidance_loss", "teacher_direction_loss", "teacher_speed_loss", "teacher_yaw_loss", "teacher_guidance_valid_steps", "teacher_guidance_gradient_ratio", "camera_aux_gradient_ratio", "mirror_aux_gradient_ratio", "stuck_aux_gradient_ratio", "auxiliary_gradient_ratio", "mirror_aux_sequence_share", "mirror_aux_eligible_sequence_count", "mirror_aux_scheduled_sequence_share", "safety_hard_positive_share")),
+                ("Actor卡滞分类质量", "p4_actor_stuck_quality", ("stuck_aux_loss", "stuck_aux_valid_steps", "actor_stuck_pr_auc", "actor_stuck_precision", "actor_stuck_recall", "actor_stuck_f1", "actor_stuck_threshold", "actor_stuck_positive_share")),
+            ),
+        ),
+        (
+            "P4安全奖励",
+            "p4_safety_rewards",
+            (
+                ("迷宫非重复进展", "p4_maze_credit", ("maze_new_best_credit", "maze_new_best_delta_m", "maze_new_best_episode_earned", "terminal_potential_clawback")),
+                ("安全原始项", "p4_safety_raw", ("reward_predictive_raw", "reward_missed_safe_raw", "reward_yaw_raw", "reward_goal_safe_raw", "reward_yaw_exit_raw")),
+                ("安全应用项", "p4_safety_applied", ("reward_predictive_collision_risk", "reward_missed_safe_direction", "reward_yaw_cancellation", "reward_yaw_exit_response", "reward_safety_group_scale", "reward_stuck_sustained", "reward_goal_safe_preference", "reward_stuck_reset", "reward_continuous_time_scale")),
+                ("Frontier停滞实际与Shadow", "p4_frontier_stagnation", ("reward_frontier_stagnation", "reward_frontier_stagnation_shadow")),
+                ("奖励守恒", "p4_reward_conservation", ("reward_decomposed_total", "rollout_reward_mean", "reward_conservation_error")),
+            ),
+        ),
+        (
+            "P4相机时序",
+            "p4_camera_timing",
+            (
+                ("共享帧状态", "p4_camera_frames", ("camera_capture", "camera_frame_changed", "camera_frame_id", "camera_age_s", "camera_raw_hole_rate", "camera_near_clip_added_hole_rate", "camera_delivered_hole_rate", "camera_center_hole_rate", "camera_lower_hole_rate", "near_clip_m", "near_clip_normalized")),
+                ("故障样本", "p4_camera_masks", ("camera_delay_only", "camera_fault_only", "camera_fault_delay_overlap", "camera_fault_kind", "camera_shadow_age_250ms")),
+                ("一致性监督", "p4_camera_aux", ("camera_memory_loss", "camera_clean_live_action_mae", "camera_clean_live_latent_cosine", "camera_aux_coefficient", "camera_aux_gradient_ratio", "camera_delay_only_share", "camera_fault_only_share", "camera_fault_delay_overlap_share")),
+            ),
+        ),
+        (
+            "P4墙面卡滞回收",
+            "p4_stuck_reset",
+            (
+                ("卡滞证据", "p4_stuck_evidence", ("motion_confined_share", "wall_evidence_share", "wall_stuck_candidate_share", "wall_stuck_duration_s", "wall_stuck_duration_p50_s", "wall_stuck_duration_p90_s", "wall_stuck_mapping_valid")),
+                ("持续卡墙惩罚", "p4_stuck_sustained", ("wall_stuck_sustained_active", "wall_stuck_sustained_severity", "reward_stuck_sustained")),
+                ("卡滞回收当前上报窗口", "p4_stuck_window_outcome", ("wall_stuck_would_reset", "wall_stuck_reset_triggered", "wall_stuck_raw_term", "wall_stuck_reset_rate", "rollout_wall_stuck_reset_count", "wall_stuck_saved_seconds", "rollout_wall_stuck_saved_seconds", "collision_to_stuck_reset_delay_s", "reset_after_push_share", "episode_starts_per_hour")),
+                ("卡滞终止回报当前上报窗口", "p4_stuck_terminal_window", ("stuck_terminal_episode_return_mean", "stuck_terminal_nonnegative_rate")),
+                ("卡滞恢复最近60秒", "p4_recovery_events_60s", ("recovery_event_count_60s",)),
+                ("卡滞恢复生命周期累计", "p4_recovery_events_lifetime", ("recovery_event_lifetime_count",)),
+                ("卡滞恢复阶段样本", "p4_recovery_phase_samples", ("recovery_early_stuck_sample_share", "recovery_confirmed_stuck_sample_share", "recovery_safe_exit_share")),
+                ("卡滞恢复当前上报窗口", "p4_recovery_window_outcome", ("recovery_candidate_entry_count", "recovery_success_count", "recovery_terminal_count", "recovery_unverified_exit_count", "recovery_success_rate", "recovery_time_s")),
+                ("卡滞恢复生命周期结果", "p4_recovery_lifetime_outcome", ("recovery_candidate_lifetime_count", "recovery_event_lifetime_count", "recovery_terminal_lifetime_count")),
+                ("平台终止与出生Hook", "p4_stuck_term", ("wall_stuck_term_available", "wall_stuck_term_config_valid", "p4_spawn_hook_installed", "spawn_validation_failure_count", "spawn_write_failure_count")),
+            ),
+        ),
+        (
+            "P4 Push与响应",
+            "p4_push_adapter",
+            (
+                ("Push装配", "p4_push_assembly", ("push_term_assembly_valid", "push_runtime_active", "push_telemetry_valid")),
+                ("Push 当前上报窗口实测", "p4_push_window", ("push_epoch", "push_event_count", "seconds_since_push", "push_runtime_active", "push_telemetry_valid", "push_actual_delta_vx_mean", "push_actual_delta_vy_mean", "push_actual_delta_vx_abs_max", "push_actual_delta_vy_abs_max")),
+                ("Push 窗口与生命周期计数", "p4_push_event_scopes", ("push_rollout_event_count_total", "push_lifetime_event_count_total")),
+                ("Push 生命周期覆盖", "p4_push_lifetime", ("push_lifetime_count", "push_env_coverage", "push_env_coverage_rate")),
+                ("Push后恢复", "p4_push_recovery", ("push_grace_active", "push_tracking_response_mae", "push_recovery_pending", "push_tracking_recovery_time_s")),
+                ("Push标签拒绝", "p4_push_label_reject", ("adapter_push_rejected_02s", "adapter_push_rejected_06s", "adapter_push_rejected_10s", "adapter_push_rejected_pose")),
+                ("Adapter兼容池", "p4_adapter_compat", ("adapter_compatible_current_records", "adapter_compatible_parent_records", "adapter_compat_migrated_legacy_parent_records", "adapter_legacy_parent_rejected_records", "adapter_compat_rejected_records", "adapter_target_current_ratio", "adapter_target_p35_ratio", "adapter_target_earlier_ratio", "adapter_latest_replay_ratio", "adapter_recent_replay_ratio", "adapter_parent_replay_ratio")),
+                ("Adapter拒绝原因", "p4_adapter_rejections", ("adapter_compat_rejected_missing_contract", "adapter_compat_rejected_mismatch_version", "adapter_compat_rejected_mismatch_schema", "adapter_compat_rejected_mismatch_low_level_digest", "adapter_compat_rejected_mismatch_feedback_digest", "adapter_compat_rejected_mismatch_capability_digest", "adapter_compat_rejected_mismatch_response_profile15", "adapter_compat_rejected_mismatch_action_mapper", "adapter_compat_rejected_mismatch_observation_layout", "adapter_compat_rejected_mismatch_label_layout")),
+            ),
+        ),
+        (
+            "P4冻结与性能",
+            "p4_runtime",
+            (
+                ("监控合同健康度", "p4_monitor_contract", ("p4_monitor_expected_metric_count", "p4_monitor_metric_with_data_count", "p4_monitor_empty_metric_count", "p4_monitor_longest_data_age_s")),
+                ("两小时归因阶段", "p4_credit_phase", ("credit_phase_warm", "credit_phase_adapt", "credit_phase_train", "credit_phase_final", "session_effective_seconds", "session_wall_seconds")),
+                ("冻结模块", "p4_credit_frozen", ("low_digest_drift", "low_optimizer_steps", "adapter_frozen", "navigation_learning_rate", "safety_head_learning_rate", "adapter_learning_rate")),
+                ("冻结合同", "p4_frozen_contract", ("low_digest_drift", "low_optimizer_steps", "high_updates", "p4_tbptt_sequences_per_env", "p4_tbptt_nav_ticks")),
+                ("资源与吞吐", "p4_resources", ("memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved", "samples_per_s")),
+            ),
+        ),
+    )
+    for group_name, group_name_en, panels in groups:
+        monitor.add_group(group_name=group_name, group_name_en=group_name_en)
+        for name, name_en, metrics in panels:
+            _add_multi_line_panel(monitor, name, name_en, metrics)
+        monitor.end_group()
+    return monitor.build()
+
+
+def _build_p3_monitor():
+    monitor = MonitorConfigBuilder()
+    monitor.title("P35 低速楼梯与后期Push")
+    groups = (
+        (
+            "P3分阶段训练",
+            "p3_joint_training",
+            (
+                ("阶段与时钟", "p3_phase_clock", ("p3_phase", "p3_session_effective_seconds", "p3_lifetime_effective_seconds")),
+                ("监控合同健康度", "p35_monitor_contract", ("p35_monitor_expected_metric_count", "p35_monitor_registered_metric_count", "p35_monitor_metric_with_data_count", "p35_monitor_empty_metric_count", "p35_monitor_longest_data_age_s")),
+                ("高低层更新", "p3_update_counts", ("p3_low_updates", "p3_high_updates", "adapter_update_attempts", "adapter_updates", "adapter_skipped_updates")),
+                ("平台生命周期", "p3_lifecycle", ("platform_lifecycle_callbacks", "platform_lifecycle_failures")),
+                ("低层收敛", "p3_low_losses", ("p3_low_policy_loss", "p3_low_value_loss", "p3_low_entropy", "p3_low_approx_kl", "p3_low_clip_fraction", "low_reward_mean", "low_done_rate")),
+                ("低层更新职责", "p3_low_update_scope", ("p3_low_actor_update_active", "p3_low_critic_update_active", "p3_low_update_time_s")),
+                ("Rollout reset终止结果", "p3_window_outcomes", ("p3_window_completed_count", "p3_window_failure_count", "p3_window_timeout_count")),
+                ("Rollout径向事件", "p3_radial_milestones", ("p3_m1_success_count", "p3_m2_success_count", "p3_standard_success_count", "p3_platform_success_count", "p3_joint_success_count", "p3_proxy_platform_agreement_count")),
+                ("径向进展与M3边界", "p3_radial_progress", ("p3_radial_distance_mean", "p3_best_radial_distance_mean", "p3_m3_hold_share", "p3_m3_target_boundary_gap_m", "p3_m3_proxy_target_gap_m")),
+            ),
+        ),
+        (
+            "Standard地形覆盖",
+            "p3_standard_terrain",
+            (
+                ("四类地形占比", "p3_terrain_family", ("p3_terrain_slope_share", "p3_terrain_slope_inv_share", "p3_terrain_stairs_share", "p3_terrain_stairs_inv_share")),
+                ("地形等级L0-L9", "p3_terrain_level", tuple(f"p3_terrain_level_l{i}_share" for i in range(10))),
+                ("静态地形列0-19", "p3_terrain_column", tuple(f"p3_terrain_column_l{i}_share" for i in range(20))),
+            ),
+        ),
+        (
+            "高层命令与反馈",
+            "p3_command_feedback",
+            (
+                ("前进速度链", "p3_vx_response", ("target_vx", "exec_vx", "measured_vx", "true_vx")),
+                ("横向速度链", "p3_vy_response", ("target_vy", "exec_vy", "measured_vy", "true_vy")),
+                ("转向速度链", "p3_wz_response", ("target_wz", "exec_wz", "measured_wz", "true_wz")),
+                ("执行跟踪误差", "p3_tracking_error", ("vx_tracking_abs_error", "vy_tracking_abs_error", "wz_tracking_abs_error")),
+                ("指令正负覆盖", "p3_command_sign_share", ("target_vx_positive_share", "target_vx_negative_share", "target_vy_positive_share", "target_vy_negative_share", "target_wz_positive_share", "target_wz_negative_share")),
+                ("低层命令桶覆盖", "p3_command_bucket_share", ("command_bucket_straight_share", "command_bucket_reserved_reverse_share", "command_bucket_vx_vy_share", "command_bucket_vx_wz_share", "command_bucket_pure_yaw_share", "command_bucket_brake_restart_share", "command_bucket_zero_share")),
+                ("横向正负条件响应", "p3_vy_signed_response", ("target_vy_positive_mean", "exec_vy_positive_mean", "true_vy_positive_mean", "vy_positive_tracking_abs_error", "target_vy_negative_mean", "exec_vy_negative_mean", "true_vy_negative_mean", "vy_negative_tracking_abs_error")),
+                ("转向正负条件响应", "p3_wz_signed_response", ("target_wz_positive_mean", "exec_wz_positive_mean", "true_wz_positive_mean", "wz_positive_tracking_abs_error", "target_wz_negative_mean", "exec_wz_negative_mean", "true_wz_negative_mean", "wz_negative_tracking_abs_error")),
+                ("反馈质量", "p3_feedback_quality", ("feedback_valid", "feedback_age_s", "feedback_true_velocity_error")),
+            ),
+        ),
+        (
+            "低层步态回归",
+            "p3_low_gait",
+            (
+                ("四足接触占空比", "p3_gait_duty", ("fl_duty_factor", "fr_duty_factor", "rl_duty_factor", "rr_duty_factor")),
+                ("四足最长悬空", "p3_gait_max_air", ("fl_max_air_time", "fr_max_air_time", "rl_max_air_time", "rr_max_air_time")),
+                ("四足步频", "p3_gait_frequency", ("fl_step_frequency", "fr_step_frequency", "rl_step_frequency", "rr_step_frequency")),
+                ("四足单次支撑滑移", "p3_gait_slip", ("fl_slip_distance", "fr_slip_distance", "rl_slip_distance", "rr_slip_distance")),
+                ("触地冲击", "p3_gait_impact", ("fl_impact_speed", "fr_impact_speed", "rl_impact_speed", "rr_impact_speed")),
+                ("触地点横向边界", "p3_gait_touchdown_y", ("fl_touchdown_y", "fr_touchdown_y", "rl_touchdown_y", "rr_touchdown_y")),
+                ("连续支撑时间", "p3_gait_stance", ("fl_continuous_stance", "fr_continuous_stance", "rl_continuous_stance", "rr_continuous_stance")),
+                ("镜像一致性", "p3_mirror", ("mirror_loss", "mirror_sequence_share", "mirror_gradient_ratio", "mirror_gradient_cosine", "mirror_error_fl", "mirror_error_fr", "mirror_error_rl", "mirror_error_rr")),
+                ("辅助梯度比例", "p35_aux_gradients", ("anchor_gradient_ratio", "anchor_gradient_cosine", "memory_gradient_ratio", "memory_gradient_cosine", "mirror_gradient_ratio", "mirror_gradient_cosine", "action_aux_combined_gradient_ratio")),
+                ("动作幅度与裁剪", "p3_action_amplitude", ("action_mean_abs_p50", "action_mean_abs_p95", "action_mean_abs_max", "action_raw_abs_p50", "action_raw_abs_p95", "action_raw_abs_max", "action_exec_abs_p95", "action_exec_abs_max", "action_clip_rate", "action_clip_rate_hip", "action_clip_rate_thigh", "action_clip_rate_calf")),
+                ("关节目标动态", "p3_joint_target_dynamics", ("joint_target_rate_abs_p50", "joint_target_rate_abs_p95", "joint_target_rate_abs_max", "joint_target_jerk_abs_p50", "joint_target_jerk_abs_p95", "joint_target_jerk_abs_max")),
+                ("高频动作功率", "p3_action_spectrum", ("action_15_25hz_power_ratio_hip", "action_15_25hz_power_ratio_thigh", "action_15_25hz_power_ratio_calf", "action_spectrum_valid_env_share")),
+                ("步态基线", "p3_gait_baseline", ("p3_gait_baseline_finalized", "p3_gait_baseline_exact_share", "p3_gait_baseline_terrain_share", "p3_gait_baseline_global_share", "p3_gait_baseline_disabled_share", "gait_baseline_samples")),
+                ("映射有效性", "p3_gait_mapping", ("gait_window_valid", "gait_sensor_mapping_valid", "body_collision_mapping_valid", "mirror_mapping_valid")),
+            ),
+        ),
+        (
+            "低层奖励与Sim2Real",
+            "p3_low_reward",
+            (
+                ("低层奖励分解", "p3_low_reward_terms", ("reward_track_lin_vel_xy", "reward_track_ang_vel_z", "reward_p3_sim2real_cost", "reward_energy", "reward_undesired_contacts", "reward_joint_acc", "reward_joint_position_penalty")),
+                ("P35训练侧奖励", "p35_low_reward_terms", ("p35_reward_progress", "p35_reward_default_posture", "p35_reward_joint_acc", "p35_reward_contact", "p35_reward_gait", "p35_reward_posture", "p35_reward_baseline_valid")),
+                ("步态Shadow诊断", "p3_gait_shadow_terms", ("shadow_p3_contact_quality", "shadow_p3_crossing", "shadow_p3_starvation")),
+                ("Sim2Real约束原始分量", "p3_sim2real_components", ("p3_sim2real_component_valid_share", "p3_sim2real_sustained_torque_raw", "p3_sim2real_torque_peak_raw", "p3_sim2real_action_rate_raw", "p3_sim2real_action_jerk_raw")),
+                ("关节力矩分位", "p3_torque_quantiles", ("hip_torque_p50", "hip_torque_p95", "hip_torque_max", "thigh_torque_p50", "thigh_torque_p95", "thigh_torque_max", "calf_torque_p50", "calf_torque_p95", "calf_torque_max")),
+                ("力矩硬线余量", "p3_torque_margin", ("torque_margin_p50", "torque_margin_p05", "torque_margin_min", "torque_near_hard_rate", "torque_hard_violation_rate", "torque_near_hard_max_duration_s")),
+                ("机械功率", "p3_mechanical_power", ("mechanical_power_mean", "mechanical_power_p50", "mechanical_power_p95", "mechanical_power_max")),
+                ("命令桶裁剪率", "p3_command_bucket_clip", ("command_bucket_straight_clip_rate", "command_bucket_reserved_reverse_clip_rate", "command_bucket_vx_vy_clip_rate", "command_bucket_vx_wz_clip_rate", "command_bucket_pure_yaw_clip_rate", "command_bucket_brake_restart_clip_rate", "command_bucket_zero_clip_rate")),
+                ("命令桶锚点", "p3_command_bucket_anchor", ("command_bucket_straight_anchor_mean", "command_bucket_reserved_reverse_anchor_mean", "command_bucket_vx_vy_anchor_mean", "command_bucket_vx_wz_anchor_mean", "command_bucket_pure_yaw_anchor_mean", "command_bucket_brake_restart_anchor_mean", "command_bucket_zero_anchor_mean")),
+            ),
+        ),
+        (
+            "楼梯视觉记忆",
+            "p3_stair_memory",
+            (
+                ("近裁剪分位", "p3_near_clip_quantiles", ("near_clip_mean_m", "near_clip_p50_m", "near_clip_p90_m", "near_clip_p99_m")),
+                ("近裁剪分布", "p3_near_clip_histogram", tuple(f"near_clip_bin_{i}_share" for i in range(10))),
+                ("原始深度孔洞", "p3_raw_depth_holes", ("depth_raw_hole_full", "depth_raw_hole_center", "depth_raw_hole_lower")),
+                ("增强深度孔洞", "p3_aug_depth_holes", ("depth_aug_hole_full", "depth_aug_hole_center", "depth_aug_hole_lower", "depth_fault_active_share", "depth_fault_enabled_share", "depth_fault_strength")),
+                ("故障类型与计划时长", "p3_depth_fault_types", ("depth_fault_near_only_share", "depth_fault_sparse_share", "depth_fault_block_share", "depth_fault_severe_share", "depth_fault_blackout_share", "depth_fault_planned_duration_s")),
+                ("严重故障事件", "p3_depth_fault_events", ("depth_fault_severe_event_count", "depth_fault_severe_duration_s", "depth_fault_blackout_event_count", "depth_fault_blackout_duration_s", "depth_fault_recovery_telemetry_available")),
+                ("近裁剪桶楼梯完成率", "p3_near_clip_stair_completion", tuple(f"near_clip_bin_{i}_stair_completion_rate" for i in range(10))),
+                ("近裁剪桶楼梯样本数", "p3_near_clip_stair_attempts", tuple(f"near_clip_bin_{i}_stair_attempt_count" for i in range(10))),
+                ("记忆监督", "p3_memory_aux", ("memory_loss", "memory_action_mae", "memory_latent_cosine", "memory_gradient_ratio", "memory_gradient_cosine")),
+                ("记忆样本来源", "p35_memory_selection", ("memory_fault_frame_share", "memory_timing_frame_share", "memory_fault_only_frame_share", "memory_timing_only_frame_share", "memory_fault_timing_overlap_share", "memory_selected_frame_share")),
+                ("相机采集与保持", "p35_camera_timing", ("camera_capture_count", "camera_hold_ratio", "camera_feature_age_mean_ms", "camera_feature_age_p95_ms", "camera_active_delay_p95_ms", "camera_shadow_delay_p95_ms")),
+                ("Hidden消融", "p3_memory_hidden_ablation", ("memory_hidden_advantage",)),
+            ),
+        ),
+        (
+            "ResponseAdapter",
+            "p3_response_adapter",
+            (
+                ("速度预测误差", "p3_adapter_mae", ("adapter_velocity_mae_02s", "adapter_velocity_mae_06s", "adapter_velocity_mae_10s")),
+                ("响应损失", "p3_adapter_losses", ("adapter_loss", "adapter_velocity_loss", "adapter_pose_loss", "adapter_stuck_loss", "adapter_nll_10s")),
+                ("标签有效率", "p3_adapter_valid", ("adapter_valid_02s", "adapter_valid_06s", "adapter_valid_10s")),
+                ("样本与梯度", "p3_adapter_samples", ("adapter_latest_records", "adapter_recent_records", "adapter_parent_records", "adapter_latest_replay_ratio", "adapter_recent_replay_ratio", "adapter_parent_replay_ratio", "adapter_low_level_version_lag", "adapter_gradient_norm", "adapter_reset_mask_ratio")),
+            ),
+        ),
+        (
+            "性能资源",
+            "p3_runtime",
+            (
+                ("阶段耗时", "p3_stage_timing", ("p3_rollout_time_s", "env_step_time_s", "p3_low_update_time_s")),
+                ("采样吞吐", "p3_throughput", ("samples_per_s",)),
+                ("随机化配置合同", "p3_domain_randomization", ("p3_friction_min", "p3_friction_max", "p3_base_added_mass_kg", "p3_restitution_max", "p3_noise_level", "p3_dr_runtime_telemetry_available")),
+                ("Push装配", "p35_push_assembly", ("p35_push_term_exists", "p35_push_mode_correct", "p35_push_wrapper_installed", "p35_push_runtime_api_available", "p3_push_enabled", "p3_push_velocity_m_s", "p3_push_runtime_telemetry_available", "p35_push_runtime_active_share", "p35_push_telemetry_valid_share")),
+                ("Push事件", "p35_push_events", ("p35_push_event_count", "p35_push_events_per_min_per_env", "p35_push_env_coverage", "p35_seconds_since_push_min")),
+                ("Push实际幅度", "p35_push_delta", ("p35_push_delta_vx_p50", "p35_push_delta_vx_p95", "p35_push_delta_vx_max", "p35_push_delta_vx_positive_share", "p35_push_delta_vy_p50", "p35_push_delta_vy_p95", "p35_push_delta_vy_max", "p35_push_delta_vy_positive_share", "p35_push_config_violation_count")),
+                ("Push后姿态恢复", "p35_push_posture_recovery", ("p35_push_post_roll_peak", "p35_push_post_pitch_peak", "p35_push_post_fall_rate", "p35_push_post_timeout_rate", "p35_push_recovery_time_p50_s", "p35_push_recovery_time_p95_s")),
+                ("Push后运动恢复", "p35_push_motion_recovery", ("p35_push_post_speed_mae_peak", "p35_push_post_timeout_rate", "p35_push_recovery_time_p50_s", "p35_push_recovery_time_p95_s")),
+                ("Push地形分桶", "p35_push_terrain", ("p35_push_terrain_slope_count", "p35_push_terrain_slope_inv_count", "p35_push_terrain_stairs_count", "p35_push_terrain_stairs_inv_count")),
+                ("Push难度分桶", "p35_push_level", tuple(f"p35_push_level_{i}_count" for i in range(10))),
+                ("Push命令分桶", "p35_push_command", ("p35_push_command_straight_count", "p35_push_command_reserved_reverse_count", "p35_push_command_vx_vy_count", "p35_push_command_vx_wz_count", "p35_push_command_pure_yaw_count", "p35_push_command_brake_restart_count", "p35_push_command_zero_count")),
+                ("Push速度与方向", "p35_push_speed_direction", ("p35_push_speed_low_count", "p35_push_speed_medium_count", "p35_push_speed_high_count", "p35_push_direction_vx_positive_count", "p35_push_direction_vx_negative_count", "p35_push_direction_vy_positive_count", "p35_push_direction_vy_negative_count")),
+                ("显存当前值", "p3_memory_current", ("memory_allocated", "memory_reserved")),
+                ("显存峰值", "p3_memory_peak", ("max_memory_allocated", "max_memory_reserved")),
+                ("低层紧凑缓存", "p3_low_compact_storage", ("p3_low_storage_bytes",)),
+            ),
+        ),
+    )
+    for group_name, group_name_en, panels in groups:
+        monitor.add_group(group_name=group_name, group_name_en=group_name_en)
+        for name, name_en, metrics in panels:
+            _add_multi_line_panel(monitor, name, name_en, metrics)
+        monitor.end_group()
+    monitor.add_group(group_name="步态条件分组", group_name_en="p3_gait_conditioned")
+    _add_multi_line_panel(
+        monitor,
+        "步态条件样本覆盖",
+        "p3_gait_condition_coverage",
+        tuple(
+            f"p3_{terrain}_{motion}_sample_share"
+            for terrain in ("slope", "slope_inv", "stairs", "stairs_inv")
+            for motion in ("low_speed", "forward", "turn_lateral")
+        ),
+    )
+    for terrain in ("slope", "slope_inv", "stairs", "stairs_inv"):
+        for metric, label in (
+            ("slip_distance", "滑移距离"),
+            ("impact_speed", "触地速度"),
+            ("stance_s", "连续支撑"),
+        ):
+            names = tuple(
+                f"p3_{terrain}_{motion}_{leg}_{metric}"
+                for motion in ("low_speed", "forward", "turn_lateral")
+                for leg in ("fl", "fr", "rl", "rr")
+            )
+            _add_multi_line_panel(
+                monitor,
+                f"{terrain} {label}",
+                f"p3_{terrain}_{metric}",
+                names,
+            )
+    monitor.end_group()
+    return monitor.build()
+
+
 def build_monitor():
-    if _configured_policy_entry() == "p15_response":
+    policy_entry = _configured_policy_entry()
+    if policy_entry == "p15_response":
         return _build_p15_monitor()
+    if policy_entry in {"p2_nav_ppo", "p2_nav_eval"}:
+        return _build_p2_monitor()
+    if policy_entry == "p4_nav_ppo":
+        return _build_p4_monitor()
+    if policy_entry == "p3_standard_joint":
+        return _build_p3_monitor()
     return _build_nav_monitor()

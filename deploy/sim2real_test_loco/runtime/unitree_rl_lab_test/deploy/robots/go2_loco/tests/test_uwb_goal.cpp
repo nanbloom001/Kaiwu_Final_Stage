@@ -54,6 +54,9 @@ int main()
 
     expect_near(vision_nav::actor_goal_from_planar_xy(1.0f, -2.0f),
                 {0.1f, -0.2f, std::sqrt(5.0f) / 20.0f, 0.0f});
+    // Existing Actor80 call sites keep the legacy per-axis clamp for distant goals.
+    expect_near(vision_nav::actor_goal_from_planar_xy(12.0f, 16.0f),
+                {1.0f, 1.0f, 1.0f, 0.0f});
     assert(std::fabs(vision_nav::time_filter_alpha(0.25f, 0.25f) -
                      (1.0f - std::exp(-1.0f))) < 1e-5f);
     assert(vision_nav::time_filter_alpha(0.0f, 0.25f) == 0.0f);

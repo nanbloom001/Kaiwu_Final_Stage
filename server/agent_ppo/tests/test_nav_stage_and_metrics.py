@@ -5,6 +5,8 @@
 import ast
 import os
 import pathlib
+import sys
+import types
 import unittest
 from unittest import mock
 
@@ -18,6 +20,13 @@ from agent_ppo.conf.conf import (
     NavDaggerConfig,
     NavEvalConfig,
     P15ResponseConfig,
+    P2NavEvalConfig,
+    P2NavPPOConfig,
+    P3StandardEvalConfig,
+    P3StandardJointConfig,
+    P3TrackEvalConfig,
+    P4NavPPOConfig,
+    StandardVisualPPOConfig,
     _configured_training_stage,
     _infer_stage_from_task_name,
 )
@@ -44,12 +53,61 @@ class _Logger:
 
 
 class TestNavStageSelection(unittest.TestCase):
+    def test_p4_training_agent_init_resolves_full_track_segment_contract(self):
+        kaiwu_mod = types.ModuleType("kaiwudrl")
+        interface_mod = types.ModuleType("kaiwudrl.interface")
+        agent_mod = types.ModuleType("kaiwudrl.interface.agent")
+        agent_mod.BaseAgent = type("BaseAgent", (), {})
+        interface_mod.agent = agent_mod
+        kaiwu_mod.interface = interface_mod
+        sys.modules.setdefault("kaiwudrl", kaiwu_mod)
+        sys.modules.setdefault("kaiwudrl.interface", interface_mod)
+        sys.modules.setdefault("kaiwudrl.interface.agent", agent_mod)
+        validate_mod = types.ModuleType("tools.train_env_conf_validate")
+        validate_mod.check_usr_conf = lambda *_args, **_kwargs: (True, "ok")
+        sys.modules.setdefault("tools.train_env_conf_validate", validate_mod)
+
+        from agent_ppo.agent import Agent
+
+        agent = Agent.__new__(Agent)
+        agent.is_p2_nav_eval = False
+        agent.is_p4_nav = True
+        agent.device = "cpu"
+        agent.num_envs = 1
+        agent.num_actions = 12
+        agent.logger = _Logger()
+        agent.monitor = None
+        agent._init_p2_nav(
+            P4NavPPOConfig,
+            {
+                "p4_nav_ppo": {"p4_seed": 1, "num_learning_epochs": 4},
+                "terrain": {
+                    "track": {
+                        "sub_terrains": [
+                            "pyramid_slope",
+                            "pyramid_slope_inv",
+                            "pyramid_stairs",
+                            "pyramid_stairs_inv",
+                            "open_entry_maze",
+                        ]
+                    }
+                },
+            },
+        )
+        self.assertEqual(
+            agent.algorithm.config["track_segment_labels"],
+            ["slope", "slope_inv", "stairs", "stairs_inv", "maze"],
+        )
+
     def test_active_branch_bootstraps_worker_and_aisrv_from_configure_app(self):
         config_path = pathlib.Path(__file__).resolve().parents[2] / "conf" / "configure_app.toml"
         policy_entry = toml.load(config_path)["app"]["policy_entry"]
         expected = {
             "nav_dagger": NavDaggerConfig,
             "p15_response": P15ResponseConfig,
+            "p2_nav_ppo": P2NavPPOConfig,
+            "p3_standard_joint": P3StandardJointConfig,
+            "p4_nav_ppo": P4NavPPOConfig,
         }[policy_entry]
         self.assertIs(Config.CURRENT, expected)
 
@@ -76,6 +134,9 @@ class TestNavStageSelection(unittest.TestCase):
         expected_name = {
             "nav_dagger": "NavDaggerConfig",
             "p15_response": "P15ResponseConfig",
+            "p2_nav_ppo": "P2NavPPOConfig",
+            "p3_standard_joint": "P3StandardJointConfig",
+            "p4_nav_ppo": "P4NavPPOConfig",
         }[policy_entry]
         self.assertEqual(current_assignment.value.id, expected_name)
 
@@ -95,23 +156,49 @@ class TestNavStageSelection(unittest.TestCase):
             with self.assertRaises(ValueError):
                 _configured_training_stage(_Logger())
 
-    def test_track_camera_without_forwarded_entry_selects_nav_eval(self):
+    def test_track_camera_without_forwarded_entry_preserves_p2_lineage(self):
         usr_conf = {
             "env_conf": {"task_name": "Unitree-Go2-Velocity-Camera"},
             "terrain": {"mode": "track"},
         }
-        self.assertIs(
-            _infer_stage_from_task_name(usr_conf, _Logger()), NavEvalConfig
-        )
+        with mock.patch.object(Config, "CURRENT", P2NavPPOConfig):
+            self.assertIs(
+                _infer_stage_from_task_name(usr_conf, _Logger()), P2NavEvalConfig
+            )
 
-    def test_standard_camera_still_selects_lbc(self):
+    def test_track_camera_without_forwarded_entry_keeps_legacy_nav_lineage(self):
+        usr_conf = {
+            "env_conf": {"task_name": "Unitree-Go2-Velocity-Camera"},
+            "terrain": {"mode": "track"},
+        }
+        with mock.patch.object(Config, "CURRENT", NavDaggerConfig):
+            self.assertIs(
+                _infer_stage_from_task_name(usr_conf, _Logger()), NavEvalConfig
+            )
+
+    def test_standard_camera_without_forwarded_entry_keeps_p3_lineage(self):
         usr_conf = {
             "env_conf": {"task_name": "Unitree-Go2-Velocity-Camera"},
             "terrain": {"mode": "standard"},
         }
-        self.assertIs(
-            _infer_stage_from_task_name(usr_conf, _Logger()), LBCLocoConfig
-        )
+        # 当前分支 bootstrap 为 P3 血缘：Standard+Camera 不能回退到 lbc_loco，
+        # 必须保持 p3_standard_eval（否则 P3 包找不到 highslow 候选）。
+        with mock.patch.object(Config, "CURRENT", P3StandardJointConfig):
+            self.assertIs(
+                _infer_stage_from_task_name(usr_conf, _Logger()),
+                P3StandardEvalConfig,
+            )
+
+    def test_standard_camera_without_forwarded_entry_keeps_legacy_lbc(self):
+        usr_conf = {
+            "env_conf": {"task_name": "Unitree-Go2-Velocity-Camera"},
+            "terrain": {"mode": "standard"},
+        }
+        # 非 P3 血缘（历史 StandardVisualPPO 基线）仍保持历史 lbc_loco 回退。
+        with mock.patch.object(Config, "CURRENT", StandardVisualPPOConfig):
+            self.assertIs(
+                _infer_stage_from_task_name(usr_conf, _Logger()), LBCLocoConfig
+            )
 
     def test_explicit_nav_dagger_is_eval_only_during_eval_inference(self):
         usr_conf = {
@@ -124,6 +211,122 @@ class TestNavStageSelection(unittest.TestCase):
         self.assertIs(
             _infer_stage_from_task_name(usr_conf, _Logger()), NavEvalConfig
         )
+
+    def test_explicit_p2_training_entry_is_eval_only_during_eval_inference(self):
+        usr_conf = {
+            "env_conf": {
+                "task_name": "Unitree-Go2-Velocity-Camera",
+                "policy_entry": "p2_nav_ppo",
+            },
+            "terrain": {"mode": "track"},
+        }
+        self.assertIs(
+            _infer_stage_from_task_name(usr_conf, _Logger()), P2NavEvalConfig
+        )
+
+    def test_p2_eval_single_stream_unpacks_aux_and_builds_wire(self):
+        import torch
+
+        kaiwu_mod = types.ModuleType("kaiwudrl")
+        interface_mod = types.ModuleType("kaiwudrl.interface")
+        agent_mod = types.ModuleType("kaiwudrl.interface.agent")
+
+        class _BaseAgent:
+            pass
+
+        agent_mod.BaseAgent = _BaseAgent
+        interface_mod.agent = agent_mod
+        kaiwu_mod.interface = interface_mod
+        sys.modules.setdefault("kaiwudrl", kaiwu_mod)
+        sys.modules.setdefault("kaiwudrl.interface", interface_mod)
+        sys.modules.setdefault("kaiwudrl.interface.agent", agent_mod)
+        validate_mod = types.ModuleType("tools.train_env_conf_validate")
+        validate_mod.check_usr_conf = lambda *_args, **_kwargs: (True, "ok")
+        sys.modules.setdefault("tools.train_env_conf_validate", validate_mod)
+
+        from agent_ppo.agent import Agent
+        from agent_ppo.feature import nav_contract, p2_contract
+
+        class _Algorithm:
+            def __init__(self):
+                self.received = None
+                self.advanced = 0
+
+            def frame_begin(self, obs, wire, *, deterministic):
+                self.received = (obs.clone(), wire.clone(), deterministic)
+                return {"actions": torch.ones(obs.shape[0], 12)}, None, None
+
+            def eval_frame_advance(self):
+                self.advanced += 1
+
+        agent = Agent.__new__(Agent)
+        agent.device = "cpu"
+        agent.is_p2_nav = True
+        agent.is_p2_nav_eval = True
+        agent.is_lbc = False
+        agent.is_nav_dagger = False
+        agent.is_nav_eval = False
+        agent.is_visual_ppo = False
+        agent._p2_eval_checkpoint_path = "/tmp/model.ckpt-navadapt-61633.pkl"
+        agent._lifecycle_probe_exploit_logged = True
+        agent.algorithm = _Algorithm()
+        obs = torch.zeros(2, nav_contract.POLICY_OBS_DIM)
+        aux = torch.arange(60, dtype=torch.float32).reshape(2, 30)
+        packed = p2_contract.pack_eval_response_aux(obs, aux)
+        result = agent.exploit(packed)
+        received_obs, received_wire, deterministic = agent.algorithm.received
+        self.assertTrue(torch.equal(received_obs, packed))
+        worker_aux = received_wire[:, p2_contract.CRITIC_OBS_DIM :]
+        self.assertTrue(
+            torch.equal(worker_aux[:, : p2_contract.RESPONSE_AUX_DIM], aux)
+        )
+        self.assertTrue(
+            torch.equal(
+                worker_aux[:, p2_contract.RESPONSE_AUX_DIM :],
+                torch.zeros(2, p2_contract.DIAGNOSTIC_AUX_DIM),
+            )
+        )
+        self.assertEqual(received_wire.shape, (2, p2_contract.PRIVILEGED_WIRE_DIM))
+        self.assertTrue(deterministic)
+        self.assertEqual(agent.algorithm.advanced, 1)
+        self.assertEqual(tuple(result[0].action.shape), (2, 12))
+
+    def test_p2_eval_ensure_load_uses_runtime_model_location(self):
+        kaiwu_mod = types.ModuleType("kaiwudrl")
+        interface_mod = types.ModuleType("kaiwudrl.interface")
+        agent_mod = types.ModuleType("kaiwudrl.interface.agent")
+        agent_mod.BaseAgent = type("BaseAgent", (), {})
+        interface_mod.agent = agent_mod
+        kaiwu_mod.interface = interface_mod
+        sys.modules.setdefault("kaiwudrl", kaiwu_mod)
+        sys.modules.setdefault("kaiwudrl.interface", interface_mod)
+        sys.modules.setdefault("kaiwudrl.interface.agent", agent_mod)
+        validate_mod = types.ModuleType("tools.train_env_conf_validate")
+        validate_mod.check_usr_conf = lambda *_args, **_kwargs: (True, "ok")
+        sys.modules.setdefault("tools.train_env_conf_validate", validate_mod)
+        config_mod = types.ModuleType("common_python.config.config_control")
+        config_mod.CONFIG = types.SimpleNamespace(
+            eval_model_dir="/tmp/p2-eval", eval_model_id="61633"
+        )
+        config_pkg = types.ModuleType("common_python.config")
+        config_pkg.config_control = config_mod
+        sys.modules["common_python.config"] = config_pkg
+        sys.modules["common_python.config.config_control"] = config_mod
+
+        from agent_ppo.agent import Agent
+
+        agent = Agent.__new__(Agent)
+        agent.is_p2_nav_eval = True
+        agent._p2_eval_checkpoint_path = None
+        calls = []
+
+        def _load(path, model_id):
+            calls.append((path, model_id))
+            agent._p2_eval_checkpoint_path = f"{path}/model.ckpt-navadapt-{model_id}.pkl"
+
+        agent._load_p2_nav = _load
+        agent._ensure_p2_eval_checkpoint_loaded()
+        self.assertEqual(calls, [("/tmp/p2-eval", "61633")])
 
     def test_active_track_config_has_no_fake_level_mix(self):
         config_path = (
@@ -205,6 +408,15 @@ class TestNavStageSelection(unittest.TestCase):
         self.assertNotIn("step_score_track_l", monitor_source)
         self.assertNotIn("hard_termination_rate", nav_panel_source)
         self.assertNotIn('name_en="value_loss"', monitor_source)
+
+    def test_p4_monitor_declares_all_twenty_track_columns(self):
+        monitor_source = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "conf"
+            / "monitor_builder.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("level_count=20", monitor_source)
+        self.assertIn('group_name_en="p4_track_outcomes"', monitor_source)
 
     def test_monitor_panel_names_use_platform_supported_characters(self):
         monitor_path = (

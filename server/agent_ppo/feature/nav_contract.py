@@ -187,8 +187,35 @@ UWB_STALE_TIMEOUT_S = 0.5             # freshness 开始衰减（TODO：与 depl
 UWB_HOLD_TIMEOUT_S = 2.0              # freshness 衰减到 0（TODO：与 deploy 配对）
 UWB_DROPOUT_RATE_PER_S = 0.05         # 丢帧段泊松到达率（每秒）
 UWB_DROPOUT_DURATION_S = (0.3, 2.0)   # 丢帧段时长均匀采样
-GOAL_XY_SCALE_M = 10.0                # encode: local_xy / 10, clamp ±1
+GOAL_XY_SCALE_M = 10.0                # XY magnitude saturation radius in meters
 GOAL_DIST_SCALE_M = 20.0              # encode: dist / 20, clamp [0,1]
+GOAL_ENCODING_VERSION = "direction_preserving_xy_v2"
+
+
+def encode_goal_xy_direction_preserving(local_goal_xy):
+    """Encode local XY without losing bearing beyond the near-goal radius.
+
+    The near-goal branch deliberately retains the original ``xy / 10``
+    arithmetic pointwise for every distance at or below 10 m.  Farther goals
+    use their unit bearing, which avoids the old independent-axis saturation.
+    """
+
+    # Keep the static checkpoint/golden-vector contract importable in tooling
+    # environments that intentionally do not install the training stack.
+    import torch
+
+    if local_goal_xy.ndim != 2 or local_goal_xy.shape[-1] != 2:
+        raise ValueError(
+            "goal XY must have shape [num_envs, 2], "
+            f"got {tuple(local_goal_xy.shape)}"
+        )
+    distance = torch.linalg.vector_norm(local_goal_xy, dim=-1)
+    legacy_near = local_goal_xy / GOAL_XY_SCALE_M
+    safe_distance = distance.clamp_min(torch.finfo(local_goal_xy.dtype).eps)
+    far_bearing = local_goal_xy / safe_distance.unsqueeze(-1)
+    return torch.where(
+        (distance <= GOAL_XY_SCALE_M).unsqueeze(-1), legacy_near, far_bearing
+    )
 
 
 def high_level_checkpoint_contract() -> dict:
@@ -214,6 +241,12 @@ def high_level_checkpoint_contract() -> dict:
         "cmd_clamp_max": list(CMD_CLAMP_MAX),
         "zero_token_bypasses_slew": ZERO_TOKEN_BYPASSES_SLEW,
         "cnn_feature_semantics": "vision_encoder.cnn(depth)_raw_v1",
+        "goal_encoding": {
+            "version": GOAL_ENCODING_VERSION,
+            "xy": "normalize(local_xy)*min(distance_m/10,1)",
+            "distance": "min(distance_m/20,1)",
+            "near_goal_compatibility": "distance_m<=10_uses_legacy_xy_over_10",
+        },
         "input_slices": {
             "cnn": list(CNN_FEAT_SLICE),
             "goal4": list(GOAL4_SLICE),

@@ -11,14 +11,25 @@ Go2 lbc_loco 学生策略部署树（楼梯测试 + 固定命令模式）。目�
 ## 与当前 Standard 训练包的边界
 
 `behavior_distill_v2`、`privileged_loco_teacher_v1` 和
-`kaiwu_train_v1`（包括 `daggerfull-16288`、`visionfull-28401` 以及
-`standard_visual_ppo` 的 `rlcritic`/`rlactor`/`rlfull` 文件）都是训练/恢复制品，
+`kaiwu_train_v1`（包括 `daggerfull-16288`、`visionfull-28401`、P1.5 `response*`、
+P2 `navwarm`/`navadapt`/`navfull` 以及 `standard_visual_ppo` 的
+`rlcritic`/`rlactor`/`rlfull` 文件）都是训练/恢复制品，
 `capabilities.deployable=false`。它们可能包含 `height_scan256`、optimizer、
 冻结教师或其他真机不可提供的状态，当前 `export_loco_onnx.py` 不接受这些格式。
+
+P2 的 `modules.high_level.component_status="complete"` 只表示训练包包含完整动作型高层，
+不表示已有部署 runtime。其输入还要求 `goal4`、`nav_nonvisual36`、
+`response_profile16`、`adapter_confidence1` 与两组 recurrent state；当前 command-v2 高层输出
+三轴 `[vx,vy,wz]`，旧二维 evaluator/exporter 不得静默补 `vy=0`。在独立完成导出、
+接口审查和真机验证前，部署端必须拒绝直接加载或通过改名伪装。
 
 默认部署路线仍只接受经过单独导出审查的 `format="lbc_loco"` 视觉策略候选；
 不得通过改名把上述训练包伪装成可部署 checkpoint。本次 R2 合入不改变 ONNX
 输入、关节顺序、动作缩放、控制频率或 Jetson 运行代码。
+
+P4 训练 checkpoint 不是本部署树的可部署候选：尚未完成与此 Actor80 `goal[1,4]`
+输入兼容的导出审查、ONNX 数值校验和 Jetson/真机验证前，必须保持
+`capabilities.deployable=false`，不得作为本路线的 `policy.onnx` 或通过改名加载。
 
 ## 所需制品清单
 | 制品 | 类型 | 当前状态 | SHA256 | 说明 |
@@ -36,6 +47,11 @@ Go2 lbc_loco 学生策略部署树（楼梯测试 + 固定命令模式）。目�
 - **输出**: `cmd[1,3]` `cmd_raw[1,3]` `clearance[1,3]`（恒 0）`joint[1,12]`（原始动作，未 scale/offset）`loco_h_out[2,1,64]` `loco_c_out[2,1,64]` `nav_h_out[2,1,64]` `nav_c_out[2,1,64]`（原样透传）
 - **LSTM 语义**: loco LSTM 状态 (h,c) 须由 C++ runner 逐帧回喂，episode 起始重置为 0；nav LSTM 状态原样透传（此图不更新）
 - **proprio[6:9] 覆写**: 推理前必须由 C++ 覆写为上一帧 cmd / 固定注入 cmd（图外契约①）
+- **UWB goal 编码**: 当前默认部署入口和现有 Actor80 继续使用
+  `ActorGoalEncoding::LegacyActor80`，即 `[clamp(x/10),clamp(y/10),min(d/20,1),0]`。
+  `DirectionPreservingV2` 只为未来与 P4 v2 合同匹配的可部署制品显式启用；`d>10m` 时其前两维
+  使用单位方位 `[x/d,y/d]`。当前 `p4full8h-r2` bundle 标记为 non-deployable，不能让训练期合同
+  静默改变稳定低层运行时。UWB 新鲜度衰减与保持超时不由编码版本改变。
 - **opset=17**, `dynamic_axes=None`（固定 batch=1）
 
 ## 生成命令

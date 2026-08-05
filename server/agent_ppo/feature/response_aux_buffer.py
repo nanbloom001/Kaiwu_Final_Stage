@@ -222,12 +222,6 @@ class ResponseAuxBuffer:
         records = list(self._records)[start : start + window]
         burn_in_records = records[: self.burn_in_steps]
         train_records = records[self.burn_in_steps :]
-        capability = torch.tensor(
-            p15_contract.CAPABILITY_PROFILE15,
-            device=self.device,
-            dtype=torch.float32,
-        )
-
         def _observations(selected):
             if not selected:
                 return torch.empty(
@@ -238,7 +232,9 @@ class ResponseAuxBuffer:
                 )
             return torch.stack(
                 [
-                    build_response_observation(record["aux"], capability)[env_ids]
+                    build_response_observation(
+                        record["aux"], self._capability_for_record(record)
+                    )[env_ids]
                     for record in selected
                 ],
                 dim=0,
@@ -249,6 +245,7 @@ class ResponseAuxBuffer:
         reset_mask = torch.stack(
             [record["episode_start"][env_ids] for record in train_records], dim=0
         )
+
         burn_in_reset_mask = (
             torch.stack(
                 [record["episode_start"][env_ids] for record in burn_in_records], dim=0
@@ -257,6 +254,44 @@ class ResponseAuxBuffer:
             else torch.empty(0, env_count, device=self.device, dtype=torch.bool)
         )
         self.total_sequences += env_count
+        metadata = {
+            "low_level_digest": tuple(
+                str(record["low_level_digest"]) for record in train_records
+            ),
+            "low_level_iteration": torch.tensor(
+                [int(record["low_level_iteration"]) for record in train_records],
+                device=self.device,
+                dtype=torch.long,
+            ),
+            "command_phase": torch.stack(
+                [record["command_phase"][env_ids] for record in train_records], dim=0
+            ),
+            "terrain_family": torch.stack(
+                [record["terrain_family"][env_ids] for record in train_records], dim=0
+            ),
+            "terrain_level": torch.stack(
+                [record["terrain_level"][env_ids] for record in train_records], dim=0
+            ),
+        }
+        # P2 Track records may carry a live spatial segment. P1.5 and legacy
+        # parent records intentionally use -1 so they cannot be mislabeled as
+        # slope/stairs/maze samples.
+        if any("current_segment" in record for record in train_records):
+            metadata["current_segment"] = torch.stack(
+                [
+                    (
+                        record["current_segment"]
+                        if torch.is_tensor(record.get("current_segment"))
+                        else torch.full(
+                            (self.num_envs,),
+                            -1.0,
+                            device=self.device,
+                        )
+                    )[env_ids]
+                    for record in train_records
+                ],
+                dim=0,
+            )
         return ResponseBatch(
             burn_in_observations=burn_in_observations,
             burn_in_reset_mask=burn_in_reset_mask,
@@ -277,25 +312,14 @@ class ResponseAuxBuffer:
             pose_mask=torch.stack(
                 [record["pose_mask"][env_ids] for record in train_records], dim=0
             ),
-            metadata={
-                "low_level_digest": tuple(
-                    str(record["low_level_digest"]) for record in train_records
-                ),
-                "low_level_iteration": torch.tensor(
-                    [int(record["low_level_iteration"]) for record in train_records],
-                    device=self.device,
-                    dtype=torch.long,
-                ),
-                "command_phase": torch.stack(
-                    [record["command_phase"][env_ids] for record in train_records], dim=0
-                ),
-                "terrain_family": torch.stack(
-                    [record["terrain_family"][env_ids] for record in train_records], dim=0
-                ),
-                "terrain_level": torch.stack(
-                    [record["terrain_level"][env_ids] for record in train_records], dim=0
-                ),
-            },
+            metadata=metadata,
+        )
+
+    def _capability_for_record(self, _record) -> torch.Tensor:
+        return torch.tensor(
+            p15_contract.CAPABILITY_PROFILE15,
+            device=self.device,
+            dtype=torch.float32,
         )
 
     def state_dict(self) -> dict[str, object]:
