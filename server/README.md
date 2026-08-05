@@ -19,47 +19,79 @@
 
 ## 活动基线
 
-- **当前 P4 Maze 入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
-  `codex/p4-maze8h-attack`，任务 `p4maze8h-10hzroute`，Track+Camera、128 env、75 秒 episode、
-  单段 `open_entry_maze`、20 个静态难度列、课程关闭；先执行 600 秒只读诊断，再累计完整
-  28800 秒梯度训练，并保留 5 分钟 rollout/保存/退出余量，平台任务配置为 8 小时 15 分钟。父包为
-  `p4nav2h_1256446-F`（checkpoint SHA256
-  `8aae0892664f2f263949f7e5f9f3b53ecd2936b44e80f3783091579bcf3d3461`）；模型 ID只负责候选选择，加载后仍以 stage、模块 spec、
-  tensor shape、有限值和实际 SHA256 为准。
-  完整任务合同、验证证据和回滚边界见
-  [`docs/p4-maze8h-attack.md`](./docs/p4-maze8h-attack.md)。
-- P4 保持 policy 57905、低层 57901/Actor77/action12、高层 Actor85。完整低层、低层 Critic与
-  方差冻结；只训练 NavigationEncoder、高层 Actor/LSTM、新 Critic、SafetyHead 和 Adapter。
-  高层 rollout 为 32 个 10Hz tick，按两个 TBPTT16 序列更新；低层只缓存未变 delivered frame 的
-  CNN feature32，LSTM 仍在每个 50Hz tick 用当前 proprio 推进。
-- P4 mapper 保持 Actor policy target 的完整 `vx=[0,1.0]`、`vy=0.30a`、`wz=0.90a`；
-  旧 slow/cruise/fast 随机速度档在 Maze 强化中关闭。Goal 过期但有历史 MAP 时限制为 `vx<=0.20`、`|vy|<=0.10`、
-  `|wz|<=0.25` 谨慎前进；从未获得有效目标时停止平移。GoalBelief v3 从 507 维 P4 training wire
-  读取未裁剪米制 goal，episode reset 时立即重建，异常测量需连续五次一致才接管；
-  critic/reward/scorer 继续使用真值。动态 safety cap 由 delivered depth 和当前 exec 弧线的
-  可部署风险探针计算，Track eval 不依赖 training-only SafetyHead。
-- Maze 强化新增软巡航惩罚：前方 clear、Goal 新鲜且中心方向接近最安全方向时，低于
-  `0.60m/s` 或高于 `0.75m/s` 的 policy target 只受轻量负奖励，不产生正奖励；前方堵塞、
-  侧向明显更安全或 Goal 失效时允许降速/停止。面板同时展示 policy target、limited target、
-  exec 和 true velocity，避免把安全限幅误读为 Actor 输出。
-- 10Hz 奖励合同把连续 tick 项按 `duration_frames/10` 缩放，保持原 5Hz 每秒量级；成功使用
-  `+200` 一次性 impulse。持续卡墙、目标一致的安全选向和额外路程均只产生小幅负奖励，分别解决
-  等待 reset、背离目标逃逸和不必要绕路；事件奖励和按米路程项不按 tick 频率重复放大。
-- 共享相机状态机在 capture 时只施加一次近裁剪/孔洞，低层和高层读取同一 delivered frame；
-  clean teacher 每 rollout 从当前高层策略刷新并保持独立 recurrent hidden。Push 在 0-2 小时
-  关闭、2-6 小时 `+-0.04m/s`、6-8 小时 `+-0.05m/s`，真实 delta 仅进入训练 tail/诊断，Actor
-  不读取 push flag。exact resume 会恢复 session 时钟并立即恢复正确 Push 阶段。
-- P4 R2 只在训练 wire 的 P3 493 维之后附加 raw goal2 与 wall-stuck diagnostics12；eval wire 仍为
-  385。当前 Maze 配置使用已经过开发容器动态验证的 `active + 7s` 墙面卡滞 reset；启动时仍须
-  在线确认平台 `nav_stuck_timeout`、`time_out=true`、公开 get/set/readback 和 `dt=0.02s`，验证
-  不通过时禁用真实 reset 并告警。reason=4 是无 bootstrap 的独立 terminal，不计作完成或普通超时。
-- P4 predictive/missed-safe/yaw 安全组使用 `-0.06` 的原 5Hz 等效上限，10Hz 正常 tick 再乘
-  0.5；启用曲线为连续的
-  `0-30m:0`、`30-60m:0->0.25`、`60-120m:0.25->1.0`，不再在 2 小时边界从约 0.5 突跳到 1.0。
-  Goal 跳变/丢失故障使用独立 multiplier，避免调整奖励时意外改变观测噪声分布。
-  P3 父包中缺少逐记录 contract 的 completed Adapter records 只在 aux/label shape、有限值、
-  horizon/sequence、来源 digest 格式和序列内部版本一致性全部通过时迁移为 training-only legacy
-  off-policy replay；当前 P4 记录缺 contract 仍会拒绝，模型 ID不参与放行。
+- **当前 P4 Maze 归因修复入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
+  `codex/p4-maze2h-credit-repair`，任务 `p4maze2h-credit-repair`。父包固定为
+  `p4maze8h10hz_1416926` 的 `mazefinal` checkpoint；128 env、10Hz 高层、50Hz 低层、
+  32-tick rollout、TBPTT16、4 PPO epochs，单段 `open_entry_maze`、20 列、课程关闭、
+  75 秒 episode，完整有效训练 `7200s`，平台任务墙钟 `2.25h`。
+  完整训练合同、平台任务和验证边界见
+  [`docs/p4-maze2h-credit-repair.md`](./docs/p4-maze2h-credit-repair.md)。
+- 本轮冻结低层、NavigationEncoder、SafetyHead 和 ResponseAdapter；保留高层 Actor/LSTM
+  权重但重置 Actor Adam，重建 Critic、Critic optimizer 和 return statistics，新建
+  training-only StuckHead。0-10 分钟只训练 Critic/StuckHead，之后按 `creditadapt ->
+  credittrain -> creditfinal` 逐步训练 Actor；模型 ID 只用于选择父包，模块/spec/shape/有限值
+  才决定兼容性。
+- Maze 进展改为每个 episode 不可重复领取的历史最短距离 credit：`2.0/m`、累计上限 `+12`，
+  terminal 不再 clawback；success `+200`，failure/timeout `-25`，10Hz 时间成本 `-0.02/tick`。
+  卡墙 reset 全程 `shadow`，只记录候选并从 0.8 秒开始轻罚，2 秒达到 `-0.02/tick`；不产生
+  reason 4 terminal。平移 limiter 仅在 risk `>0.75` 时收紧，risk=1 时仍保留 60% 平移，
+  `wz` 不缩放，解除风险每 tick 最多恢复 0.20。
+- 本轮关闭额外 Camera/Goal fault、Push、五段随机出生、segment frontier、route-excess 和
+  open-straight；保留基础反馈模拟和父模型已有安全奖励。checkpoint 使用 `creditwarm / creditadapt /
+  credittrain / creditfinal` 标签，新合同才可 exact resume；旧 P4 包只能 warm start。
+
+- **历史 P4 五段全赛道入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
+  `codex/p4-full8h-r2`，任务 `p4full8h-r2`，父包
+  `p4maze8h10hz_1416926`。ZIP SHA256 为
+  `106908c8830f4fc7989125372f6ed397366f7ca1b4aac071128dccf71add0f6c`，checkpoint
+  SHA256 为 `0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`。
+  训练为 128 env、10Hz 高层、冻结低层、完整 `28800s`，固定五段
+  `slope -> slope_inv -> stairs -> stairs_inv -> maze`，20 列、课程关闭、120 秒 episode。
+  70/60/75% episode 从整条赛道起点开始；其余 episode 按 15/15/20/20/30% 分配至五段，
+  四个段内分位与 70/30 safe/hard 位置训练。困难位置必须经运行时 raycast 验证；不可验证时
+  fail-closed 到同段入口，不能把“请求了随机出生”当作已经覆盖。
+- 目标输入 shape 不变：P4 训练在 `d<=10m` 与旧包逐值一致，`d>10m` 改用单位方位，距离仍为
+  `min(d/20,1)`。训练期 GoalBelief 使用距离相关、零均值椭圆跳变，径向最大 0.20m、切向最大
+  1.0m，并在近终点平滑衰减。部署端 `UwbGoal` 已增加显式编码版本，但稳定 Actor80 调用默认仍
+  使用 legacy 逐轴 clamp；本轮 checkpoint 为 `deployable=false`，未来只有匹配 P4 v2 spec 的制品
+  才能启用方向保持版本。
+- reason 4 使用 10 秒滑动空间窗口、非足端墙接触、真实速度和 Goal 距离确认，主动 reset
+  结算 `-25`，不计成功且不与碰撞/安全惩罚重复。前两次回到同一出生桶，第三次退回同段入口，
+  防止通过更靠后出生刷完成率。worker 的 quota/RNG 没有公开 checkpoint transport，fresh-process
+  resume 会从确定性 seed 重新初始化出生调度；模型、optimizer、训练时钟可 exact resume，但不得
+  宣称 worker 出生序列位级恢复。
+- P4 正式训练要求 reset spawn hook 安装成功，active 卡滞 term 最多等待 8 个真实帧完成装配；超时、
+  readback 不一致或物理 root-state 写入失败均明确停止训练。同帧 wall-stuck 优先于 success，防止
+  reason4 reset 被计为完成。出生比例面板只在 reset edge 计数，难度列与 safe/hard 位置分开报告。
+- 五段 frontier 使用 terminal-clawed potential，长期不产生净刷分；全局路程惩罚关闭。开阔直行
+  只在 teacher 证明 `slope/slope_inv` 前方安全、Goal 新鲜、远离边界且非 junction/dead-end/contact/
+  recovery 时生效，总下限 `-0.0125/tick`，不约束楼梯和 Maze 的必要绕行。Camera 仅 nominal/light，
+  Push 关闭。训练 wire 为 `519 = P3 493 + P4 tail26`；eval wire 与 Actor85/三轴动作不变。
+
+- **历史 P4 Maze 入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
+  `codex/p4-maze3h-recovery`，任务 `p4maze3h-recovery-r2`。父包为
+  `p4maze8h10hz_1416926`，checkpoint SHA256
+  `0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`。128 env、75 秒 episode、
+  单段 `open_entry_maze`、20 个静态难度列、课程关闭，完整训练 `10800s`；平台墙钟 `3.15h`
+  只额外覆盖 rollout、保存和正常退出。模型 ID和标签仅用于候选定位，结构/spec/shape/有限值才是
+  加载依据。完整合同见 [`docs/p4-maze3h-recovery.md`](./docs/p4-maze3h-recovery.md)。
+- 网络和部署接口不变：低层 57901/Actor77/action12、高层 Actor85，低层全程冻结；高层保持
+  10Hz、32 tick rollout 和 TBPTT16。新增 training-only `Actor LSTM hidden -> stuck_logit`、
+  rollout-time Actor mean 教师和从 rollout 内真实 reset 起点构造的零-hidden TBPTT16 中约 10%
+  sequence mirror，均不增加 Actor observation，也不进入 eval；任意固定 PPO chunk 的中途非零
+  recurrent context 不做伪镜像。
+  Camera clean/live 辅助仍可更新 NavigationEncoder；privileged safe3 教师只更新 Actor/LSTM/head。
+- 三轴 policy mapper 保持 `vx=[0,1.0]`、`vy=+-0.30`、`wz=+-0.90`。slew 改为
+  `vx 0.30/0.30`、`vy 0.40/0.80`、`wz 1.50/3.00`，继续先归零再反向。部署可得 predictive risk
+  同比例缩放完整 `(vx,vy)`、不压缩 `wz`；解除风险时 alpha 每个 10Hz tick 最多恢复 0.15。
+- 近终点 `0.65-1.20m` 且 Goal 新鲜、策略方向朝向目标时只限制平移速度，不改方向、不归零、不增加
+  距离正奖励。predictive、missed-safe、yaw cancellation、yaw-exit 和 goal-safe preference 共用
+  原 5Hz 等效 `-0.06` 安全预算，reason 4 卡墙 terminal 单独结算 `-15` 且不计完成。
+- 卡墙确认合同由 7 秒延长为 10 秒。训练标签同时要求 policy/exec 运动意图、低 true motion、墙面
+  证据和 mapping valid。当前平台没有经过验证的 aisrv 到 worker 高层运动意图 transport，因此正式
+  配置保持 `shadow`：worker 继续报告位移、真值速度、墙面证据和候选时长，但绝不把主动停车误判成
+  物理 reset。training wire 为 `509 = P3 493 + raw goal2 + stuck diagnostics13 + raw wall term1`；只有未来公开 hook
+  提供并通过 readback 后才能切到 active。
 
 - **当前 P3 功能分支入口**：`P3StandardJointConfig`（`p3_standard_joint`），分支
   `codex/p35-gaitfix2h`，任务 `p35gaitfix2h`。128 env、25 秒 episode、课程关闭，总计
@@ -246,6 +278,25 @@ python3 container_rpc_client.py --cwd . "nvidia-smi"
 
 该命令复用 `IDE_SYNC_TOKEN` 和 Cookie 缓存；远端 `cwd` 必须位于项目根目录，
 并受超时和输出大小限制。它只用于开发容器诊断，不用于启动或管理平台训练任务。
+
+开发容器运行 Isaac/PyTorch smoke 时，当前已验证的解释器入口是：
+
+```bash
+/workspace/isaaclab/_isaac_sim/python.sh -c \
+  'import torch; print(torch.__version__, torch.cuda.is_available())'
+```
+
+预检通过后，再用同一入口运行 smoke：
+
+```bash
+/workspace/isaaclab/_isaac_sim/python.sh agent_ppo/tools/<smoke>.py ...
+```
+
+不要直接调用普通 `python`、Conda 环境 Python，或未经预检就使用
+`/workspace/isaaclab/isaaclab.sh -p`。平台不同镜像中的 `isaaclab.sh -p` 可能选择未注入
+`omni.isaac.ml_archive/pip_prebundle` 的 Conda Python，表现为 `ModuleNotFoundError: torch`，
+而平台训练进程本身仍可正常加载 Torch。若 `_isaac_sim/python.sh` 不存在或预检失败，应先
+定位当前镜像的 Isaac Python 入口，不能把导入失败归因于模型、checkpoint 或训练代码。
 
 大 checkpoint 不应塞进常规源码同步清单。使用独立分片工具上传到受限临时目录：
 

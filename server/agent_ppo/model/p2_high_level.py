@@ -88,6 +88,18 @@ class NavigationSafetyHead(nn.Module):
         return self.net(nav_feat)
 
 
+class P4ActorStuckHead(nn.Module):
+    """Training-only wall-stuck classifier over the recurrent Actor state."""
+
+    def __init__(self, hidden_dim: int = 64):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.logit = nn.Linear(self.hidden_dim, 1)
+
+    def forward(self, actor_features: torch.Tensor) -> torch.Tensor:
+        return self.logit(actor_features)
+
+
 class P2NavigationActor(nn.Module):
     def __init__(self, hidden_dim: int = 64, num_layers: int = 2):
         super().__init__()
@@ -185,11 +197,33 @@ class P2NavigationActor(nn.Module):
         target = p2_contract.map_normalized_action(normalized, hard_abs_vy=hard_abs_vy)
         return target, normalized, mean, log_std, hidden
 
-    def evaluate_actions(self, inputs, pre_tanh, hidden=None, reset_mask=None):
-        mean, log_std, hidden = self.distribution_parameters(inputs, hidden, reset_mask)
+    def evaluate_actions(
+        self,
+        inputs,
+        pre_tanh,
+        hidden=None,
+        reset_mask=None,
+        *,
+        return_features: bool = False,
+    ):
+        features, hidden = self._memory_forward(inputs, hidden, reset_mask)
+        main_mean = self.mean_head(features)
+        vy_mean = self.vy_mean_head(features)
+        mean = torch.cat((main_mean[..., 0:1], vy_mean, main_mean[..., 1:2]), dim=-1)
+        main_log_std = torch.clamp(
+            self.log_std, p2_contract.LOG_STD_MIN, p2_contract.LOG_STD_MAX
+        )
+        vy_log_std = torch.clamp(
+            self.vy_log_std, p2_contract.LOG_STD_MIN, p2_contract.LOG_STD_MAX
+        )
+        log_std = torch.cat(
+            (main_log_std[0:1], vy_log_std, main_log_std[1:2]), dim=0
+        ).expand_as(mean)
         log_prob = squashed_log_prob(pre_tanh, mean, log_std)
         # Monte-Carlo entropy estimate at the rollout action.
         entropy = -log_prob
+        if return_features:
+            return log_prob, entropy, mean, log_std, hidden, features
         return log_prob, entropy, mean, log_std, hidden
 
 
@@ -241,6 +275,15 @@ def navigation_safety_head_spec() -> dict[str, object]:
         "hidden_dim": p2_contract.NAV_FEATURE_DIM,
         "output_dim": 3,
         "output_layout": ["left_risk", "center_risk", "right_risk"],
+        "training_only": True,
+    }
+
+
+def p4_actor_stuck_head_spec() -> dict[str, object]:
+    return {
+        "input_dim": 64,
+        "output_dim": 1,
+        "input_source": "actor_lstm_feature",
         "training_only": True,
     }
 

@@ -22,6 +22,7 @@ from agent_ppo.checkpoint_io import (
 )
 from agent_ppo.feature import p2_contract, p3_contract, p4_contract
 from agent_ppo.feature.p2_response_buffer import P2ResponseAuxBuffer
+from agent_ppo.feature.p2_worker_bridge import _termination_reason_codes
 from agent_ppo.feature.p4_camera import P4SharedCameraState
 from agent_ppo.feature.p4_goal_belief import GoalBeliefChainV2
 from agent_ppo.feature.p4_stuck import MotionWallStuckTracker
@@ -34,12 +35,76 @@ from agent_ppo.model.p2_high_level import (
 from agent_ppo.model.response_adapter import CommandResponseAdapter
 from agent_ppo.model.vision_encoder import VisionEncoder
 from agent_ppo.workflow.p2_nav_ppo_workflow import (
+    _event_share,
     _expected_critic_wire_dim,
     _goal_history_stuck,
     _p4_conditional_metrics,
+    _p4_recovery_event_masks,
+    _p4_reset_completion_mismatch,
     _p4_worker_push_resume_offset,
     _terminal_safe_p4_critic_wire,
 )
+
+
+def test_p4_spawn_event_share_is_zero_for_empty_window_and_exact_otherwise():
+    assert _event_share(0.0, 0.0) == 0.0
+    assert _event_share(torch.tensor(0.0), torch.tensor(0.0)) == 0.0
+    assert _event_share(3.0, 4.0) == pytest.approx(0.75)
+
+
+def test_p4_recovery_events_distinguish_safe_exit_from_terminal_reset():
+    masks = _p4_recovery_event_masks(
+        active=torch.tensor([False, True, True, True, True]),
+        awaiting_evidence=torch.zeros(5, dtype=torch.bool),
+        candidate=torch.tensor([True, False, True, False, False]),
+        duration_s=torch.tensor([0.9, 0.0, 2.4, 0.0, 0.0]),
+        transition_done=torch.tensor([False, False, True, True, False]),
+        evidence_valid=torch.tensor([True, True, True, True, False]),
+        escape_evidence=torch.tensor([False, True, False, False, True]),
+        completion=torch.tensor([False, False, False, True, False]),
+    )
+    assert masks["entry"].tolist() == [True, False, False, False, False]
+    assert masks["success"].tolist() == [False, True, False, True, False]
+    assert masks["terminal"].tolist() == [False, False, True, False, False]
+    assert masks["unverified_exit"].tolist() == [False, False, False, False, True]
+    assert masks["early"].tolist() == [True, False, False, False, False]
+    assert masks["confirmed"].tolist() == [False, False, True, False, False]
+    assert masks["next_active"].tolist() == [True, False, False, False, True]
+    assert masks["next_awaiting"].tolist() == [False, False, False, False, True]
+
+
+def test_p4_unverified_recovery_exit_is_counted_once_while_waiting_for_evidence():
+    first = _p4_recovery_event_masks(
+        active=torch.tensor([True]),
+        awaiting_evidence=torch.tensor([False]),
+        candidate=torch.tensor([False]),
+        duration_s=torch.tensor([0.0]),
+        transition_done=torch.tensor([False]),
+        evidence_valid=torch.tensor([False]),
+        escape_evidence=torch.tensor([False]),
+        completion=torch.tensor([False]),
+    )
+    second = _p4_recovery_event_masks(
+        active=first["next_active"],
+        awaiting_evidence=first["next_awaiting"],
+        candidate=torch.tensor([False]),
+        duration_s=torch.tensor([0.0]),
+        transition_done=torch.tensor([False]),
+        evidence_valid=torch.tensor([False]),
+        escape_evidence=torch.tensor([False]),
+        completion=torch.tensor([False]),
+    )
+    assert first["unverified_exit"].item() is True
+    assert second["unverified_exit"].item() is False
+    assert second["next_awaiting"].item() is True
+
+
+def test_p4_reset_completion_mismatch_uses_independent_reset_signal():
+    mismatch = _p4_reset_completion_mismatch(
+        raw_wall_reset=torch.tensor([True, True, False, False]),
+        completion=torch.tensor([True, False, True, False]),
+    )
+    assert mismatch.tolist() == [True, False, False, False]
 
 
 def _p4_algorithm(num_envs=1, config=None):
@@ -62,6 +127,12 @@ def _p4_algorithm(num_envs=1, config=None):
         device="cpu",
         config=runtime_config,
     )
+
+
+def test_p4_auto_branch_can_initialize_before_diagnostic_buffers_exist():
+    algorithm = _p4_algorithm(config={"maze_training_branch": "auto"})
+    assert algorithm.maze_training_branch == "auto"
+    assert hasattr(algorithm, "_maze_diag_risk_positive_hist")
 
 
 def _p4_eval_algorithm(num_envs=1):
@@ -116,8 +187,9 @@ def _p4_reward_context(num_envs=1, *, terminal=False, reason=0):
     }
 
 
-def test_p4_workflow_requires_507_training_wire_without_changing_p2_eval_wire():
-    assert _expected_critic_wire_dim(is_p4=True) == 507
+def test_p4_workflow_requires_full_track_training_wire_without_changing_p2_eval_wire():
+    assert _expected_critic_wire_dim(is_p4=True) == p4_contract.P4_PRIVILEGED_WIRE_DIM
+    assert p4_contract.P4_PRIVILEGED_WIRE_DIM == 519
     assert _expected_critic_wire_dim(is_p4=False) == 385
 
 
@@ -172,9 +244,10 @@ def test_p4_track_eval_without_training_only_safety_head_keeps_zero_risk():
     )
 
 
-def test_p4_runtime_rejects_non_maze_segment_and_slew_contract_drift():
-    with pytest.raises(ValueError, match="Maze-only training"):
+def test_p4_runtime_requires_canonical_full_track_and_slew_contract():
+    with pytest.raises(ValueError, match="requires segments"):
         _p4_algorithm(config={"track_segment_labels": ["slope_inv"]})
+    assert _p4_algorithm().track_segment_labels == p4_contract.FULL_TRACK_SEGMENT_LABELS
     with pytest.raises(ValueError, match="runtime slew"):
         _p4_algorithm(config={"slew_rate": [0.30, 0.30, 0.75]})
 
@@ -265,8 +338,8 @@ def test_p4_stuck_goal_safe_and_route_rewards_have_bounded_semantics():
         confirmation_s=7.0,
     )
     assert stuck[0].item() == 0.0
-    assert stuck[1].item() == pytest.approx(-0.02)
-    assert stuck[2].item() == pytest.approx(-0.10)
+    assert stuck[1].item() == pytest.approx(-0.0075)
+    assert stuck[2].item() == pytest.approx(-0.02)
     assert stuck[3].item() == 0.0
     assert stuck[4].item() == 0.0
     assert stuck_diag["wall_stuck_sustained_active"].tolist() == [0, 1, 1, 0, 0]
@@ -292,9 +365,9 @@ def test_p4_stuck_goal_safe_and_route_rewards_have_bounded_semantics():
         torch.tensor((False, False, True)),
     )
     assert route_penalty[0].item() == pytest.approx(0.0, abs=1.0e-7)
-    assert route_penalty[1].item() == pytest.approx(-0.005)
+    assert route_penalty[1].item() == 0.0
     assert route_penalty[2].item() == 0.0
-    assert route_diag["route_excess_distance_m"][1].item() == pytest.approx(0.10)
+    assert route_diag["route_excess_distance_m"][1].item() == 0.0
 
 
 def test_p4_goal_safe_reward_uses_terminal_safe_true_goal_not_noisy_belief():
@@ -697,38 +770,39 @@ def test_p4_missing_contract_current_records_remain_incompatible():
     assert buffer.compatibility_rejections["missing_contract"] == 1
 
 
-def test_p4_maze_schedule_and_soft_cruise_are_explicit():
+def test_p4_credit_repair_contract_and_soft_cruise_are_explicit():
     warm = p4_contract.training_schedule(0.0)
-    assert warm["phase"] == "mazeprobe"
-    assert warm["actor_multiplier"] == pytest.approx(0.70)
-    assert warm["navigation_multiplier"] == pytest.approx(0.35)
-    assert warm["cruise_multiplier"] == pytest.approx(0.0)
-    assert p4_contract.training_schedule(1_800.0)["cruise_multiplier"] == 0.0
-    assert p4_contract.training_schedule(3_600.0)["phase"] == "mazeattack"
-    assert p4_contract.training_schedule(18_000.0)["phase"] == "mazehard"
-    assert p4_contract.training_schedule(25_200.0)["phase"] == "mazefinal"
+    assert warm["phase"] == "fullwarm"
+    assert warm["actor_multiplier"] == pytest.approx(0.20)
+    assert warm["navigation_multiplier"] == pytest.approx(0.15)
+    assert warm["teacher_gradient_target_ratio"] == 0.0
+    assert p4_contract.training_schedule(1_800.0)["phase"] == "fulladapt"
+    assert p4_contract.training_schedule(7_200.0)["phase"] == "fulltrain"
+    assert p4_contract.training_schedule(21_600.0)["phase"] == "fullstabilize"
     visual = p4_contract.training_schedule(0.0, branch="visual_recovery")
-    assert visual["actor_multiplier"] == pytest.approx(0.25)
-    assert visual["safety_head_multiplier"] == pytest.approx(1.5)
+    assert visual["actor_multiplier"] == pytest.approx(0.20)
+    assert visual["safety_head_multiplier"] == pytest.approx(1.0)
     assert (
         p4_contract.training_contract()["safety_reward_ramp"]["version"]
         == p4_contract.SAFETY_REWARD_RAMP_VERSION
     )
     assert p4_contract.command_contract()["soft_cruise"]["preferred_vx"] == [0.60, 0.75]
     training = p4_contract.training_contract()
-    assert training["required_platform_wall_seconds"] == 29_700
-    assert training["clock_semantics"]["platform_wall_margin_seconds"] == 300
-    assert training["target_effective_seconds"] == 28_800
+    assert training["required_platform_wall_seconds"] == 8_100
+    assert training["clock_semantics"]["platform_wall_margin_seconds"] == 900
+    assert training["target_effective_seconds"] == 7_200
+    assert training["maze_only"] is True
+    assert training["spawn"]["enabled"] is False
+    assert training["goal_jump"]["enabled"] is False
     scaling = p4_contract.reward_contract()["tick_time_scaling"]
     assert scaling["reference_period_frames"] == 10
     assert scaling["runtime_period_frames"] == 5
 
 
 def test_p4_missed_safe_direction_ramp_and_event_normalization():
-    assert p4_contract.safe_direction_weight(0.0) == 0.0
-    assert p4_contract.safe_direction_weight(1_800.0) == pytest.approx(0.015)
-    assert p4_contract.safe_direction_weight(7_200.0) == pytest.approx(0.040)
-    assert p4_contract.safe_direction_weight(28_800.0) == pytest.approx(0.030)
+    assert p4_contract.safe_direction_weight(0.0) == pytest.approx(0.012)
+    assert p4_contract.safe_direction_weight(900.0) == pytest.approx(0.012)
+    assert p4_contract.safe_direction_weight(7_200.0) == pytest.approx(0.012)
     penalty, diagnostics = p4_contract.maze_missed_safe_direction_penalty(
         torch.tensor(((0.9, 0.2, 0.1),)),
         torch.tensor(((0.6, 0.0, 0.0),)),
@@ -737,24 +811,24 @@ def test_p4_missed_safe_direction_ramp_and_event_normalization():
     )
     assert diagnostics["missed_safe_event_active"].item() == 1.0
     assert 0.0 < diagnostics["missed_safe_event_severity"].item() <= 1.0
-    assert -0.04 <= penalty.item() < 0.0
+    assert -0.012 <= penalty.item() < 0.0
 
 
-def test_p4_auto_diagnostic_does_not_consume_training_clock():
+def test_p4_recovery_has_no_diagnostic_wall_clock():
     algorithm = _p4_algorithm()
     algorithm.maze_training_branch = "auto"
     algorithm.update_training_clocks(599.0)
-    assert algorithm.current_phase == "mazediag"
-    assert algorithm.diagnostic_elapsed_seconds == pytest.approx(599.0)
+    assert algorithm.current_phase == "fullwarm"
+    assert algorithm.diagnostic_elapsed_seconds == pytest.approx(0.0)
     assert algorithm.session_effective_seconds == pytest.approx(0.0)
 
     algorithm.update_training_clocks(600.0)
-    assert algorithm.current_phase == "mazeprobe"
+    assert algorithm.current_phase == "fullwarm"
     assert algorithm._resolved_maze_training_branch == "visual_recovery"
-    assert algorithm.session_effective_seconds == pytest.approx(0.0)
+    assert algorithm.session_effective_seconds == pytest.approx(1.0)
 
     algorithm.update_training_clocks(7_800.0)
-    assert algorithm.session_effective_seconds == pytest.approx(7_200.0)
+    assert algorithm.session_effective_seconds == pytest.approx(7_201.0)
 
 
 def test_p4_auto_branch_uses_accumulated_perception_metrics_not_last_tick():
@@ -790,7 +864,13 @@ def test_p4_auto_branch_uses_accumulated_perception_metrics_not_last_tick():
 def test_p4_checkpoint_priority_prefers_new_maze_labels():
     candidates = p4_nav_checkpoint_candidates("/models", 42)
     labels = [Path(candidate).stem.split("-")[-2] for candidate in candidates]
-    assert labels[:6] == [
+    assert labels[:4] == [
+        "creditfinal",
+        "credittrain",
+        "creditadapt",
+        "creditwarm",
+    ]
+    assert labels[8:14] == [
         "mazefinal",
         "mazehard",
         "mazeattack",
@@ -798,7 +878,7 @@ def test_p4_checkpoint_priority_prefers_new_maze_labels():
         "mazeprobe",
         "mazediag",
     ]
-    assert labels.index("mazefinal") < labels.index("pnavstable")
+    assert labels.index("creditfinal") < labels.index("mazefinal")
 
 
 def test_p4_training_discovers_one_structurally_compatible_parent_before_p3():
@@ -827,25 +907,27 @@ def test_p4_configuration_and_monitor_route_are_explicit():
     root = Path(__file__).resolve().parents[1]
     config = toml.load(root / "conf/train_env_conf_track_p4_nav_ppo.toml")
     app_config = toml.load(root.parent / "conf/configure_app.toml")
-    assert config["p4_nav_ppo"]["run_name"] == "p4maze8h-10hzroute"
-    assert config["p4_nav_ppo"]["target_effective_seconds"] == 28_800
-    assert config["p4_nav_ppo"]["task_end_hours"] == pytest.approx(8.25)
-    assert p4_contract.PLATFORM_WALL_MARGIN_SECONDS == 300.0
-    assert p4_contract.PLATFORM_WALL_SECONDS == 29_700.0
-    assert config["p4_nav_ppo"]["maze_training_branch"] == "auto"
+    assert config["p4_nav_ppo"]["run_name"] == "p4maze2h-credit-repair"
+    assert config["p4_nav_ppo"]["target_effective_seconds"] == 7_200
+    assert config["p4_nav_ppo"]["task_end_hours"] == pytest.approx(2.25)
+    assert p4_contract.PLATFORM_WALL_MARGIN_SECONDS == 900.0
+    assert p4_contract.PLATFORM_WALL_SECONDS == 8_100.0
+    assert config["p4_nav_ppo"]["maze_training_branch"] == "credit_repair"
+    assert config["p4_nav_ppo"]["training_profile"] == "maze_credit_repair"
     assert config["p4_nav_ppo"]["nav_period_frames"] == 5
     assert config["env"]["num_envs"] == 128
     assert config["env"]["episode_length_s"] == 75.0
     assert config["terrain"]["track"]["track_length"] == 1
     assert config["terrain"]["track"]["sub_terrains"] == ["open_entry_maze"]
-    assert config["p4_nav_ppo"]["parent_model_id"] == 1256446
-    assert config["p4_nav_ppo"]["parent_model_label"] == "p4nav2h_1256446-F"
+    assert config["p4_nav_ppo"]["parent_model_id"] == 1416926
+    assert config["p4_nav_ppo"]["parent_model_label"] == "p4maze8h10hz_1416926-mazefinal"
     assert app_config["app"]["preload_model"] is True
-    assert app_config["app"]["preload_model_id"] == 1256446
+    assert app_config["app"]["preload_model_id"] == 1416926
     assert app_config["app"]["policy_entry"] == "p4_nav_ppo"
     source = (root / "conf/monitor_builder.py").read_text()
     assert 'policy_entry == "p4_nav_ppo"' in source
     assert "p4_maze_perception" in source
+    assert "p4_maze_credit" in source
     assert "p4_push_label_reject" in source
     assert "p4_adapter_compat" in source
     assert len(p4_contract.MONITOR_REQUIRED_METRICS) >= 100
@@ -867,7 +949,7 @@ def test_p4_configuration_and_monitor_route_are_explicit():
     assert "mazediag" in P4_NAV_PHASE_LABELS
 
 
-def test_p4_worker_push_clock_excludes_diagnostic_wall_time():
+def test_p4_worker_push_clock_has_no_diagnostic_offset_and_push_stays_off():
     fresh = SimpleNamespace(
         maze_training_branch="auto",
         diagnostic_elapsed_seconds=0.0,
@@ -889,12 +971,12 @@ def test_p4_worker_push_clock_excludes_diagnostic_wall_time():
         session_effective_seconds=123.0,
     )
 
-    assert _p4_worker_push_resume_offset(fresh) == -600.0
-    assert _p4_worker_push_resume_offset(partial) == -360.0
+    assert _p4_worker_push_resume_offset(fresh) == 0.0
+    assert _p4_worker_push_resume_offset(partial) == 0.0
     assert _p4_worker_push_resume_offset(trained) == 7_199.0
     assert _p4_worker_push_resume_offset(explicit) == 123.0
     assert p4_contract.push_phase_config(7_199.0)["active"] is False
-    assert p4_contract.push_phase_config(7_200.0)["active"] is True
+    assert p4_contract.push_phase_config(7_200.0)["active"] is False
 
 
 def test_p4_monitor_panels_obey_platform_line_limits():
@@ -1020,7 +1102,7 @@ def test_p4_low_lstm_advances_each_tick_while_cnn_feature_is_reused():
     assert any(not torch.equal(before, after) for before, after in zip(hidden_before, hidden_after))
 
 
-def test_p4_one_tick_uses_57905_policy_and_507_training_wire():
+def test_p4_one_tick_uses_57905_policy_and_full_track_training_wire():
     from agent_ppo.feature import nav_contract
 
     algorithm = _p4_algorithm()
@@ -1061,6 +1143,36 @@ def test_p4_terminal_wire_keeps_old_raw_goal_and_stuck_diagnostics():
     p4_tail = result[:, p3_contract.P3_PRIVILEGED_WIRE_DIM :]
     assert torch.equal(p4_tail[0], terminal[0])
     assert torch.equal(p4_tail[1], live[1, p3_contract.P3_PRIVILEGED_WIRE_DIM :])
+
+
+def test_p4_wall_stuck_owns_success_overlap_and_preserves_raw_term():
+    class _TerminationManager:
+        active_terms = ("goal_reached", "nav_stuck_timeout")
+        terminated = torch.tensor([False])
+        time_outs = torch.tensor([False])
+
+        @staticmethod
+        def get_term(name):
+            assert name == "goal_reached"
+            return torch.tensor([True])
+
+    env = SimpleNamespace(termination_manager=_TerminationManager())
+    reset = torch.tensor([True])
+    raw_wall_term = torch.tensor([True])
+    reason = _termination_reason_codes(env, reset, wall_stuck=raw_wall_term)
+    assert reason.tolist() == [4.0]
+    assert raw_wall_term.tolist() == [True]
+
+    live = torch.zeros(1, p4_contract.P4_PRIVILEGED_WIRE_DIM)
+    terminal = torch.zeros(1, p4_contract.P4_WORKER_EXTRA_DIM)
+    terminal[:, p4_contract.STUCK_RAW_TERM_INDEX] = raw_wall_term.float()
+    safe = _terminal_safe_p4_critic_wire(live, terminal, reset)
+    preserved_raw_term = safe[
+        :, p3_contract.P3_PRIVILEGED_WIRE_DIM + p4_contract.STUCK_RAW_TERM_INDEX
+    ] > 0.5
+    assert _p4_reset_completion_mismatch(
+        preserved_raw_term, reason == 1
+    ).tolist() == [False]
 
 
 def test_p4_warmup_freezes_actor_and_navigation_but_not_safety_head():
@@ -1136,12 +1248,46 @@ def test_p4_stuck_tracker_shadow_and_active_contract():
         "terminal_reason": torch.zeros(1),
         "seconds_since_push": torch.full((1,), 10.0),
         "episode_age_s": torch.full((1,), 10.0),
+        "true_velocity3": torch.zeros(1, 3),
+        "motion_intent": torch.ones(1, dtype=torch.bool),
     }
-    tracker.update(**common)
-    tracker.update(**common)
-    diagnostics = tracker.update(**common)
+    events = []
+    for _ in range(4):
+        diagnostics = tracker.update(**common)
+        events.append(diagnostics[0, 4].item())
     assert tracker.term_available and tracker.term_config_valid
-    assert diagnostics[0, 4].item() == 1.0
+    assert sum(events) == 1.0
+    assert getattr(env, "_nav_motion_stuck").item() >= 2.0
+    manager.value.fill_(True)
+    assert tracker.termination_mask(torch.ones(1, dtype=torch.bool)).item()
+
+
+def test_p4_active_stuck_reset_does_not_depend_on_command_intent():
+    manager = _FakeTerminationManager(1)
+    env = SimpleNamespace(step_dt=0.02, termination_manager=manager)
+    tracker = MotionWallStuckTracker(
+        env,
+        num_envs=1,
+        device="cpu",
+        config={"mode": "active", "confirmation_s": 0.04},
+    )
+    common = {
+        "root_xy": torch.zeros(1, 2),
+        "goal_distance": torch.ones(1),
+        "collision_force": torch.full((1,), 40.0),
+        "mapping_valid": torch.ones(1, dtype=torch.bool),
+        "reset": torch.zeros(1, dtype=torch.bool),
+        "terminal_reason": torch.zeros(1),
+        "seconds_since_push": torch.full((1,), 10.0),
+        "episode_age_s": torch.full((1,), 10.0),
+        "true_velocity3": torch.zeros(1, 3),
+    }
+    would_reset_events = []
+    for _ in range(6):
+        diagnostics = tracker.update(**common)
+        would_reset_events.append(diagnostics[0, 4].item())
+    assert sum(would_reset_events) == 1.0
+    assert diagnostics[0, 12].item() == 0.0
     assert getattr(env, "_nav_motion_stuck").item() >= 2.0
     manager.value.fill_(True)
     assert tracker.termination_mask(torch.ones(1, dtype=torch.bool)).item()
@@ -1166,10 +1312,36 @@ def test_p4_stuck_tracker_retries_after_termination_manager_assembly():
         terminal_reason=torch.zeros(1),
         seconds_since_push=torch.full((1,), 10.0),
         episode_age_s=torch.full((1,), 10.0),
+        true_velocity3=torch.zeros(1, 3),
     )
     assert tracker.term_available
     assert tracker.term_config_valid
     assert env.termination_manager.cfg.params["max_stuck"] == 2
+
+
+def test_p4_active_stuck_tracker_fails_after_bounded_hook_retries():
+    env = SimpleNamespace(step_dt=0.02, termination_manager=None)
+    tracker = MotionWallStuckTracker(
+        env,
+        num_envs=1,
+        device="cpu",
+        config={"mode": "active", "confirmation_s": 0.04},
+    )
+    kwargs = {
+        "root_xy": torch.zeros(1, 2),
+        "goal_distance": torch.ones(1),
+        "collision_force": torch.zeros(1),
+        "mapping_valid": torch.ones(1, dtype=torch.bool),
+        "reset": torch.zeros(1, dtype=torch.bool),
+        "terminal_reason": torch.zeros(1),
+        "seconds_since_push": torch.full((1,), 10.0),
+        "episode_age_s": torch.full((1,), 10.0),
+        "true_velocity3": torch.zeros(1, 3),
+    }
+    for _ in range(6):
+        tracker.update(**kwargs)
+    with pytest.raises(RuntimeError, match="requires a validated nav_stuck_timeout"):
+        tracker.update(**kwargs)
 
 
 def test_p4_shadow_stuck_event_and_saved_time_are_reported_once():
@@ -1189,6 +1361,7 @@ def test_p4_shadow_stuck_event_and_saved_time_are_reported_once():
         "terminal_reason": torch.zeros(1),
         "seconds_since_push": torch.full((1,), 10.0),
         "episode_age_s": torch.full((1,), 10.0),
+        "true_velocity3": torch.zeros(1, 3),
     }
     events = []
     saved = []
@@ -1199,6 +1372,40 @@ def test_p4_shadow_stuck_event_and_saved_time_are_reported_once():
     assert sum(events) == 1.0
     assert sum(value > 0.0 for value in saved) == 1
     assert not tracker.termination_mask(torch.ones(1, dtype=torch.bool)).item()
+
+
+def test_p4_stuck_tracker_requires_low_true_motion():
+    env = SimpleNamespace(step_dt=0.02, termination_manager=None)
+    tracker = MotionWallStuckTracker(
+        env,
+        num_envs=1,
+        device="cpu",
+        config={"mode": "shadow", "confirmation_s": 0.04},
+    )
+    common = {
+        "root_xy": torch.zeros(1, 2),
+        "goal_distance": torch.ones(1),
+        "collision_force": torch.full((1,), 40.0),
+        "mapping_valid": torch.ones(1, dtype=torch.bool),
+        "reset": torch.zeros(1, dtype=torch.bool),
+        "terminal_reason": torch.zeros(1),
+        "seconds_since_push": torch.full((1,), 10.0),
+        "episode_age_s": torch.full((1,), 10.0),
+    }
+    for _ in range(4):
+        diagnostics = tracker.update(
+            **common,
+            true_velocity3=torch.tensor(((0.20, 0.0, 0.0),)),
+        )
+    assert diagnostics[0, 2].item() == 0.0
+    events = []
+    for _ in range(4):
+        diagnostics = tracker.update(
+            **common,
+            true_velocity3=torch.zeros(1, 3),
+        )
+        events.append(diagnostics[0, 4].item())
+    assert sum(events) == 1.0
 
 
 def test_p4_adapter_replay_ratios_use_mutually_exclusive_pool_counts():
@@ -1236,7 +1443,7 @@ def test_p4_stuck_terminal_is_single_penalty_and_suppresses_duplicate_safety():
         end_goal_distance=torch.ones(1),
         path_length_m=torch.zeros(1),
     )
-    assert result["stuck_reset"].item() == pytest.approx(-15.0)
+    assert result["stuck_reset"].item() == pytest.approx(-25.0)
     for name in (
         "body_collision",
         "predictive_collision_risk",
@@ -1330,10 +1537,14 @@ def test_p4_conditional_metrics_do_not_divide_event_rates_by_all_ticks():
 
 
 def test_p4_exact_resume_round_trip_restores_stage_rng_and_clock():
-    algorithm = _p4_algorithm()
-    algorithm.maze_training_branch = "auto"
-    algorithm._resolved_maze_training_branch = "actor_attack"
-    algorithm.diagnostic_elapsed_seconds = p4_contract.DIAGNOSTIC_SECONDS
+    config = {
+        "training_profile": "maze_credit_repair",
+        "maze_training_branch": "credit_repair",
+        "track_segment_labels": ["maze"],
+        "camera_fault_course_enabled": False,
+        "goal_fault_course_enabled": False,
+    }
+    algorithm = _p4_algorithm(config=config)
     algorithm._initial_low_digest = algorithm._module_digest(
         (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
     )
@@ -1342,18 +1553,23 @@ def test_p4_exact_resume_round_trip_restores_stage_rng_and_clock():
     algorithm._diagnostic_nav_risk_probe.weight.data.fill_(0.125)
     algorithm._maze_diag_goal_top1_total.fill_(37.0)
     algorithm._maze_diag_fault_top1_total.fill_(13.0)
-    algorithm.update_training_clocks(600.0)
-    algorithm.update_training_clocks(15_000.0)
+    algorithm._p4_recovery_monitor_state = {
+        "event_times": [8_042.0, 8_087.5],
+        "success_lifetime_count": 7,
+        "candidate_lifetime_count": 11,
+        "terminal_lifetime_count": 4,
+    }
+    algorithm.update_training_clocks(1_800.0)
     with tempfile.TemporaryDirectory() as directory:
-        path = str(Path(directory) / "model.ckpt-pnavfull-42.pkl")
+        path = str(Path(directory) / "model.ckpt-credittrain-42.pkl")
         algorithm.save_training_bundle(path, platform_model_id="42")
-        resumed = _p4_algorithm()
+        resumed = _p4_algorithm(config=config)
         mode = resumed.load_bundle(path, platform_model_id="42")
     assert mode == "p4_exact_resume_history_reset"
-    assert resumed.session_effective_seconds == pytest.approx(14_400.0)
-    assert resumed.session_wall_seconds == pytest.approx(15_000.0)
-    assert resumed._resolved_maze_training_branch == "actor_attack"
-    assert resumed.current_phase == "mazeattack"
+    assert resumed.session_effective_seconds == pytest.approx(1_800.0)
+    assert resumed.session_wall_seconds == pytest.approx(1_800.0)
+    assert resumed._resolved_maze_training_branch is None
+    assert resumed.current_phase == "credittrain"
     assert resumed._initial_low_digest == algorithm._initial_low_digest
     assert not hasattr(resumed, "speed_generator")
     assert torch.equal(
@@ -1362,38 +1578,43 @@ def test_p4_exact_resume_round_trip_restores_stage_rng_and_clock():
     )
     assert resumed._maze_diag_goal_top1_total.item() == pytest.approx(37.0)
     assert resumed._maze_diag_fault_top1_total.item() == pytest.approx(13.0)
+    assert resumed._p4_recovery_monitor_state == algorithm._p4_recovery_monitor_state
 
 
-def test_p4_exact_resume_restores_visual_recovery_schedule_before_parent_load():
-    algorithm = _p4_algorithm()
-    algorithm.maze_training_branch = "auto"
-    algorithm._resolved_maze_training_branch = "visual_recovery"
-    algorithm.diagnostic_elapsed_seconds = p4_contract.DIAGNOSTIC_SECONDS
+def test_p4_exact_resume_restores_credit_schedule_before_parent_load():
+    config = {
+        "training_profile": "maze_credit_repair",
+        "maze_training_branch": "credit_repair",
+        "track_segment_labels": ["maze"],
+        "camera_fault_course_enabled": False,
+        "goal_fault_course_enabled": False,
+    }
+    algorithm = _p4_algorithm(config=config)
     algorithm._initial_low_digest = algorithm._module_digest(
         (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
     )
     algorithm.low_level_state_digest = algorithm._initial_low_digest
     algorithm._configure_adapter_contract()
-    algorithm.update_training_clocks(600.0)
+    algorithm.update_training_clocks(700.0)
     with tempfile.TemporaryDirectory() as directory:
-        path = str(Path(directory) / "model.ckpt-mazeprobe-42.pkl")
+        path = str(Path(directory) / "model.ckpt-creditadapt-42.pkl")
         algorithm.save_training_bundle(path, platform_model_id="42")
-        resumed = _p4_algorithm()
+        resumed = _p4_algorithm(config=config)
         mode = resumed.load_bundle(path, platform_model_id="42")
     assert mode == "p4_exact_resume_history_reset"
-    assert resumed._resolved_maze_training_branch == "visual_recovery"
-    expected = p4_contract.training_schedule(0.0, branch="visual_recovery")
+    assert resumed._resolved_maze_training_branch is None
+    expected = p4_contract.training_schedule(700.0, branch="credit_repair")
     assert resumed.current_phase == expected["phase"]
     actor_group = next(
         group for group in resumed.actor_optimizer.param_groups
         if group.get("name") == "actor_trunk"
     )
     assert actor_group["lr"] == pytest.approx(
-        p4_contract.ACTOR_LR * expected["actor_multiplier"]
+        expected["actor_lr"] * expected["actor_multiplier"]
     )
 
 
-def test_p4_maze_diagnostic_probe_trains_inside_finish_tick_no_grad_context():
+def test_p4_maze_diagnostic_probe_is_disabled_for_recovery_training():
     algorithm = _p4_algorithm(num_envs=5)
     algorithm.maze_training_branch = "auto"
     algorithm._resolved_maze_training_branch = None
@@ -1415,9 +1636,7 @@ def test_p4_maze_diagnostic_probe_trains_inside_finish_tick_no_grad_context():
     with torch.no_grad():
         algorithm._accumulate_maze_diagnostic(safe3, valid, nav_feat, goal4)
 
-    assert not torch.equal(
-        algorithm._diagnostic_nav_risk_probe.weight.detach(), before
-    )
+    assert torch.equal(algorithm._diagnostic_nav_risk_probe.weight.detach(), before)
     assert all(
         parameter.grad is None
         for group in algorithm._diagnostic_probe_optimizer.param_groups
@@ -1425,7 +1644,7 @@ def test_p4_maze_diagnostic_probe_trains_inside_finish_tick_no_grad_context():
     )
 
 
-def test_p4_fault_diagnostic_uses_only_held_out_probe_environments():
+def test_p4_fault_diagnostic_is_disabled_for_recovery_training():
     algorithm = _p4_algorithm(num_envs=5)
     algorithm.maze_training_branch = "auto"
     algorithm._resolved_maze_training_branch = None
@@ -1461,7 +1680,7 @@ def test_p4_fault_diagnostic_uses_only_held_out_probe_environments():
         fault_feat,
         torch.tensor([True, False, False, False, False]),
     )
-    assert algorithm._maze_diag_fault_scene_confusion.sum().item() == 1.0
+    assert algorithm._maze_diag_fault_scene_confusion.sum().item() == 0.0
 
 
 def test_p4_exact_resume_rejects_stuck_reset_contract_drift():
@@ -1500,14 +1719,14 @@ def test_p4_exact_resume_rejects_non_mapper_command_contract_drift():
             resumed.load_bundle(str(path), platform_model_id="42")
 
 
-def test_p4_previous_contract_loads_as_maze_warm_start():
+def test_p4_previous_contract_loads_as_credit_repair_warm_start():
     algorithm = _p4_algorithm()
     algorithm._initial_low_digest = algorithm._module_digest(
         (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
     )
     algorithm.low_level_state_digest = algorithm._initial_low_digest
     algorithm._configure_adapter_contract()
-    algorithm.update_training_clocks(28_800.0)
+    algorithm.update_training_clocks(10_800.0)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "model.ckpt-pnavstable-42.pkl"
         algorithm.save_training_bundle(str(path), platform_model_id="42")
@@ -1515,6 +1734,16 @@ def test_p4_previous_contract_loads_as_maze_warm_start():
         payload["phase_label"] = "pnavstable"
         payload["contracts"]["training"]["version"] = "p4_nav_robust_v3_smooth_safety_ramp"
         payload["training_states"]["high_level"]["optimizer_phase"] = "pnavstable"
+        actor_optimizer = payload["optimizers"]["high_level_actor"]
+        stuck_group_index = next(
+            index
+            for index, group in enumerate(actor_optimizer["param_groups"])
+            if group.get("name") == "actor_stuck_head"
+        )
+        stuck_group = actor_optimizer["param_groups"].pop(stuck_group_index)
+        for parameter_id in stuck_group["params"]:
+            actor_optimizer["state"].pop(parameter_id, None)
+        payload["modules"]["high_level"].pop("actor_stuck_head")
         incompatible_rng = torch.arange(16, dtype=torch.uint8)
         for key in (
             "shuffle_rng_state",
@@ -1527,8 +1756,15 @@ def test_p4_previous_contract_loads_as_maze_warm_start():
             incompatible_rng.clone()
         )
         torch.save(payload, path)
-        resumed = _p4_algorithm()
-        resumed.maze_training_branch = "auto"
+        resumed = _p4_algorithm(
+            config={
+                "training_profile": "maze_credit_repair",
+                "maze_training_branch": "credit_repair",
+                "track_segment_labels": ["maze"],
+                "camera_fault_course_enabled": False,
+                "goal_fault_course_enabled": False,
+            }
+        )
         resumed._diagnostic_nav_risk_probe.weight.data.fill_(1.0)
         expected_rng = {
             "shuffle": resumed.ppo_generator.get_state().clone(),
@@ -1538,11 +1774,11 @@ def test_p4_previous_contract_loads_as_maze_warm_start():
             "adapter": resumed.adapter_generator.get_state().clone(),
         }
         mode = resumed.load_bundle(str(path), platform_model_id="42")
-    assert mode == "p4_maze_warm_start"
+    assert mode == "p4_maze_credit_repair_warm_start"
     assert resumed.session_effective_seconds == 0.0
     assert resumed.session_wall_seconds == 0.0
     assert resumed._resolved_maze_training_branch is None
-    assert resumed.current_phase == "mazediag"
+    assert resumed.current_phase == "creditwarm"
     assert torch.count_nonzero(resumed._diagnostic_nav_risk_probe.weight) == 0
     assert resumed.ppo_generator.get_state().equal(expected_rng["shuffle"])
     assert resumed.action_generator.get_state().equal(expected_rng["action"])
@@ -1552,6 +1788,73 @@ def test_p4_previous_contract_loads_as_maze_warm_start():
     assert resumed.optimizer_migration_report["p4_warm_start_rng"][
         "action_rng_state"
     ]["status"] == "fresh_seed"
+    optimizer_report = resumed.optimizer_migration_report["p4_actor_optimizer"]
+    assert optimizer_report == {
+        "status": "reset",
+        "reason": "maze_credit_assignment_objective_change",
+    }
+    stuck_parameters = {
+        parameter
+        for group in resumed.actor_optimizer.param_groups
+        if group.get("name") == "actor_stuck_head"
+        for parameter in group["params"]
+    }
+    assert all(
+        parameter not in resumed.actor_optimizer.state
+        for parameter in stuck_parameters
+    )
+
+
+def test_p4_credit_repair_checkpoint_exact_resume_round_trip():
+    config = {
+        "training_profile": "maze_credit_repair",
+        "maze_training_branch": "credit_repair",
+        "track_segment_labels": ["maze"],
+        "camera_fault_course_enabled": False,
+        "goal_fault_course_enabled": False,
+    }
+    algorithm = _p4_algorithm(config=config)
+    algorithm._initial_low_digest = algorithm._module_digest(
+        (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
+    )
+    algorithm.low_level_state_digest = algorithm._initial_low_digest
+    algorithm._configure_adapter_contract()
+    algorithm.update_training_clocks(700.0)
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "model.ckpt-creditadapt-42.pkl"
+        algorithm.save_training_bundle(str(path), platform_model_id="42")
+        payload = torch.load(path, weights_only=False, map_location="cpu")
+        assert payload["training_states"]["global"]["train_scope"] == (
+            "maze_actor_critic_stuck_only"
+        )
+        resumed = _p4_algorithm(config=config)
+        mode = resumed.load_bundle(str(path), platform_model_id="42")
+    assert mode == "p4_exact_resume_history_reset"
+    assert resumed.current_phase == "creditadapt"
+    assert resumed.session_effective_seconds == pytest.approx(700.0)
+    assert resumed.training_profile == "maze_credit_repair"
+    assert all(not parameter.requires_grad for parameter in resumed.navigation_encoder.parameters())
+    assert all(not parameter.requires_grad for parameter in resumed.safety_head.parameters())
+    assert all(not parameter.requires_grad for parameter in resumed.response_adapter.parameters())
+
+
+def test_p4_credit_repair_separates_wall_and_active_training_clocks():
+    algorithm = _p4_algorithm(
+        config={
+            "training_profile": "maze_credit_repair",
+            "maze_training_branch": "credit_repair",
+            "track_segment_labels": ["maze"],
+            "camera_fault_course_enabled": False,
+            "goal_fault_course_enabled": False,
+        }
+    )
+    algorithm.update_training_clocks(
+        120.0,
+        session_effective_seconds=30.0,
+    )
+    assert algorithm.session_wall_seconds == pytest.approx(120.0)
+    assert algorithm.session_effective_seconds == pytest.approx(30.0)
+    assert algorithm.effective_training_seconds == pytest.approx(30.0)
 
 
 def test_p4_runtime_stuck_reset_contract_controls_reward_and_metadata():
@@ -1582,7 +1885,11 @@ def test_p4_runtime_stuck_reset_contract_controls_reward_and_metadata():
     assert result["stuck_reset"].item() == pytest.approx(-4.5)
     assert metadata["training"]["stuck_reset"]["mode"] == "active"
     assert metadata["training"]["stuck_reset"]["confirmation_s"] == 12.0
-    assert metadata["reward"]["new_terms"]["confirmed_wall_stuck_reset"] == -4.5
+    assert metadata["reward"]["new_terms"]["confirmed_wall_stuck_reset"] == {
+        "mode": "active",
+        "terminal_penalty": -4.5,
+        "semantics": "active_reason4_terminal",
+    }
 
 
 def test_p4_track_eval_loads_only_inference_modules_from_new_checkpoint():

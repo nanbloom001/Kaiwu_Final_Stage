@@ -4,6 +4,79 @@
 
 ## [未发布]
 
+- **[P4 creditwarm 空辅助批反传修复]** 首阶段 Actor/CNN 冻结且当前 minibatch 没有有效
+  stuck 标签时，组合 Actor loss 可能是无计算图常量。公共 PPO 循环现在只在 loss 实际具有
+  gradient graph 时执行 backward，并且只有真正产生 Actor 梯度时才 step optimizer 和递增
+  gradient-step；Critic 更新继续执行。新增空 stuck batch 回归，防止首轮训练再次因
+  `element 0 of tensors does not require grad` 停止。
+
+- **[P4 Maze 两小时归因修复]** 新分支 `codex/p4-maze2h-credit-repair` 从
+  `p4maze8h10hz_1416926` 的 `mazefinal` 权重 warm start，任务
+  `p4maze2h-credit-repair` 累计完整 `7200s`。训练回到单段 Maze、20 列、课程关闭和 75 秒
+  episode；低层、NavigationEncoder、SafetyHead、ResponseAdapter 全程冻结，高层 Actor 权重保留
+  但 Adam state 重置，Critic/return statistics 重建，并保留 training-only StuckHead。
+- 删除 terminal frontier clawback，改为每 episode 非重复的历史最短距离 credit（`2.0/m`、上限
+  `+12`）。平移 limiter 改为 risk `>0.75` 才进入紧急减速，risk=1 时保留 60% 平移且不缩放
+  `wz`；卡滞 reset 保持 shadow，只施加 0.8-2.0 秒渐进到 `-0.02/tick` 的持续惩罚。
+  关闭额外 Camera/Goal fault、Push、五段出生、segment frontier、route-excess 和 open-straight，
+  保留父模型安全组权重。新增 `credit*` checkpoint 标签、Maze credit 面板和新合同 exact-resume
+  round-trip；修复 warm start 把旧 session 时钟带入新 optimizer phase，以及 P4 新 train scope 被
+  继承 P2 loader 拒绝的问题。
+  最终审查进一步把 `session_effective_seconds` 改为只累计 rollout collection 与 PPO update
+  活跃时间，checkpoint/监控/日志耗时只计入 `session_wall_seconds`；移除未接线的 Teacher TOML
+  伪旋钮，并在共享接口合同中补齐 credit-repair 的保存、评估和恢复边界。
+
+- **[P4 五段全赛道八小时长训]** 新分支 `codex/p4-full8h-r2` 从
+  `p4maze8h10hz_1416926` continuation warm start，任务 `p4full8h-r2` 完整训练 `28800s`。
+  Track 改为正坡、逆坡、正楼梯、逆楼梯、开放入口迷宫五段，20 列、课程关闭、120 秒 episode；
+  高层保持 10Hz/32-tick/TBPTT16，低层冻结。新增 70/60/75% 整轨起点与五段/四分位/70:30
+  safe-hard quota 出生，困难位置只有通过运行时表面和机身 clearance raycast 才写入，否则退回同段
+  入口。reason 4 同桶重试两次后退回同段入口，禁止通过后移出生刷完成率。
+- Goal 编码保持 4 维接口：P4 训练在 10m 内逐值兼容、10m 外保存单位方位；部署 `UwbGoal`
+  改为显式版本化，现有 Actor80 默认仍走 legacy 逐轴 clamp，只有未来匹配 P4 v2 spec 的可部署
+  制品才显式启用方向保持编码，避免 non-deployable 训练合同改变稳定运行时。
+  GoalBelief 加入近目标衰减的零均值椭圆跳变，切向最大 1m、径向最大 0.2m。五段首次推进使用
+  terminal-clawed potential，全局 route-excess 关闭；开阔直行只在正/逆坡、teacher 明确开阔、
+  Goal 新鲜、远离边界且非 junction/dead-end/contact/recovery 时施加小额 lateral/S-turn/path cost。
+  修复了大 `|wz|` 会错误削弱 S-turn 惩罚的逃逸口。
+- P4 training wire 从 509 扩为 519，增加出生段、段内分位、安全点与 reason4/fallback 诊断。
+  面板独立报告出生段和终止所在段、正负 `vy/wz` 命令链、Goal clean/fault 方位、跳变径向/切向、
+  五段 frontier、开阔直行和 active stuck reset。旧 P4 合同只可 warm start；新合同才可 learner
+  exact resume。worker quota/RNG 在 fresh-process resume 后按 seed 重启，未伪装成位级 exact resume。
+  正式训练的 reset spawn hook 和 active `nav_stuck_timeout` 现在属于启动正确性条件：出生 hook 安装
+  失败立即停止，卡滞 term 允许 8 帧装配重试后失败，物理 root-state 写入异常直接抛错。同帧
+  wall-stuck 优先于 success，确保真实 reason4 reset 不会获得 `+200` 或进入完成统计。出生比例改为
+  reset-event 口径；L0-L9/L10-L19 只称难度列，不再误标为 safe/hard 出生位置。
+  平台启动 smoke 进一步修复 worker bridge 的 P4 wire 日志在构造期间读取未初始化
+  `_p4_enabled` 的顺序回归；该标志现由已经解析的 runtime stage 动态派生，P2/P4 eval 不受影响。
+  同一平台链发现 spawn quota 保持在 CPU 而 worker tail 位于 CUDA，现先统一迁移 device 再组合
+  519 wire，避免首次 observation 生成时发生 CPU/CUDA `torch.where` 冲突。
+
+- **[P4 Maze 三小时卡滞恢复与转向稳定]** 新分支 `codex/p4-maze3h-recovery` 从
+  `p4maze8h10hz_1416926` continuation warm start，运行 `p4maze3h-recovery-r2` 完整
+  `10800s`。保持 Actor85、三轴动作、10Hz/50Hz、32-tick/TBPTT16 和冻结低层不变；将三轴
+  slew 更新为 `0.30/0.40/1.50` 增速与 `0.30/0.80/3.00` 释放。新增 Actor mean 容差教师、
+  training-only StuckHead、从 rollout 内任意真实 reset 起点构造的零-hidden TBPTT16 中按全部
+  PPO sequence-update 约 10% 调度的 mirror、
+  SafetyHead hard-positive 加权、完整平移
+  vector limiter 和近终点软捕获。所有辅助梯度共用 5% 上限；privileged teacher 不反传到
+  NavigationEncoder，Camera clean/live 辅助继续更新视觉编码器。
+- 安全奖励将 predictive、missed-safe、yaw cancellation、yaw-exit 和 goal-safe preference 统一到
+  原 5Hz 等效 `-0.06` 预算；success 保持 `+200`，reason 4 保持 `-15` 且 terminal tick 不重复
+  collision/safety 惩罚。卡墙确认从 7 秒改为 10 秒，Push 全程关闭。平台暂无可信的高层运动意图
+  回传，worker wire 升级为 509，额外保留独立 raw wall term，并对 active reset fail-closed，正式配置保持 shadow；面板分别统计
+  候选进入、有运动/正进度证据的自然脱困、证据暂失但未确认运动的退出、候选中终止、恢复耗时
+  和 60 秒/lifetime 成功脱困，不再把 reset 记为恢复；reset/completion 使用独立信号交叉检查，
+  exact resume 恢复 recovery 时间戳和 lifetime 计数。
+  旧 P4 checkpoint 只做
+  continuation warm start：按稳定 optimizer group 名恢复 8 个旧 Actor/CNN/SafetyHead Adam 组，
+  新 StuckHead 保持空 state；同合同 exact resume 严格恢复新 leaf、mirror RNG 和校准状态。
+- 平台首轮任务 `p4maze3h-recovery-r1`（ID `236388`）在第一次真实 PPO 更新进入 mirror
+  auxiliary 时暴露 GPU dtype 回归：CPU pinned rollout 的 FP16 depth 在未启用 AMP 的路径中直接
+  输入 FP32 NavigationEncoder。mirror CNN 重算现与主 PPO 路径一致启用 CUDA autocast，并在 CPU
+  测试路径显式转为 FP32；新增 FP16 mirror-depth 回归用例。失败任务只保留为诊断证据，正式替代
+  任务使用 `p4maze3h-recovery-r2`。
+
 - **[P4 Maze 10Hz 路径效率强化]** 基于 `p4nav2h_1256446-F` 将 P4 高层控制由 5Hz 提升到
   10Hz，同时保持 Actor85、三轴动作、32-tick rollout、TBPTT16、低层 50Hz 和部署接口不变。
   成功 impulse 提高到 `+200`；新增持续卡墙、目标一致的安全选向和额外路程三项小幅负奖励。
@@ -930,3 +1003,4 @@
 - 阶段 4 已完成：378413、分析报告和旧部署包分别纳入 `archive/` 与 `shared/`。
 - 阶段 5：通过 PR merge commit 合入 `main`，随后按分支登记执行带远程 SHA 复核的分支收敛。
 - 训练长跑与 Jetson 真机验证属于后续模型发布验收，不作为本次仓库布局合并的阻断条件。
+- **[P4 全赛道监控平台校验修复]** 五段出生覆盖和出生位置四分位面板移除平台不接受的中文括号，标题缩短到 20 字符以内；新增 P4 面板标题字符集和长度回归，避免单个非法标题导致平台跳过整份自定义监控配置。

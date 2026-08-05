@@ -108,8 +108,42 @@ inline float approach_speed_scale(
         0.0f, 1.0f);
 }
 
+enum class ActorGoalEncoding
+{
+    LegacyActor80,
+    DirectionPreservingV2,
+};
+
+inline std::array<float, 4> actor_goal_from_planar_xy(
+    float local_x, float local_y,
+    ActorGoalEncoding encoding = ActorGoalEncoding::LegacyActor80)
+{
+    if (!std::isfinite(local_x) || !std::isfinite(local_y))
+        return {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const float planar_distance = std::hypot(local_x, local_y);
+    const float distance_scale = std::clamp(planar_distance / 20.0f, 0.0f, 1.0f);
+    if (encoding == ActorGoalEncoding::LegacyActor80 || planar_distance <= 10.0f) {
+        return {
+            std::clamp(local_x / 10.0f, -1.0f, 1.0f),
+            std::clamp(local_y / 10.0f, -1.0f, 1.0f),
+            distance_scale,
+            0.0f,
+        };
+    }
+
+    // Preserve bearing for distant goals instead of independently saturating X/Y.
+    return {
+        local_x / planar_distance,
+        local_y / planar_distance,
+        distance_scale,
+        0.0f,
+    };
+}
+
 inline std::array<float, 4> actor_goal_from_uwb(
-    float beta, float pitch, float distance_m)
+    float beta, float pitch, float distance_m,
+    ActorGoalEncoding encoding = ActorGoalEncoding::LegacyActor80)
 {
     if (!std::isfinite(beta) || !std::isfinite(pitch) || !std::isfinite(distance_m))
         return {0.0f, 0.0f, 0.0f, 0.0f};
@@ -117,27 +151,7 @@ inline std::array<float, 4> actor_goal_from_uwb(
     const float planar_distance = planar_distance_from_uwb(pitch, distance_m);
     const float local_x = planar_distance * std::cos(beta);
     const float local_y = planar_distance * std::sin(beta);
-
-    return {
-        std::clamp(local_x / 10.0f, -1.0f, 1.0f),
-        std::clamp(local_y / 10.0f, -1.0f, 1.0f),
-        std::clamp(planar_distance / 20.0f, 0.0f, 1.0f),
-        0.0f,
-    };
-}
-
-inline std::array<float, 4> actor_goal_from_planar_xy(float local_x, float local_y)
-{
-    if (!std::isfinite(local_x) || !std::isfinite(local_y))
-        return {0.0f, 0.0f, 0.0f, 0.0f};
-
-    const float planar_distance = std::hypot(local_x, local_y);
-    return {
-        std::clamp(local_x / 10.0f, -1.0f, 1.0f),
-        std::clamp(local_y / 10.0f, -1.0f, 1.0f),
-        std::clamp(planar_distance / 20.0f, 0.0f, 1.0f),
-        0.0f,
-    };
+    return actor_goal_from_planar_xy(local_x, local_y, encoding);
 }
 
 inline float time_filter_alpha(float dt_s, float tau_s)

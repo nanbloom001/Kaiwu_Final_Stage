@@ -525,7 +525,104 @@ checkpoint 明确记录 `seeded_fresh_after_environment_reset`，不得宣称该
 
 #### `p4_nav_ppo`：冻结 P3.5 低层的 Track 导航鲁棒包
 
-P4 Maze 强化当前父包选择为 `p4nav2h_1256446-F`（平台模型 ID `1256446`，checkpoint SHA256
+##### 当前 `p4_full_track_v2` 合同
+
+活动训练入口为 `p4full8h-r2`，父包 `p4maze8h10hz_1416926`。Actor observation 仍为 85，
+Critic、三轴动作、10Hz 高层/50Hz 低层和冻结低层接口不变。Track 顺序固定为
+`pyramid_slope -> pyramid_slope_inv -> pyramid_stairs -> pyramid_stairs_inv -> open_entry_maze`，
+20 列、课程关闭、120 秒 episode。训练专属 wire 为
+`p4_worker_wire_v6_full_track_spawn=519`：P3 493 后附加 raw goal2、卡滞诊断、raw wall term，
+以及出生 full/segment/quartile/safe 和 reason4/fallback 累计诊断。Track eval 继续使用稳定 eval wire，
+training-only tail 不进入 Actor、ONNX 或部署。
+
+P4 训练 Goal XY 使用方向保持 v2：`d<=10m` 继续 `xy/10`，`d>10m` 使用单位方位；距离通道为
+`min(d/20,1)`，shape 不变。部署 `UwbGoal` 以 `ActorGoalEncoding` 显式版本化：当前稳定 Actor80
+调用不传版本并保持 legacy 逐轴 clamp，只有未来与 P4 v2 spec/digest 匹配的可部署制品才能显式
+选择 `DirectionPreservingV2`。当前 P4 bundle 为 `deployable=false`，不得静默改变稳定部署入口。
+训练期椭圆跳变只作用于 Actor GoalBelief，Critic/reward/scorer 使用干净真值；径向轴为
+`capture*clamp(0.04+0.004d,0.04,0.20)`，切向轴为
+`capture*clamp(0.10+0.05d,0.10,1.00)`，`capture=smoothstep((d-1.5)/1.5)`。
+
+出生调度为三阶段整轨比例 70/60/75%，随机段权重 15/15/20/20/30%，四分位和 70/30
+safe-hard。Maze 困难位置必须有运行时表面 hit 与八方向 0.35m clearance；验证不可用时退回同段
+入口。reason 4 同桶最多重试两次，之后仍只退回同段入口。learner checkpoint 不包含 worker
+EventManager 的 live quota/RNG，fresh-process resume 后该部分按 seed 重启；不得将其描述为完整
+位级 exact resume。
+
+reward 合同为 `p4_full_track_reward_v2_potential_straight`。success `+200`，hard failure、normal
+timeout、reason4 均 `-25`。五段首次推进使用 terminal-clawed potential；global route-excess 权重
+为 0。开阔直行项只对正/逆坡的 teacher-confirmed straightaway 生效，总下限 `-0.0125/tick`，
+在楼梯、Maze、路口、dead-end、边界、碰撞、恢复、Goal stale 和 terminal 中严格为 0。
+同一 checkpoint 仍支持 Standard 低层-only 评估与 Track 完整层级评估；training-only SafetyHead、
+出生调度和诊断状态均不得进入部署。
+
+##### 历史 `p4_maze_recovery_v1` 合同
+
+活动入口为 `p4maze3h-recovery-r2`，父包 `p4maze8h10hz_1416926` 的 checkpoint SHA256 为
+`0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`。模型 ID `1416926` 和标签只
+用于候选定位；stage、模块 class/spec、tensor shape、有限值和合同 digest 才决定是否可加载。
+`p4maze3h-recovery-r1` 仅指平台任务 `236388` 的 FP16 mirror auxiliary 失败证据，不能作为活动
+训练入口或有效 checkpoint lineage。
+
+部署形状不变：worker policy 57905、低层输入 57901、Actor77、joint12、高层 Actor85。训练保持
+10Hz 高层、50Hz 低层、32-tick rollout 和 TBPTT16，低层全冻结。新增的 `P4ActorStuckHead` 是
+training-only leaf，Track/Standard eval 均不创建；rollout-time safe3 教师、mirror labels 和
+worker stuck diagnostics 不进入 Actor/Critic observation。
+
+活动训练 wire 为 `p4_worker_wire_v5_raw_wall_term=509`：P3 493 维后附加 raw metric goal2、
+stuck diagnostics13 和独立 raw wall term1。运动意图诊断仍表示经过验证的 worker-local 高层运动意图
+hook 是否可用；raw wall term 不进入网络，只用于检测同帧 success 优先级覆盖 wall-stuck 的归因冲突。原生
+`base_velocity` 不得替代 P4 exec command。当前平台无该 transport，活动 TOML 保持 `mode=shadow`，
+active reset 在 motion intent 缺失时 fail-closed。该训练尾部不进入 Track eval 385 维 wire、Actor85、
+Critic、ONNX 或部署接口。
+
+三轴 mapper 仍为 `vx=[0,1.0]`、`vy=+-0.30`、`wz=+-0.90`；slew 合同改为
+`increase=[0.30,0.40,1.50]`、`release=[0.30,0.80,3.00]`，保持先归零后反向。部署可得 depth risk
+只同比例缩放 `(vx,vy)`，不修改 `wz`；近终点 capture 仅在 Goal freshness >=0.90、距离
+`0.65-1.20m` 且 policy 朝向目标时限制平移速度，不修改动作方向、不提前 terminal。
+
+reward 合同为 `p4_maze_reward_v4_recovery`。predictive、missed-safe、yaw cancellation、yaw-exit、
+goal-safe preference 共用原 5Hz 等效 `-0.06` 安全预算；success 为 `+200`。reason 4 的 `-15`、
+不计 completion、不 bootstrap 和 terminal 去重语义只在未来 active reset 合同满足时生效；当前
+shadow 配置不会生成 reason 4。训练侧卡滞标签额外要求 policy/exec 意图，worker 侧只输出物理
+候选诊断，不能在缺少已验证 motion intent 时触发真实 reset。
+
+旧 P4 包只允许 continuation warm start。`1416926` 的 8 个同名 Actor/CNN/SafetyHead Adam 组按
+参数组名称和组内参数顺序迁移；新增 `actor_stuck_head` 保持空 optimizer state。只有完整匹配
+`p4_maze_recovery_v1` training/reward/command/stuck/camera 合同的包可以 exact resume，并恢复新
+leaf、mirror RNG、auxiliary calibration、optimizer、return statistics、Adapter completed records
+以及 recovery 60 秒窗口时间戳和 lifetime 计数。镜像序列从 rollout 内任意真实 reset 起点构造，
+不得依赖 PPO 固定 chunk 恰好与 episode 边界对齐。
+
+##### 当前 `p4_maze_credit_repair_v1` 合同
+
+当前训练入口为 `p4maze2h-credit-repair`，从 `p4maze8h10hz_1416926` 的 Maze 最终包做
+结构 warm start。网络和部署 I/O 不变：低层 57901/12、Track worker 385、高层 Actor85；
+`NavigationEncoder`、`SafetyHead`、低层和 `ResponseAdapter` 全程冻结，只训练已有高层
+Actor/LSTM、新建 Critic 和 training-only `StuckHead`。
+
+训练环境固定为单段 `open_entry_maze`、20 个静态难度列、课程关闭、75 秒 episode。P4
+session 只累计 rollout collection 与 PPO update 的活跃秒数；checkpoint、监控和日志耗时只进入
+`session_wall_seconds`，不能消耗 7200 秒有效训练预算。平台任务墙钟必须至少覆盖 7200 秒训练和
+900 秒保存/关闭余量。
+
+reward/command/checkpoint 版本分别为 `p4_maze_credit_repair_reward_v1`、
+`p4_maze_credit_repair_command_v1` 和 `p4_maze_credit_repair_v1`。Maze 进展仅按 episode
+历史最短目标距离发放不可重复 credit（`2.0/m`，累计上限 `+12`），terminal 不再 clawback；
+success/failure/timeout 为 `+200/-25/-25`。平移 limiter 只在 risk `>0.75` 时收紧，risk=1
+仍保留 60% `(vx,vy)` 且不缩放 `wz`。卡滞 reset 固定为 shadow，只产生候选诊断和持续卡滞
+轻罚，不生成 reason4 terminal。
+
+Actor mean teacher 是固定合同而非 TOML 可调旋钮：direction/speed/yaw 权重为
+`0.45/0.20/0.35`，最少 64 个有效 step，阶段梯度目标最高 3.5%，总硬上限 5%。旧 P4 包只允许
+warm start；只有完整匹配本节 command/reward/training/stuck/camera digest 的新包才能 exact
+resume。保存标签优先级为 `creditfinal > credittrain > creditadapt > creditwarm >` 历史 P4 标签。
+Standard eval 继续只抽取低层，Track eval 加载完整 P4；training-only `StuckHead` 与
+`SafetyHead` 均不进入部署执行。
+
+##### 历史 `p4_maze_attack10hz_v1` 合同（非活动入口）
+
+历史 P4 Maze 八小时强化父包为 `p4nav2h_1256446-F`（平台模型 ID `1256446`，checkpoint SHA256
 `8aae0892664f2f263949f7e5f9f3b53ecd2936b44e80f3783091579bcf3d3461`）。该 ID只用于候选选择；
 请求/配置 ID 不可用时只允许唯一结构兼容 P4 discovery，多个候选必须报歧义。选中包仍须通过
 stage、模块 spec、tensor shape 与有限值验证后才能 warm start。
@@ -567,7 +664,7 @@ digest 格式和序列内部 `(digest,iteration)` 一致性做 `legacy_parent_st
 连续池，不能把 32 条记录对半切成小于 `burn-in8+sequence16` 的不可采样窗口。`safety_cap` 从 delivered depth 与当前
 exec 命令的 0.8 秒 slew 弧线计算，Track eval 不加载 SafetyHead 也必须执行同一限速合同。
 
-P4 Maze 八小时 reward 合同为 `p4_maze_reward_v3_10hz_route`。predictive collision raw 按父项
+历史 P4 Maze 八小时 reward 合同为 `p4_maze_reward_v3_10hz_route`。predictive collision raw 按父项
 放大 1.25 倍并限制到不低于 `-0.03/tick`；missed-safe 仅在 scanner 有效、正在运动且存在明显
 安全替代时结算，方向 gap 归一化后按 0-30 分钟 `0->0.015`、30 分钟-2 小时
 `0.015->0.040`、2-6 小时保持 `0.040`、6-8 小时 `0.040->0.030`。predictive、missed-safe 和
@@ -579,7 +676,7 @@ failure、timeout、stuck reset 等事件 impulse，按米计算的 route excess
 `-0.04`，额外路程按 `-0.05/m` 且每 tick 最多 0.20m。旧 `frontier_stagnation` 的 PPO 权重为零，
 只保留 shadow 诊断；Goal 跳变/丢失故障继续使用独立 `goal_fault_multiplier`。
 
-P4 Maze checkpoint 合同为 `p4_maze_attack10hz_v1`：10 分钟只读诊断使用独立
+历史 P4 Maze checkpoint 合同为 `p4_maze_attack10hz_v1`：10 分钟只读诊断使用独立
 `session_wall_seconds`，不计入正式 `session_effective_seconds=28800`；诊断结束的 rollout 边界是
 正式训练时钟零点。诊断期除 clean/live 对照外，使用独立 RNG 对 10% clean depth 生成轻故障
 shadow；该 shadow 只用于 detached 线性探针和动作差异诊断，不进入 Actor observation、PPO
@@ -599,7 +696,7 @@ EventManager timer、pending rollout 在新环境中重建。
 
 P4 R2 的 `p4_stuck_reset_v1` 只在 worker bridge 中维护世界坐标约束与非足端接触证据，不修改
 平台 BaseEnv。active 前必须在线确认既有 `nav_stuck_timeout` term、`time_out=true`、公开
-get/set/readback 和 `dt=0.02s`。当前 Maze 八小时合同以 7 秒确认，reason=4 结算 `-15` terminal
+get/set/readback 和 `dt=0.02s`。历史 Maze 八小时合同以 7 秒确认，reason=4 结算 `-15` terminal
 impulse 并回收该 episode 未结算的 frontier potential；因此完整 terminal tick 不保证恰好 -15，
 但必须通过 `stuck_terminal_episode_return_mean/nonnegative_rate` 验证 reset episode 的整体收益为负。
 reason=4 使用 `bootstrap_mask=continuation_mask=0`，同 tick 不重复 collision、predictive collision、

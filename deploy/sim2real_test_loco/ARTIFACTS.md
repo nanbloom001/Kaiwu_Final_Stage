@@ -27,6 +27,10 @@ P2 的 `modules.high_level.component_status="complete"` 只表示训练包包含
 不得通过改名把上述训练包伪装成可部署 checkpoint。本次 R2 合入不改变 ONNX
 输入、关节顺序、动作缩放、控制频率或 Jetson 运行代码。
 
+P4 训练 checkpoint 不是本部署树的可部署候选：尚未完成与此 Actor80 `goal[1,4]`
+输入兼容的导出审查、ONNX 数值校验和 Jetson/真机验证前，必须保持
+`capabilities.deployable=false`，不得作为本路线的 `policy.onnx` 或通过改名加载。
+
 ## 所需制品清单
 | 制品 | 类型 | 当前状态 | SHA256 | 说明 |
 |---|---|---|---|---|
@@ -43,6 +47,11 @@ P2 的 `modules.high_level.component_status="complete"` 只表示训练包包含
 - **输出**: `cmd[1,3]` `cmd_raw[1,3]` `clearance[1,3]`（恒 0）`joint[1,12]`（原始动作，未 scale/offset）`loco_h_out[2,1,64]` `loco_c_out[2,1,64]` `nav_h_out[2,1,64]` `nav_c_out[2,1,64]`（原样透传）
 - **LSTM 语义**: loco LSTM 状态 (h,c) 须由 C++ runner 逐帧回喂，episode 起始重置为 0；nav LSTM 状态原样透传（此图不更新）
 - **proprio[6:9] 覆写**: 推理前必须由 C++ 覆写为上一帧 cmd / 固定注入 cmd（图外契约①）
+- **UWB goal 编码**: 当前默认部署入口和现有 Actor80 继续使用
+  `ActorGoalEncoding::LegacyActor80`，即 `[clamp(x/10),clamp(y/10),min(d/20,1),0]`。
+  `DirectionPreservingV2` 只为未来与 P4 v2 合同匹配的可部署制品显式启用；`d>10m` 时其前两维
+  使用单位方位 `[x/d,y/d]`。当前 `p4full8h-r2` bundle 标记为 non-deployable，不能让训练期合同
+  静默改变稳定低层运行时。UWB 新鲜度衰减与保持超时不由编码版本改变。
 - **opset=17**, `dynamic_axes=None`（固定 batch=1）
 
 ## 生成命令

@@ -65,6 +65,17 @@ class P2RolloutStorage:
         # update semantics while allowing clean/live camera supervision.
         self.clean_action_mean = _cpu_tensor(*common, 3)
         self.camera_aux_mask = _cpu_tensor(*common, 3)
+        # P4 recovery supervision is sampled with the action transition and
+        # replayed on exactly the same TBPTT16 timeline as old log-probs.
+        self.teacher_safe3 = _cpu_tensor(*common, 3)
+        self.teacher_goal_xy = _cpu_tensor(*common, 2)
+        self.teacher_predictive_risk = _cpu_tensor(*common, 1)
+        self.teacher_mask = _cpu_tensor(*common, 1)
+        self.teacher_goal_mask = _cpu_tensor(*common, 1)
+        self.teacher_weight = _cpu_tensor(*common, 1)
+        self.stuck_label = _cpu_tensor(*common, 1)
+        self.stuck_mask = _cpu_tensor(*common, 1)
+        self.mirror_eligible = _cpu_tensor(*common, 1)
         self.critic_input = _cpu_tensor(*common, p2_contract.CRITIC_INPUT_DIM)
         self.pre_tanh_action = _cpu_tensor(*common, p2_contract.ACTION_DIM)
         self.old_log_prob = _cpu_tensor(*common, 1)
@@ -161,6 +172,19 @@ class P2RolloutStorage:
                 torch.zeros(self.num_envs, 3, device=transition["reward"].device),
             ),
         )
+        defaults = {
+            "teacher_safe3": torch.zeros(self.num_envs, 3, device=transition["reward"].device),
+            "teacher_goal_xy": torch.zeros(self.num_envs, 2, device=transition["reward"].device),
+            "teacher_predictive_risk": torch.zeros(self.num_envs, 1, device=transition["reward"].device),
+            "teacher_mask": torch.zeros(self.num_envs, 1, device=transition["reward"].device),
+            "teacher_goal_mask": torch.zeros(self.num_envs, 1, device=transition["reward"].device),
+            "teacher_weight": torch.zeros(self.num_envs, 1, device=transition["reward"].device),
+            "stuck_label": torch.zeros(self.num_envs, 1, device=transition["reward"].device),
+            "stuck_mask": torch.zeros(self.num_envs, 1, device=transition["reward"].device),
+            "mirror_eligible": torch.zeros(self.num_envs, 1, device=transition["reward"].device),
+        }
+        for name, default in defaults.items():
+            self._copy(getattr(self, name)[index], transition.get(name, default))
         actor_h, actor_c = transition["actor_hidden"]
         critic_h, critic_c = transition["critic_hidden"]
         self._copy(self.actor_h[index], actor_h)
@@ -203,6 +227,44 @@ class P2RolloutStorage:
         ]
         order = torch.randperm(len(refs), generator=generator).tolist()
         return [refs[index] for index in order]
+
+    def episode_aligned_refs(
+        self,
+        *,
+        eligibility: torch.Tensor | None = None,
+    ) -> list[SequenceRef]:
+        """Return complete TBPTT chunks starting at actual episode resets.
+
+        These refs are auxiliary-only and may overlap PPO's fixed partition.
+        Starting at a reset gives recurrent mirror replay a true zero hidden
+        state without inventing a left/right transform for LSTM state.
+        """
+        if eligibility is not None:
+            eligibility = torch.as_tensor(eligibility).bool()
+            if eligibility.shape[:2] != (self.num_ticks, self.num_envs):
+                raise ValueError("episode-aligned eligibility has invalid shape")
+            if eligibility.ndim > 2:
+                eligibility = eligibility.reshape(
+                    self.num_ticks, self.num_envs, -1
+                ).all(dim=-1)
+        refs: list[SequenceRef] = []
+        for env in range(self.num_envs):
+            starts = torch.nonzero(
+                self.reset_mask[: self.step, env], as_tuple=False
+            ).reshape(-1)
+            for raw_start in starts.tolist():
+                start = int(raw_start)
+                stop = start + self.sequence_length
+                if stop > self.step:
+                    continue
+                if bool(self.reset_mask[start + 1 : stop, env].any()):
+                    continue
+                if eligibility is not None and not bool(
+                    eligibility[start:stop, env].all()
+                ):
+                    continue
+                refs.append(SequenceRef(start, env))
+        return refs
 
     @staticmethod
     def microbatch_loss_scale(

@@ -33,6 +33,8 @@ class GoalBeliefChainV2:
         self.dropout_remaining_s = torch.zeros(shape, device=self.device)
         self.jump_remaining_s = torch.zeros(shape, device=self.device)
         self.jump_offset = torch.zeros(self.num_envs, 2, device=self.device)
+        self.jump_radial_offset_m = torch.zeros(shape, device=self.device)
+        self.jump_tangent_offset_m = torch.zeros(shape, device=self.device)
         self.goal_epoch = torch.full(shape, -1, dtype=torch.long, device=self.device)
         self.reacquire_pending = torch.zeros(
             shape, dtype=torch.bool, device=self.device
@@ -82,6 +84,8 @@ class GoalBeliefChainV2:
         self.dropout_remaining_s[mask] = 0.0
         self.jump_remaining_s[mask] = 0.0
         self.jump_offset[mask] = 0.0
+        self.jump_radial_offset_m[mask] = 0.0
+        self.jump_tangent_offset_m[mask] = 0.0
         self.goal_epoch[mask] = -1
         self.reacquire_pending[mask] = False
         self.reacquire_elapsed_s[mask] = 0.0
@@ -228,6 +232,10 @@ class GoalBeliefChainV2:
         was_dropout = self.dropout_remaining_s > 0.0
         self.dropout_remaining_s.sub_(float(dt_s)).clamp_min_(0.0)
         self.jump_remaining_s.sub_(float(dt_s)).clamp_min_(0.0)
+        jump_ended = self.jump_remaining_s <= 0.0
+        self.jump_offset[jump_ended] = 0.0
+        self.jump_radial_offset_m[jump_ended] = 0.0
+        self.jump_tangent_offset_m[jump_ended] = 0.0
         dropout_ended = was_dropout & (self.dropout_remaining_s <= 0.0)
         self.reacquire_pending |= dropout_ended
         self.reacquire_elapsed_s = torch.where(
@@ -265,23 +273,42 @@ class GoalBeliefChainV2:
                 )
                 self.reacquire_pending[drop_start] = False
                 self.reacquire_elapsed_s[drop_start] = 0.0
+            true_distance = torch.linalg.vector_norm(true_goal_xy, dim=-1)
             jump_start = (
                 self._uniform((self.num_envs,))
-                < 0.015 * float(dt_s) * self.fault_scale
-            ) & (self.jump_remaining_s <= 0.0) & fault_allowed
+                < p4_contract.GOAL_JUMP_RATE_PER_S * float(dt_s) * self.fault_scale
+            ) & (self.jump_remaining_s <= 0.0) & fault_allowed & (
+                true_distance >= p4_contract.GOAL_JUMP_MIN_DISTANCE_M
+            )
             if bool(jump_start.any()):
                 ids = jump_start.nonzero(as_tuple=False).reshape(-1)
-                direction = 2.0 * math.pi * self._uniform((ids.numel(),))
-                magnitude = 0.3 + 0.9 * self._uniform((ids.numel(),))
-                distance_cap = 0.15 * torch.linalg.vector_norm(
-                    true_goal_xy[ids], dim=-1
+                distance = true_distance[ids]
+                capture_x = torch.clamp((distance - 1.5) / 1.5, 0.0, 1.0)
+                capture = capture_x.square() * (3.0 - 2.0 * capture_x)
+                radial_axis = capture * torch.clamp(
+                    0.04 + 0.004 * distance,
+                    p4_contract.GOAL_JUMP_RADIAL_RANGE_M[0],
+                    p4_contract.GOAL_JUMP_RADIAL_RANGE_M[1],
                 )
-                magnitude = torch.minimum(magnitude, distance_cap)
-                self.jump_offset[ids] = torch.stack(
-                    (magnitude * torch.cos(direction), magnitude * torch.sin(direction)),
-                    dim=-1,
+                tangent_axis = capture * torch.clamp(
+                    0.10 + 0.05 * distance,
+                    p4_contract.GOAL_JUMP_TANGENT_RANGE_M[0],
+                    p4_contract.GOAL_JUMP_TANGENT_RANGE_M[1],
                 )
-                self.jump_remaining_s[ids] = 0.2 + 0.6 * self._uniform((ids.numel(),))
+                theta = 2.0 * math.pi * self._uniform((ids.numel(),))
+                radius = torch.sqrt(self._uniform((ids.numel(),)))
+                radial_component = radius * torch.cos(theta) * radial_axis
+                tangent_component = radius * torch.sin(theta) * tangent_axis
+                radial_unit = true_goal_xy[ids] / distance.clamp_min(1.0e-6).unsqueeze(-1)
+                tangent_unit = torch.stack((-radial_unit[:, 1], radial_unit[:, 0]), dim=-1)
+                self.jump_offset[ids] = (
+                    radial_component.unsqueeze(-1) * radial_unit
+                    + tangent_component.unsqueeze(-1) * tangent_unit
+                )
+                self.jump_radial_offset_m[ids] = radial_component
+                self.jump_tangent_offset_m[ids] = tangent_component
+                low, high = p4_contract.GOAL_JUMP_DURATION_S
+                self.jump_remaining_s[ids] = low + (high - low) * self._uniform((ids.numel(),))
 
         due = (self.measurement_clock_s >= 0.20) & (
             self.dropout_remaining_s <= 0.0
@@ -424,6 +451,8 @@ class GoalBeliefChainV2:
             "goal_age_s": self.age_s.detach().clone(),
             "goal_dropout_active": (self.dropout_remaining_s > 0.0).float(),
             "goal_jump_active": (self.jump_remaining_s > 0.0).float(),
+            "goal_jump_radial_offset_m": self.jump_radial_offset_m.detach().clone(),
+            "goal_jump_tangent_offset_m": self.jump_tangent_offset_m.detach().clone(),
             "goal_map_x_m": self.estimate[:, 0].detach().clone(),
             "goal_map_y_m": self.estimate[:, 1].detach().clone(),
             "goal_map_distance_m": torch.linalg.vector_norm(
@@ -444,8 +473,8 @@ class GoalBeliefChainV2:
         return goal4
 
     def goal4(self) -> torch.Tensor:
-        encoded_xy = torch.clamp(
-            self.estimate / nav_contract.GOAL_XY_SCALE_M, -1.0, 1.0
+        encoded_xy = nav_contract.encode_goal_xy_direction_preserving(
+            self.estimate
         )
         distance = torch.linalg.vector_norm(self.estimate, dim=-1)
         encoded_distance = torch.clamp(
@@ -480,6 +509,7 @@ class GoalBeliefChainV2:
     def state_dict(self) -> dict[str, object]:
         return {
             "version": p4_contract.GOAL_BELIEF_VERSION,
+            "goal_encoding_version": nav_contract.GOAL_ENCODING_VERSION,
             "generator_state": self.generator.get_state(),
             "fault_scale": self.fault_scale,
             # Live per-environment estimator state is intentionally not exact-
@@ -489,6 +519,8 @@ class GoalBeliefChainV2:
     def load_state_dict(self, state: dict[str, object]) -> None:
         if state.get("version") != p4_contract.GOAL_BELIEF_VERSION:
             raise ValueError("P4 GoalBelief checkpoint version mismatch")
+        if state.get("goal_encoding_version") != nav_contract.GOAL_ENCODING_VERSION:
+            raise ValueError("P4 GoalBelief goal-encoding version mismatch")
         generator_state = state.get("generator_state")
         if not torch.is_tensor(generator_state):
             raise ValueError("P4 GoalBelief checkpoint missing RNG state")

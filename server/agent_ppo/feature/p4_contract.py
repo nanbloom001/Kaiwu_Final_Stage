@@ -13,34 +13,38 @@ import torch
 from agent_ppo.feature import p2_contract
 
 
-RUN_NAME = "p4maze8h-10hzroute"
+RUN_NAME = "p4maze2h-credit-repair"
 STAGE_NAME = "p4_nav_ppo"
 STAGE_TYPE = "p4_nav_ppo"
-TRAINING_HOURS = 8.0
-TARGET_EFFECTIVE_SECONDS = 28_800.0
-DIAGNOSTIC_SECONDS = 600.0
-PLATFORM_WALL_MARGIN_SECONDS = 300.0
+TRAINING_HOURS = 2.0
+TARGET_EFFECTIVE_SECONDS = 7_200.0
+DIAGNOSTIC_SECONDS = 0.0
+PLATFORM_WALL_MARGIN_SECONDS = 900.0
 PLATFORM_WALL_SECONDS = (
     TARGET_EFFECTIVE_SECONDS
     + DIAGNOSTIC_SECONDS
     + PLATFORM_WALL_MARGIN_SECONDS
 )
 PLATFORM_WALL_HOURS = PLATFORM_WALL_SECONDS / 3_600.0
-SCHEDULE_BOUNDARIES_SECONDS = (3_600.0, 18_000.0, 25_200.0)
+SCHEDULE_BOUNDARIES_SECONDS = (600.0, 1_800.0, 3_600.0, 5_400.0, 6_300.0, 7_200.0)
 
 LEGACY_ACTION_MAPPER_VERSION = "p2_legacy_action_mapper_v1"
 ACTION_MAPPER_VERSION = "p4_capability_action_mapper_v1"
-GOAL_BELIEF_VERSION = "p4_goal_belief_v3_metric_raw"
-CAMERA_CONTRACT_VERSION = "p4_shared_camera_v3_diagnostic_shadow"
+GOAL_BELIEF_VERSION = "p4_goal_belief_v4_full_track_metric_raw"
+CAMERA_CONTRACT_VERSION = "p4_shared_camera_v4_recovery_nominal_light"
 ADAPTER_RECORD_CONTRACT_VERSION = "p4_adapter_record_v1"
-SAFETY_REWARD_RAMP_VERSION = "p4_maze_safe_direction_ramp_v3_goal_safe"
-CHECKPOINT_CONTRACT_VERSION = "p4_maze_attack10hz_v1"
-WORKER_WIRE_VERSION = "p4_worker_wire_v2"
-STUCK_RESET_CONTRACT_VERSION = "p4_stuck_reset_v1"
+SAFETY_REWARD_RAMP_VERSION = "p4_maze_credit_repair_safety_group_v1"
+CHECKPOINT_CONTRACT_VERSION = "p4_maze_credit_repair_v1"
+WORKER_WIRE_VERSION = "p4_worker_wire_v6_full_track_spawn"
+STUCK_RESET_CONTRACT_VERSION = "p4_stuck_reset_v3_sliding_window_10s"
+ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION = "p4_actor_mean_guidance_v1"
+TRANSLATION_VECTOR_LIMITER_CONTRACT_VERSION = "p4_translation_vector_limiter_v2_emergency_only"
+NEAR_GOAL_CAPTURE_CONTRACT_VERSION = "p4_near_goal_capture_v1"
+STUCK_AUX_CONTRACT_VERSION = "p4_stuck_aux_v1"
 # Training-only transport appended after the stable P3 493-column wire.
 # These fields never enter either learned network and are absent from eval.
-P4_WORKER_EXTRA_DIM = 14
-P4_PRIVILEGED_WIRE_DIM = 507
+P4_WORKER_EXTRA_DIM = 26
+P4_PRIVILEGED_WIRE_DIM = 519
 RAW_GOAL_XY_SLICE = slice(0, 2)
 STUCK_MOTION_CONFINED_INDEX = 2
 STUCK_WALL_EVIDENCE_INDEX = 3
@@ -54,6 +58,18 @@ STUCK_SAVED_SECONDS_INDEX = 10
 STUCK_COLLISION_TO_RESET_S_INDEX = 11
 STUCK_TERM_AVAILABLE_INDEX = 12
 STUCK_TERM_CONFIG_VALID_INDEX = 13
+SPAWN_INSTALLED_INDEX = 14
+STUCK_RAW_TERM_INDEX = 15
+SPAWN_FULL_START_INDEX = 16
+SPAWN_SEGMENT_INDEX = 17
+SPAWN_QUARTILE_INDEX = 18
+SPAWN_SAFE_POINT_INDEX = 19
+SPAWN_REASON4_RETRY_COUNT_INDEX = 20
+SPAWN_REASON4_EXHAUSTED_COUNT_INDEX = 21
+SPAWN_REASON4_FALLBACK_APPLIED_COUNT_INDEX = 22
+SPAWN_ALL_POSITION_APPLIED_COUNT_INDEX = 23
+SPAWN_VALIDATION_FAILURE_COUNT_INDEX = 24
+SPAWN_WRITE_FAILURE_COUNT_INDEX = 25
 
 SOFT_CRUISE_MIN_VX = 0.60
 SOFT_CRUISE_MAX_VX = 0.75
@@ -65,8 +81,8 @@ P4_MAX_ABS_WZ = 0.90
 P4_MAX_VX = 1.00
 P4_NAV_PERIOD_FRAMES = 5
 P4_NAV_DT_S = p2_contract.CONTROL_DT_S * P4_NAV_PERIOD_FRAMES
-P4_SLEW_RATE = (0.30, 0.30, 1.00)
-P4_SLEW_RELEASE_RATE = (0.30, 0.60, 2.50)
+P4_SLEW_RATE = (0.30, 0.40, 1.50)
+P4_SLEW_RELEASE_RATE = (0.30, 0.80, 3.00)
 STALE_GOAL_WAIT_MAX_ABS_VY = 0.10
 STALE_GOAL_WAIT_MAX_ABS_WZ = 0.25
 
@@ -80,28 +96,73 @@ GOAL_PROCESS_SIGMA_V_M_S = 0.03
 GOAL_PROCESS_SIGMA_WZ_RAD_S = 0.011
 GOAL_REACQUIRE_SAMPLES = 5
 
-STUCK_RESET_TERMINAL_PENALTY = -15.0
+STUCK_RESET_TERMINAL_PENALTY = -25.0
 SUCCESS_IMPULSE = 200.0
-STUCK_SUSTAINED_GRACE_S = 1.0
-STUCK_SUSTAINED_BASE = -0.02
-STUCK_SUSTAINED_FLOOR = -0.10
-GOAL_SAFE_PREFERENCE_WEIGHT = -0.04
+TIMEOUT_IMPULSE = -25.0
+STUCK_SUSTAINED_GRACE_S = 0.8
+STUCK_SUSTAINED_FULL_S = 2.0
+STUCK_SUSTAINED_BASE = -0.005
+STUCK_SUSTAINED_FLOOR = -0.02
+GOAL_SAFE_PREFERENCE_WEIGHT = -0.012
 GOAL_SAFE_PREFERENCE_MARGIN = 0.08
 GOAL_SAFE_PREFERENCE_SCALE = 0.35
-ROUTE_EXCESS_WEIGHT = -0.05
-ROUTE_EXCESS_CAP_M = 0.20
+ROUTE_EXCESS_WEIGHT = 0.0
+ROUTE_EXCESS_CAP_M = 0.0
+YAW_EXIT_RESPONSE_RAW_FLOOR = -0.006
+TRANSLATION_LIMITER_RISK_THRESHOLD = 0.75
+TRANSLATION_LIMITER_ALPHA_FLOOR = 0.60
+TRANSLATION_LIMITER_RELEASE_PER_TICK = 0.20
+NEAR_GOAL_CAPTURE_MIN_DISTANCE_M = 0.65
+NEAR_GOAL_CAPTURE_MAX_DISTANCE_M = 1.20
+NEAR_GOAL_CAPTURE_MIN_SPEED_M_S = 0.10
+NEAR_GOAL_CAPTURE_GOAL_COSINE_MIN = 0.70
+NEAR_GOAL_CAPTURE_FRESHNESS_MIN = 0.90
+TEACHER_SAFE_MIN = 0.65
+TEACHER_SAFE_MARGIN_MIN = 0.20
+TEACHER_GOAL_FRESHNESS_MIN = 0.75
+TEACHER_DIRECTION_TOLERANCE_DEG = 35.0
+TEACHER_SPEED_RISK_MIN = 0.65
+TEACHER_MIN_VALID_STEPS = 64
 STUCK_RESET_DEFAULTS = {
     "enabled": True,
     "mode": "shadow",
     "confirmation_s": 10.0,
-    "radius_m": 0.30,
+    "radius_m": 0.50,
     "min_goal_distance_m": 0.80,
     "body_collision_force_n": 30.0,
     "wall_evidence_latch_s": 2.0,
     "episode_grace_s": 5.0,
     "push_grace_s": 2.0,
+    "max_true_motion_speed_m_s": 0.08,
     "terminal_penalty": STUCK_RESET_TERMINAL_PENALTY,
 }
+
+FULL_TRACK_SEGMENT_LABELS = (
+    "slope",
+    "slope_inv",
+    "stairs",
+    "stairs_inv",
+    "maze",
+)
+FULL_TRACK_SEGMENT_LENGTH_M = 8.0
+SEGMENT_FRONTIER_WEIGHT = 1.0
+MAZE_NEW_BEST_WEIGHT_PER_M = 2.0
+MAZE_NEW_BEST_EPISODE_CAP = 12.0
+OPEN_STRAIGHT_LATERAL_WEIGHT = -0.005
+OPEN_STRAIGHT_S_TURN_WEIGHT = -0.005
+OPEN_STRAIGHT_EXTRA_PATH_WEIGHT = -0.0025
+OPEN_STRAIGHT_TOTAL_FLOOR = -0.0125
+OPEN_STRAIGHT_TRUE_VY_DEADBAND_M_S = 0.08
+OPEN_STRAIGHT_GOAL_BEARING_MAX_DEG = 15.0
+OPEN_STRAIGHT_CENTER_SAFE_MIN = 0.75
+OPEN_STRAIGHT_CENTER_BEST_MARGIN = 0.05
+OPEN_STRAIGHT_BOUNDARY_MARGIN_M = 0.80
+
+GOAL_JUMP_RATE_PER_S = 0.015
+GOAL_JUMP_DURATION_S = (0.20, 0.80)
+GOAL_JUMP_MIN_DISTANCE_M = 3.0
+GOAL_JUMP_RADIAL_RANGE_M = (0.04, 0.20)
+GOAL_JUMP_TANGENT_RANGE_M = (0.10, 1.00)
 
 
 def normalize_stuck_reset_contract(
@@ -127,6 +188,9 @@ def normalize_stuck_reset_contract(
         "wall_evidence_latch_s": float(merged["wall_evidence_latch_s"]),
         "episode_grace_s": float(merged["episode_grace_s"]),
         "push_grace_s": float(merged["push_grace_s"]),
+        "max_true_motion_speed_m_s": float(
+            merged["max_true_motion_speed_m_s"]
+        ),
         "terminal_penalty": float(merged["terminal_penalty"]),
     }
     numeric = tuple(value for key, value in result.items() if key not in {"enabled", "mode"})
@@ -142,6 +206,7 @@ def normalize_stuck_reset_contract(
             "wall_evidence_latch_s",
             "episode_grace_s",
             "push_grace_s",
+            "max_true_motion_speed_m_s",
         )
     ):
         raise ValueError("P4 stuck-reset durations, distances and force must be non-negative")
@@ -173,6 +238,70 @@ SAFETY_HEAD_LR = 3.0e-4
 ADAPTER_LR = 1.0e-5
 
 MONITOR_REQUIRED_METRICS = (
+    "session_wall_seconds",
+    "session_effective_seconds",
+    "teacher_guidance_loss",
+    "teacher_direction_loss",
+    "teacher_speed_loss",
+    "teacher_yaw_loss",
+    "teacher_guidance_valid_steps",
+    "teacher_guidance_gradient_ratio",
+    "mirror_aux_gradient_ratio",
+    "mirror_aux_sequence_share",
+    "mirror_aux_eligible_sequence_count",
+    "mirror_aux_scheduled_sequence_share",
+    "stuck_aux_gradient_ratio",
+    "stuck_aux_loss",
+    "stuck_aux_valid_steps",
+    "auxiliary_gradient_ratio",
+    "safety_hard_positive_share",
+    "actor_stuck_pr_auc",
+    "actor_stuck_precision",
+    "actor_stuck_recall",
+    "actor_stuck_f1",
+    "actor_stuck_threshold",
+    "actor_stuck_positive_share",
+    "teacher_risk_left",
+    "teacher_risk_center",
+    "teacher_risk_right",
+    "safe_alternative_available",
+    "selected_safest_direction",
+    "reward_goal_safe_raw",
+    "reward_yaw_exit_raw",
+    "reward_yaw_exit_response",
+    "translation_safety_risk",
+    "translation_safety_alpha_raw",
+    "translation_safety_alpha",
+    "translation_safety_emergency",
+    "near_goal_final_translation_alpha",
+    "near_goal_capture_candidate",
+    "near_goal_capture_active",
+    "near_goal_capture_distance_m",
+    "near_goal_capture_alignment",
+    "near_goal_capture_cap_m_s",
+    "near_goal_capture_alpha",
+    "near_goal_capture_candidate_count",
+    "near_goal_capture_entry_count",
+    "near_goal_capture_exit_count",
+    "near_goal_capture_zone_success_count",
+    "near_goal_capture_zone_collision_count",
+    "near_goal_capture_zone_timeout_count",
+    "near_goal_capture_zone_reset_count",
+    "near_goal_capture_reset_counted_as_completion_error",
+    "near_goal_capture_entry_to_platform_success_latency_s",
+    "recovery_event_count_60s",
+    "recovery_event_lifetime_count",
+    "recovery_candidate_entry_count",
+    "recovery_success_count",
+    "recovery_terminal_count",
+    "recovery_unverified_exit_count",
+    "recovery_success_rate",
+    "recovery_time_s",
+    "recovery_early_stuck_sample_share",
+    "recovery_confirmed_stuck_sample_share",
+    "recovery_safe_exit_share",
+    "recovery_candidate_lifetime_count",
+    "recovery_terminal_lifetime_count",
     "goal_map_x_m",
     "goal_map_y_m",
     "goal_map_distance_m",
@@ -312,6 +441,7 @@ MONITOR_REQUIRED_METRICS = (
     "wall_stuck_duration_s",
     "wall_stuck_would_reset",
     "wall_stuck_reset_triggered",
+    "wall_stuck_raw_term",
     "wall_stuck_reset_rate",
     "rollout_wall_stuck_reset_count",
     "wall_stuck_mapping_valid",
@@ -323,10 +453,43 @@ MONITOR_REQUIRED_METRICS = (
     "collision_to_stuck_reset_delay_s",
     "wall_stuck_term_available",
     "wall_stuck_term_config_valid",
+    "p4_spawn_hook_installed",
     "reward_stuck_reset",
     "reward_stuck_sustained",
     "reward_goal_safe_preference",
     "reward_route_excess",
+    "reward_open_straight",
+    "open_straight_eligible",
+    "open_straight_lateral_penalty",
+    "open_straight_s_turn_penalty",
+    "open_straight_extra_path_penalty",
+    "current_segment_slope_share",
+    "current_segment_slope_inv_share",
+    "current_segment_stairs_share",
+    "current_segment_stairs_inv_share",
+    "current_segment_maze_share",
+    "spawn_segment_slope_event_share",
+    "spawn_segment_slope_inv_event_share",
+    "spawn_segment_stairs_event_share",
+    "spawn_segment_stairs_inv_event_share",
+    "spawn_segment_maze_event_share",
+    "spawn_safe_point_event_share",
+    "spawn_hard_position_event_share",
+    "spawn_full_start_event_share",
+    "spawn_segment_start_event_share",
+    "spawn_reset_event_count",
+    "spawn_reason4_retry_count",
+    "spawn_reason4_exhausted_count",
+    "spawn_reason4_fallback_applied_count",
+    "spawn_validation_failure_count",
+    "spawn_write_failure_count",
+    "goal_jump_radial_offset_m",
+    "goal_jump_tangent_offset_m",
+    "legitimate_side_goal_selection_rate",
+    "policy_target_vy_positive_mean",
+    "policy_target_vy_negative_mean",
+    "policy_target_wz_positive_mean",
+    "policy_target_wz_negative_mean",
     "wall_stuck_sustained_active",
     "wall_stuck_sustained_severity",
     "goal_safe_preference_eligible",
@@ -339,6 +502,10 @@ MONITOR_REQUIRED_METRICS = (
     "route_efficiency",
     "reward_frontier_stagnation",
     "reward_frontier_stagnation_shadow",
+    "maze_new_best_credit",
+    "maze_new_best_delta_m",
+    "maze_new_best_episode_earned",
+    "terminal_potential_clawback",
     "stuck_terminal_count",
     "stuck_terminal_episode_return_mean",
     "stuck_terminal_nonnegative_rate",
@@ -385,6 +552,10 @@ MONITOR_REQUIRED_METRICS = (
     "adapter_latest_replay_ratio",
     "adapter_recent_replay_ratio",
     "adapter_parent_replay_ratio",
+    "adapter_frozen",
+    "navigation_learning_rate",
+    "safety_head_learning_rate",
+    "adapter_learning_rate",
     "adapter_compat_rejected_missing_contract",
     "adapter_compat_rejected_mismatch_version",
     "adapter_compat_rejected_mismatch_schema",
@@ -406,12 +577,48 @@ MONITOR_REQUIRED_METRICS = (
     "max_memory_allocated",
     "max_memory_reserved",
     "samples_per_s",
+    "full_phase_warm",
+    "full_phase_adapt",
+    "full_phase_train",
+    "full_phase_stabilize",
+    "credit_phase_warm",
+    "credit_phase_adapt",
+    "credit_phase_train",
+    "credit_phase_final",
+)
+
+# P4 retains the broad P2 dashboard for diagnostics.  These inherited panels
+# are intentionally excluded from the P4 health denominator; each prefix is a
+# complete P2 metric family rather than a fallback for an unknown P4 key.
+MONITOR_OPTIONAL_METRICS = (
     "maze_branch_actor_attack",
     "maze_branch_visual_recovery",
     "maze_phase_probe",
     "maze_phase_attack",
     "maze_phase_hard",
     "maze_phase_final",
+    "abnormal_count_track_l",
+    "completed_count_track_l",
+    "energy_score_track_l",
+    "p4_monitor_empty_metric_count",
+    "p4_monitor_expected_metric_count",
+    "p4_monitor_longest_data_age_s",
+    "p4_monitor_metric_with_data_count",
+    "pose_score_track_l",
+    "stuck",
+    "time_score_track_l",
+    "timeout_rate",
+    "timeout_count_track_l",
+    "total_score_track_l",
+)
+MONITOR_OPTIONAL_METRIC_PREFIXES = (
+    "completed_count_track_l",
+    "abnormal_count_track_l",
+    "timeout_count_track_l",
+    "total_score_track_l",
+    "energy_score_track_l",
+    "pose_score_track_l",
+    "time_score_track_l",
 )
 
 ADAPTER_COMPATIBILITY_REJECTION_REASONS = (
@@ -531,12 +738,291 @@ def effective_speed_cap(
     )
 
 
+def translation_vector_limiter(
+    policy_cmd3: torch.Tensor,
+    predictive_risk: torch.Tensor,
+    alpha_prev: torch.Tensor,
+    *,
+    reset_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Limit the complete translational vector using deployable depth risk.
+
+    ``alpha_prev`` is caller-owned live state.  This function deliberately does
+    not retain it, so reset/resume can restore the prescribed alpha=1.0 without
+    putting limiter state in a checkpoint.
+    """
+    if policy_cmd3.ndim != 2 or policy_cmd3.shape[1] != 3:
+        raise ValueError("P4 translation limiter expects policy_cmd3=[N,3]")
+    count = policy_cmd3.shape[0]
+    risk = torch.as_tensor(
+        predictive_risk, device=policy_cmd3.device, dtype=policy_cmd3.dtype
+    ).reshape(-1)
+    previous = torch.as_tensor(
+        alpha_prev, device=policy_cmd3.device, dtype=policy_cmd3.dtype
+    ).reshape(-1)
+    if risk.numel() != count or previous.numel() != count:
+        raise ValueError("P4 translation limiter batch shape drift")
+    if reset_mask is None:
+        reset = torch.zeros(count, device=policy_cmd3.device, dtype=torch.bool)
+    else:
+        reset = torch.as_tensor(reset_mask, device=policy_cmd3.device).reshape(-1).bool()
+        if reset.numel() != count:
+            raise ValueError("P4 translation limiter reset shape drift")
+    risk = torch.nan_to_num(risk, nan=1.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    emergency = torch.clamp(
+        (risk - TRANSLATION_LIMITER_RISK_THRESHOLD)
+        / (1.0 - TRANSLATION_LIMITER_RISK_THRESHOLD),
+        0.0,
+        1.0,
+    )
+    raw_alpha = 1.0 - (1.0 - TRANSLATION_LIMITER_ALPHA_FLOOR) * emergency
+    previous = torch.nan_to_num(previous, nan=1.0, posinf=1.0, neginf=1.0).clamp(
+        TRANSLATION_LIMITER_ALPHA_FLOOR, 1.0
+    )
+    previous = torch.where(reset, torch.ones_like(previous), previous)
+    # Tightening is immediate; only release is rate limited at the 10 Hz tick.
+    alpha = torch.minimum(
+        raw_alpha,
+        previous + TRANSLATION_LIMITER_RELEASE_PER_TICK,
+    )
+    limited = policy_cmd3.clone()
+    limited[:, :2] *= alpha.unsqueeze(-1)
+    return limited, {
+        "translation_safety_alpha_raw": raw_alpha,
+        "translation_safety_alpha": alpha,
+        "translation_safety_risk": risk,
+        "translation_safety_emergency": emergency,
+    }
+
+
+def near_goal_capture(
+    policy_cmd3: torch.Tensor,
+    goal_xy_m: torch.Tensor,
+    goal_freshness: torch.Tensor,
+    safety_alpha: torch.Tensor,
+    terminal: torch.Tensor,
+    reset: torch.Tensor,
+    goal_epoch_changed: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Apply the near-goal translation cap without changing direction or yaw."""
+    if policy_cmd3.ndim != 2 or policy_cmd3.shape[1] != 3:
+        raise ValueError("P4 near-goal capture expects policy_cmd3=[N,3]")
+    if goal_xy_m.shape != (policy_cmd3.shape[0], 2):
+        raise ValueError("P4 near-goal capture expects goal_xy_m=[N,2]")
+    count = policy_cmd3.shape[0]
+
+    def _flat(value: torch.Tensor, name: str, *, boolean: bool = False) -> torch.Tensor:
+        result = torch.as_tensor(value, device=policy_cmd3.device).reshape(-1)
+        if result.numel() != count:
+            raise ValueError(f"P4 near-goal capture {name} shape drift")
+        return result.bool() if boolean else result.to(dtype=policy_cmd3.dtype)
+
+    freshness = _flat(goal_freshness, "freshness").clamp(0.0, 1.0)
+    alpha_safe = _flat(safety_alpha, "safety_alpha").clamp(0.0, 1.0)
+    terminal_mask = _flat(terminal, "terminal", boolean=True)
+    reset_mask = _flat(reset, "reset", boolean=True)
+    epoch_changed = _flat(goal_epoch_changed, "goal_epoch_changed", boolean=True)
+    goal = torch.nan_to_num(goal_xy_m.to(policy_cmd3), nan=0.0, posinf=0.0, neginf=0.0)
+    policy_xy = policy_cmd3[:, :2]
+    speed = torch.linalg.vector_norm(policy_xy, dim=-1)
+    distance = torch.linalg.vector_norm(goal, dim=-1)
+    goal_unit = goal / distance.unsqueeze(-1).clamp_min(1.0e-6)
+    policy_unit = policy_xy / speed.unsqueeze(-1).clamp_min(1.0e-6)
+    alignment = (policy_unit * goal_unit).sum(dim=-1)
+    candidate = (
+        (freshness >= NEAR_GOAL_CAPTURE_FRESHNESS_MIN)
+        & ~terminal_mask
+        & ~reset_mask
+        & ~epoch_changed
+        & (distance > NEAR_GOAL_CAPTURE_MIN_DISTANCE_M)
+        & (distance < NEAR_GOAL_CAPTURE_MAX_DISTANCE_M)
+        & (speed > NEAR_GOAL_CAPTURE_MIN_SPEED_M_S)
+        & (alignment >= NEAR_GOAL_CAPTURE_GOAL_COSINE_MIN)
+    )
+    capture_cap = 0.10 + 0.35 * torch.clamp(
+        (distance - 0.70) / 0.50, min=0.0, max=1.0
+    )
+    alpha_capture = torch.minimum(torch.ones_like(speed), capture_cap / speed.clamp_min(1.0e-6))
+    applied_alpha = torch.where(
+        candidate, torch.minimum(alpha_safe, alpha_capture), alpha_safe
+    )
+    limited = policy_cmd3.clone()
+    limited[:, :2] *= applied_alpha.unsqueeze(-1)
+    return limited, {
+        "near_goal_capture_candidate": candidate.float(),
+        "near_goal_capture_active": candidate.float(),
+        "near_goal_capture_distance_m": distance,
+        "near_goal_capture_alignment": alignment,
+        "near_goal_capture_cap_m_s": capture_cap,
+        "near_goal_capture_alpha": torch.where(
+            candidate, alpha_capture, torch.ones_like(alpha_capture)
+        ),
+        "near_goal_final_translation_alpha": applied_alpha,
+    }
+
+
+def teacher_guidance_mask(
+    *,
+    alive: torch.Tensor,
+    scanner_valid: torch.Tensor,
+    mapping_valid: torch.Tensor,
+    terminal: torch.Tensor,
+    reset: torch.Tensor,
+    push_grace: torch.Tensor,
+    episode_grace: torch.Tensor,
+    goal_freshness: torch.Tensor,
+    safe3: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Build rollout-time masks for the non-privileged Actor mean guidance."""
+    if safe3.ndim != 2 or safe3.shape[1] != 3:
+        raise ValueError("P4 teacher guidance expects safe3=[N,3]")
+    count = safe3.shape[0]
+
+    def _flat(value: torch.Tensor, name: str, *, boolean: bool = True) -> torch.Tensor:
+        result = torch.as_tensor(value, device=safe3.device).reshape(-1)
+        if result.numel() != count:
+            raise ValueError(f"P4 teacher guidance {name} shape drift")
+        return result.bool() if boolean else result.to(dtype=safe3.dtype)
+
+    values = torch.nan_to_num(safe3, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    top2 = torch.topk(values, k=2, dim=-1).values
+    best_safe = top2[:, 0]
+    margin = best_safe - top2[:, 1]
+    base = (
+        _flat(alive, "alive")
+        & _flat(scanner_valid, "scanner_valid")
+        & _flat(mapping_valid, "mapping_valid")
+        & ~_flat(terminal, "terminal")
+        & ~_flat(reset, "reset")
+        & ~_flat(push_grace, "push_grace")
+        & ~_flat(episode_grace, "episode_grace")
+        & (best_safe >= TEACHER_SAFE_MIN)
+        & (margin >= TEACHER_SAFE_MARGIN_MIN)
+    )
+    freshness = _flat(goal_freshness, "goal_freshness", boolean=False)
+    return {
+        "teacher_guidance_eligible": base,
+        "teacher_guidance_goal_eligible": base & (freshness >= TEACHER_GOAL_FRESHNESS_MIN),
+        "teacher_best_safe": best_safe,
+        "teacher_safe_margin": margin,
+    }
+
+
+def teacher_guidance_loss(
+    policy_mean_cmd3: torch.Tensor,
+    safe3: torch.Tensor,
+    goal_xy_m: torch.Tensor,
+    predictive_risk: torch.Tensor,
+    stuck_active: torch.Tensor,
+    teacher_mask: torch.Tensor,
+    goal_mask: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
+    *,
+    min_valid_steps: int = TEACHER_MIN_VALID_STEPS,
+) -> dict[str, torch.Tensor]:
+    """Return tolerant direction, speed and yaw guidance without a full action teacher."""
+    if policy_mean_cmd3.ndim != 2 or policy_mean_cmd3.shape[1] != 3:
+        raise ValueError("P4 teacher loss expects policy_mean_cmd3=[N,3]")
+    if safe3.shape != (policy_mean_cmd3.shape[0], 3):
+        raise ValueError("P4 teacher loss safe3 shape drift")
+    if goal_xy_m.shape != (policy_mean_cmd3.shape[0], 2):
+        raise ValueError("P4 teacher loss goal_xy_m shape drift")
+    count = policy_mean_cmd3.shape[0]
+
+    def _flat(value: torch.Tensor, name: str, *, boolean: bool = False) -> torch.Tensor:
+        result = torch.as_tensor(value, device=policy_mean_cmd3.device).reshape(-1)
+        if result.numel() != count:
+            raise ValueError(f"P4 teacher loss {name} shape drift")
+        return result.bool() if boolean else result.to(dtype=policy_mean_cmd3.dtype)
+
+    base = _flat(teacher_mask, "teacher_mask", boolean=True)
+    goal_valid = _flat(goal_mask, "goal_mask", boolean=True)
+    weights = (
+        torch.ones(count, device=policy_mean_cmd3.device, dtype=policy_mean_cmd3.dtype)
+        if sample_weight is None
+        else _flat(sample_weight, "sample_weight").clamp_min(0.0)
+    )
+    values = torch.nan_to_num(safe3.to(policy_mean_cmd3), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    best_safe, best_index = values.max(dim=-1)
+    sector_angles = policy_mean_cmd3.new_tensor((35.0, 0.0, -35.0)) * (math.pi / 180.0)
+    safe_angle = sector_angles[best_index]
+    safe_direction = torch.stack((torch.cos(safe_angle), torch.sin(safe_angle)), dim=-1)
+    mean_xy = policy_mean_cmd3[:, :2]
+    mean_speed = torch.linalg.vector_norm(mean_xy, dim=-1)
+    mean_direction = mean_xy / mean_speed.unsqueeze(-1).clamp_min(1.0e-6)
+    direction_cosine = (mean_direction * safe_direction).sum(dim=-1)
+    direction_error = torch.relu(
+        math.cos(math.radians(TEACHER_DIRECTION_TOLERANCE_DEG)) - direction_cosine
+    )
+    direction_loss = direction_error.square()
+
+    risk = _flat(predictive_risk, "predictive_risk").clamp(0.0, 1.0)
+    stuck = _flat(stuck_active, "stuck_active", boolean=True)
+    speed_mask = base & ((risk >= TEACHER_SPEED_RISK_MIN) | stuck)
+    speed_cap = 0.20 + 0.45 * best_safe
+    speed_loss = torch.relu(mean_speed - speed_cap).square()
+
+    goal = torch.nan_to_num(goal_xy_m.to(policy_mean_cmd3), nan=0.0, posinf=0.0, neginf=0.0)
+    goal_distance = torch.linalg.vector_norm(goal, dim=-1)
+    goal_direction = goal / goal_distance.unsqueeze(-1).clamp_min(1.0e-6)
+    compatible = (goal_direction * safe_direction).sum(dim=-1) >= math.cos(
+        math.radians(TEACHER_DIRECTION_TOLERANCE_DEG)
+    )
+    bearing = torch.atan2(goal[:, 1], goal[:, 0])
+    bearing_abs_deg = bearing.abs() * (180.0 / math.pi)
+    required_wz = torch.where(
+        bearing_abs_deg <= 15.0,
+        torch.zeros_like(bearing_abs_deg),
+        torch.where(
+            bearing_abs_deg <= 35.0,
+            torch.full_like(bearing_abs_deg, 0.06),
+            torch.where(
+                bearing_abs_deg <= 60.0,
+                torch.full_like(bearing_abs_deg, 0.12),
+                torch.where(
+                    bearing_abs_deg <= 90.0,
+                    torch.full_like(bearing_abs_deg, 0.18),
+                    torch.zeros_like(bearing_abs_deg),
+                ),
+            ),
+        ),
+    )
+    yaw_mask = goal_valid & compatible & (required_wz > 0.0)
+    yaw_loss = torch.relu(required_wz - torch.sign(bearing) * policy_mean_cmd3[:, 2]).square()
+
+    valid_steps = base.sum()
+    active = valid_steps >= int(min_valid_steps)
+
+    def _masked_mean(value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        selected_weight = weights * mask.to(weights.dtype)
+        return (value * selected_weight).sum() / selected_weight.sum().clamp_min(1.0)
+
+    direction = _masked_mean(direction_loss, base)
+    speed = _masked_mean(speed_loss, speed_mask)
+    yaw = _masked_mean(yaw_loss, yaw_mask)
+    total = 0.45 * direction + 0.20 * speed + 0.35 * yaw
+    active_float = active.to(dtype=policy_mean_cmd3.dtype)
+    total = total * active_float
+    return {
+        "loss": total,
+        "direction": direction * active_float,
+        "speed": speed * active_float,
+        "yaw": yaw * active_float,
+        "teacher_valid_steps": valid_steps.to(dtype=policy_mean_cmd3.dtype),
+        "teacher_loss_active": active_float,
+        "teacher_direction_mask": base.to(dtype=policy_mean_cmd3.dtype),
+        "teacher_speed_mask": speed_mask.to(dtype=policy_mean_cmd3.dtype),
+        "teacher_yaw_mask": yaw_mask.to(dtype=policy_mean_cmd3.dtype),
+    }
+
+
 def soft_cruise_penalty(
     policy_target_cmd3: torch.Tensor,
     safe3: torch.Tensor,
     teacher_valid: torch.Tensor,
     goal_freshness: torch.Tensor,
     terminal: torch.Tensor,
+    capture_active: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Softly discourage clear-road cruising outside the preferred vx band."""
     vx = policy_target_cmd3[..., 0]
@@ -553,7 +1039,12 @@ def soft_cruise_penalty(
         SOFT_CRUISE_LOW_WEIGHT * clear_factor * low_error.square()
         + SOFT_CRUISE_HIGH_WEIGHT * high_error.square()
     )
-    penalty = torch.where(terminal.reshape(-1).bool(), torch.zeros_like(penalty), penalty)
+    disabled = terminal.reshape(-1).bool()
+    if capture_active is not None:
+        disabled |= torch.as_tensor(
+            capture_active, device=disabled.device
+        ).reshape(-1).bool()
+    penalty = torch.where(disabled, torch.zeros_like(penalty), penalty)
     return penalty, {
         "soft_cruise_clear_factor": clear_factor,
         "soft_cruise_low_error": low_error,
@@ -604,7 +1095,8 @@ def sustained_wall_stuck_penalty(
         & ~terminal.reshape(-1).bool()
         & (duration >= STUCK_SUSTAINED_GRACE_S)
     )
-    ramp_span = max(float(confirmation_s) - STUCK_SUSTAINED_GRACE_S, 1.0e-6)
+    del confirmation_s
+    ramp_span = max(STUCK_SUSTAINED_FULL_S - STUCK_SUSTAINED_GRACE_S, 1.0e-6)
     severity = torch.clamp(
         (duration - STUCK_SUSTAINED_GRACE_S) / ramp_span, 0.0, 1.0
     )
@@ -616,6 +1108,36 @@ def sustained_wall_stuck_penalty(
         "wall_stuck_sustained_active": active.float(),
         "wall_stuck_sustained_severity": severity,
     }
+
+
+def maze_new_best_credit(
+    best_distance_before: torch.Tensor,
+    end_distance: torch.Tensor,
+    episode_credit_before: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reward each newly reached Maze distance once, without terminal clawback."""
+    best_raw = best_distance_before.float()
+    end_raw = end_distance.float()
+    earned_raw = episode_credit_before.float()
+    valid = (
+        torch.isfinite(best_raw)
+        & torch.isfinite(end_raw)
+        & torch.isfinite(earned_raw)
+    )
+    best = torch.where(valid, best_raw.clamp_min(0.0), torch.zeros_like(best_raw))
+    end = torch.where(valid, end_raw.clamp_min(0.0), best)
+    earned = torch.nan_to_num(
+        earned_raw, nan=0.0, posinf=MAZE_NEW_BEST_EPISODE_CAP, neginf=0.0
+    ).clamp(0.0, MAZE_NEW_BEST_EPISODE_CAP)
+    delta = torch.clamp(best - torch.minimum(best, end), min=0.0)
+    raw_reward = MAZE_NEW_BEST_WEIGHT_PER_M * delta
+    reward = torch.minimum(
+        raw_reward,
+        torch.clamp(MAZE_NEW_BEST_EPISODE_CAP - earned, min=0.0),
+    )
+    reward = torch.where(valid, reward, torch.zeros_like(reward))
+    delta = torch.where(valid, delta, torch.zeros_like(delta))
+    return reward, earned + reward, delta
 
 
 def goal_safe_direction_penalty(
@@ -660,7 +1182,7 @@ def goal_safe_direction_penalty(
     goal_distance = torch.linalg.vector_norm(goal, dim=-1)
     eligible = (
         teacher_valid.reshape(-1).bool()
-        & (goal_freshness.reshape(-1) >= 0.50)
+        & (goal_freshness.reshape(-1) >= TEACHER_GOAL_FRESHNESS_MIN)
         & moving
         & distinct
         & (safe3.max(dim=-1).values >= p2_contract.SAFE_DIRECTION_MIN_BEST_SAFE)
@@ -684,13 +1206,89 @@ def goal_safe_direction_penalty(
     }
 
 
+def yaw_exit_response_penalty(
+    safe3: torch.Tensor,
+    target_cmd3: torch.Tensor,
+    goal_xy_m: torch.Tensor,
+    teacher_valid: torch.Tensor,
+    goal_freshness: torch.Tensor,
+    terminal: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Require a small correctly signed yaw response at a clear side exit."""
+    if safe3.ndim != 2 or safe3.shape[1] != 3:
+        raise ValueError("P4 yaw-exit response expects safe3=[N,3]")
+    if target_cmd3.shape != (safe3.shape[0], 3):
+        raise ValueError("P4 yaw-exit response expects target_cmd3=[N,3]")
+    if goal_xy_m.shape != (safe3.shape[0], 2):
+        raise ValueError("P4 yaw-exit response expects goal_xy_m=[N,2]")
+
+    values = torch.nan_to_num(
+        safe3.to(target_cmd3), nan=0.0, posinf=1.0, neginf=0.0
+    ).clamp(0.0, 1.0)
+    goal = torch.nan_to_num(
+        goal_xy_m.to(target_cmd3), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    bearing = torch.atan2(goal[:, 1], goal[:, 0]).clamp(
+        min=math.radians(-80.0), max=math.radians(80.0)
+    )
+    centers = target_cmd3.new_tensor(
+        p2_contract.PREDICTIVE_COLLISION_SECTOR_CENTERS_DEG
+    ) * (math.pi / 180.0)
+    width = math.radians(p2_contract.PREDICTIVE_COLLISION_SECTOR_WIDTH_DEG)
+    goal_weights = torch.softmax(
+        -0.5 * ((bearing[:, None] - centers[None, :]) / width).square(), dim=-1
+    )
+    score3 = values * goal_weights
+    top2 = torch.topk(score3, k=2, dim=-1).values
+    best_index = score3.argmax(dim=-1)
+    side_exit = best_index != 1
+    desired_sign = torch.where(
+        best_index == 0,
+        torch.ones_like(bearing),
+        -torch.ones_like(bearing),
+    )
+    signed_wz = desired_sign * target_cmd3[:, 2]
+    response_error = torch.clamp((0.10 - signed_wz) / 0.20, 0.0, 1.0)
+    goal_distance = torch.linalg.vector_norm(goal, dim=-1)
+    eligible = (
+        teacher_valid.reshape(-1).bool()
+        & (goal_freshness.reshape(-1) >= TEACHER_GOAL_FRESHNESS_MIN)
+        & ~terminal.reshape(-1).bool()
+        & side_exit
+        & (values.max(dim=-1).values >= TEACHER_SAFE_MIN)
+        & ((top2[:, 0] - top2[:, 1]) >= GOAL_SAFE_PREFERENCE_MARGIN)
+        & (goal_distance >= NEAR_GOAL_CAPTURE_MAX_DISTANCE_M)
+        & (target_cmd3[:, 0] >= 0.15)
+        & (target_cmd3[:, 1].abs() <= 0.10)
+        & (response_error > 0.0)
+    )
+    penalty = torch.where(
+        eligible,
+        YAW_EXIT_RESPONSE_RAW_FLOOR * response_error,
+        torch.zeros_like(response_error),
+    )
+    return penalty, {
+        "yaw_exit_response_eligible": eligible.float(),
+        "yaw_exit_response_error": response_error,
+        "yaw_exit_response_desired_sign": torch.where(
+            side_exit, desired_sign, torch.zeros_like(desired_sign)
+        ),
+        "yaw_exit_response_signed_wz": signed_wz,
+    }
+
+
 def route_excess_penalty(
     path_length_m: torch.Tensor,
     start_goal_distance_m: torch.Tensor,
     end_goal_distance_m: torch.Tensor,
     terminal: torch.Tensor,
+    *,
+    recovery_active: torch.Tensor | None = None,
+    dead_end: torch.Tensor | None = None,
+    goal_freshness: torch.Tensor | None = None,
+    contact_latch: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Apply a small cost only to travelled distance not converted into progress."""
+    """Apply a small cost only outside recovery, dead-end and stale-goal windows."""
     path = torch.nan_to_num(path_length_m.float(), nan=0.0, posinf=0.0, neginf=0.0)
     progress = torch.clamp(
         start_goal_distance_m.float() - end_goal_distance_m.float(), min=0.0
@@ -702,8 +1300,31 @@ def route_excess_penalty(
         & torch.isfinite(end_goal_distance_m)
         & ~terminal.reshape(-1).bool()
     )
+    count = path.numel()
+
+    def _optional_mask(value: torch.Tensor | None, name: str) -> torch.Tensor:
+        if value is None:
+            return torch.zeros(count, device=path.device, dtype=torch.bool)
+        result = torch.as_tensor(value, device=path.device).reshape(-1)
+        if result.numel() != count:
+            raise ValueError(f"P4 route-excess {name} shape drift")
+        return result.bool()
+
+    if goal_freshness is not None:
+        freshness = torch.as_tensor(
+            goal_freshness, device=path.device, dtype=path.dtype
+        ).reshape(-1)
+        if freshness.numel() != count:
+            raise ValueError("P4 route-excess goal_freshness shape drift")
+        valid &= torch.isfinite(freshness) & (freshness > GOAL_FRESHNESS_FLOOR)
+    suspended = (
+        _optional_mask(recovery_active, "recovery_active")
+        | _optional_mask(dead_end, "dead_end")
+        | _optional_mask(contact_latch, "contact_latch")
+    )
+    eligible = valid & ~suspended
     penalty = torch.where(
-        valid,
+        eligible,
         ROUTE_EXCESS_WEIGHT * excess,
         torch.zeros_like(excess),
     )
@@ -717,6 +1338,125 @@ def route_excess_penalty(
         "route_positive_progress_m": progress,
         "route_excess_distance_m": excess,
         "route_efficiency": efficiency,
+        "route_excess_eligible": eligible.float(),
+        "route_excess_suspended": suspended.float(),
+    }
+
+
+def segment_frontier_potential(
+    spawn_segment: torch.Tensor,
+    max_segment_before: torch.Tensor,
+    current_segment: torch.Tensor,
+    duration_frames: torch.Tensor,
+    terminal: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Potential shaping for first-time segment progress with terminal clawback."""
+    spawn = torch.nan_to_num(spawn_segment.float(), nan=0.0).round().clamp(0, 4)
+    before_max = torch.maximum(
+        torch.nan_to_num(max_segment_before.float(), nan=0.0).round(), spawn
+    ).clamp(0, 4)
+    current = torch.nan_to_num(current_segment.float(), nan=0.0).round().clamp(0, 4)
+    after_max = torch.maximum(before_max, current)
+    phi_before = SEGMENT_FRONTIER_WEIGHT * (before_max - spawn)
+    phi_after = SEGMENT_FRONTIER_WEIGHT * (after_max - spawn)
+    settled_after = torch.where(
+        terminal.reshape(-1).bool(), torch.zeros_like(phi_after), phi_after
+    )
+    discount = torch.pow(
+        torch.full_like(phi_before, p2_contract.GAMMA_FRAME),
+        duration_frames.float().reshape(-1).clamp(1.0, float(P4_NAV_PERIOD_FRAMES)),
+    )
+    return discount * settled_after - phi_before, phi_before, settled_after, after_max
+
+
+def track_boundary_distance_m(
+    root_x_m: torch.Tensor,
+    current_segment: torch.Tensor,
+    *,
+    segment_length_m: float = FULL_TRACK_SEGMENT_LENGTH_M,
+    segment_count: int = 5,
+) -> torch.Tensor:
+    """Distance to the closest Track segment boundary in the centered world frame."""
+    root_x = torch.nan_to_num(root_x_m.float(), nan=0.0)
+    segment = current_segment.float().round().clamp(0, segment_count - 1)
+    offset = -0.5 * float(segment_count) * float(segment_length_m)
+    local_x = root_x - (offset + segment * float(segment_length_m))
+    return torch.minimum(local_x, float(segment_length_m) - local_x).clamp_min(0.0)
+
+
+def open_straight_penalty(
+    policy_cmd3: torch.Tensor,
+    true_velocity3: torch.Tensor,
+    clean_goal_xy_m: torch.Tensor,
+    safe3: torch.Tensor,
+    teacher_valid: torch.Tensor,
+    current_segment: torch.Tensor,
+    boundary_distance_m: torch.Tensor,
+    terminal: torch.Tensor,
+    *,
+    junction: torch.Tensor,
+    dead_end: torch.Tensor,
+    contact_or_recovery: torch.Tensor,
+    goal_freshness: torch.Tensor,
+    yaw_cancellation_value: torch.Tensor,
+    path_excess_m: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Small anti-S-turn cost restricted to verified open slope straightaways."""
+    if policy_cmd3.ndim != 2 or policy_cmd3.shape[-1] != 3:
+        raise ValueError("P4 open-straight penalty expects policy_cmd3=[N,3]")
+    if true_velocity3.shape != policy_cmd3.shape:
+        raise ValueError("P4 open-straight true velocity shape drift")
+    n = policy_cmd3.shape[0]
+    for name, value in (
+        ("clean_goal_xy_m", clean_goal_xy_m),
+        ("safe3", safe3),
+    ):
+        expected = (n, 2) if name == "clean_goal_xy_m" else (n, 3)
+        if value.shape != expected:
+            raise ValueError(f"P4 open-straight {name} shape drift")
+    safe = torch.nan_to_num(safe3.to(policy_cmd3), nan=0.0).clamp(0.0, 1.0)
+    best_safe = safe.max(dim=-1).values
+    center_safe = safe[:, 1]
+    goal = torch.nan_to_num(clean_goal_xy_m.to(policy_cmd3), nan=0.0)
+    bearing = torch.atan2(goal[:, 1], goal[:, 0]).abs()
+    segment = current_segment.reshape(-1).round().long()
+    open_slope = (segment == 0) | (segment == 1)
+    eligible = (
+        teacher_valid.reshape(-1).bool()
+        & open_slope
+        & (center_safe >= OPEN_STRAIGHT_CENTER_SAFE_MIN)
+        & ((best_safe - center_safe) <= OPEN_STRAIGHT_CENTER_BEST_MARGIN)
+        & (bearing <= math.radians(OPEN_STRAIGHT_GOAL_BEARING_MAX_DEG))
+        & (boundary_distance_m.reshape(-1) > OPEN_STRAIGHT_BOUNDARY_MARGIN_M)
+        & ~junction.reshape(-1).bool()
+        & ~dead_end.reshape(-1).bool()
+        & ~contact_or_recovery.reshape(-1).bool()
+        & (goal_freshness.reshape(-1) >= TEACHER_GOAL_FRESHNESS_MIN)
+        & ~terminal.reshape(-1).bool()
+    )
+    lateral_error = torch.relu(
+        true_velocity3[:, 1].abs() - OPEN_STRAIGHT_TRUE_VY_DEADBAND_M_S
+    ) / max(P4_MAX_ABS_VY, 1.0e-6)
+    lateral = OPEN_STRAIGHT_LATERAL_WEIGHT * lateral_error.square()
+    s_turn = OPEN_STRAIGHT_S_TURN_WEIGHT * torch.clamp(
+        yaw_cancellation_value.reshape(-1) - 0.15, min=0.0, max=1.0
+    )
+    # ``yaw_cancellation_value`` is already close to zero for legitimate
+    # one-direction steering and high only when recent yaw repeatedly cancels
+    # itself.  Scaling it down by the current |wz| would let large alternating
+    # commands escape the anti-S-turn term.
+    extra_path = OPEN_STRAIGHT_EXTRA_PATH_WEIGHT * torch.clamp(
+        path_excess_m.reshape(-1) / 0.20, 0.0, 1.0
+    )
+    raw = torch.where(eligible, lateral + s_turn + extra_path, torch.zeros_like(lateral))
+    total = raw.clamp_min(OPEN_STRAIGHT_TOTAL_FLOOR)
+    return total, {
+        "open_straight_eligible": eligible.float(),
+        "open_straight_lateral_penalty": torch.where(eligible, lateral, torch.zeros_like(lateral)),
+        "open_straight_s_turn_penalty": torch.where(eligible, s_turn, torch.zeros_like(s_turn)),
+        "open_straight_extra_path_penalty": torch.where(eligible, extra_path, torch.zeros_like(extra_path)),
+        "open_straight_goal_bearing_abs_rad": bearing,
+        "open_straight_boundary_distance_m": boundary_distance_m.reshape(-1),
     }
 
 
@@ -736,70 +1476,49 @@ def proportional_negative_cap(
     missed_raw: torch.Tensor,
     yaw_raw: torch.Tensor,
     *,
+    goal_safe_raw: torch.Tensor | None = None,
+    yaw_exit_raw: torch.Tensor | None = None,
     floor: float = SAFETY_GROUP_FLOOR,
-) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]:
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     """Proportionally cap a group of non-positive reward terms."""
-    raw_sum = predictive_raw + missed_raw + yaw_raw
+    terms = [predictive_raw, missed_raw, yaw_raw]
+    if goal_safe_raw is not None:
+        terms.append(goal_safe_raw)
+    if yaw_exit_raw is not None:
+        terms.append(yaw_exit_raw)
+    if any(term.shape != predictive_raw.shape for term in terms):
+        raise ValueError("P4 safety group tensor shape drift")
+    raw_sum = sum(terms)
     magnitude = torch.clamp(-raw_sum, min=0.0)
     scale = torch.minimum(
         torch.ones_like(magnitude),
         torch.full_like(magnitude, abs(float(floor))) / magnitude.clamp_min(1.0e-9),
     )
-    return (
-        predictive_raw * scale,
-        missed_raw * scale,
-        yaw_raw * scale,
-    ), scale
+    return tuple(term * scale for term in terms), scale
 
 
 def push_phase_config(session_effective_seconds: float) -> dict[str, float | str | bool]:
-    seconds = max(0.0, float(session_effective_seconds))
-    if seconds < 7_200.0:
-        return {
-            "name": "pnavwarm",
-            "active": False,
-            "max_velocity_xy_m_s": 0.0,
-            "min_interval_s": 30.0,
-            "max_interval_s": 45.0,
-        }
-    if seconds < 21_600.0:
-        return {
-            "name": "pnavrobust",
-            "active": True,
-            "max_velocity_xy_m_s": 0.04,
-            "min_interval_s": 30.0,
-            "max_interval_s": 45.0,
-        }
+    del session_effective_seconds
     return {
-        "name": "pnavfull",
-        "active": True,
-        "max_velocity_xy_m_s": 0.05,
-        "min_interval_s": 25.0,
-        "max_interval_s": 40.0,
+        "name": "p4recovery_no_push",
+        "active": False,
+        "max_velocity_xy_m_s": 0.0,
+        "min_interval_s": 30.0,
+        "max_interval_s": 45.0,
     }
 
 
 def camera_mix(session_effective_seconds: float) -> dict[str, float]:
     seconds = max(0.0, float(session_effective_seconds))
-    if seconds < 3_600.0:
+    if seconds < 7_200.0:
         return {"nominal": 0.90, "light": 0.10, "delayed": 0.0, "severe": 0.0}
-    if seconds < 18_000.0:
-        return {"nominal": 0.70, "light": 0.25, "delayed": 0.05, "severe": 0.0}
-    return {"nominal": 0.60, "light": 0.25, "delayed": 0.10, "severe": 0.05}
+    return {"nominal": 0.80, "light": 0.20, "delayed": 0.0, "severe": 0.0}
 
 
 def safe_direction_weight(session_effective_seconds: float) -> float:
-    """Aggressive but continuous Maze-only safety-direction curriculum."""
-    seconds = max(0.0, min(float(session_effective_seconds), TARGET_EFFECTIVE_SECONDS))
-    if seconds <= 1_800.0:
-        return 0.015 * seconds / 1_800.0
-    if seconds <= 7_200.0:
-        ratio = (seconds - 1_800.0) / 5_400.0
-        return 0.015 + ratio * (0.040 - 0.015)
-    if seconds <= 21_600.0:
-        return 0.040
-    ratio = (seconds - 21_600.0) / 7_200.0
-    return 0.040 + ratio * (0.030 - 0.040)
+    """Keep the verified parent safety weight fixed during credit repair."""
+    del session_effective_seconds
+    return 0.012
 
 
 def maze_missed_safe_direction_penalty(
@@ -848,98 +1567,145 @@ def training_schedule(
 ) -> dict[str, float | str | bool]:
     seconds = max(0.0, float(session_effective_seconds))
     branch = str(branch or "actor_attack")
-    if branch == "auto" and seconds < DIAGNOSTIC_SECONDS:
-        return {
-            "phase": "mazediag",
-            "training_branch": "auto",
-            "navigation_multiplier": 0.0,
-            "actor_multiplier": 0.0,
-            "critic_multiplier": 0.0,
-            "safety_head_multiplier": 0.0,
-            "adapter_multiplier": 0.0,
-            "reward_multiplier": 0.0,
-            "goal_fault_multiplier": 0.0,
-            "camera_aux_ratio": 0.0,
-            "cruise_multiplier": 0.0,
-            "entropy_coefficient": 0.0,
-        }
     if branch == "auto":
         branch = "actor_attack"
-    if branch not in {"actor_attack", "visual_recovery"}:
+    if branch not in {"actor_attack", "visual_recovery", "credit_repair"}:
         branch = "actor_attack"
-    if seconds < 3_600.0:
-        visual = branch == "visual_recovery"
-        cruise = min(1.0, max(0.0, (seconds - 1_800.0) / 1_800.0))
-        return {
-            "phase": "mazeprobe",
+    if branch == "credit_repair":
+        common = {
             "training_branch": branch,
-            "navigation_multiplier": 0.75 if visual else 0.35,
-            "actor_multiplier": 0.25 if visual else 0.70,
-            "critic_multiplier": 1.0,
-            "safety_head_multiplier": 1.5 if visual else 1.0,
-            "adapter_multiplier": 0.5,
             "reward_multiplier": 1.0,
-            "goal_fault_multiplier": 0.25,
-            "camera_aux_ratio": 0.02 if visual else 0.01,
-            "cruise_multiplier": cruise,
-            "entropy_coefficient": 0.008,
-        }
-    if seconds < 18_000.0:
-        entropy_ratio = (seconds - 3_600.0) / 14_400.0
-        return {
-            "phase": "mazeattack",
-            "training_branch": branch,
-            "navigation_multiplier": 0.60,
-            "actor_multiplier": 0.85,
-            "critic_multiplier": 0.8,
-            "safety_head_multiplier": 1.0,
-            "adapter_multiplier": 0.5,
-            "reward_multiplier": 1.0,
-            "goal_fault_multiplier": 0.60,
-            "camera_aux_ratio": 0.015,
+            "goal_fault_multiplier": 0.0,
+            "camera_aux_ratio": 0.0,
+            "stuck_gradient_target_ratio": 0.005,
+            "mirror_sequence_share": 0.0,
             "cruise_multiplier": 1.0,
-            "entropy_coefficient": 0.006 + entropy_ratio * (0.004 - 0.006),
+            "teacher_gradient_hard_cap": 0.05,
+            "auxiliary_gradient_hard_cap": 0.05,
+            "mirror_gradient_hard_cap": 0.0,
+            "navigation_multiplier": 0.0,
+            "safety_head_multiplier": 0.0,
+            "adapter_multiplier": 0.0,
+            "stuck_head_multiplier": 1.0,
+            "mirror_gradient_target_ratio": 0.0,
+            "entropy_coefficient": 0.005,
         }
-    if seconds < 25_200.0:
+        if seconds < 600.0:
+            return {
+                **common,
+                "phase": "creditwarm",
+                "actor_multiplier": 0.0,
+                "critic_lr": 1.2e-4,
+                "teacher_gradient_target_ratio": 0.0,
+            }
+        if seconds < 1_800.0:
+            return {
+                **common,
+                "phase": "creditadapt",
+                "actor_multiplier": 1.0,
+                "actor_lr": 7.5e-5,
+                "critic_lr": 1.2e-4,
+                "teacher_gradient_target_ratio": (
+                    0.025 * (seconds - 600.0) / 1_200.0
+                ),
+            }
+        if seconds < 6_300.0:
+            return {
+                **common,
+                "phase": "credittrain",
+                "actor_multiplier": 1.0,
+                "actor_lr": 1.0e-4,
+                "critic_lr": 1.0e-4,
+                "teacher_gradient_target_ratio": 0.035,
+            }
         return {
-            "phase": "mazehard",
-            "training_branch": branch,
-            "navigation_multiplier": 0.40,
-            "actor_multiplier": 0.65,
-            "critic_multiplier": 0.6,
+            **common,
+            "phase": "creditfinal",
+            "actor_multiplier": 1.0,
+            "actor_lr": 5.0e-5,
+            "critic_lr": 6.0e-5,
+            "teacher_gradient_target_ratio": 0.020,
+        }
+    common = {
+        "training_branch": branch,
+        "reward_multiplier": 1.0,
+        "goal_fault_multiplier": min(1.0, max(0.0, (seconds - 1_800.0) / 5_400.0)),
+        "camera_aux_ratio": 0.01,
+        "stuck_gradient_target_ratio": 0.005,
+        "mirror_sequence_share": 0.10,
+        "cruise_multiplier": 1.0,
+        "teacher_gradient_hard_cap": 0.03,
+        "auxiliary_gradient_hard_cap": 0.05,
+        "mirror_gradient_hard_cap": 0.01,
+    }
+    if seconds < 1_800.0:
+        teacher_ratio = 0.015 * seconds / 1_800.0
+        return {
+            **common,
+            "phase": "fullwarm",
+            "navigation_multiplier": 0.15,
+            "actor_multiplier": 0.20,
+            "critic_multiplier": 0.60,
+            "safety_head_multiplier": 1.00,
+            "stuck_head_multiplier": 1.00,
+            "adapter_multiplier": 0.50,
+            "teacher_gradient_target_ratio": teacher_ratio,
+            "mirror_gradient_target_ratio": 0.005,
+            "entropy_coefficient": 0.006,
+        }
+    if seconds < 7_200.0:
+        entropy = 0.006 + (seconds - 1_800.0) / 5_400.0 * (0.005 - 0.006)
+        return {
+            **common,
+            "phase": "fulladapt",
+            "navigation_multiplier": 0.35,
+            "actor_multiplier": 0.55,
+            "critic_multiplier": 0.80,
+            "safety_head_multiplier": 1.00,
+            "stuck_head_multiplier": 1.00,
+            "adapter_multiplier": 0.50,
+            "teacher_gradient_target_ratio": 0.0225,
+            "mirror_gradient_target_ratio": 0.005,
+            "entropy_coefficient": entropy,
+        }
+    if seconds < 21_600.0:
+        return {
+            **common,
+            "phase": "fulltrain",
+            "navigation_multiplier": 0.30,
+            "actor_multiplier": 0.45,
+            "critic_multiplier": 0.60,
             "safety_head_multiplier": 0.75,
-            "adapter_multiplier": 0.5,
-            "reward_multiplier": 1.0,
-            "goal_fault_multiplier": 0.80,
-            "camera_aux_ratio": 0.0125,
-            "cruise_multiplier": 1.0,
-            "entropy_coefficient": 0.004,
+            "stuck_head_multiplier": 0.75,
+            "adapter_multiplier": 0.50,
+            "teacher_gradient_target_ratio": 0.020,
+            "mirror_gradient_target_ratio": 0.005,
+            "entropy_coefficient": 0.005,
         }
     return {
-        "phase": "mazefinal",
-        "training_branch": branch,
-        "navigation_multiplier": 0.20,
-        "actor_multiplier": 0.35,
-        "critic_multiplier": 0.4,
-        "safety_head_multiplier": 0.5,
+        **common,
+        "phase": "fullstabilize",
+        "navigation_multiplier": 0.15,
+        "actor_multiplier": 0.20,
+        "critic_multiplier": 0.35,
+        "safety_head_multiplier": 0.50,
+        "stuck_head_multiplier": 0.50,
         "adapter_multiplier": 0.25,
-        "reward_multiplier": 1.0,
-        "goal_fault_multiplier": 0.80,
-        "camera_aux_ratio": 0.01,
-        "cruise_multiplier": 1.0,
-        "entropy_coefficient": 0.003,
+        "teacher_gradient_target_ratio": 0.010,
+        "mirror_gradient_target_ratio": 0.005,
+        "entropy_coefficient": 0.004,
     }
 
 
 def command_contract() -> dict[str, Any]:
     return {
-        "version": "p4_maze_soft_cruise_command_v1",
+        "version": "p4_maze_credit_repair_command_v1",
         "mapper_version": ACTION_MAPPER_VERSION,
         "legacy_mapper_version": LEGACY_ACTION_MAPPER_VERSION,
         "normalized_action": "unchanged_tanh_gaussian_v2",
         "mapped_ranges": {"vx": [0.0, 1.0], "vy": [-0.30, 0.30], "wz": [-0.90, 0.90]},
         "policy_target_vx": [0.0, 1.0],
-        "limited_target_vx": "min(policy_target, stale_goal_cap, safety_cap)",
+        "limited_target": "stale_goal_cap_then_translation_vector_limiter_then_near_goal_capture",
         "stale_goal_wait": {
             "no_estimate": {
                 "vx": 0.0,
@@ -965,6 +1731,23 @@ def command_contract() -> dict[str, Any]:
         "nav_period_frames": P4_NAV_PERIOD_FRAMES,
         "nav_frequency_hz": 1.0 / P4_NAV_DT_S,
         "slew_semantics": p2_contract.command_contract()["slew_semantics"],
+        "translation_vector_limiter": {
+            "version": TRANSLATION_VECTOR_LIMITER_CONTRACT_VERSION,
+            "source": "deployment_available_predictive_depth_risk",
+            "alpha_raw": "risk<=0.75:1; risk=1:0.60; linear between",
+            "risk_threshold": TRANSLATION_LIMITER_RISK_THRESHOLD,
+            "alpha_floor": TRANSLATION_LIMITER_ALPHA_FLOOR,
+            "release_per_10hz_tick": TRANSLATION_LIMITER_RELEASE_PER_TICK,
+            "state": "live_only_reset_to_one_not_checkpointed",
+            "axes": "scale_vx_vy_preserve_wz",
+        },
+        "near_goal_capture": {
+            "version": NEAR_GOAL_CAPTURE_CONTRACT_VERSION,
+            "distance_m": [NEAR_GOAL_CAPTURE_MIN_DISTANCE_M, NEAR_GOAL_CAPTURE_MAX_DISTANCE_M],
+            "goal_freshness_min": NEAR_GOAL_CAPTURE_FRESHNESS_MIN,
+            "policy_goal_cosine_min": NEAR_GOAL_CAPTURE_GOAL_COSINE_MIN,
+            "axes": "translation_only_preserve_yaw",
+        },
     }
 
 
@@ -973,7 +1756,7 @@ def reward_contract(
 ) -> dict[str, Any]:
     stuck = normalize_stuck_reset_contract(stuck_reset)
     return {
-        "version": "p4_maze_reward_v3_10hz_route",
+        "version": "p4_maze_credit_repair_reward_v1",
         "inherits": p2_contract.reward_contract()["version"],
         "tick_time_scaling": {
             "reference_period_frames": p2_contract.NAV_PERIOD_FRAMES,
@@ -992,12 +1775,30 @@ def reward_contract(
             "yaw_exec_weight": YAW_EXEC_WEIGHT,
             "yaw_true_weight": YAW_TRUE_WEIGHT,
             "yaw_total_floor": YAW_TOTAL_FLOOR,
+            "yaw_exit_response_raw_floor": YAW_EXIT_RESPONSE_RAW_FLOOR,
             "safety_group_floor": SAFETY_GROUP_FLOOR,
-            "cap_semantics": "proportional_no_hidden_adjustment",
-            "confirmed_wall_stuck_reset": stuck["terminal_penalty"],
+            "safety_group_terms": [
+                "predictive_collision",
+                "missed_safe_direction",
+                "yaw_cancellation",
+                "yaw_exit_response",
+                "goal_safe_preference",
+            ],
+            "cap_semantics": "proportional_no_hidden_adjustment_5hz_reference",
+            "confirmed_wall_stuck_reset": {
+                "mode": stuck["mode"],
+                "terminal_penalty": stuck["terminal_penalty"],
+                "semantics": (
+                    "shadow_only_no_reason4_terminal"
+                    if stuck["mode"] == "shadow"
+                    else "active_reason4_terminal"
+                ),
+            },
             "success_impulse": SUCCESS_IMPULSE,
+            "timeout_impulse": TIMEOUT_IMPULSE,
             "sustained_wall_stuck": {
                 "grace_s": STUCK_SUSTAINED_GRACE_S,
+                "full_penalty_s": STUCK_SUSTAINED_FULL_S,
                 "base": STUCK_SUSTAINED_BASE,
                 "floor": STUCK_SUSTAINED_FLOOR,
             },
@@ -1010,7 +1811,21 @@ def reward_contract(
             "route_excess": {
                 "weight_per_m": ROUTE_EXCESS_WEIGHT,
                 "per_tick_cap_m": ROUTE_EXCESS_CAP_M,
-                "source": "simulation_true_velocity_integral",
+                "status": "disabled_global_term",
+            },
+            "maze_new_best_credit": {
+                "weight_per_m": MAZE_NEW_BEST_WEIGHT_PER_M,
+                "episode_cap": MAZE_NEW_BEST_EPISODE_CAP,
+                "terminal": "retain_earned_credit_no_clawback",
+            },
+            "open_straight": {
+                "segments": ["slope", "slope_inv"],
+                "lateral_weight": OPEN_STRAIGHT_LATERAL_WEIGHT,
+                "s_turn_weight": OPEN_STRAIGHT_S_TURN_WEIGHT,
+                "extra_path_weight": OPEN_STRAIGHT_EXTRA_PATH_WEIGHT,
+                "total_floor": OPEN_STRAIGHT_TOTAL_FLOOR,
+                "requires": "teacher_open_center_clean_goal_near_axis_boundary_margin",
+                "zero_on": ["stairs", "maze", "junction", "dead_end", "contact", "recovery", "stale", "terminal"],
             },
             "soft_cruise": {
                 "preferred_vx": [SOFT_CRUISE_MIN_VX, SOFT_CRUISE_MAX_VX],
@@ -1038,7 +1853,9 @@ def training_contract(
         "clock_semantics": {
             "diagnostic": "wall_seconds_before_training_not_counted_in_session",
             "session_effective_seconds": "gradient_training_seconds_only",
-            "session_wall_seconds": "diagnostic_plus_training",
+            "session_wall_seconds": (
+                "task_wall_including_rollout_update_checkpoint_monitor_and_logging"
+            ),
             "platform_task": (
                 "must_cover diagnostic plus target effective seconds plus bounded "
                 "rollout/save shutdown margin"
@@ -1049,18 +1866,13 @@ def training_contract(
         "safety_reward_ramp": {
             "version": SAFETY_REWARD_RAMP_VERSION,
             "segments": [
-                {"seconds": [0, 1_800], "weight": [0.0, 0.015]},
-                {"seconds": [1_800, 7_200], "weight": [0.015, 0.040]},
-                {"seconds": [7_200, 21_600], "weight": [0.040, 0.040]},
-                {"seconds": [21_600, 28_800], "weight": [0.040, 0.030]},
+                {"seconds": [0, 7_200], "weight": [0.012, 0.012]},
             ],
         },
         "goal_fault_ramp": {
-            "semantics": "independent_from_safety_reward_multiplier",
+            "semantics": "disabled_for_credit_assignment_run",
             "segments": [
-                {"seconds": [0, 3_600], "multiplier": [0.25, 0.25]},
-                {"seconds": [3_600, 18_000], "multiplier": [0.60, 0.60]},
-                {"seconds": [18_000, 28_800], "multiplier": [0.80, 0.80]},
+                {"seconds": [0, 7_200], "multiplier": [0.0, 0.0]},
             ],
         },
         "rollout_nav_ticks": 32,
@@ -1068,7 +1880,8 @@ def training_contract(
         "nav_period_frames": P4_NAV_PERIOD_FRAMES,
         "nav_frequency_hz": 1.0 / P4_NAV_DT_S,
         "frozen_low_level": ["cnn", "lstm", "actor", "std", "critic"],
-        "trainable": ["navigation_encoder", "high_actor_lstm", "high_critic", "safety_head", "response_adapter"],
+        "trainable": ["high_actor_lstm", "high_actor_head", "high_critic", "stuck_head"],
+        "frozen_high_level": ["navigation_encoder", "safety_head", "response_adapter"],
         "goal_belief_version": GOAL_BELIEF_VERSION,
         "camera_contract_version": CAMERA_CONTRACT_VERSION,
         "worker_wire_version": WORKER_WIRE_VERSION,
@@ -1076,10 +1889,40 @@ def training_contract(
         "stuck_reset_contract_version": STUCK_RESET_CONTRACT_VERSION,
         "stuck_reset": stuck,
         "adapter_record_contract_version": ADAPTER_RECORD_CONTRACT_VERSION,
+        "actor_mean_guidance": {
+            "version": ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION,
+            "minimum_valid_steps": TEACHER_MIN_VALID_STEPS,
+            "weights": {"direction": 0.45, "speed": 0.20, "yaw": 0.35},
+            "gradient_target_ratio": [0.0, 0.035],
+            "gradient_hard_cap": 0.05,
+            "nav_feat_detached": True,
+            "rollout_time_labels_required": True,
+        },
+        "mirror": {
+            "requested_eligible_sequence_share": 0.0,
+            "eligibility": "episode_start_zero_hidden_no_reset_crossing",
+            "gradient_target_ratio": 0.0,
+            "gradient_hard_cap": 0.0,
+        },
+        "stuck_aux": {
+            "version": STUCK_AUX_CONTRACT_VERSION,
+            "balanced_positive_negative": True,
+            "classifier": "actor_lstm_to_stuck_logit_training_only",
+        },
         "maze_only": True,
         "track_segment_labels": ["maze"],
+        "track_length": 1,
+        "episode_length_s": 75.0,
+        "spawn": {
+            "enabled": False,
+            "semantics": "platform_default_single_maze_spawn",
+        },
+        "goal_jump": {
+            "enabled": False,
+            "semantics": "base_feedback_only_no_extra_goal_fault_course",
+        },
         "soft_cruise": command_contract()["soft_cruise"],
-        "exact_resume": "p4_maze_attack10hz_v1_only",
+        "exact_resume": "p4_maze_credit_repair_v1_only",
     }
 
 

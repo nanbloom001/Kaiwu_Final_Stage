@@ -74,6 +74,17 @@ def main() -> int:
             raise RuntimeError("P4 real Isaac priming step returned None")
         term_cfg = manager.get_term_cfg("nav_stuck_timeout")
         max_stuck = int(term_cfg.params["max_stuck"])
+        spawn_controller = getattr(
+            unwrapped, "_agent_ppo_p4_full_track_spawn", None
+        )
+        if spawn_controller is None or not spawn_controller.installed:
+            raise RuntimeError("P4 full-track spawn hook is not installed")
+        maze_row = int(spawn_controller._terrain_rows()[0][4])
+        spawn_controller.quota.last_full[0] = False
+        spawn_controller.quota.last_segment[0] = 4
+        spawn_controller.quota.last_quartile[0] = 1
+        spawn_controller.quota.last_safe[0] = False
+        spawn_controller.quota.reason4_retries[0] = 0
         before_episode_len = int(unwrapped.episode_length_buf[0].item())
         unwrapped._nav_motion_stuck = torch.full(
             (1,), float(max_stuck), device=unwrapped.device
@@ -90,6 +101,10 @@ def main() -> int:
         ]
         worker_reset = bool(worker_aux[0, 24] > 0.5)
         worker_reason = int(worker_aux[0, 25].round().item())
+        spawn_diagnostics = spawn_controller.diagnostics()
+        terrain_level = int(
+            unwrapped.scene.terrain.terrain_levels.reshape(-1)[0].item()
+        )
         payload = {
             "active_terms": list(manager.active_terms),
             "time_out": bool(term_cfg.time_out),
@@ -101,6 +116,16 @@ def main() -> int:
             "truncated": bool(torch.as_tensor(truncated).reshape(-1)[0]),
             "worker_reset": worker_reset,
             "worker_reason": worker_reason,
+            "spawn_hook_installed": int(spawn_controller.installed),
+            "spawn_raycast_status": spawn_diagnostics["raycast_status"],
+            "spawn_all_position_applied_count": int(
+                spawn_diagnostics["all_position_applied_count"]
+            ),
+            "spawn_write_failure_count": int(
+                spawn_diagnostics["spawn_write_failure_count"]
+            ),
+            "expected_maze_row": maze_row,
+            "terrain_level_after_reset": terrain_level,
         }
         print(json.dumps(payload, sort_keys=True), flush=True)
         if "nav_stuck_timeout" not in payload["active_terms"]:
@@ -115,6 +140,12 @@ def main() -> int:
             raise AssertionError("wall-stuck termination did not auto-reset the env")
         if not payload["worker_reset"] or payload["worker_reason"] != 4:
             raise AssertionError("worker did not preserve wall-stuck terminal reason 4")
+        if payload["spawn_all_position_applied_count"] < 1:
+            raise AssertionError("reason4 reset did not apply a validated all-position spawn")
+        if payload["spawn_write_failure_count"] != 0:
+            raise AssertionError("reason4 spawn reported a physical writer failure")
+        if payload["terrain_level_after_reset"] != payload["expected_maze_row"]:
+            raise AssertionError("reason4 reset did not place the env in the requested Maze row")
         print("P4_STUCK_RUNTIME_SMOKE_PASS", flush=True)
         return 0
     finally:

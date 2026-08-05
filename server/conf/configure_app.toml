@@ -5,7 +5,7 @@
 preload_model_dir = "/data/pre_model/ckpt"
 # P4 warm-start parent selected by the operator. The ID chooses a candidate;
 # the loader still validates stage, module specs, tensor shapes and finiteness.
-preload_model_id = 1256446
+preload_model_id = 1416926
 preload_model = true
 # Repository-side stage bootstrap. This is read before the stage-specific
 # training TOML path is constructed; the same TOML cannot select itself.

@@ -69,4 +69,8 @@ if(BUILD_TESTING)
   add_executable(test_uwb_goal tests/test_uwb_goal.cpp)
   target_include_directories(test_uwb_goal PRIVATE include)
   add_test(NAME uwb_goal_conversion COMMAND test_uwb_goal)
+
+  add_executable(test_uwb_goal_direction tests/test_uwb_goal_direction.cpp)
+  target_include_directories(test_uwb_goal_direction PRIVATE include)
+  add_test(NAME uwb_goal_direction_encoding COMMAND test_uwb_goal_direction)
 endif()

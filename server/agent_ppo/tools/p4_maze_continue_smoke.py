@@ -157,6 +157,151 @@ def _module_digest(algorithm: AlgorithmP4NavPPO) -> str:
     )
 
 
+def _exercise_fp16_mirror_auxiliary(
+    algorithm: AlgorithmP4NavPPO,
+) -> None:
+    """Deterministically exercise the rollout FP16 mirror-CNN boundary."""
+    timesteps = 16
+    batch_size = 1
+    device = algorithm.device
+    actor_input = torch.randn(
+        timesteps,
+        batch_size,
+        p2_contract.ACTOR_INPUT_DIM,
+        device=device,
+    )
+    hidden = (
+        torch.zeros(2, batch_size, 64, device=device),
+        torch.zeros(2, batch_size, 64, device=device),
+    )
+    reset_mask = torch.cat(
+        (
+            torch.ones(1, batch_size, dtype=torch.bool, device=device),
+            torch.zeros(
+                timesteps - 1,
+                batch_size,
+                dtype=torch.bool,
+                device=device,
+            ),
+        ),
+        dim=0,
+    )
+    pre_tanh = torch.zeros(
+        timesteps,
+        batch_size,
+        p2_contract.ACTION_DIM,
+        device=device,
+    )
+    _, _, mean, _, _, features = algorithm.actor.evaluate_actions(
+        actor_input,
+        pre_tanh,
+        hidden,
+        reset_mask,
+        return_features=True,
+    )
+    nav_nonvisual = torch.zeros(
+        timesteps,
+        batch_size,
+        p2_contract.NAV_NONVISUAL_DIM,
+        device=device,
+    )
+    response_profile = torch.zeros(
+        timesteps,
+        batch_size,
+        p2_contract.RESPONSE_PROFILE_DIM,
+        device=device,
+    )
+    confidence = torch.ones(timesteps, batch_size, 1, device=device)
+    batch = {
+        "nav_nonvisual": nav_nonvisual,
+        "response_profile": response_profile,
+        "confidence": confidence,
+        "pre_tanh_action": pre_tanh,
+        "reset_mask": reset_mask,
+        "actor_hidden": hidden,
+        "camera_aux_mask": torch.zeros(
+            timesteps, batch_size, 3, device=device
+        ),
+        "clean_action_mean": torch.zeros(
+            timesteps, batch_size, 3, device=device
+        ),
+        "teacher_safe3": torch.zeros(
+            timesteps, batch_size, 3, device=device
+        ),
+        "teacher_goal_xy": torch.zeros(
+            timesteps, batch_size, 2, device=device
+        ),
+        "teacher_predictive_risk": torch.zeros(
+            timesteps, batch_size, 1, device=device
+        ),
+        "teacher_mask": torch.zeros(
+            timesteps, batch_size, 1, device=device
+        ),
+        "teacher_goal_mask": torch.zeros(
+            timesteps, batch_size, 1, device=device
+        ),
+        "teacher_weight": torch.ones(
+            timesteps, batch_size, 1, device=device
+        ),
+        "stuck_label": torch.zeros(
+            timesteps, batch_size, 1, device=device
+        ),
+        "stuck_mask": torch.zeros(
+            timesteps, batch_size, 1, device=device
+        ),
+        "mirror_eligible": torch.ones(
+            timesteps, batch_size, 1, device=device
+        ),
+        "mirror_batch": {
+            "depth": torch.zeros(
+                timesteps,
+                batch_size,
+                p2_contract.DEPTH_HEIGHT,
+                p2_contract.DEPTH_WIDTH,
+                1,
+                dtype=torch.float16,
+                device=device,
+            ),
+            "nav_nonvisual": nav_nonvisual,
+            "response_profile": response_profile,
+            "confidence": confidence,
+            "pre_tanh_action": pre_tanh,
+            "reset_mask": reset_mask,
+        },
+    }
+    saved_coefficients = dict(algorithm._auxiliary_coefficients)
+    algorithm._auxiliary_coefficients = {"mirror": 1.0}
+    algorithm.actor_optimizer.zero_grad(set_to_none=True)
+    loss, metrics = algorithm._actor_auxiliary_loss(
+        normalized_mean=torch.tanh(mean),
+        actor_features=features,
+        nav_feat=torch.zeros(
+            timesteps,
+            batch_size,
+            p2_contract.NAV_FEATURE_DIM,
+            device=device,
+        ),
+        batch=batch,
+        ppo_actor_loss=mean.square().mean(),
+    )
+    loss.backward()
+    if not bool(torch.isfinite(loss)):
+        raise AssertionError("P4 FP16 mirror auxiliary produced non-finite loss")
+    if float(metrics.get("mirror_aux_sequence_share", 0.0)) <= 0.0:
+        raise AssertionError("P4 FP16 mirror auxiliary was not exercised")
+    if any(
+        parameter.grad is not None
+        for parameter in algorithm.navigation_encoder.parameters()
+    ):
+        raise AssertionError("P4 mirror auxiliary updated NavigationEncoder")
+    if not any(
+        parameter.grad is not None for parameter in algorithm.actor.parameters()
+    ):
+        raise AssertionError("P4 mirror auxiliary did not update Actor")
+    algorithm.actor_optimizer.zero_grad(set_to_none=True)
+    algorithm._auxiliary_coefficients = saved_coefficients
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", required=True)
@@ -181,20 +326,30 @@ def main() -> int:
     raw = torch.load(checkpoint, map_location="cpu", weights_only=False)
     platform_model_id = raw.get("platform_model_id", 1256446)
 
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
+    device = torch.device(args.device)
+    cuda_smoke = device.type == "cuda"
+    cuda_index = (
+        device.index if device.index is not None else torch.cuda.current_device()
+    ) if cuda_smoke else None
+    if cuda_smoke:
+        # Isaac's prebundled torch rejects peak-stat operations before the
+        # primary CUDA context exists, even when ``is_available()`` is true.
+        torch.empty(0, device=device)
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(cuda_index)
     algorithm = _algorithm(args.num_envs, args.device, config)
     mode = algorithm.load_bundle(
         str(checkpoint), platform_model_id=platform_model_id
     )
-    if mode != "p4_maze_warm_start":
+    if mode != "p4_full_track_warm_start":
         raise AssertionError(f"unexpected warm-start mode: {mode}")
+    _exercise_fp16_mirror_auxiliary(algorithm)
     low_digest_before = _module_digest(algorithm)
 
     algorithm._resolved_maze_training_branch = "actor_attack"
     algorithm.update_training_clocks(p4_contract.DIAGNOSTIC_SECONDS)
-    if algorithm.current_phase == "mazediag":
-        raise AssertionError("P4 smoke failed to enter gradient-training phase")
+    if algorithm.current_phase not in {"fullwarm", "fulladapt", "fulltrain", "fullstabilize"}:
+        raise AssertionError("P4 smoke failed to enter the full-track schedule")
     _seed_response_records(algorithm)
     _fill_rollout(algorithm)
     metrics = algorithm.update()
@@ -232,10 +387,19 @@ def main() -> int:
                 "critic_gradient_steps": algorithm.critic_gradient_steps,
                 "adapter_gradient_steps": algorithm.adapter_gradient_steps,
                 "low_digest_unchanged": low_digest_before == low_digest_after,
-                "memory_allocated": torch.cuda.memory_allocated(),
-                "memory_reserved": torch.cuda.memory_reserved(),
-                "max_memory_allocated": torch.cuda.max_memory_allocated(),
-                "max_memory_reserved": torch.cuda.max_memory_reserved(),
+                "fp16_mirror_auxiliary": "PASS",
+                "memory_allocated": (
+                    torch.cuda.memory_allocated(cuda_index) if cuda_smoke else 0
+                ),
+                "memory_reserved": (
+                    torch.cuda.memory_reserved(cuda_index) if cuda_smoke else 0
+                ),
+                "max_memory_allocated": (
+                    torch.cuda.max_memory_allocated(cuda_index) if cuda_smoke else 0
+                ),
+                "max_memory_reserved": (
+                    torch.cuda.max_memory_reserved(cuda_index) if cuda_smoke else 0
+                ),
                 "pinned_depth_bytes": 0
                 if algorithm.rollout.depth is None
                 else algorithm.rollout.depth.numel()

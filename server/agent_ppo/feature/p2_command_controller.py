@@ -8,6 +8,41 @@ import torch
 from agent_ppo.feature import nav_contract, p2_contract
 
 
+def slew_step(
+    current_cmd3: torch.Tensor,
+    target_cmd3: torch.Tensor,
+    slew_rate: torch.Tensor,
+    slew_release_rate: torch.Tensor,
+    *,
+    dt_s: float = p2_contract.CONTROL_DT_S,
+) -> torch.Tensor:
+    """Advance one command frame while requiring a zero crossing on reversals."""
+    if current_cmd3.shape != target_cmd3.shape or current_cmd3.shape[-1] != 3:
+        raise ValueError("command slew expects matching [N,3] current and target tensors")
+    up = torch.as_tensor(
+        slew_rate, device=current_cmd3.device, dtype=current_cmd3.dtype
+    ).reshape(1, 3)
+    release = torch.as_tensor(
+        slew_release_rate, device=current_cmd3.device, dtype=current_cmd3.dtype
+    ).reshape(1, 3)
+    if not torch.isfinite(up).all() or not torch.isfinite(release).all():
+        raise ValueError("command slew rates must be finite")
+    if bool((up < 0.0).any()) or bool((release < 0.0).any()):
+        raise ValueError("command slew rates must be non-negative")
+    if not torch.isfinite(torch.as_tensor(float(dt_s))) or float(dt_s) <= 0.0:
+        raise ValueError("command slew dt_s must be positive and finite")
+    opposite = (target_cmd3 * current_cmd3) < 0.0
+    reducing = target_cmd3.abs() < current_cmd3.abs()
+    rate = torch.where(opposite | reducing, release, up)
+    effective_target = torch.where(opposite, torch.zeros_like(target_cmd3), target_cmd3)
+    max_delta = rate * float(dt_s)
+    next_cmd = current_cmd3 + torch.clamp(
+        effective_target - current_cmd3, -max_delta, max_delta
+    )
+    crossed_zero = opposite & ((next_cmd * current_cmd3) <= 0.0)
+    return torch.where(crossed_zero, torch.zeros_like(next_cmd), next_cmd)
+
+
 class P2CommandController:
     def __init__(
         self,
@@ -40,19 +75,13 @@ class P2CommandController:
         critic_obs[:, c0:c1] = self.exec_cmd.to(critic_obs)
 
     def step(self) -> None:
-        target = self.active_target
-        current = self.exec_cmd.clone()
-        opposite = (target * current) < 0.0
-        reducing = target.abs() < current.abs()
-        release = opposite | reducing
-        rate = torch.where(release, self.slew_release_rate, self.slew_rate)
-        effective_target = torch.where(opposite, torch.zeros_like(target), target)
-        max_delta = rate * p2_contract.CONTROL_DT_S
-        delta = torch.clamp(effective_target - current, -max_delta, max_delta)
-        self.exec_cmd.add_(delta)
-        crossed_zero = opposite & ((self.exec_cmd * current) <= 0.0)
         self.exec_cmd.copy_(
-            torch.where(crossed_zero, torch.zeros_like(self.exec_cmd), self.exec_cmd)
+            slew_step(
+                self.exec_cmd,
+                self.active_target,
+                self.slew_rate,
+                self.slew_release_rate,
+            )
         )
 
     def reset(self, env_ids: torch.Tensor) -> None:

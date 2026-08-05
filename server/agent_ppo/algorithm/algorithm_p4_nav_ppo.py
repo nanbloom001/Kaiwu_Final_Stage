@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 from uuid import uuid4
 
@@ -12,6 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from agent_ppo.algorithm.algorithm_p2_nav_ppo import AlgorithmP2NavPPO
+from agent_ppo.algorithm.algorithm_visual_ppo import _calibrate_auxiliary_gradients
 from agent_ppo.checkpoint_io import (
     normalize_kaiwu_train_bundle,
     validate_p3_eval_bundle,
@@ -23,10 +25,12 @@ from agent_ppo.feature.p2_response_buffer import split_p2_transport
 from agent_ppo.feature.p4_camera import P4SharedCameraState
 from agent_ppo.feature.p4_goal_belief import GoalBeliefChainV2
 from agent_ppo.model.p2_high_level import (
+    P4ActorStuckHead,
     assemble_actor_input,
     navigation_actor_spec,
     navigation_encoder_spec,
     navigation_safety_head_spec,
+    p4_actor_stuck_head_spec,
 )
 from agent_ppo.model.response_adapter import response_adapter_spec
 
@@ -39,9 +43,16 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         early_config.setdefault(
             "nav_period_frames", p4_contract.P4_NAV_PERIOD_FRAMES
         )
+        early_config.setdefault("slew_rate", p4_contract.P4_SLEW_RATE)
+        early_config.setdefault(
+            "slew_release_rate", p4_contract.P4_SLEW_RELEASE_RATE
+        )
         kwargs["config"] = early_config
         self.maze_training_branch = str(
             early_config.get("maze_training_branch", "actor_attack")
+        )
+        self.training_profile = str(
+            early_config.get("training_profile", "full_track")
         )
         self._resolved_maze_training_branch = None
         self.session_wall_seconds = 0.0
@@ -49,13 +60,22 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self._training_clock_origin_seconds = None
         super().__init__(*args, **kwargs)
         runtime_segments = tuple(
-            self.config.get("track_segment_labels", ("maze",))
+            self.config.get(
+                "track_segment_labels", p4_contract.FULL_TRACK_SEGMENT_LABELS
+            )
         )
-        if runtime_segments != ("maze",):
+        expected_segments = (
+            ("maze",)
+            if self.training_profile == "maze_credit_repair"
+            else p4_contract.FULL_TRACK_SEGMENT_LABELS
+        )
+        if runtime_segments != expected_segments:
             raise ValueError(
-                "P4 Maze-only training requires track_segment_labels=['maze']; "
+                f"P4 {self.training_profile} requires segments "
+                f"{list(expected_segments)!r}; "
                 f"got {list(runtime_segments)!r}"
             )
+        self.track_segment_labels = runtime_segments
         if self.nav_period_frames != p4_contract.P4_NAV_PERIOD_FRAMES:
             raise ValueError(
                 "P4 runtime navigation period does not match the 10 Hz contract: "
@@ -87,12 +107,23 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self.maze_training_branch = str(
             self.config.get("maze_training_branch", "actor_attack")
         )
+        self.camera_fault_course_enabled = bool(
+            self.config.get("camera_fault_course_enabled", True)
+        )
+        self.goal_fault_course_enabled = bool(
+            self.config.get("goal_fault_course_enabled", True)
+        )
         if not hasattr(self, "_resolved_maze_training_branch"):
             self._resolved_maze_training_branch = None
         self.user_speed_cap = torch.full(
             (self.num_envs,), p4_contract.P4_MAX_VX, device=self.device
         )
         self.safety_speed_cap = torch.ones(self.num_envs, device=self.device)
+        self._translation_alpha_prev = torch.ones(
+            self.num_envs, device=self.device
+        )
+        self._translation_limiter_diagnostics: dict[str, torch.Tensor] = {}
+        self._near_goal_capture_diagnostics: dict[str, torch.Tensor] = {}
         self._safety_cap_predictive_risk = torch.zeros(
             self.num_envs, device=self.device
         )
@@ -165,6 +196,17 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             (self.num_envs,), -1, dtype=torch.long, device=self.device
         )
         self._clean_depth = None
+        self._delivered_depth = None
+        self._mirror_batch_schedule: list[object | None] = []
+        self._mirror_batch_cursor = 0
+        self._mirror_aux_eligible_sequence_count = 0
+        self._mirror_aux_scheduled_sequence_share = 0.0
+        self._p4_recovery_monitor_state = {
+            "event_times": [],
+            "success_lifetime_count": 0,
+            "candidate_lifetime_count": 0,
+            "terminal_lifetime_count": 0,
+        }
         self._diagnostic_fault_depth = None
         self._diagnostic_fault_mask = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
@@ -213,11 +255,36 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self.num_envs, dtype=torch.bool, device=self.device
         )
         self._p4_episode_return = torch.zeros(self.num_envs, device=self.device)
+        self._spawn_segment = torch.zeros(self.num_envs, device=self.device)
+        self._max_segment_reached = torch.zeros(self.num_envs, device=self.device)
+        self._segment_state_initialized = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._maze_credit_earned = torch.zeros(self.num_envs, device=self.device)
         self._teacher_navigation_encoder = copy.deepcopy(self.navigation_encoder).to(
             self.device
         )
         self._teacher_actor = copy.deepcopy(self.actor).to(self.device)
         self._teacher_hidden = None
+        self.stuck_head = (
+            P4ActorStuckHead(self.actor.hidden_dim).to(self.device)
+            if self.training_enabled
+            else None
+        )
+        self.mirror_generator = torch.Generator(device="cpu")
+        self.mirror_generator.manual_seed(seed + 31)
+        self._auxiliary_calibration = {
+            "combined_ratio": 0.0,
+            "teacher_ratio": 0.0,
+            "camera_ratio": 0.0,
+            "mirror_ratio": 0.0,
+            "stuck_ratio": 0.0,
+            "teacher_valid_steps": 0.0,
+            "stuck_valid_steps": 0.0,
+        }
+        self._auxiliary_coefficients: dict[str, float] = {}
+        self._teacher_update_enabled = True
+        self.actor_stuck_positive_ema = 0.10
         self.parent_phase_label = None
         self._diagnostic_nav_risk_probe = nn.Linear(32, 3).to(self.device)
         self._diagnostic_nav_scene_probe = nn.Linear(32, 5).to(self.device)
@@ -236,7 +303,41 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self.current_vy_trusted_limit = p4_contract.P4_MAX_ABS_VY
         self.current_vy_hard_limit = p4_contract.P4_MAX_ABS_VY
         if self.training_enabled:
+            self.actor_optimizer.add_param_group(
+                {
+                    "params": list(self.stuck_head.parameters()),
+                    "lr": p4_contract.SAFETY_HEAD_LR,
+                    "base_lr": p4_contract.SAFETY_HEAD_LR,
+                    "name": "actor_stuck_head",
+                }
+            )
+            self._assert_optimizer_isolation()
             self._apply_training_schedule(self.session_effective_seconds)
+            self._credit_fresh_actor_optimizer_state = copy.deepcopy(
+                self.actor_optimizer.state_dict()
+            )
+            self._credit_fresh_critic_state = copy.deepcopy(self.critic.state_dict())
+            self._credit_fresh_critic_optimizer_state = copy.deepcopy(
+                self.critic_optimizer.state_dict()
+            )
+            self._credit_fresh_critic_scheduler_state = (
+                copy.deepcopy(self.critic_scheduler.state_dict())
+                if self.critic_scheduler is not None
+                else None
+            )
+            self._credit_fresh_actor_scheduler_state = (
+                copy.deepcopy(self.actor_scheduler.state_dict())
+                if self.actor_scheduler is not None
+                else None
+            )
+            self._credit_fresh_response_scheduler_state = (
+                copy.deepcopy(self.response_scheduler.state_dict())
+                if self.response_scheduler is not None
+                else None
+            )
+            self._credit_fresh_stuck_head_state = copy.deepcopy(
+                self.stuck_head.state_dict()
+            )
             if self.rollout is not None:
                 self.rollout = self.rollout.reset(
                     store_depth=self.cnn_unfrozen
@@ -255,7 +356,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             return split_p2_transport(critic_wire)
         if critic_wire.shape[1] != p4_contract.P4_PRIVILEGED_WIRE_DIM:
             raise ValueError(
-                "P4 privileged wire must be 385 eval columns or 507 training "
+                "P4 privileged wire must be 385 eval columns or 519 training "
                 f"columns, got {tuple(critic_wire.shape)}"
             )
         base = critic_wire[:, : p2_contract.PRIVILEGED_WIRE_DIM]
@@ -302,8 +403,8 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         return critic, aux
 
     def _prepare_policy_parts(self, parts, critic_obs, aux, reset):
-        del reset
         worker_reset = aux[:, 24] > 0.5
+        self._translation_alpha_prev[worker_reset | reset] = 1.0
         self.user_speed_cap.fill_(p4_contract.P4_MAX_VX)
         if self.training_enabled:
             true_xy = self._p4_worker_extra[:, p4_contract.RAW_GOAL_XY_SLICE]
@@ -320,12 +421,14 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             )
             self.goal_belief.set_fault_scale(
                 float(schedule["goal_fault_multiplier"])
+                if self.goal_fault_course_enabled
+                else 0.0
             )
-            if self.session_effective_seconds < 3_600.0:
+            if self.session_effective_seconds < 1_800.0:
                 goal_fault_profile = "noise_only"
-            elif self.session_effective_seconds < 18_000.0:
+            elif self.session_effective_seconds < 21_600.0:
                 goal_fault_profile = "medium"
-            elif self.session_effective_seconds < 25_200.0:
+            elif self.session_effective_seconds < 27_000.0:
                 goal_fault_profile = "full"
             else:
                 goal_fault_profile = "stress"
@@ -342,7 +445,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 dt_s=p2_contract.CONTROL_DT_S,
                 reset_mask=worker_reset,
                 deterministic=False,
-                fault_profile=goal_fault_profile,
+                fault_profile=(
+                    goal_fault_profile
+                    if self.goal_fault_course_enabled
+                    else "noise_only"
+                ),
                 fault_allowed_mask=fault_allowed,
             )
             self._goal_epoch_changed_since_tick |= (
@@ -352,23 +459,13 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             parts["depth"],
             reset_mask=worker_reset,
             session_effective_seconds=self.session_effective_seconds,
-            training=self.training_enabled,
+            training=(self.training_enabled and self.camera_fault_course_enabled),
         )
         self._clean_depth = self.camera_state.clean_capture.detach().clone()
+        # This read-only view is consumed immediately by _map_policy_target()
+        # before env.step() can recycle the observation buffer.
+        self._delivered_depth = delivered.detach()
         parts["depth"] = delivered
-        if self.frame_count % self.nav_period_frames == 0:
-            with torch.inference_mode():
-                current_arc = self._predictive_command(
-                    self.command.active_target
-                )
-                safety_probe = p2_contract.predictive_collision_risk_penalty(
-                    delivered, current_arc
-                )
-                current_risk = safety_probe[3]
-            self._safety_cap_predictive_risk = current_risk.detach()
-            self.safety_speed_cap = torch.clamp(
-                1.0 - 0.75 * current_risk, 0.25, 1.0
-            )
         self.effective_speed_cap = p4_contract.effective_speed_cap(
             self.user_speed_cap,
             parts["goal4"][:, 3],
@@ -441,9 +538,45 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         policy = p4_contract.map_normalized_action(
             normalized, full_cap, goal_freshness=None
         )
-        limited = p4_contract.map_normalized_action(
-            normalized, self.effective_speed_cap, goal4[:, 3]
+        stale_cap = p4_contract.stale_goal_cap(self.user_speed_cap, goal4[:, 3])
+        stale_limited = p4_contract.map_normalized_action(
+            normalized, stale_cap, goal4[:, 3]
         )
+        if self._delivered_depth is None:
+            raise RuntimeError("P4 translation limiter missing current delivered depth")
+        # Risk must correspond to the candidate sampled for this transition.
+        # Using command.active_target here would lag by one 10 Hz decision and
+        # can protect the direction that the policy has already abandoned.
+        with torch.inference_mode():
+            candidate_arc = self._predictive_command(stale_limited)
+            current_risk = p2_contract.predictive_collision_risk_penalty(
+                self._delivered_depth, candidate_arc
+            )[3]
+        self._safety_cap_predictive_risk = current_risk.detach()
+        _, limiter = p4_contract.translation_vector_limiter(
+            stale_limited,
+            current_risk,
+            self._translation_alpha_prev,
+            reset_mask=self.reset_since_tick,
+        )
+        self.safety_speed_cap = limiter["translation_safety_alpha_raw"].detach()
+        limited, capture = p4_contract.near_goal_capture(
+            stale_limited,
+            self.goal_belief.estimate,
+            goal4[:, 3],
+            limiter["translation_safety_alpha"],
+            torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
+            self.reset_since_tick,
+            self._goal_epoch_changed_since_tick,
+        )
+        self._translation_alpha_prev.copy_(limiter["translation_safety_alpha"])
+        self._translation_limiter_diagnostics = {
+            name: value.detach() for name, value in limiter.items()
+        }
+        self._near_goal_capture_diagnostics = {
+            name: value.detach() for name, value in capture.items()
+        }
+        self.effective_speed_cap = stale_cap * limiter["translation_safety_alpha"]
         self._last_normalized_action = normalized.detach()
         self._last_policy_command = policy.detach()
         self._last_limited_command = limited.detach()
@@ -489,17 +622,111 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
     # Clean/live camera auxiliary and reward closure
     # ------------------------------------------------------------------
 
+    @torch.no_grad()
+    def frame_begin(self, obs: torch.Tensor, critic_wire: torch.Tensor, *, deterministic=False):
+        """Attach recovery labels after the parent has sampled its safe3 teacher."""
+        result, critic_obs, aux = super().frame_begin(
+            obs, critic_wire, deterministic=deterministic
+        )
+        if not (self.training_enabled and result.get("is_tick") and self.pending_tick):
+            return result, critic_obs, aux
+
+        pending = self.pending_tick
+        reset = pending["reset_mask"].reshape(-1).bool()
+        safe3 = pending["safe3"]
+        scanner_valid = pending["safety_valid"].reshape(-1) > 0.5
+        mapping_valid = (
+            self._p4_worker_extra[:, p4_contract.STUCK_MAPPING_VALID_INDEX] > 0.5
+        )
+        wall_evidence = (
+            self._p4_worker_extra[:, p4_contract.STUCK_WALL_EVIDENCE_INDEX] > 0.5
+        )
+        worker_candidate = (
+            self._p4_worker_extra[:, p4_contract.STUCK_CANDIDATE_INDEX] > 0.5
+        )
+        duration_s = torch.nan_to_num(
+            self._p4_worker_extra[:, p4_contract.STUCK_DURATION_S_INDEX], nan=0.0
+        ).clamp_min(0.0)
+        policy_xy = pending["target_cmd3"][:, :2]
+        exec_xy = self.command.exec_cmd[:, :2]
+        true_xy = aux[:, 12:14]
+        policy_or_exec_intent = (
+            torch.linalg.vector_norm(policy_xy, dim=-1) > 0.10
+        ) | (torch.linalg.vector_norm(exec_xy, dim=-1) > 0.08)
+        true_motion_low = torch.linalg.vector_norm(true_xy, dim=-1) < 0.08
+        push_grace = self.seconds_since_push < float(
+            self.stuck_reset_contract.get("push_grace_s", 0.0)
+        )
+        episode_grace = reset
+        alive = torch.isfinite(safe3).all(dim=-1) & torch.isfinite(true_xy).all(dim=-1)
+        stuck_mask = (
+            alive
+            & mapping_valid
+            & wall_evidence
+            & policy_or_exec_intent
+            & ~push_grace
+            & ~episode_grace
+        )
+        stuck_label = (
+            worker_candidate
+            & true_motion_low
+            & policy_or_exec_intent
+            & wall_evidence
+            & mapping_valid
+            & ~push_grace
+            & ~episode_grace
+            & (duration_s >= 0.8)
+        )
+        stuck_weight = torch.where(
+            duration_s >= 2.0,
+            torch.ones_like(duration_s),
+            torch.full_like(duration_s, 0.25),
+        )
+        stuck_weight = torch.where(stuck_label, stuck_weight, torch.ones_like(stuck_weight))
+        guidance = p4_contract.teacher_guidance_mask(
+            alive=alive,
+            scanner_valid=scanner_valid,
+            mapping_valid=mapping_valid,
+            terminal=torch.zeros_like(alive),
+            reset=reset,
+            push_grace=push_grace,
+            episode_grace=episode_grace,
+            goal_freshness=self._last_goal_freshness,
+            safe3=safe3,
+        )
+        teacher_mask = guidance["teacher_guidance_eligible"].reshape(-1).bool()
+        goal_mask = guidance["teacher_guidance_goal_eligible"].reshape(-1).bool()
+        mirror_eligible = (
+            alive & mapping_valid & ~push_grace & ~worker_candidate
+        )
+        pending.update(
+            {
+                "teacher_safe3": safe3.detach(),
+                "teacher_goal_xy": self.goal_belief.estimate.detach(),
+                "teacher_predictive_risk": pending["predictive_collision_risk"].reshape(-1, 1),
+                "teacher_mask": teacher_mask.float().unsqueeze(-1),
+                "teacher_goal_mask": goal_mask.float().unsqueeze(-1),
+                "teacher_weight": stuck_weight.unsqueeze(-1),
+                "stuck_label": stuck_label.float().unsqueeze(-1),
+                "stuck_mask": stuck_mask.float().unsqueeze(-1),
+                "mirror_eligible": mirror_eligible.float().unsqueeze(-1),
+            }
+        )
+        return result, critic_obs, aux
+
     def begin_rollout(self) -> None:
         """Refresh the clean teacher from the current live policy."""
         self._push_rollout_count.zero_()
         self.camera_state.begin_rollout(
-            self.session_effective_seconds, training=self.training_enabled
+            self.session_effective_seconds,
+            training=(self.training_enabled and self.camera_fault_course_enabled),
         )
         self._teacher_navigation_encoder.load_state_dict(
             self.navigation_encoder.state_dict(), strict=True
         )
         self._teacher_actor.load_state_dict(self.actor.state_dict(), strict=True)
         self._camera_aux_calibration_pending = True
+        self._auxiliary_coefficients = {}
 
     def _update_policy_auxiliary_target(
         self, *, parts, nav_feat, nav_nonvisual, profile, confidence, reset
@@ -624,75 +851,446 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "camera_aux_mask": self._camera_aux_mask,
         }
 
-    @staticmethod
-    def _grad_norm(grads) -> torch.Tensor:
-        values = [grad.square().sum() for grad in grads if grad is not None]
-        if not values:
-            return torch.tensor(0.0)
-        return torch.sqrt(torch.stack(values).sum())
-
     def _actor_auxiliary_loss(
-        self, *, normalized_mean, batch, ppo_actor_loss
+        self,
+        *,
+        normalized_mean,
+        actor_normalized_mean=None,
+        batch,
+        ppo_actor_loss,
+        actor_features=None,
+        nav_feat=None,
     ):
-        mask3 = batch["camera_aux_mask"] > 0.5
-        selected = mask3.any(dim=-1)
-        if not bool(selected.any()):
-            zero = normalized_mean.new_zeros(())
-            return zero, {
-                "camera_memory_loss": zero.detach(),
-                "camera_aux_gradient_ratio": zero.detach(),
-            }
-        per_action = F.smooth_l1_loss(
-            normalized_mean,
-            batch["clean_action_mean"],
-            reduction="none",
-        ).mean(dim=-1)
-        raw = per_action[selected].mean()
-        target_ratio = float(
-            p4_contract.training_schedule(
-                self.session_effective_seconds,
-                branch=self._effective_maze_branch(self.session_effective_seconds),
-            )["camera_aux_ratio"]
+        zero = normalized_mean.new_zeros(())
+        if actor_normalized_mean is None:
+            actor_normalized_mean = normalized_mean
+        schedule = p4_contract.training_schedule(
+            self.session_effective_seconds,
+            branch=self._effective_maze_branch(self.session_effective_seconds),
         )
-        if target_ratio <= 0.0:
-            coefficient = 0.0
-            actual_ratio = 0.0
-        elif self._camera_aux_calibration_pending:
-            parameters = [
-                parameter
-                for module in (self.navigation_encoder, self.actor)
-                for parameter in module.parameters()
-                if parameter.requires_grad
-            ]
-            aux_grads = torch.autograd.grad(
-                raw, parameters, retain_graph=True, allow_unused=True
+        specs: list[tuple[str, torch.Tensor, float]] = []
+        mask3 = batch["camera_aux_mask"] > 0.5
+        camera_selected = mask3.any(dim=-1)
+        camera_raw = zero
+        if bool(camera_selected.any()):
+            camera_raw = F.smooth_l1_loss(
+                normalized_mean,
+                batch["clean_action_mean"],
+                reduction="none",
+            ).mean(dim=-1)[camera_selected].mean()
+            specs.append(("camera", camera_raw, float(schedule.get("camera_aux_ratio", 0.01))))
+
+        teacher_raw = zero
+        teacher = {
+            "direction": zero, "speed": zero, "yaw": zero,
+            "teacher_valid_steps": zero, "teacher_loss_active": zero,
+        }
+        teacher_mask = batch["teacher_mask"].reshape(-1) > 0.5
+        if self._teacher_update_enabled and bool(teacher_mask.any()):
+            full_cap = torch.full(
+                actor_normalized_mean.shape[:-1], p4_contract.P4_MAX_VX,
+                dtype=actor_normalized_mean.dtype,
+                device=actor_normalized_mean.device,
             )
-            ppo_grads = torch.autograd.grad(
-                ppo_actor_loss, parameters, retain_graph=True, allow_unused=True
+            mean_command = p4_contract.map_normalized_action(
+                actor_normalized_mean, full_cap, goal_freshness=None
+            ).reshape(-1, 3)
+            teacher = p4_contract.teacher_guidance_loss(
+                mean_command,
+                batch["teacher_safe3"].reshape(-1, 3),
+                batch["teacher_goal_xy"].reshape(-1, 2),
+                batch["teacher_predictive_risk"].reshape(-1),
+                batch["stuck_label"].reshape(-1) > 0.5,
+                batch["teacher_mask"].reshape(-1) > 0.5,
+                batch["teacher_goal_mask"].reshape(-1) > 0.5,
+                sample_weight=batch["teacher_weight"].reshape(-1),
+                min_valid_steps=1,
             )
-            aux_norm = float(self._grad_norm(aux_grads).detach().cpu())
-            ppo_norm = float(self._grad_norm(ppo_grads).detach().cpu())
-            coefficient = target_ratio * ppo_norm / max(aux_norm, 1.0e-12)
-            coefficient = max(0.0, min(coefficient, 0.02 * ppo_norm / max(aux_norm, 1.0e-12)))
-            actual_ratio = coefficient * aux_norm / max(ppo_norm, 1.0e-12)
-            self._camera_aux_coefficient = coefficient
-            self._camera_aux_gradient_ratio = min(actual_ratio, 0.02)
-            self._camera_aux_calibration_pending = False
-        else:
-            coefficient = self._camera_aux_coefficient
-            actual_ratio = self._camera_aux_gradient_ratio
-        loss = raw * float(coefficient)
+            teacher_raw = teacher["loss"]
+            specs.append((
+                "teacher", teacher_raw,
+                min(
+                    float(schedule.get("teacher_gradient_target_ratio", 0.02)),
+                    float(schedule.get("teacher_gradient_hard_cap", 0.03)),
+                ),
+            ))
+
+        stuck_raw = zero
+        stuck_logits = None
+        stuck_precision = zero
+        stuck_recall = zero
+        stuck_f1 = zero
+        stuck_pr_auc = zero
+        stuck_threshold = zero.new_tensor(0.5)
+        stuck_positive_share = zero
+        stuck_mask = batch["stuck_mask"].reshape(-1) > 0.5
+        if actor_features is not None and bool(stuck_mask.any()) and self.stuck_head is not None:
+            stuck_logits = self.stuck_head(actor_features).reshape(-1)
+            labels = batch["stuck_label"].reshape(-1)
+            selected_labels = labels[stuck_mask]
+            positive = selected_labels.mean().detach()
+            self.actor_stuck_positive_ema = float(
+                0.99 * self.actor_stuck_positive_ema + 0.01 * positive
+            )
+            pos_weight = min(
+                10.0,
+                max(1.0, (1.0 - self.actor_stuck_positive_ema) / max(self.actor_stuck_positive_ema, 1.0e-4)),
+            )
+            stuck_raw = F.binary_cross_entropy_with_logits(
+                stuck_logits[stuck_mask], selected_labels,
+                pos_weight=torch.tensor(pos_weight, device=stuck_logits.device),
+            )
+            with torch.no_grad():
+                probabilities = torch.sigmoid(stuck_logits[stuck_mask])
+                labels_bool = selected_labels > 0.5
+                predicted = probabilities >= 0.5
+                true_positive = (predicted & labels_bool).float().sum()
+                false_positive = (predicted & ~labels_bool).float().sum()
+                false_negative = (~predicted & labels_bool).float().sum()
+                stuck_precision = true_positive / (
+                    true_positive + false_positive
+                ).clamp_min(1.0)
+                stuck_recall = true_positive / (
+                    true_positive + false_negative
+                ).clamp_min(1.0)
+                stuck_f1 = (
+                    2.0 * stuck_precision * stuck_recall
+                    / (stuck_precision + stuck_recall).clamp_min(1.0e-6)
+                )
+                stuck_positive_share = labels_bool.float().mean()
+                order = torch.argsort(probabilities, descending=True)
+                sorted_labels = labels_bool[order].float()
+                cumulative_positive = sorted_labels.cumsum(dim=0)
+                ranks = torch.arange(
+                    1,
+                    sorted_labels.numel() + 1,
+                    device=sorted_labels.device,
+                    dtype=sorted_labels.dtype,
+                )
+                precision_curve = cumulative_positive / ranks
+                positive_count = sorted_labels.sum()
+                stuck_pr_auc = (
+                    (precision_curve * sorted_labels).sum()
+                    / positive_count.clamp_min(1.0)
+                )
+                recall_curve = cumulative_positive / positive_count.clamp_min(1.0)
+                f1_curve = (
+                    2.0 * precision_curve * recall_curve
+                    / (precision_curve + recall_curve).clamp_min(1.0e-6)
+                )
+                if sorted_labels.numel() and float(positive_count) > 0.0:
+                    best_index = int(f1_curve.argmax())
+                    stuck_threshold = probabilities[order[best_index]]
+            specs.append(("stuck", stuck_raw, float(schedule.get("stuck_gradient_target_ratio", 0.005))))
+
+        mirror_raw = zero
+        mirror_sequence_count = 0
+        mirror_batch = batch.get("mirror_batch")
+        if isinstance(mirror_batch, dict) and "depth" in mirror_batch:
+            depth = mirror_batch["depth"]
+            mirror_sequence_count = int(depth.shape[1])
+            if mirror_sequence_count:
+                flat_depth = depth.reshape(
+                    -1, p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH, 1
+                )
+                mirrored_depth = depth.flip(dims=(-2,)).reshape(
+                    -1, p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH, 1
+                )
+                amp_enabled = self.device.type == "cuda"
+                if not amp_enabled:
+                    flat_depth = flat_depth.float()
+                    mirrored_depth = mirrored_depth.float()
+                with torch.no_grad(), torch.autocast(
+                    device_type=self.device.type, enabled=amp_enabled
+                ):
+                    original_feat = self.navigation_encoder(flat_depth).float().reshape(
+                        depth.shape[0], depth.shape[1], -1
+                    )
+                    mirrored_feat = self.navigation_encoder(
+                        mirrored_depth
+                    ).float().reshape(depth.shape[0], depth.shape[1], -1)
+                original_input = assemble_actor_input(
+                    original_feat.detach(),
+                    mirror_batch["nav_nonvisual"],
+                    mirror_batch["response_profile"],
+                    mirror_batch["confidence"],
+                )
+                mirrored_input = assemble_actor_input(
+                    mirrored_feat.detach(),
+                    self._mirror_nav_nonvisual(mirror_batch["nav_nonvisual"]),
+                    self._mirror_response_profile(
+                        mirror_batch["response_profile"]
+                    ),
+                    mirror_batch["confidence"],
+                )
+                zero_hidden = (
+                    torch.zeros(
+                        self.actor.num_layers,
+                        mirror_sequence_count,
+                        self.actor.hidden_dim,
+                        device=normalized_mean.device,
+                        dtype=normalized_mean.dtype,
+                    ),
+                    torch.zeros(
+                        self.actor.num_layers,
+                        mirror_sequence_count,
+                        self.actor.hidden_dim,
+                        device=normalized_mean.device,
+                        dtype=normalized_mean.dtype,
+                    ),
+                )
+                with torch.no_grad():
+                    _, _, original_mean, _, _, _ = self.actor.evaluate_actions(
+                        original_input,
+                        mirror_batch["pre_tanh_action"],
+                        zero_hidden,
+                        mirror_batch["reset_mask"],
+                        return_features=True,
+                    )
+                _, _, mirrored_mean, _, _, _ = self.actor.evaluate_actions(
+                    mirrored_input,
+                    mirror_batch["pre_tanh_action"],
+                    zero_hidden,
+                    mirror_batch["reset_mask"],
+                    return_features=True,
+                )
+                expected = torch.tanh(original_mean).detach().clone()
+                expected[..., 1:].neg_()
+                mirror_raw = F.smooth_l1_loss(torch.tanh(mirrored_mean), expected)
+                specs.append((
+                    "mirror",
+                    mirror_raw,
+                    min(
+                        float(schedule.get("mirror_gradient_target_ratio", 0.005)),
+                        float(schedule.get("mirror_gradient_hard_cap", 0.01)),
+                    ),
+                ))
+
+        parameters = [
+            parameter
+            for module in (self.navigation_encoder, self.actor, self.stuck_head)
+            if module is not None
+            for parameter in module.parameters() if parameter.requires_grad
+        ]
+        stored_ratios = {
+            name: float(self._auxiliary_calibration.get(f"{name}_ratio", 0.0))
+            for name in ("camera", "teacher", "mirror", "stuck")
+        }
+        uncalibrated = [
+            spec for spec in specs if spec[0] not in self._auxiliary_coefficients
+        ]
+        head_only_calibrated = []
+        head_only_names: set[str] = set()
+        if uncalibrated and not ppo_actor_loss.requires_grad:
+            # During creditwarm the Actor is frozen but the new StuckHead is
+            # intentionally calibrated.  With no PPO reference gradient a
+            # ratio is undefined, so train only the isolated head with BCE.
+            # Do not persist this coefficient: after Actor unfreezes, stuck
+            # supervision must be recalibrated against the real PPO gradient.
+            for name, raw, _target in uncalibrated:
+                if name == "stuck" and raw.requires_grad:
+                    head_only_calibrated.append(
+                        {
+                            "name": name,
+                            "loss": raw,
+                            "multiplier": 1.0,
+                            "component_ratio": 0.0,
+                        }
+                    )
+                    head_only_names.add(name)
+            uncalibrated = []
+        if uncalibrated:
+            remaining = max(
+                0.0,
+                float(schedule.get("auxiliary_gradient_hard_cap", 0.05))
+                - sum(stored_ratios.values()),
+            )
+            newly_calibrated, _new_ratio = _calibrate_auxiliary_gradients(
+                ppo_actor_loss,
+                uncalibrated,
+                parameters,
+                remaining,
+            )
+            for item in newly_calibrated:
+                name = str(item["name"])
+                self._auxiliary_coefficients[name] = float(item["multiplier"])
+                stored_ratios[name] = float(item["component_ratio"])
+        self._camera_aux_calibration_pending = False
+        calibrated = head_only_calibrated + [
+            {
+                "name": name,
+                "loss": raw,
+                "multiplier": float(self._auxiliary_coefficients.get(name, 0.0)),
+                "component_ratio": stored_ratios.get(name, 0.0),
+            }
+            for name, raw, _target in specs
+            if name not in head_only_names
+        ]
+        combined_ratio = min(
+            float(schedule.get("auxiliary_gradient_hard_cap", 0.05)),
+            sum(stored_ratios.values()),
+        )
+        multipliers = {item["name"]: float(item["multiplier"]) for item in calibrated}
+        ratios = {item["name"]: float(item["component_ratio"]) for item in calibrated}
+        loss = sum(
+            (item["loss"] * item["multiplier"] for item in calibrated), zero
+        )
+        self._auxiliary_calibration = {
+            "combined_ratio": float(combined_ratio),
+            "teacher_ratio": stored_ratios.get("teacher", 0.0),
+            "camera_ratio": stored_ratios.get("camera", 0.0),
+            "mirror_ratio": stored_ratios.get("mirror", 0.0),
+            "stuck_ratio": stored_ratios.get("stuck", 0.0),
+            "teacher_valid_steps": float(teacher["teacher_valid_steps"].detach()),
+            "stuck_valid_steps": float(stuck_mask.sum()),
+        }
+        self._camera_aux_coefficient = multipliers.get("camera", 0.0)
+        self._camera_aux_gradient_ratio = ratios.get("camera", 0.0)
         return loss, {
-            "camera_memory_loss": raw.detach(),
+            "camera_memory_loss": camera_raw.detach(),
             "camera_clean_live_action_mae": (
-                normalized_mean[selected]
-                - batch["clean_action_mean"][selected]
-            ).abs().mean().detach(),
-            "camera_aux_coefficient": raw.new_tensor(float(coefficient)),
-            "camera_aux_gradient_ratio": raw.new_tensor(float(actual_ratio)),
+                (normalized_mean[camera_selected] - batch["clean_action_mean"][camera_selected])
+                .abs().mean().detach() if bool(camera_selected.any()) else zero.detach()
+            ),
+            "camera_aux_coefficient": zero.new_tensor(self._camera_aux_coefficient),
+            "camera_aux_gradient_ratio": zero.new_tensor(self._camera_aux_gradient_ratio),
             "camera_delay_only_share": mask3[..., 0].float().mean().detach(),
             "camera_fault_only_share": mask3[..., 1].float().mean().detach(),
             "camera_fault_delay_overlap_share": mask3[..., 2].float().mean().detach(),
+            "teacher_guidance_loss": teacher_raw.detach(),
+            "teacher_guidance_valid_steps": teacher["teacher_valid_steps"].detach(),
+            "teacher_guidance_gradient_ratio": zero.new_tensor(ratios.get("teacher", 0.0)),
+            "stuck_aux_loss": stuck_raw.detach(),
+            "stuck_aux_valid_steps": zero.new_tensor(float(stuck_mask.sum())),
+            "stuck_aux_gradient_ratio": zero.new_tensor(ratios.get("stuck", 0.0)),
+            "actor_stuck_pr_auc": stuck_pr_auc.detach(),
+            "actor_stuck_precision": stuck_precision.detach(),
+            "actor_stuck_recall": stuck_recall.detach(),
+            "actor_stuck_f1": stuck_f1.detach(),
+            "actor_stuck_threshold": stuck_threshold.detach(),
+            "actor_stuck_positive_share": stuck_positive_share.detach(),
+            "mirror_aux_loss": mirror_raw.detach(),
+            "mirror_aux_sequence_share": zero.new_tensor(
+                float(mirror_sequence_count) / max(normalized_mean.shape[1], 1)
+            ),
+            "mirror_aux_eligible_sequence_count": zero.new_tensor(
+                float(self._mirror_aux_eligible_sequence_count)
+            ),
+            "mirror_aux_scheduled_sequence_share": zero.new_tensor(
+                float(self._mirror_aux_scheduled_sequence_share)
+            ),
+            "mirror_aux_gradient_ratio": zero.new_tensor(ratios.get("mirror", 0.0)),
+            "auxiliary_gradient_ratio": zero.new_tensor(float(combined_ratio)),
+            "teacher_direction_loss": teacher["direction"].detach(),
+            "teacher_speed_loss": teacher["speed"].detach(),
+            "teacher_yaw_loss": teacher["yaw"].detach(),
+        }
+
+    @staticmethod
+    def _mirror_nav_nonvisual(values: torch.Tensor) -> torch.Tensor:
+        mirrored = values.clone()
+        # goal-y and target/executed/measured vy/wz channels.
+        for index in (1, 5, 6, 8, 9, 11, 12):
+            mirrored[..., index].neg_()
+        # Angular velocity is an axial vector under a left/right reflection;
+        # projected gravity is an ordinary vector.
+        for index in (15, 17, 19):
+            mirrored[..., index].neg_()
+        return mirrored
+
+    @staticmethod
+    def _mirror_response_profile(values: torch.Tensor) -> torch.Tensor:
+        mirrored = values.clone()
+        for index in (1, 2, 4, 5, 7, 8):
+            mirrored[..., index].neg_()
+        mirrored[..., 10].neg_()
+        mirrored[..., 11].neg_()
+        return mirrored
+
+    def _actor_micro_loss(self, batch):
+        if "depth" in batch:
+            depth = batch["depth"].reshape(
+                -1, p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH, 1
+            )
+            amp_enabled = self.device.type == "cuda"
+            if not amp_enabled:
+                depth = depth.float()
+            with torch.autocast(device_type=self.device.type, enabled=amp_enabled):
+                feat = self.navigation_encoder(depth).float()
+            feat = feat.reshape(batch["nav_nonvisual"].shape[0], -1, 32)
+        else:
+            feat = batch["nav_feat"]
+        inputs = assemble_actor_input(
+            feat, batch["nav_nonvisual"], batch["response_profile"], batch["confidence"]
+        )
+        log_prob, entropy, mean, _, _, _ = self.actor.evaluate_actions(
+            inputs, batch["pre_tanh_action"], batch["actor_hidden"],
+            batch["reset_mask"], return_features=True,
+        )
+        ratio = torch.exp(log_prob - batch["old_log_prob"])
+        surrogate = -torch.minimum(
+            ratio * batch["advantages"],
+            torch.clamp(ratio, 0.8, 1.2) * batch["advantages"],
+        ).mean()
+        if getattr(self, "track_safety_enabled", True):
+            safety_logits = self.safety_head(feat)
+            safety_elements = F.binary_cross_entropy_with_logits(
+                safety_logits, batch["safety_target"], reduction="none"
+            )
+            safety_mask = batch["safety_valid"].expand_as(safety_elements)
+            hard_positive = (
+                (batch["safety_target"] >= 0.65).any(dim=-1)
+                | (batch["stuck_label"].squeeze(-1) > 0.5)
+            )
+            safety_weight = 1.0 + hard_positive.float()
+            weighted_safety_mask = safety_mask * safety_weight.unsqueeze(-1)
+            safety_loss = (
+                safety_elements.mul(weighted_safety_mask).sum()
+                / weighted_safety_mask.sum().clamp_min(1.0)
+            )
+            student_risk = torch.sigmoid(safety_logits).mean(dim=(0, 1))
+        else:
+            safety_loss = surrogate.new_zeros(())
+            student_risk = torch.zeros(3, device=surrogate.device)
+            hard_positive = torch.zeros(
+                batch["safety_target"].shape[:-1],
+                dtype=torch.bool,
+                device=surrogate.device,
+            )
+        detached_inputs = assemble_actor_input(
+            feat.detach(), batch["nav_nonvisual"], batch["response_profile"], batch["confidence"]
+        )
+        _, _, auxiliary_mean, _, _, auxiliary_features = self.actor.evaluate_actions(
+            detached_inputs, batch["pre_tanh_action"], batch["actor_hidden"],
+            batch["reset_mask"], return_features=True,
+        )
+        auxiliary_loss, auxiliary_metrics = self._actor_auxiliary_loss(
+            normalized_mean=torch.tanh(mean),
+            actor_normalized_mean=torch.tanh(auxiliary_mean),
+            actor_features=auxiliary_features,
+            nav_feat=feat,
+            batch=batch, ppo_actor_loss=surrogate,
+        )
+        auxiliary_metrics["safety_hard_positive_share"] = (
+            hard_positive.float().mean().detach()
+        )
+        total_loss = (
+            surrogate - self.entropy_coefficient * entropy.mean()
+            + p2_contract.SAFETY_BCE_WEIGHT * safety_loss + auxiliary_loss
+        )
+        with torch.no_grad():
+            log_ratio = log_prob - batch["old_log_prob"]
+            approx_kl = ((torch.exp(log_ratio) - 1.0) - log_ratio).mean()
+            clip_fraction = ((ratio - 1.0).abs() > 0.2).float().mean()
+        return total_loss, {
+            "surrogate_loss": surrogate.detach(), "entropy": entropy.mean().detach(),
+            "approx_kl": approx_kl.detach(), "clip_fraction": clip_fraction.detach(),
+            "safety_bce": safety_loss.detach(),
+            "scanner_valid_share": batch["safety_valid"].float().mean().detach(),
+            "safety_head_risk_left": student_risk[0].detach(),
+            "safety_head_risk_center": student_risk[1].detach(),
+            "safety_head_risk_right": student_risk[2].detach(),
+            **auxiliary_metrics,
         }
 
     def _actor_auxiliary_metric_names(self) -> tuple[str, ...]:
@@ -704,7 +1302,167 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "camera_delay_only_share",
             "camera_fault_only_share",
             "camera_fault_delay_overlap_share",
+            "teacher_guidance_loss",
+            "teacher_guidance_valid_steps",
+            "teacher_guidance_gradient_ratio",
+            "teacher_direction_loss",
+            "teacher_speed_loss",
+            "teacher_yaw_loss",
+            "stuck_aux_loss",
+            "stuck_aux_valid_steps",
+            "stuck_aux_gradient_ratio",
+            "actor_stuck_pr_auc",
+            "actor_stuck_precision",
+            "actor_stuck_recall",
+            "actor_stuck_f1",
+            "actor_stuck_threshold",
+            "actor_stuck_positive_share",
+            "mirror_aux_loss",
+            "mirror_aux_sequence_share",
+            "mirror_aux_eligible_sequence_count",
+            "mirror_aux_scheduled_sequence_share",
+            "mirror_aux_gradient_ratio",
+            "auxiliary_gradient_ratio",
+            "safety_hard_positive_share",
         )
+
+    def _actor_sequence_batch(self, refs, *, advantage_mean, advantage_std):
+        batch = super()._actor_sequence_batch(
+            refs, advantage_mean=advantage_mean, advantage_std=advantage_std
+        )
+        for name in (
+            "teacher_safe3", "teacher_goal_xy", "teacher_predictive_risk",
+            "teacher_mask", "teacher_goal_mask", "teacher_weight",
+            "stuck_label", "stuck_mask", "mirror_eligible",
+        ):
+            batch[name] = self._stack_refs(name, refs)
+        if self._mirror_batch_cursor < len(self._mirror_batch_schedule):
+            mirror_ref = self._mirror_batch_schedule[self._mirror_batch_cursor]
+            self._mirror_batch_cursor += 1
+            if mirror_ref is not None:
+                batch["mirror_batch"] = {
+                    name: self._stack_refs(name, [mirror_ref])
+                    for name in (
+                        "depth",
+                        "nav_nonvisual",
+                        "response_profile",
+                        "confidence",
+                        "pre_tanh_action",
+                        "reset_mask",
+                    )
+                }
+        return batch
+
+    def _prepare_mirror_batch_schedule(self) -> None:
+        """Schedule episode-aligned mirror sequences across actor microbatches."""
+        self._mirror_batch_schedule = []
+        self._mirror_batch_cursor = 0
+        self._mirror_aux_eligible_sequence_count = 0
+        self._mirror_aux_scheduled_sequence_share = 0.0
+        if self.rollout.store_depth:
+            pool = self.rollout.episode_aligned_refs(
+                eligibility=self.rollout.mirror_eligible[: self.rollout.step]
+            )
+            self._mirror_aux_eligible_sequence_count = len(pool)
+            fixed_sequence_count = (
+                self.num_envs * self.rollout.num_ticks
+                // self.rollout.sequence_length
+            )
+            minibatch_sequences = max(
+                1,
+                (fixed_sequence_count + self.num_mini_batches - 1)
+                // self.num_mini_batches,
+            )
+            micro_calls_per_epoch = sum(
+                (
+                    min(minibatch_sequences, fixed_sequence_count - start)
+                    + self.micro_sequences - 1
+                )
+                // self.micro_sequences
+                for start in range(0, fixed_sequence_count, minibatch_sequences)
+            )
+            total_micro_calls = micro_calls_per_epoch * self.num_learning_epochs
+            target_sequences = min(
+                total_micro_calls,
+                int(round(
+                    fixed_sequence_count
+                    * self.num_learning_epochs
+                    * float(p4_contract.training_schedule(
+                        self.session_effective_seconds,
+                        branch=self._effective_maze_branch(
+                            self.session_effective_seconds
+                        ),
+                    ).get("mirror_sequence_share", 0.10))
+                )),
+            )
+            if pool and target_sequences > 0:
+                selected_slots = torch.randperm(
+                    total_micro_calls, generator=self.mirror_generator
+                )[:target_sequences].tolist()
+                selected_refs = torch.randint(
+                    len(pool),
+                    (target_sequences,),
+                    generator=self.mirror_generator,
+                ).tolist()
+                schedule: list[object | None] = [None] * total_micro_calls
+                for slot, ref_index in zip(selected_slots, selected_refs):
+                    schedule[int(slot)] = pool[int(ref_index)]
+                self._mirror_batch_schedule = schedule
+                self._mirror_aux_scheduled_sequence_share = (
+                    float(target_sequences)
+                    / max(
+                        fixed_sequence_count * self.num_learning_epochs,
+                        1,
+                    )
+                )
+
+    def _run_ppo_epochs(self) -> dict[str, float]:
+        valid_teacher_steps = int(
+            self.rollout.teacher_mask[: self.rollout.step].sum().item()
+        )
+        schedule = p4_contract.training_schedule(
+            self.session_effective_seconds,
+            branch=self._effective_maze_branch(self.session_effective_seconds),
+        )
+        self._teacher_update_enabled = (
+            valid_teacher_steps >= p4_contract.TEACHER_MIN_VALID_STEPS
+            and float(schedule.get("teacher_gradient_target_ratio", 0.0)) > 0.0
+        )
+        self._camera_aux_calibration_pending = True
+        self._auxiliary_coefficients = {}
+        self._auxiliary_calibration.update(
+            {
+                "combined_ratio": 0.0,
+                "teacher_ratio": 0.0,
+                "camera_ratio": 0.0,
+                "mirror_ratio": 0.0,
+                "stuck_ratio": 0.0,
+                "teacher_valid_steps": float(valid_teacher_steps),
+            }
+        )
+        self._prepare_mirror_batch_schedule()
+        return super()._run_ppo_epochs()
+
+    def _actor_update_enabled(self) -> bool:
+        schedule = p4_contract.training_schedule(
+            self.session_effective_seconds,
+            branch=self._effective_maze_branch(self.session_effective_seconds),
+        )
+        # During the first ten minutes the inherited Actor is frozen, but the
+        # fresh training-only StuckHead still calibrates through its own group.
+        return (
+            float(schedule.get("actor_multiplier", 0.0)) > 0.0
+            or float(schedule.get("stuck_head_multiplier", 0.0)) > 0.0
+        )
+
+    def _adapter_update(self) -> dict[str, float]:
+        if self.training_profile == "maze_credit_repair":
+            return {
+                "adapter_loss": 0.0,
+                "adapter_updates": 0.0,
+                "adapter_frozen": 1.0,
+            }
+        return super()._adapter_update()
 
     def _override_reward_components(self, components, **context):
         exec_cmd = context["reward_exec_cmd"]
@@ -718,6 +1476,33 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         continuous_time_scale = torch.clamp(
             duration_frames / float(p2_contract.NAV_PERIOD_FRAMES), 0.0, 1.0
         )
+        credit_profile = self.training_profile == "maze_credit_repair"
+        if credit_profile:
+            components["time"] = (
+                p2_contract.TIME_COST_PER_TICK
+                * duration_frames
+                / float(p4_contract.P4_NAV_PERIOD_FRAMES)
+            )
+            best_before = torch.where(
+                torch.isfinite(self.best_goal_distance),
+                self.best_goal_distance,
+                context["start_goal_distance"].reshape(-1),
+            )
+            maze_credit_before = self._maze_credit_earned.clone()
+            maze_credit, maze_credit_after, maze_credit_delta = (
+                p4_contract.maze_new_best_credit(
+                    best_before,
+                    context["end_goal_distance"].reshape(-1),
+                    self._maze_credit_earned,
+                )
+            )
+            components["frontier_shaping"] = maze_credit
+            self._maze_credit_earned.copy_(maze_credit_after)
+        else:
+            maze_credit_before = self._maze_credit_earned
+            maze_credit = torch.zeros(self.num_envs, device=self.device)
+            maze_credit_after = self._maze_credit_earned
+            maze_credit_delta = torch.zeros_like(maze_credit)
         for name in ("crawl", "tracking", "gait_symmetry"):
             if name in components:
                 components[name] = components[name] * continuous_time_scale
@@ -787,18 +1572,50 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         predictive_raw *= reward_multiplier
         missed_raw *= reward_multiplier
         yaw_raw *= reward_multiplier
-        (predictive, missed, yaw), scale = p4_contract.proportional_negative_cap(
-            predictive_raw, missed_raw, yaw_raw
+        goal_safe_raw, goal_safe_diag = p4_contract.goal_safe_direction_penalty(
+            safe3,
+            self._last_policy_command,
+            self._p4_worker_extra[:, p4_contract.RAW_GOAL_XY_SLICE],
+            safety_valid,
+            self._last_goal_freshness,
+            terminal,
+        )
+        yaw_exit_raw, yaw_exit_diag = p4_contract.yaw_exit_response_penalty(
+            safe3,
+            self._last_policy_command,
+            self._p4_worker_extra[:, p4_contract.RAW_GOAL_XY_SLICE],
+            safety_valid,
+            self._last_goal_freshness,
+            terminal,
+        )
+        goal_safe_raw *= reward_multiplier
+        yaw_exit_raw *= reward_multiplier
+        (predictive, missed, yaw, goal_safe, yaw_exit), scale = (
+            p4_contract.proportional_negative_cap(
+                predictive_raw,
+                missed_raw,
+                yaw_raw,
+                goal_safe_raw=goal_safe_raw,
+                yaw_exit_raw=yaw_exit_raw,
+            )
         )
         predictive *= continuous_time_scale
         missed *= continuous_time_scale
         yaw *= continuous_time_scale
+        goal_safe *= continuous_time_scale
+        yaw_exit *= continuous_time_scale
         components["predictive_collision_risk"] = predictive
         components["missed_safe_direction"] = missed
         components["yaw_cancellation"] = yaw
+        components["goal_safe_preference"] = goal_safe
+        components["yaw_exit_response"] = yaw_exit
         components["success"] = (context["reason"].reshape(-1) == 1).float() * float(
             p4_contract.SUCCESS_IMPULSE
         )
+        if "timeout" in components:
+            components["timeout"] = (
+                context["reason"].reshape(-1) == 3
+            ).float() * float(p4_contract.TIMEOUT_IMPULSE)
         stagnation_shadow = components["frontier_stagnation"].detach().clone()
         components["frontier_stagnation"] = torch.zeros_like(stagnation_shadow)
         # A confirmed wall-stuck reset is a single terminal event. Recharging
@@ -808,6 +1625,9 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "body_collision",
             "predictive_collision_risk",
             "missed_safe_direction",
+            "yaw_cancellation",
+            "yaw_exit_response",
+            "goal_safe_preference",
             "frontier_stagnation",
         ):
             components[name] = torch.where(
@@ -827,33 +1647,97 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 confirmation_s=float(self.stuck_reset_contract["confirmation_s"]),
             )
         )
-        components["stuck_sustained"] = (
-            stuck_sustained * continuous_time_scale
+        stuck_time_scale = torch.clamp(
+            duration_frames / float(p4_contract.P4_NAV_PERIOD_FRAMES), 0.0, 1.0
         )
-        goal_safe, goal_safe_diag = p4_contract.goal_safe_direction_penalty(
-            safe3,
-            self._last_policy_command,
-            self._p4_worker_extra[:, p4_contract.RAW_GOAL_XY_SLICE],
-            safety_valid,
-            self._last_goal_freshness,
-            terminal,
-        )
-        components["goal_safe_preference"] = (
-            goal_safe * continuous_time_scale
-        )
+        components["stuck_sustained"] = stuck_sustained * stuck_time_scale
         path_length_m = context.get("path_length_m")
         if path_length_m is None:
             path_length_m = torch.zeros(self.num_envs, device=self.device)
+        scene = p4_contract.safety_scene_diagnostics(safe3, safety_valid)
+        recovery_active = (
+            (self._p4_worker_extra[:, p4_contract.STUCK_CANDIDATE_INDEX] > 0.5)
+            & (self._p4_worker_extra[:, p4_contract.STUCK_MAPPING_VALID_INDEX] > 0.5)
+        )
         route_excess, route_diag = p4_contract.route_excess_penalty(
             torch.as_tensor(path_length_m, device=self.device).reshape(-1),
             context["start_goal_distance"].reshape(-1),
             context["end_goal_distance"].reshape(-1),
             terminal,
+            recovery_active=recovery_active,
+            dead_end=scene["teacher_scene_dead_end"] > 0.5,
+            goal_freshness=self._last_goal_freshness,
+            contact_latch=self.previous_body_collision,
         )
         grace = self.seconds_since_push < 0.30
         components["route_excess"] = torch.where(
             grace, torch.zeros_like(route_excess), route_excess
         )
+        current_segment = (
+            torch.full(
+                (self.num_envs,),
+                float(len(p4_contract.FULL_TRACK_SEGMENT_LABELS) - 1),
+                device=self.device,
+            )
+            if credit_profile
+            else torch.nan_to_num(
+                source_aux[:, p2_contract.CURRENT_SEGMENT_INDEX], nan=0.0
+            ).round().clamp(0, len(p4_contract.FULL_TRACK_SEGMENT_LABELS) - 1)
+        )
+        initialize_segment = ~self._segment_state_initialized
+        if bool(initialize_segment.any()):
+            self._spawn_segment[initialize_segment] = current_segment[initialize_segment]
+            self._max_segment_reached[initialize_segment] = current_segment[initialize_segment]
+            self._segment_state_initialized[initialize_segment] = True
+        segment_frontier, segment_phi_before, segment_phi_after, segment_max_after = (
+            p4_contract.segment_frontier_potential(
+                self._spawn_segment,
+                self._max_segment_reached,
+                current_segment,
+                duration_frames,
+                terminal,
+            )
+        )
+        components["segment_frontier"] = segment_frontier
+        self._max_segment_reached.copy_(segment_max_after)
+        root_x_m = source_aux[:, 15]
+        boundary_distance = p4_contract.track_boundary_distance_m(
+            root_x_m, current_segment
+        )
+        positive_progress = torch.clamp(
+            context["start_goal_distance"].reshape(-1)
+            - context["end_goal_distance"].reshape(-1),
+            min=0.0,
+        )
+        open_path_excess = torch.clamp(
+            torch.as_tensor(path_length_m, device=self.device).reshape(-1)
+            - positive_progress,
+            min=0.0,
+            max=0.20,
+        )
+        open_straight, open_straight_diag = p4_contract.open_straight_penalty(
+            self._last_policy_command,
+            source_aux[:, 12:15],
+            self._p4_worker_extra[:, p4_contract.RAW_GOAL_XY_SLICE],
+            safe3,
+            safety_valid,
+            current_segment,
+            boundary_distance,
+            terminal,
+            junction=scene["teacher_scene_junction"] > 0.5,
+            dead_end=scene["teacher_scene_dead_end"] > 0.5,
+            contact_or_recovery=(self.previous_body_collision | recovery_active),
+            goal_freshness=self._last_goal_freshness,
+            yaw_cancellation_value=true_cancel,
+            path_excess_m=open_path_excess,
+        )
+        components["open_straight"] = open_straight * continuous_time_scale
+        if credit_profile:
+            components["route_excess"] = torch.zeros_like(components["route_excess"])
+            components["segment_frontier"] = torch.zeros_like(
+                components["segment_frontier"]
+            )
+            components["open_straight"] = torch.zeros_like(components["open_straight"])
         soft_cruise, cruise_diag = p4_contract.soft_cruise_penalty(
             self._last_policy_command,
             self.pending_tick.get("safe3", torch.zeros(self.num_envs, 3, device=self.device)),
@@ -863,12 +1747,25 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             ).reshape(-1) > 0.5,
             self._last_goal_freshness,
             terminal,
+            capture_active=self._near_goal_capture_diagnostics.get(
+                "near_goal_capture_active",
+                torch.zeros(self.num_envs, device=self.device),
+            ),
         )
         soft_cruise *= (
             float(schedule.get("cruise_multiplier", 1.0))
             * continuous_time_scale
         )
         components["soft_cruise"] = soft_cruise
+        capture_active = self._near_goal_capture_diagnostics.get(
+            "near_goal_capture_active", torch.zeros(self.num_envs, device=self.device)
+        ) > 0.5
+        if "crawl" in components:
+            components["crawl"] = torch.where(
+                capture_active,
+                torch.zeros_like(components["crawl"]),
+                components["crawl"],
+            )
         components["tracking"] = torch.where(
             grace, components["tracking"] * 0.5, components["tracking"]
         )
@@ -887,9 +1784,17 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "reward_predictive_raw": predictive_raw.detach(),
             "reward_missed_safe_raw": missed_raw.detach(),
             "reward_yaw_raw": yaw_raw.detach(),
+            "reward_goal_safe_raw": goal_safe_raw.detach(),
+            "reward_yaw_exit_raw": yaw_exit_raw.detach(),
             "reward_continuous_time_scale": continuous_time_scale.detach(),
             "reward_safety_group_scale": scale.detach(),
             "reward_frontier_stagnation_shadow": stagnation_shadow,
+            "maze_new_best_credit": maze_credit.detach(),
+            "maze_new_best_delta_m": maze_credit_delta.detach(),
+            "maze_new_best_episode_earned": maze_credit_after.detach(),
+            "frontier_potential_before": maze_credit_before.detach(),
+            "frontier_potential_after": maze_credit_after.detach(),
+            "terminal_potential_clawback": torch.zeros_like(maze_credit),
             "yaw_exec_cancellation": exec_cancel.detach(),
             "yaw_true_cancellation": true_cancel.detach(),
             "yaw_exec_sign_flip": exec_sign_flip.float(),
@@ -903,10 +1808,24 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "push_tracking_response_mae": response_mae,
             **{name: value.detach() for name, value in stuck_sustained_diag.items()},
             **{name: value.detach() for name, value in goal_safe_diag.items()},
+            **{name: value.detach() for name, value in yaw_exit_diag.items()},
             **{name: value.detach() for name, value in route_diag.items()},
+            "segment_frontier_phi_before": segment_phi_before.detach(),
+            "segment_frontier_phi_after": segment_phi_after.detach(),
+            "segment_frontier_spawn_segment": self._spawn_segment.detach().clone(),
+            "segment_frontier_max_segment": segment_max_after.detach(),
+            "current_segment_index": current_segment.detach(),
+            **{name: value.detach() for name, value in open_straight_diag.items()},
             **{name: value.detach() for name, value in missed_diagnostics.items()},
             **{name: value.detach() for name, value in cruise_diag.items()},
+            **self._translation_limiter_diagnostics,
+            **self._near_goal_capture_diagnostics,
         }
+        if bool(terminal.any()):
+            self._segment_state_initialized[terminal] = False
+            self._spawn_segment[terminal] = 0.0
+            self._max_segment_reached[terminal] = 0.0
+            self._maze_credit_earned[terminal] = 0.0
         self._goal_epoch_changed_since_tick.zero_()
         return components
 
@@ -921,6 +1840,15 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         timeout = torch.as_tensor(
             kwargs["timeout"], device=self.device
         ).reshape(-1).bool()
+        terminal_for_aux = (reason != 0) | hard | timeout
+        if self.pending_tick is not None and bool(terminal_for_aux.any()):
+            # Terminal/reset transitions never provide recovery supervision.
+            for name in ("teacher_mask", "teacher_goal_mask", "stuck_mask", "mirror_eligible"):
+                value = self.pending_tick.get(name)
+                if torch.is_tensor(value):
+                    value = value.clone()
+                    value[terminal_for_aux] = 0.0
+                    self.pending_tick[name] = value
         self._diagnostic_terminal_mask.copy_((reason != 0) | hard | timeout)
         full = super().finish_tick(*args, **kwargs)
         tick_reward = self.last_tick_penalties["decomposed_total"].reshape(-1)
@@ -1408,6 +2336,20 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 goal_bucket_metrics[f"goal_{outcome}_{label}"] = rate.expand(
                     self.num_envs
                 )
+            clean_bearing = torch.atan2(
+                self._p4_worker_extra[:, p4_contract.RAW_GOAL_XY_SLICE.stop - 1],
+                self._p4_worker_extra[:, p4_contract.RAW_GOAL_XY_SLICE.start],
+            ).abs()
+            fault_bearing = torch.atan2(
+                self.goal_belief.estimate[:, 1], self.goal_belief.estimate[:, 0]
+            ).abs()
+            bucket_count = bucket.float().sum().clamp_min(1.0)
+            goal_bucket_metrics[f"goal_bearing_clean_{label}_abs_rad"] = (
+                (clean_bearing * bucket.float()).sum() / bucket_count
+            ).expand(self.num_envs)
+            goal_bucket_metrics[f"goal_bearing_fault_{label}_abs_rad"] = (
+                (fault_bearing * bucket.float()).sum() / bucket_count
+            ).expand(self.num_envs)
 
         stuck_duration = self._p4_worker_extra[
             :, p4_contract.STUCK_DURATION_S_INDEX
@@ -1455,6 +2397,48 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         schedule = p4_contract.training_schedule(
             self.session_effective_seconds, branch=resolved_branch
         )
+        current_segment = self._p4_reward_diagnostics.get(
+            "current_segment_index", raw_goal_distance.new_zeros(self.num_envs)
+        ).round().long().clamp(0, len(p4_contract.FULL_TRACK_SEGMENT_LABELS) - 1)
+        spawn_segment = self._p4_worker_extra[
+            :, p4_contract.SPAWN_SEGMENT_INDEX
+        ].round().long()
+        spawn_quartile = self._p4_worker_extra[
+            :, p4_contract.SPAWN_QUARTILE_INDEX
+        ].round().long()
+        clean_goal = self._p4_worker_extra[:, p4_contract.RAW_GOAL_XY_SLICE]
+        clean_bearing_signed = torch.atan2(clean_goal[:, 1], clean_goal[:, 0])
+        side_goal_candidate = (
+            teacher_valid
+            & (clean_bearing_signed.abs() >= math.radians(15.0))
+            & (clean_bearing_signed.abs() <= math.radians(90.0))
+        )
+        side_goal_selected = side_goal_candidate & (
+            self._last_policy_command[:, 2] * clean_bearing_signed > 0.0
+        )
+        frontier_before = self._p4_reward_diagnostics.get(
+            "segment_frontier_phi_before", raw_goal_distance.new_zeros(self.num_envs)
+        )
+        frontier_after = self._p4_reward_diagnostics.get(
+            "segment_frontier_phi_after", raw_goal_distance.new_zeros(self.num_envs)
+        )
+        full_track_metrics: dict[str, torch.Tensor] = {}
+        for index, label in enumerate(p4_contract.FULL_TRACK_SEGMENT_LABELS):
+            current_mask = current_segment == index
+            spawn_mask = spawn_segment == index
+            full_track_metrics[f"current_segment_{label}_share"] = current_mask.float()
+            full_track_metrics[f"spawn_segment_{label}_share"] = spawn_mask.float()
+            denominator = spawn_mask.float().sum().clamp_min(1.0)
+            full_track_metrics[f"frontier_potential_before_{label}"] = (
+                (frontier_before * spawn_mask.float()).sum() / denominator
+            ).expand(self.num_envs)
+            full_track_metrics[f"frontier_potential_after_{label}"] = (
+                (frontier_after * spawn_mask.float()).sum() / denominator
+            ).expand(self.num_envs)
+        for index in range(4):
+            full_track_metrics[f"spawn_column_q{index + 1}_share"] = (
+                spawn_quartile == index
+            ).float()
         values = {
             **goal_diagnostics,
             **goal_bucket_metrics,
@@ -1467,6 +2451,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "safety_cap_predictive_risk": self._safety_cap_predictive_risk,
             **scene_diag,
             **diagnostic_metrics,
+            **full_track_metrics,
             "safety_head_risk_left": self._last_safety_head_risk3[:, 0],
             "safety_head_risk_center": self._last_safety_head_risk3[:, 1],
             "safety_head_risk_right": self._last_safety_head_risk3[:, 2],
@@ -1489,18 +2474,59 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "maze_branch_visual_recovery": raw_goal_distance.new_full(
                 (self.num_envs,), float(resolved_branch == "visual_recovery")
             ),
-            "maze_phase_probe": raw_goal_distance.new_full(
-                (self.num_envs,), float(schedule["phase"] == "mazeprobe")
+            "full_phase_warm": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "fullwarm")
             ),
-            "maze_phase_attack": raw_goal_distance.new_full(
-                (self.num_envs,), float(schedule["phase"] == "mazeattack")
+            "full_phase_adapt": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "fulladapt")
             ),
-            "maze_phase_hard": raw_goal_distance.new_full(
-                (self.num_envs,), float(schedule["phase"] == "mazehard")
+            "full_phase_train": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "fulltrain")
             ),
-            "maze_phase_final": raw_goal_distance.new_full(
-                (self.num_envs,), float(schedule["phase"] == "mazefinal")
+            "full_phase_stabilize": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "fullstabilize")
             ),
+            "credit_phase_warm": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "creditwarm")
+            ),
+            "credit_phase_adapt": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "creditadapt")
+            ),
+            "credit_phase_train": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "credittrain")
+            ),
+            "credit_phase_final": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "creditfinal")
+            ),
+            "legitimate_side_goal_candidate_count": side_goal_candidate.float(),
+            "legitimate_side_goal_selected_count": side_goal_selected.float(),
+            "legitimate_side_goal_bearing_abs_rad": clean_bearing_signed.abs(),
+            "spawn_safe_point_share": self._p4_worker_extra[
+                :, p4_contract.SPAWN_SAFE_POINT_INDEX
+            ],
+            "spawn_full_start_share": self._p4_worker_extra[
+                :, p4_contract.SPAWN_FULL_START_INDEX
+            ],
+            "spawn_segment_index": spawn_segment.float(),
+            "spawn_position_quartile": spawn_quartile.float(),
+            "spawn_reason4_retry_count": self._p4_worker_extra[
+                :, p4_contract.SPAWN_REASON4_RETRY_COUNT_INDEX
+            ],
+            "spawn_reason4_exhausted_count": self._p4_worker_extra[
+                :, p4_contract.SPAWN_REASON4_EXHAUSTED_COUNT_INDEX
+            ],
+            "spawn_reason4_fallback_applied_count": self._p4_worker_extra[
+                :, p4_contract.SPAWN_REASON4_FALLBACK_APPLIED_COUNT_INDEX
+            ],
+            "spawn_all_position_applied_count": self._p4_worker_extra[
+                :, p4_contract.SPAWN_ALL_POSITION_APPLIED_COUNT_INDEX
+            ],
+            "spawn_validation_failure_count": self._p4_worker_extra[
+                :, p4_contract.SPAWN_VALIDATION_FAILURE_COUNT_INDEX
+            ],
+            "spawn_write_failure_count": self._p4_worker_extra[
+                :, p4_contract.SPAWN_WRITE_FAILURE_COUNT_INDEX
+            ],
             "zero_hidden_action_mae": self._zero_hidden_action_mae,
             "zero_hidden_direction_disagreement": self._zero_hidden_direction_disagreement,
             "push_epoch": self.push_epoch.float(),
@@ -1578,6 +2604,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "wall_stuck_term_config_valid": self._p4_worker_extra[
                 :, p4_contract.STUCK_TERM_CONFIG_VALID_INDEX
             ],
+            "p4_spawn_hook_installed": self._p4_worker_extra[
+                :, p4_contract.SPAWN_INSTALLED_INDEX
+            ],
+            "wall_stuck_raw_term": self._p4_worker_extra[
+                :, p4_contract.STUCK_RAW_TERM_INDEX
+            ],
         }
         normalized = getattr(self, "_last_normalized_action", None)
         mapped = getattr(self, "_last_mapped_command", None)
@@ -1619,6 +2651,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         configured = str(self.maze_training_branch or "actor_attack")
         if configured != "auto":
             return configured
+        # The parent constructor applies the optimizer schedule before P4
+        # diagnostic buffers are allocated.  Treat that initialization-only
+        # call as unresolved auto; the first rollout-boundary schedule resolves
+        # the branch after all diagnostics exist.
+        if not hasattr(self, "_maze_diag_risk_positive_hist"):
+            return "auto"
         if self.diagnostic_elapsed_seconds < p4_contract.DIAGNOSTIC_SECONDS:
             return "auto"
         if self._resolved_maze_training_branch is None:
@@ -1690,12 +2728,17 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 if name == "navigation_safety_head":
                     base = p4_contract.SAFETY_HEAD_LR
                     multiplier = float(schedule["safety_head_multiplier"])
+                elif name == "actor_stuck_head":
+                    base = p4_contract.SAFETY_HEAD_LR
+                    multiplier = float(
+                        schedule.get("stuck_head_multiplier", schedule["safety_head_multiplier"])
+                    )
                 elif name.startswith("navigation_"):
                     layer = name.removeprefix("navigation_")
                     base = p4_contract.NAVIGATION_ENCODER_LRS[layer]
                     multiplier = float(schedule["navigation_multiplier"])
                 else:
-                    base = p4_contract.ACTOR_LR
+                    base = float(schedule.get("actor_lr", p4_contract.ACTOR_LR))
                     multiplier = float(schedule["actor_multiplier"])
                 group["base_lr"] = base
                 group["lr"] = base * multiplier
@@ -1705,13 +2748,22 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                     if not trainable:
                         parameter.grad = None
         if self.critic_optimizer is not None:
-            self.critic_optimizer.param_groups[0]["lr"] = (
-                p4_contract.CRITIC_LR * float(schedule["critic_multiplier"])
+            self.critic_optimizer.param_groups[0]["lr"] = float(
+                schedule.get(
+                    "critic_lr",
+                    p4_contract.CRITIC_LR
+                    * float(schedule.get("critic_multiplier", 1.0)),
+                )
             )
         if self.response_optimizer is not None:
             self.response_optimizer.param_groups[0]["lr"] = (
                 p4_contract.ADAPTER_LR * float(schedule["adapter_multiplier"])
             )
+        adapter_trainable = float(schedule["adapter_multiplier"]) > 0.0
+        for parameter in self.response_adapter.parameters():
+            parameter.requires_grad_(adapter_trainable)
+            if not adapter_trainable:
+                parameter.grad = None
         return schedule
 
     def maybe_unfreeze_cnn(self, effective_seconds: float) -> bool:
@@ -1720,8 +2772,18 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self._apply_training_schedule(self.session_effective_seconds)
         return (not previous) and self.cnn_unfrozen
 
-    def update_training_clocks(self, session_wall_seconds: float) -> None:
+    def update_training_clocks(
+        self,
+        session_wall_seconds: float,
+        *,
+        session_effective_seconds: float | None = None,
+    ) -> None:
         self.session_wall_seconds = max(0.0, float(session_wall_seconds))
+        supplied_effective_seconds = (
+            None
+            if session_effective_seconds is None
+            else max(0.0, float(session_effective_seconds))
+        )
         if self.maze_training_branch == "auto":
             self.diagnostic_elapsed_seconds = min(
                 self.session_wall_seconds, p4_contract.DIAGNOSTIC_SECONDS
@@ -1745,7 +2807,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         else:
             self.diagnostic_elapsed_seconds = 0.0
             self._training_clock_origin_seconds = 0.0
-            training_seconds = self.session_wall_seconds
+            training_seconds = (
+                self.session_wall_seconds
+                if supplied_effective_seconds is None
+                else supplied_effective_seconds
+            )
         previous = self.cnn_unfrozen
         self._apply_training_schedule(training_seconds)
         if (
@@ -1765,20 +2831,6 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         )
 
     def update(self) -> dict[str, float]:
-        if self.current_phase == "mazediag":
-            self.current_iteration += 1
-            metrics = {
-                "actor_loss": 0.0,
-                "critic_loss": 0.0,
-                "adapter_loss": 0.0,
-                "adapter_updates": 0.0,
-                "updates": 0.0,
-                "diagnostic_read_only": 1.0,
-            }
-            metrics.update(self._training_monitor_metrics())
-            self.rollout = self.rollout.reset(store_depth=self.cnn_unfrozen)
-            self.rollout_invalid = False
-            return metrics
         return super().update()
 
     def reset_live_state(self) -> None:
@@ -1796,6 +2848,13 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self._risk_event_baseline_limited_vx.zero_()
             self._risk_condition_previous.zero_()
             self._p4_episode_return.zero_()
+            self._spawn_segment.zero_()
+            self._max_segment_reached.zero_()
+            self._segment_state_initialized.zero_()
+            self._maze_credit_earned.zero_()
+            self._translation_alpha_prev.fill_(1.0)
+            self._translation_limiter_diagnostics = {}
+            self._near_goal_capture_diagnostics = {}
             self._diagnostic_fault_depth = None
             self._diagnostic_fault_mask.zero_()
             self._diagnostic_terminal_mask.zero_()
@@ -1821,6 +2880,83 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             )
         )
         self.response_buffer.enable_p4_compatible_replay()
+
+    def _migrate_previous_p4_actor_optimizer(
+        self, old_state: dict
+    ) -> tuple[dict, dict[str, object]]:
+        """Restore previous P4 Adam groups while leaving StuckHead fresh."""
+        if not isinstance(old_state, dict):
+            raise KeyError("P4 warm start missing high-level actor optimizer")
+        validate_state_dict_finite(old_state, "P4 previous actor optimizer")
+        old_groups = old_state.get("param_groups")
+        old_states = old_state.get("state")
+        if not isinstance(old_groups, list) or not isinstance(old_states, dict):
+            raise ValueError("P4 previous actor optimizer is malformed")
+
+        old_by_name = {str(group.get("name", "")): group for group in old_groups}
+        current_state = self.actor_optimizer.state_dict()
+        restored_parameters = 0
+        restored_groups: list[str] = []
+        fresh_groups: list[str] = []
+        for object_group, serialized_group in zip(
+            self.actor_optimizer.param_groups, current_state["param_groups"]
+        ):
+            name = str(object_group.get("name", ""))
+            if name == "actor_stuck_head":
+                fresh_groups.append(name)
+                continue
+            source_group = old_by_name.get(name)
+            if source_group is None:
+                raise ValueError(
+                    f"P4 previous actor optimizer missing group {name!r}"
+                )
+            source_ids = list(source_group.get("params", ()))
+            target_ids = list(serialized_group.get("params", ()))
+            if len(source_ids) != len(target_ids):
+                raise ValueError(
+                    f"P4 previous actor optimizer group mismatch {name!r}: "
+                    f"source={len(source_ids)} target={len(target_ids)}"
+                )
+            for key, value in source_group.items():
+                if key != "params":
+                    serialized_group[key] = copy.deepcopy(value)
+            serialized_group["params"] = target_ids
+            for source_id, target_id, parameter in zip(
+                source_ids, target_ids, object_group["params"]
+            ):
+                source = old_states.get(source_id)
+                if not isinstance(source, dict):
+                    continue
+                copied = {}
+                for key, value in source.items():
+                    if torch.is_tensor(value):
+                        if value.ndim and value.shape != parameter.shape:
+                            raise ValueError(
+                                "P4 previous actor optimizer tensor mismatch "
+                                f"{name}.{key}: source={tuple(value.shape)} "
+                                f"target={tuple(parameter.shape)}"
+                            )
+                        copied[key] = value.detach().clone()
+                    else:
+                        copied[key] = copy.deepcopy(value)
+                current_state["state"][target_id] = copied
+                restored_parameters += 1
+            restored_groups.append(name)
+        unexpected = sorted(set(old_by_name) - set(restored_groups))
+        if unexpected:
+            raise ValueError(
+                "P4 previous actor optimizer has unexpected groups: "
+                + ", ".join(unexpected)
+            )
+        validate_state_dict_finite(
+            current_state, "P4 migrated actor optimizer"
+        )
+        return current_state, {
+            "mapping_basis": "stable_optimizer_group_name_and_parameter_order",
+            "restored_parameters": restored_parameters,
+            "restored_groups": restored_groups,
+            "fresh_groups": fresh_groups,
+        }
 
     def load_bundle(self, path: str, *, platform_model_id) -> str:
         raw = torch.load(path, weights_only=False, map_location="cpu")
@@ -1898,14 +3034,86 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             compatible["contracts"]["reward"] = p2_contract.reward_contract()
             compatible["contracts"]["training"] = p2_contract.training_contract()
             compatible["contracts"]["command"] = p2_contract.command_contract()
+            global_state = compatible.get("training_states", {}).get("global", {})
+            if exact_compatible:
+                saved_scope = global_state.get("train_scope")
+                if saved_scope != "maze_actor_critic_stuck_only":
+                    raise ValueError(
+                        "P4 exact resume train_scope mismatch: "
+                        f"{saved_scope!r}"
+                    )
+            # The inherited loader validates P2's historical scope string.
+            # P4 has already validated its stricter scope above, so only the
+            # temporary compatibility view is translated here.
+            if isinstance(global_state, dict):
+                global_state["train_scope"] = "high_level_and_response_adapter"
             if not exact_compatible:
+                optimizers = compatible.get("optimizers")
+                if not isinstance(optimizers, dict):
+                    raise KeyError("P4 warm start missing optimizer payload")
+                credit_repair = self.training_profile == "maze_credit_repair"
+                if credit_repair:
+                    optimizers["high_level_actor"] = copy.deepcopy(
+                        self._credit_fresh_actor_optimizer_state
+                    )
+                    actor_optimizer_report = {
+                        "status": "reset",
+                        "reason": "maze_credit_assignment_objective_change",
+                    }
+                else:
+                    migrated_actor_optimizer, actor_optimizer_report = (
+                        self._migrate_previous_p4_actor_optimizer(
+                            optimizers.get("high_level_actor")
+                        )
+                    )
+                    optimizers["high_level_actor"] = migrated_actor_optimizer
+                optimizers["high_level_critic"] = copy.deepcopy(
+                    self._credit_fresh_critic_optimizer_state
+                )
+                if credit_repair and self.response_optimizer is not None:
+                    optimizers["response_adapter"] = copy.deepcopy(
+                        self.response_optimizer.state_dict()
+                    )
+                schedulers = compatible.get("schedulers")
+                if isinstance(schedulers, dict) and self.critic_scheduler is not None:
+                    schedulers["high_level_critic"] = copy.deepcopy(
+                        self._credit_fresh_critic_scheduler_state
+                    )
+                    if credit_repair and self.actor_scheduler is not None:
+                        schedulers["high_level_actor"] = copy.deepcopy(
+                            self._credit_fresh_actor_scheduler_state
+                        )
+                    if credit_repair and self.response_scheduler is not None:
+                        schedulers["response_adapter"] = copy.deepcopy(
+                            self._credit_fresh_response_scheduler_state
+                        )
                 high_state = compatible.get("training_states", {}).get("high_level", {})
                 if isinstance(high_state, dict):
-                    saved_seconds = float(high_state.get("session_effective_seconds", 0.0))
                     warm_schedule = p4_contract.training_schedule(
-                        saved_seconds,
-                        branch="actor_attack",
+                        0.0,
+                        branch=("credit_repair" if credit_repair else "actor_attack"),
                     )
+                    if credit_repair:
+                        inherited_seconds = max(
+                            0.0,
+                            float(high_state.get("lifetime_effective_seconds", 0.0)),
+                            float(high_state.get("effective_training_seconds", 0.0)),
+                            float(high_state.get("session_effective_seconds", 0.0)),
+                        )
+                        high_state.update(
+                            effective_training_seconds=0.0,
+                            session_effective_seconds=0.0,
+                            lifetime_effective_seconds=inherited_seconds,
+                            lifetime_base_seconds=inherited_seconds,
+                            frame_count=0,
+                            iteration=0,
+                            actor_gradient_steps=0,
+                            critic_gradient_steps=0,
+                            nav_ticks=0,
+                            skipped_nonfinite=0,
+                            nonfinite_action_fallbacks=0,
+                            invalid_transition_count=0,
+                        )
                     high_state["optimizer_phase"] = str(warm_schedule["phase"])
                     high_state["entropy_coefficient"] = float(
                         warm_schedule["entropy_coefficient"]
@@ -1913,6 +3121,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                     high_state["cnn_unfrozen"] = (
                         float(warm_schedule["navigation_multiplier"]) > 0.0
                     )
+                    high_state["return_statistics"] = {
+                        "count": 0,
+                        "mean": 0.0,
+                        "m2": 0.0,
+                        "value_normalization_enabled": False,
+                    }
                     # A previous-contract package starts a new P4 session.  Its
                     # serialized generator states may belong to another device
                     # backend (CUDA and CPU generator formats are different), so
@@ -1935,6 +3149,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                         migration = {}
                     high_state["optimizer_migration_report"] = {
                         **migration,
+                        "p4_actor_optimizer": actor_optimizer_report,
+                        "p4_critic_optimizer": {
+                            "status": "reset",
+                            "reason": "maze_credit_reward_and_horizon_change",
+                        },
                         "p4_warm_start_rng": warm_rng_report,
                     }
                 response_state = compatible.get("training_states", {}).get(
@@ -1959,8 +3178,36 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 "p4_parent_phase"
             )
             if exact_compatible:
+                high = (bundle.get("modules") or {}).get("high_level") or {}
+                self._load_leaf(
+                    high,
+                    "actor_stuck_head",
+                    self.stuck_head,
+                    class_name="P4ActorStuckHead",
+                    spec=p4_actor_stuck_head_spec(),
+                    context="P4 exact resume high_level",
+                )
                 self._load_p4_state(original_p4_state)
             else:
+                if self.training_profile == "maze_credit_repair":
+                    self.critic.load_state_dict(
+                        self._credit_fresh_critic_state, strict=True
+                    )
+                    self.critic_optimizer.load_state_dict(
+                        copy.deepcopy(self._credit_fresh_critic_optimizer_state)
+                    )
+                    self.actor_optimizer.load_state_dict(
+                        copy.deepcopy(self._credit_fresh_actor_optimizer_state)
+                    )
+                    self.stuck_head.load_state_dict(
+                        self._credit_fresh_stuck_head_state, strict=True
+                    )
+                    self.return_statistics = {
+                        "count": 0,
+                        "mean": 0.0,
+                        "m2": 0.0,
+                        "value_normalization_enabled": False,
+                    }
                 self.parent_phase_label = str(bundle.get("phase_label", "p4_previous"))
                 self.lifetime_base_seconds = float(self.lifetime_effective_seconds)
                 self.maze_training_branch = runtime_maze_branch
@@ -1980,11 +3227,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 self.reset_live_state()
                 if self.logger:
                     self.logger.warning(
-                        "[P4NavPPO] previous P4 contract loaded as maze warm start; "
-                        "session clock and live state reset"
+                        "[P4NavPPO] previous P4 contract loaded as Maze credit-repair "
+                        "warm start; Actor Adam, Critic and session state reset"
                     )
             self._configure_adapter_contract()
-            return f"p4_{mode if exact_compatible else 'maze_warm_start'}"
+            return f"p4_{mode if exact_compatible else 'maze_credit_repair_warm_start'}"
         disposition = validate_p3_eval_bundle(raw, mode="track")
         if self.logger and not disposition.get("phase_label_known", False):
             self.logger.warning(
@@ -2085,6 +3332,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "diagnostic_elapsed_seconds": self.diagnostic_elapsed_seconds,
             "training_clock_origin_seconds": self._training_clock_origin_seconds,
             "maze_training_branch": self.maze_training_branch,
+            "training_profile": self.training_profile,
             "resolved_maze_training_branch": self._resolved_maze_training_branch,
             "maze_diagnostic": {
                 "total": self._maze_diag_total.detach().cpu(),
@@ -2116,6 +3364,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             },
             "camera_aux_coefficient": self._camera_aux_coefficient,
             "camera_aux_gradient_ratio": self._camera_aux_gradient_ratio,
+            "mirror_rng_state": self.mirror_generator.get_state().cpu(),
+            "auxiliary_calibration": dict(self._auxiliary_calibration),
+            "actor_stuck_positive_ema": self.actor_stuck_positive_ema,
+            "recovery_monitor": copy.deepcopy(self._p4_recovery_monitor_state),
             "action_mapper_version": p4_contract.ACTION_MAPPER_VERSION,
             "push_phase": p4_contract.push_phase_config(self.session_effective_seconds),
             "push_lifetime_count": self._push_lifetime_count.detach().cpu(),
@@ -2166,6 +3418,8 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self.maze_training_branch = str(
             state.get("maze_training_branch", self.maze_training_branch)
         )
+        if str(state.get("training_profile", self.training_profile)) != self.training_profile:
+            raise ValueError("P4 exact resume training profile mismatch")
         resolved = state.get("resolved_maze_training_branch")
         self._resolved_maze_training_branch = (
             str(resolved) if isinstance(resolved, str) else None
@@ -2228,6 +3482,44 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self._push_env_seen.copy_(push_env_seen.reshape(-1).to(self.device).bool())
         self._camera_aux_coefficient = float(state.get("camera_aux_coefficient", 0.0))
         self._camera_aux_gradient_ratio = float(state.get("camera_aux_gradient_ratio", 0.0))
+        mirror_rng_state = state.get("mirror_rng_state")
+        if not torch.is_tensor(mirror_rng_state):
+            raise ValueError("P4 exact resume missing mirror RNG state")
+        self.mirror_generator.set_state(mirror_rng_state.cpu())
+        calibration = state.get("auxiliary_calibration")
+        if not isinstance(calibration, dict):
+            raise ValueError("P4 exact resume missing auxiliary calibration")
+        self._auxiliary_calibration = {
+            name: float(calibration.get(name, 0.0))
+            for name in (
+                "combined_ratio", "teacher_ratio", "camera_ratio", "mirror_ratio",
+                "stuck_ratio", "teacher_valid_steps", "stuck_valid_steps",
+            )
+        }
+        self.actor_stuck_positive_ema = float(
+            state.get("actor_stuck_positive_ema", 0.10)
+        )
+        recovery_monitor = state.get("recovery_monitor")
+        if not isinstance(recovery_monitor, dict):
+            raise ValueError("P4 exact resume missing recovery monitor state")
+        event_times = recovery_monitor.get("event_times")
+        if not isinstance(event_times, (list, tuple)):
+            raise ValueError("P4 exact resume invalid recovery event times")
+        parsed_times = [float(value) for value in event_times]
+        if not all(torch.isfinite(torch.tensor(parsed_times)).tolist()):
+            raise ValueError("P4 exact resume non-finite recovery event time")
+        self._p4_recovery_monitor_state = {
+            "event_times": parsed_times,
+            "success_lifetime_count": int(
+                recovery_monitor.get("success_lifetime_count", 0)
+            ),
+            "candidate_lifetime_count": int(
+                recovery_monitor.get("candidate_lifetime_count", 0)
+            ),
+            "terminal_lifetime_count": int(
+                recovery_monitor.get("terminal_lifetime_count", 0)
+            ),
+        }
         self._apply_training_schedule(self.session_effective_seconds)
 
     def save_training_bundle(self, path: str, *, platform_model_id) -> str:
@@ -2252,7 +3544,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             },
         }
         payload["training_states"]["p4"] = self._p4_state()
-        payload["training_states"]["global"]["train_scope"] = "high_level_and_response_adapter"
+        payload["training_states"]["global"]["train_scope"] = (
+            "maze_actor_critic_stuck_only"
+            if self.training_profile == "maze_credit_repair"
+            else "high_level_and_response_adapter"
+        )
         payload["modules"]["high_level"]["action_mapper_version"] = p4_contract.ACTION_MAPPER_VERSION
         payload["lineage"]["p4_parent_phase"] = self.parent_phase_label
         payload["lineage"]["low_level_frozen_digest"] = self._initial_low_digest
@@ -2269,6 +3565,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             raise RuntimeError("P4 frozen low-level digest drift before checkpoint save")
         for name in ("navigation_safety_head", "critic"):
             payload["modules"]["high_level"][name]["training_only"] = True
+        payload["modules"]["high_level"]["actor_stuck_head"] = self._leaf(
+            "P4ActorStuckHead",
+            p4_actor_stuck_head_spec(),
+            self.stuck_head.state_dict(),
+        )
+        payload["modules"]["high_level"]["actor_stuck_head"]["training_only"] = True
         directory = os.path.dirname(path) or "."
         temporary = os.path.join(directory, f".{os.path.basename(path)}.{uuid4().hex}.tmp")
         try:

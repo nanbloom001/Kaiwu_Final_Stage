@@ -1871,6 +1871,7 @@ class AlgorithmP2NavPPO:
                 actor_enabled = bool(self._actor_update_enabled())
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 actor_finite = actor_enabled
+                actor_has_grad = False
                 for micro_start in range(0, len(minibatch), self.micro_sequences) if actor_enabled else ():
                     micro = minibatch[micro_start : micro_start + self.micro_sequences]
                     actor_batch = self._actor_sequence_batch(
@@ -1885,7 +1886,9 @@ class AlgorithmP2NavPPO:
                     if not bool(torch.isfinite(loss)):
                         actor_finite = False
                         break
-                    (loss * scale).backward()
+                    if loss.requires_grad:
+                        (loss * scale).backward()
+                        actor_has_grad = True
                     totals["actor_loss"] += float(loss.detach()) * scale
                     for name in (
                         "safety_bce", "approx_kl", "clip_fraction", "entropy",
@@ -1900,7 +1903,7 @@ class AlgorithmP2NavPPO:
                     for name in ("safety_bce", "approx_kl", "clip_fraction", "entropy"):
                         epoch_totals[name] += float(actor_metrics[name]) * scale
                     epoch_totals["micro_weight"] += scale
-                if actor_enabled and actor_finite and all(
+                if actor_enabled and actor_has_grad and actor_finite and all(
                     p.grad is None or bool(torch.isfinite(p.grad).all())
                     for g in self.actor_optimizer.param_groups for p in g["params"]
                 ):
@@ -1914,7 +1917,7 @@ class AlgorithmP2NavPPO:
                             p2_contract.LOG_STD_MIN, p2_contract.LOG_STD_MAX
                         )
                     self.actor_gradient_steps += 1
-                elif actor_enabled:
+                elif actor_enabled and not actor_finite:
                     self.actor_optimizer.zero_grad(set_to_none=True)
                     self.skipped_nonfinite += 1
                 totals["actor_update_time_s"] += time.perf_counter() - actor_started
@@ -2116,9 +2119,23 @@ class AlgorithmP2NavPPO:
                     for axis in range(3)
                 ]
             )
+        segment_labels = tuple(
+            self.config.get(
+                "track_segment_labels",
+                p2_contract.TRACK_SEGMENT_METRIC_LABELS,
+            )
+        )
+        segment_metric_labels = (
+            p2_contract.TRACK_SEGMENT_METRIC_LABELS
+            if all(
+                label in p2_contract.TRACK_SEGMENT_METRIC_LABELS
+                for label in segment_labels
+            )
+            else p2_contract.CANONICAL_TRACK_SEGMENT_METRIC_LABELS
+        )
         grouped_metrics = {
             f"adapter_{label}_{suffix}": 0.0
-            for label in p2_contract.TRACK_SEGMENT_METRIC_LABELS
+            for label in segment_metric_labels
             for suffix in ("sample_share", "mae")
         }
         current_segment = metadata.get("current_segment")
@@ -2131,16 +2148,10 @@ class AlgorithmP2NavPPO:
             segment_horizon_mask = (
                 batch.horizon_mask & segment_valid.unsqueeze(-1)
             )
-            segment_labels = tuple(
-                self.config.get(
-                    "track_segment_labels",
-                    p2_contract.TRACK_SEGMENT_METRIC_LABELS,
-                )
-            )
             metric_segment = p2_contract.track_segment_metric_indices(
                 current_segment, segment_labels
             )
-            for row, label in enumerate(p2_contract.TRACK_SEGMENT_METRIC_LABELS):
+            for row, label in enumerate(segment_metric_labels):
                 group = metric_segment == row
                 grouped_metrics[f"adapter_{label}_sample_share"] = float(
                     self._masked_group_share(group, segment_horizon_mask)

@@ -38,16 +38,32 @@ PRIVILEGED_WIRE_DIM = CRITIC_OBS_DIM + WORKER_AUX_DIM
 CRITIC_INPUT_DIM = 341
 ACTION_DIM = 3
 TERRAIN_NUM_COLUMNS = 20
+# P2/P3 runs wrote three fixed metric buckets.  Retain those row IDs for their
+# old chains while exposing the complete Track vocabulary for P4's five-stage
+# curriculum.  Consumers that aggregate five rows must use the canonical tuple.
 TRACK_SEGMENT_METRIC_LABELS = ("slope_inv", "stairs_inv", "maze")
+CANONICAL_TRACK_SEGMENT_METRIC_LABELS = (
+    "slope",
+    "slope_inv",
+    "stairs",
+    "stairs_inv",
+    "maze",
+)
 TRACK_TERRAIN_TO_METRIC_LABEL = {
+    "pyramid_slope": "slope",
     "pyramid_slope_inv": "slope_inv",
+    "pyramid_stairs": "stairs",
     "pyramid_stairs_inv": "stairs_inv",
     "open_entry_maze": "maze",
 }
 
 
 def canonical_track_segment_labels(sub_terrains) -> tuple[str, ...]:
-    """Map configured Track terrain names to stable metric bucket labels."""
+    """Map configured Track terrain names to their stable metric labels.
+
+    An omitted chain retains the historic P2/P3 three-segment default.  An
+    explicit P4 chain may contain all five canonical terrain types.
+    """
     if sub_terrains is None or sub_terrains == ():
         return TRACK_SEGMENT_METRIC_LABELS
     if not isinstance(sub_terrains, (list, tuple)) or not sub_terrains:
@@ -71,11 +87,16 @@ def track_segment_metric_indices(
 ) -> torch.Tensor:
     """Translate physical Track segment indices into stable metric bucket IDs."""
     labels = tuple(str(label) for label in segment_labels)
+    metric_labels = (
+        TRACK_SEGMENT_METRIC_LABELS
+        if all(label in TRACK_SEGMENT_METRIC_LABELS for label in labels)
+        else CANONICAL_TRACK_SEGMENT_METRIC_LABELS
+    )
     result = torch.full_like(physical_segment.round().long(), -1)
     for physical_index, label in enumerate(labels):
-        if label not in TRACK_SEGMENT_METRIC_LABELS:
+        if label not in metric_labels:
             continue
-        metric_index = TRACK_SEGMENT_METRIC_LABELS.index(label)
+        metric_index = metric_labels.index(label)
         result[physical_segment.round().long() == physical_index] = metric_index
     return result
 

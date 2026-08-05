@@ -3849,3 +3849,401 @@
   这些证据支持“训练链路正常推进，暂无需中断或重训”，但不证明最终迷宫完成率已提升。
   最终导航能力、提前避障、S-turn 和路径效率仍需在长训后通过固定种子 Track 评估和视频验证，
   不得将平台训练稳定性等同为评估已验证。
+
+## BUG-20260804-003：P4 碰撞后卡死、斜移替代转向与近终点错过缺少训练闭环
+
+- 日期：2026-08-04；状态：平台启动与更新链已验证，行为效果待完整训练和评估。
+- 影响范围：分支 `codex/p4-maze3h-recovery`、任务 `p4maze3h-recovery-r2`、P4 Maze 10Hz
+  高层 Actor、NavigationEncoder、SafetyHead、training-only StuckHead、wall-stuck reset、命令 slew、
+  safety reward、checkpoint continuation 和监控面板。未修改平台覆盖的 `server/isaac_env/base_env.py`。
+- 父模型/制品：`p4maze8h10hz_1416926.zip`，ZIP SHA256
+  `106908c8830f4fc7989125372f6ed397366f7ca1b4aac071128dccf71add0f6c`；checkpoint
+  `model.ckpt-mazefinal-1416926.pkl`，SHA256
+  `0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`。
+- 用户可见症状：上一轮评估中多次出现前腿或后腿接触柱体后长期不脱困、目标已在侧前方仍以
+  `vy` 斜移而不建立正确 `wz`、target yaw 建立后 exec/true yaw 滞后、绕障后继续撞击，以及进入
+  终点附近却离开成功半径。训练面板又显示 Head 正确但 Actor 选错率仍高，说明只改善诊断 Head
+  不能直接改变策略动作。
+- 根因：旧训练仅把 safe3 用于 SafetyHead 和轻量 reward，没有在 rollout 时间轴上给 Actor mean
+  施加容差引导；安全 limiter 主要限制 `vx`，留下 `vy` 斜向碰墙；`wz` slew 建立速度偏慢；卡墙
+  reset 为 7 秒但 Actor 没有独立 stuck 表征；近终点 soft-cruise/crawl 与主动减速存在冲突。实现
+  期间进一步发现真实父包 Actor optimizer 只有 8 个参数组，而新增 StuckHead 后运行时为 9 组，
+  直接 exact-loader 会在 `optimizer.load_state_dict()` 因 group count 不一致失败。合成旧合同测试因
+  使用当前代码生成包而错误携带第 9 组，未覆盖该真实迁移边界。
+- 修复：新增 rollout-time Actor mean 教师，只在 scanner/mapping/Goal 等高置信条件下处罚超出
+  35 度安全方向容差、近墙过快和错误 yaw 符号；教师路径 detach `nav_feat32`，Camera clean/live
+  辅助仍允许更新 NavigationEncoder。增加 training-only StuckHead、2x SafetyHead hard-positive
+  权重和从 rollout 内任意真实 reset 起点构造的零-hidden完整 TBPTT16 sequence mirror；镜像按
+  全部 PPO sequence-update 的 10% 调度，合格 episode 少时有放回抽样。四类辅助梯度采用总 5%、
+  teacher 3%、mirror 1% 上限。固定 PPO chunk 的中途非零 recurrent context 不做伪镜像。
+  教师 64-step 门槛按完整 rollout 统计，不再错误要求单个 64-frame microbatch 全部有效。
+- 命令/奖励修复：slew 改为 `vx 0.30/0.30`、`vy 0.40/0.80`、`wz 1.50/3.00`；部署可得 risk
+  同比例缩放完整 `(vx,vy)`，不压缩 `wz`。近终点 `0.65-1.20m` 只做平移软捕获并屏蔽 crawl/低速
+  巡航惩罚。predictive、missed-safe、yaw cancellation、yaw-exit 和 goal-safe preference 统一进入
+  原 5Hz 等效 `-0.06` 安全预算；reason 4 保持 `-15`，同 terminal tick 不重复 safety/collision。
+  wall-stuck 确认合同延长到 10 秒，Push 全程关闭；当前 shadow 配置不生成 reason 4。
+- checkpoint 修复：旧 `1416926` 包只能 continuation warm start；按稳定 optimizer group 名和组内
+  参数顺序恢复 8 个旧组共 26 个参数的 Adam state，新 `actor_stuck_head` 保持空 state。新合同
+  exact resume 保存/恢复 StuckHead leaf、mirror RNG、auxiliary calibration 和 Adapter completed
+  records。模型 ID和标签继续只用于选择，不作为结构正确时的单点门禁。
+- 平台边界：训练侧 stuck label 能同时读取 policy target、aisrv exec、true velocity 和墙面证据；
+  worker 物理 reset 不修改 BaseEnv，也没有公开 P4 exec transport。原生 `base_velocity` 不能替代
+  P4 实际 exec command，否则主动停车会被误杀。现将 training wire 升级为 509，并加入显式
+  motion-intent hook 可用性与独立 raw wall term；缺少 hook 时 active reset fail-closed，正式 TOML
+  保持 `shadow`。进一步定位到 `_termination_reason_codes()` 的原地布尔掩码会修改调用方传入的
+  wall term，success 优先时连原始证据也会被清零；现对所有 manager term 输入先 clone，再计算互斥
+  reason。raw wall term 因而不受 success/failure reason 优先级覆盖，可核验同帧终止归因冲突。
+  世界位移、低 true velocity、墙面证据和候选时长继续用于诊断与训练侧标签，但本轮不声称具备
+  10 秒真实物理 reset。
+- 监控口径修复：原实现把 `wall_stuck_reset_triggered` 累计成 recovery event，实际会把失败 reset
+  误报为成功脱困。现分别统计 candidate entry、带 true XY 运动或正进度证据的 recovery success、
+  墙面证据暂失但未确认运动的 unverified exit 边沿事件、候选中 terminal、恢复耗时、early/confirmed sample
+  share，以及 60 秒/lifetime 成功恢复计数；reset 永不进入 recovery success 或 completion。
+  unverified exit 进入 awaiting-evidence 状态，证据持续缺失时不再逐 tick 重复累计。reset/completion
+  交叉检查读取独立 raw wall term；exact resume 恢复 recovery 事件时间戳和三类
+  lifetime 计数，避免续训后面板归零。
+- 本地验证：审查修复后的 `PY311test` P4/P2/监控邻近回归为 `229 passed`。真实父 checkpoint 已成功以
+  `p4_maze_warm_start` 加载：恢复 8 个 optimizer groups、26 个参数 state，新 Head state 为 0，
+  Adam step 范围为 `26784-27584`，session 时钟归零，Adapter current/parent completed records
+  分别恢复 32/64。最新代码又使用真实父包完成 1-env、32-tick PPO、1 次 Adapter update、保存和
+  `p4_exact_resume_history_reset` 联合 smoke，低层 digest 保持不变；同时修复 smoke 工具在 CPU
+  设备上无条件调用 CUDA 峰值统计和 `auto` 分支在 P4 诊断 buffer 创建前解析的初始化错误。全部
+  修改 Python 编译、14 个活动 TOML 解析、`git diff --check`、BaseEnv 未修改
+  和无 `archive/shared` 运行时依赖检查均通过。此处是修复完成时的本地证据快照；后续容器与平台
+  启动链复验见本条末尾，三小时完整任务、固定种子评估和真机仍未验证。
+  容器首次调用 smoke 时还发现 Isaac 预置 Torch 的 CUDA memory API 不接受 `torch.device` 参数；
+  测试工具现仅在显存统计调用中转换为整数 device index，不改变训练设备或算法语义。
+- 防复发：回归覆盖真实 8->9 optimizer group 迁移、Camera 辅助视觉梯度、rollout-wide teacher
+  门槛、teacher/mirror/stuck TBPTT 对齐、镜像 involution、slew 先归零、vector limiter、近终点捕获、
+  safety reward conservation、reason 4 互斥和 eval 不创建 StuckHead。以后 previous-contract 测试必须
+  删除新增 leaf/group，不能仅修改 version 字符串冒充旧包。
+- 回滚：回滚本条 recovery contract、StuckHead、teacher/mirror、limiter/capture 和新 slew 即可回到
+  `p4_maze_attack10hz_v1`；不得回滚已验证的 eval-only SafetyHead、GoalBelief、相机单位、terminal
+  snapshot 和 10Hz duration scaling。再遇加载失败先检查 optimizer group name/count，再检查新 leaf
+  exact-resume 合同；再遇卡墙误杀先看 mapping、true speed、wall latch 和 reason 4，而不是调整模型 ID。
+- 关联 commit/PR：待生成；平台替代任务 ID `236395`，首个输出 checkpoint 和 SHA256 见本条末尾。
+
+### 2026-08-04 平台首轮更正：FP16 mirror auxiliary 未进入 AMP
+
+- 平台任务 `p4maze3h-recovery-r1`（任务 ID `236388`，UUID
+  `85bd42f2-7950-402b-9c12-58a980073b93`）正确装配 P4、父包 `1416926`、128 环境和单段 Maze，
+  但在第一次真实 PPO update 失败，关键日志为：
+  `RuntimeError: Input type (c10::Half) and bias type (float) should be the same`。
+- 根因是 mirror auxiliary 从 CPU pinned rollout 读取 FP16 depth 后，直接调用 FP32
+  `NavigationEncoder`；主 PPO CNN 路径已使用 autocast，而该新增辅助路径漏掉了同样的 dtype
+  边界。本地 CPU smoke 会显式使用 FP32，先前容器联合 smoke 又没有抽中真实 mirror batch，因而
+  未覆盖 `CUDA + FP16 depth + mirror auxiliary` 的组合。这与模型 ID、父包加载、reset、显存或容器
+  文件数量无关。
+- 修复为：CUDA mirror CNN 重算进入 `torch.autocast`，CPU 路径显式转 FP32，输出 feature 再恢复
+  FP32 供 recurrent actor 使用；测试强制使用 FP16 mirror depth，并继续断言视觉 CNN 不接收 mirror
+  梯度。正式替代任务统一改名为 `p4maze3h-recovery-r2`。
+- 验证层级：本地专项及邻近回归 `229 passed`，真实父包 CPU 1-env 联合 smoke 通过。随后同步
+  热修复到开发容器，确定性构造 `CUDA + FP16 depth + 16-step mirror batch`，结果
+  `fp16_mirror_auxiliary=PASS`；同一进程继续完成真实父包 warm start、32-tick PPO（8 次
+  minibatch update）、1 次 Adapter update、保存和 `p4_exact_resume_history_reset`，低层 digest
+  未漂移。峰值 CUDA allocated/reserved 为 `87217152/111149056` bytes。测试 ZIP、解压 checkpoint
+  和 smoke 输出已按 `agent_ppo/test_artifacts/p4_maze3h` 精确清理。替代平台任务仍待创建和复验；
+  `236388` 只作为失败证据，不代表有效训练进度，也不得用于评估能力。
+
+### 2026-08-04 平台替代任务复验
+
+- 替代任务 `p4maze3h-recovery-r2` 已创建并运行：任务 ID `236395`，UUID
+  `a95cea3d-52c2-4e3e-8265-286f6a7cc189`，父模型 `p4maze8h10hz_1416926`，128 环境、单段
+  `open_entry_maze`、3 小时有效训练合同。模型 ID 仅用于选择父包，实际加载仍通过模块、spec、
+  shape、有限值和 optimizer group 迁移校验。
+- 截至 `effective_min=15.0`、`iter=28`，任务已连续越过首轮任务的第一次 PPO update 崩溃点，
+  `actor/critic/adapter` 均为有限值，`lifecycle_fail=0`，`low_digest_drift=0`，
+  `low_optimizer_steps=0`，`high_updates=28032`。GPU 峰值 allocated/reserved 约为
+  `820271616/1021313024` bytes，pinned depth storage 为 `471859200` bytes，未出现 OOM 或 dtype
+  异常。`mazeprobe` 是 0-20 分钟的低学习率恢复训练阶段，不是只读诊断阶段。
+- 5 分钟首次保存已成功生成 `model.ckpt-mazeprobe-1418526.pkl`，SHA256
+  `c0fedf70a27afb371fd9d2330911137af5bb073c05438be632d01985cbbce53e`，平台归档 ZIP 同步完成。
+  15 分钟周期保存再次成功生成 `model.ckpt-mazeprobe-1421566.pkl`，SHA256
+  `ce0180661beb950033f51ecf998215e15268e4c53af8bedd91f8c846dcc4411d`。
+  EnvMonitor 持续上报 321 个指标；Adapter 三池目标比例为 `0.50/0.25/0.25`，兼容性拒绝计数为
+  0。该证据验证的是平台装配、真实 CUDA PPO/辅助反向、Adapter 更新、低层冻结和保存链，不证明
+  三小时后的 Maze 完成率、碰撞恢复或真机能力；这些仍需完整训练 checkpoint 和固定种子评估。
+
+## BUG-20260804-004：开发容器 smoke 反复选错 Isaac Python 入口
+
+- 日期：2026-08-04；状态：容器已验证，流程防线已补充。
+- 影响范围：腾讯开悟开发容器中的 Isaac/PyTorch smoke、checkpoint 加载、PPO/Adapter 联合测试；
+  不影响平台训练进程自身的 Python 启动栈。
+- 用户可见症状：直接调用 Conda Python，或在当前镜像运行
+  `/workspace/isaaclab/isaaclab.sh -p` 时，解释器没有注入 Isaac Sim 的
+  `omni.isaac.ml_archive/pip_prebundle`，在导入阶段报 `ModuleNotFoundError: No module named
+  'torch'`。该症状在 P2、P3 和 P4 容器 smoke 中多次出现，曾被误判为“容器没有 PyTorch”。
+- 根因：平台训练栈、Isaac Sim 自带 Python 和普通 Conda Python 是三个不同的依赖环境。
+  `isaaclab.sh -p` 的实际选择会随平台镜像变化，不能把历史上可用的 wrapper 当成稳定 ABI；
+  直接 Conda 启动也不会自动获得 Isaac Sim 预置的 Torch 路径。
+- 当前容器证据：`/workspace/isaaclab/_isaac_sim/python.sh` 可导入 Torch
+  `2.7.0+cu128`，`torch.cuda.is_available()` 为 true，并已完成真实父 checkpoint、CUDA FP16
+  mirror、32-tick PPO、Adapter update、save/resume smoke。相同代码用当前
+  `isaaclab.sh -p` 在导入阶段停止，证明这是解释器入口问题，不是 checkpoint SHA、模型 ID、
+  算法代码或 GPU 不可用。
+- 修复与防复发：`server/README.md` 统一记录解释器预检和 smoke 命令；活动工具文档不再推荐
+  `isaaclab.sh -p`。以后容器测试先执行
+  `/workspace/isaaclab/_isaac_sim/python.sh -c 'import torch; print(torch.__version__,
+  torch.cuda.is_available())'`，预检成功后全程复用同一入口。若该路径不存在或预检失败，必须先
+  在线定位当前镜像入口，禁止静默回退到 Conda Python，也禁止把 import failure 归因于模型或代码。
+- 验证边界：本条只验证当前开发容器解释器和 CUDA smoke；未来平台升级镜像后仍须重新执行
+  一行预检。回滚只涉及文档说明，不改变训练代码、环境配置或 checkpoint。
+- 关联任务：`p4maze3h-recovery-r2`，任务 ID `236395`；commit/PR：待生成。
+## BUG-20260805-001：P4 全赛道方案存在出生覆盖假象、五段统计漂移和大角速度 S-turn 逃逸
+
+- 日期：2026-08-05；状态：平台启动与首次保存已验证，正式训练进行中，训练效果待验证。
+- 影响范围：`codex/p4-full8h-r2` 的五段 Track 出生、reason 4 卡滞回收、开阔直行奖励、
+  P4 training wire、监控归因和长距离 Goal 编码；不修改平台覆盖的 `BaseEnv`。
+- 父制品：`p4maze8h10hz_1416926.zip`，ZIP SHA256
+  `106908c8830f4fc7989125372f6ed397366f7ca1b4aac071128dccf71add0f6c`；内部 checkpoint
+  `model.ckpt-mazefinal-1416926.pkl` SHA256
+  `0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`。
+- 用户可见风险：
+  1. 计划要求 Maze 内 30% 困难随机位置，但初版即使完成 horizontal clearance raycast，仍显式
+     排除 Maze，使全部困难 Maze 样本回落入口；监控可能显示“请求了 hard spawn”，实际未覆盖。
+  2. 聚合仍混用旧三段/迷宫命名，出生段、终止所在段和 reset 后新 episode 容易被混为一类，
+     正负 `vy/wz` 均值也会互相抵消。
+  3. 开阔 S-turn 惩罚被当前 `|wz|` 反向减权，大幅左右交替反而容易逃逸。
+  4. 旧 509 wire 无法携带出生段、分位、安全点和 reason4 fallback 事实，面板空值或错误口径无法
+     自检。
+- 根因：
+  - 将“垂直表面 hit 不足以证明 Maze 安全”的旧判断保留到了已经包含八方向 clearance 的新查询后，
+    形成过度保守 fallback。
+  - 训练从单 Maze/三段历史迭代而来，workflow、monitor 和 worker histogram 没有一次性升级到五段
+    单一事实来源。
+  - anti-S-turn 公式重复使用当前角速度幅度去保护合法转向，但历史 cancellation 本身已经能区分
+    单向转弯和反复换向。
+- 修复：
+  - 新增 P4-only `p4_spawn.py`，按整轨/五段/四分位/safe-hard quota 调度；困难位置只有表面 hit
+    与八方向 0.35m clearance 均有效才写入，Maze 不再被无条件排除。验证不可用仍 fail-closed。
+  - reason 4 同桶重试两次后退回同段入口；wire 扩为 519，显式传输出生事实和累计失败计数。
+  - workflow 分离出生段与 terminal current segment，分别统计四类 outcome；正负 `vy/wz` 的
+    policy/limited/mapped/exec/true 链独立聚合，累计 counter 使用 max/latest 而不是每 tick 重复求和。
+  - 五段 current/spawn、Goal clean/fault、跳变径向/切向、frontier、open-straight 和 active stuck
+    面板改为实际生产的键；每个 line 面板不超过 20 项。
+  - anti-S-turn 直接使用历史 cancellation，移除按当前 `|wz|` 削弱的逃逸口；仍受 open-slope、
+    teacher、Goal、边界、路口、接触和恢复门控，总下限 `-0.0125/tick`。
+  - Goal 编码 10m 内保持逐值兼容，10m 外保存单位方位；server、deploy 和共享接口合同原子更新。
+  - 2026-08-05 独立终审补充发现四项阻断并修复：P4 reset spawn hook 安装失败不再只记录日志；
+    active `nav_stuck_timeout` 允许平台装配延迟最多 8 帧，仍不可用则明确失败；物理 root-state 写入
+    异常累计后立即抛错。同帧 wall-stuck 现在优先于 success/failure/timeout，确保 reason4 reset
+    不获得 `+200`、不进入完成统计。
+  - 出生覆盖改为 `transition_done` reset edge 的事件统计：整轨/段内、五段、四分位和 safe/hard
+    分母均来自真实新 episode；L0-L9/L10-L19 仅表示静态难度列。worker tail 的废弃 motion-intent
+    位改为 `p4_spawn_hook_installed`，并上报物理写入/验证失败。
+  - 部署 `UwbGoal` 增加 `ActorGoalEncoding` 版本。现有 Actor80 默认保持 legacy 逐轴 clamp；P4
+    方向保持 v2 只能由未来匹配 spec 的可部署制品显式选择，修正了 non-deployable 训练合同会改变
+    稳定部署入口的跨端漂移。
+- 已排除的错误方向：
+  - 未修改 `server/isaac_env/base_env.py`；平台会覆盖该文件。
+  - 未用模型 ID、训练分数或 hard-spawn 成功率作为单点加载门禁。
+  - 未启用全局最短路惩罚、Maze heading reward、固定速度映射、两次反转确认或运行时动作覆盖。
+- 本地验证：
+  - `PYTHONPATH=server .../PY311test/bin/python -m pytest -q server/agent_ppo/tests/test_p4_*.py`：
+    `116 passed`。
+  - 新回归覆盖 3/10/20/40m Goal 方位、五段映射、reason4 同桶/同段退回、困难 Maze spawn
+    验证、滑动卡滞窗口、大 `|wz|` S-turn 逃逸和 Maze/边界免罚。
+  - 修复终审阻断后的 P4 定向回归：`118 passed`；新增 writer failure、active term bounded retry、
+    wall-stuck/success overlap 和 reset-event 面板合同回归。
+  - Python 编译、TOML、`git diff --check` 与 `BaseEnv` 未修改检查通过；legacy/v2 两个 C++
+    UwbGoal 测试均编译运行通过。
+- 开发容器验证（2026-08-05）：
+  - 最终同步代码的 P4 定向回归通过：
+    `test_p4_nav.py + test_p4_full_track_spawn.py + test_p4_full_track_monitor.py`
+    共 `84 passed`。容器解释器为 `env_isaaclab` Python，并保留 Isaac Sim 预置
+    `PYTHONPATH`，避免再现“有 pytest 无 torch”的假性环境错误。
+  - 父 ZIP SHA256 校验为
+    `106908c8830f4fc7989125372f6ed397366f7ca1b4aac071128dccf71add0f6c`，内部
+    checkpoint SHA256 校验为
+    `0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`。
+  - 8-env CUDA 联合 smoke 通过：`p4_full_track_warm_start`、32-tick rollout、16 次 PPO
+    update、Adapter update、FP16 mirror auxiliary、save 和 fresh-process
+    `p4_exact_resume_history_reset` 均成功；低层 digest 未漂移。峰值
+    `memory_allocated=230938112`、`memory_reserved=295698432`，pinned depth
+    `29491200` bytes。
+  - 1-env Isaac 工具在补齐 IsaacLab/Unitree 源码 `PYTHONPATH` 后进入 SimulationApp，
+    显存上升到约 1.9 GiB；但开发 WebIDE 在进入 reset 断言前两次返回
+    `WEBIDE_RECORD_NOT_FOUND` 并回收资源，未产生 exit marker。因此不能声称
+    reason4 物理 reset 和 Maze 出生 readback 已通过；改由有界平台 smoke
+    检查启动 hard-fail、spawn 事件指标和 reason4 终止链。
+- 待验证：
+  - 当前平台镜像清单生成于 2026-07-29，不能证明 2026-08-05 容器的 RayCaster mesh、EventManager
+    和 termination term。必须在开发容器完成 1-env physical reset 与随机出生 readback。
+  - worker EventManager 没有 learner checkpoint transport，fresh-process resume 后 spawn quota/RNG
+    会按 seed 重启。文档已明确，未宣称完整位级 exact resume。
+  - 8-env PPO/Adapter/save-resume smoke 已完成；平台 reason4 物理 reset、五段面板和
+    正式八小时训练结果尚未完成。
+- 回滚：关闭 `[p4_nav_ppo.full_track_spawn].enabled` 可恢复平台默认出生；将 stuck
+  `mode=shadow` 可关闭物理 reason4；旧父包仍可按结构 warm start。不得回滚 Goal 跨端编码的任一
+  单端实现，必须 server/deploy/shared 同步回滚。
+- 关联 commit/PR、任务 ID、新 checkpoint：待生成。
+
+### 2026-08-05 平台 smoke 更正：worker bridge P4 标志初始化顺序
+
+- 平台 smoke `p4full-r2-smoke`（任务 ID `236441`，父模型
+  `p4maze8h10hz_1416926`）确认活动配置已经是 128 环境、五段固定顺序、20 列和
+  `curriculum=false`，但首次环境 reset 在 ObservationManager 装配期停止。关键日志为：
+  `AttributeError: 'P2WorkerBridge' object has no attribute '_p4_enabled'`，随后 workflow 只看到
+  `RuntimeError: P2 env.reset returned None`。
+- 根因是本轮新增的 worker 启动诊断在 `P2WorkerBridge.__init__` 尾部读取 `_p4_enabled`，但该
+  成员没有稳定的初始化来源。容器单测和联合算法 smoke 没有构造完整平台 ObservationManager，
+  因而没有覆盖这一真实构造路径。这与父 checkpoint、模型 ID、容器磁盘、五段地形或
+  `BaseEnv` 无关。
+- 修复为只读派生属性：`_p4_enabled` 始终由已经解析的
+  `runtime_stage_type == "p4_nav_ppo"` 得出，不再依赖赋值顺序。新增回归覆盖 P4 train、P4 eval
+  与 P2 train 的 wire 选择边界。
+- 当前状态：代码已修复待平台复验。任务 `236441` 只作为失败证据，不代表训练开始；修复同步后
+  必须重新创建有界 smoke，确认环境 reset、spawn/stuck preflight、首轮 PPO 和保存链后才创建
+  正式八小时任务。
+- 第二次 smoke `p4full-r2-smoke2`（任务 ID `236444`）越过上述属性异常后，在首次 worker
+  `step()` 暴露 quota 设备混用：`spawn.last_full` 已迁移到 CUDA，但
+  `spawn.last_segment` 仍为 CPU，`torch.where` 报
+  `Expected all tensors to be on the same device`。修复为先将全部 CPU-owned spawn quota tensor
+  迁移到 worker device，再组合 519 wire；不改变 quota 采样、RNG 或出生写入。该任务同样只作为
+  失败证据，正式任务仍等待下一次平台 smoke 通过。
+
+### 2026-08-05 第三次平台 smoke：训练主链通过，监控标题校验失败
+
+- 第三次 smoke `p4full-r2-smoke3`（任务 ID `236445`，UUID
+  `a9058628-afa6-48c8-bb85-9f9e70218b07`）越过前两次 worker bridge 构造和设备问题，完成 128
+  环境 reset 并运行到 `iter=3`、`effective_min=1.6`。Actor、Critic 和 Adapter 指标均有限，
+  `lifecycle_fail=0`、`low_digest_drift=0`、`low_optimizer_steps=0`；五段固定顺序、20 列、
+  `curriculum=false` 和 450 MiB pinned depth storage 均按正式合同装配。
+- 平台同时报告自定义监控配置校验失败：`出生五段覆盖（Reset事件）` 和
+  `整轨与段内位置四分位（Reset事件）` 含平台不接受的中文括号，导致整份
+  `monitor_builder.py` 被跳过。该错误不影响 PPO 数据流，但会让正式任务缺失 P4 专用面板。
+- 修复为平台兼容的短标题 `出生五段重置覆盖` 和 `出生位置与四分位`，并新增长度 1-20、仅
+  中英文/数字/下划线/连字符/空格的静态回归。第三次 smoke 已手动释放；正式任务必须使用同步
+  后的监控配置创建，并确认启动日志不再出现 `Error occurred while loading user monitor config`。
+
+### 2026-08-05 正式八小时任务启动验证
+
+- 正式任务 `p4full8h-r2` 已创建：任务 ID `236446`，UUID
+  `2db48b40-5028-4ca3-b880-89edd3f8520a`，父模型 `p4maze8h10hz_1416926`，任务页时长
+  `8h15min`，代码内有效训练目标 `28800s`。平台日志确认 stage 为 `p4_nav_ppo`、128 环境、
+  低层 `inference_only`、Adapter `online_auxiliary`、五段固定顺序、20 列、`track_length=5` 和
+  `curriculum=false`。
+- 修复后的自定义监控配置已被平台完整加载，显示 `P4全赛道诊断(19)` 及其他 P4 面板，启动阶段
+  `暂无错误日志`，不再出现标题校验失败。训练连续运行到 `iter=11`、`effective_min=6.1`；
+  Actor/Critic/Adapter 指标有限，`lifecycle_fail=0`、`low_digest_drift=0`、
+  `low_optimizer_steps=0`。峰值 CUDA allocated/reserved 约为
+  `820380672/1021313024` bytes，pinned depth 为 `471859200` bytes，未出现 OOM。
+- 首次保存链已验证：有效训练约 5 分钟时生成
+  `/data/ckpt/legged_robot_competition_26_ppo/model.ckpt-fullwarm-1418400.pkl`，SHA256
+  `7f20cf566282cb98add08b5556d7f6fef8054fe1eb1fdb6e0fef90a56d7c4839`；随后平台归档生成
+  `/data/user_ckpt_dir/legged_robot_competition_26_ppo/model.ckpt-fullwarm-1418526.pkl`，SHA256
+  `1acdc8d9e7eae947f214637f522fa95952ad391e980a63af8e3f2d7b712b8153`。
+- 当前验证只证明正式任务正常开始、监控与 checkpoint 探活链闭环，不证明八小时后的五段完成率、
+  reason 4 误杀率、长距离直行、Maze 能力或真机表现。任务保持运行，后续按固定窗口抓取和最终评估
+  更新本条，不得提前把启动证据描述为训练目标已经达成。
+
+### 2026-08-05 正式任务持续启动复核
+
+- Chrome 登录态复核确认任务 `236446` 连续运行至页面时长约 18 分钟，状态仍为“进行中”，错误日志
+  区显示“暂无错误日志”。训练日志推进到 `iter=27`、`effective_min=15.1`，Actor `0.0652`、
+  Critic `64.5540`、Adapter `-0.1379` 均有限；`lifecycle_fail=0`、`low_digest_drift=0`、
+  `low_optimizer_steps=0`，峰值 CUDA allocated/reserved 仍为约
+  `820380672/1021313024` bytes，未发生 OOM 或冻结低层误更新。
+- EnvMonitor 每个窗口上报 501 个指标，最新窗口出现 `completed=10, abnormal=11, timeout=2`，证明
+  环境 reset、scorer、训练监控和终止结果链持续工作；这只是启动健康证据，不作为训练效果结论。
+- 五段装配日志再次确认顺序为
+  `pyramid_slope -> pyramid_slope_inv -> pyramid_stairs -> pyramid_stairs_inv -> open_entry_maze`。
+  第二次周期保存成功生成并归档 `model.ckpt-fullwarm-1421246.pkl`，SHA256
+  `9c7f55f4c859f078d499d0807c54b57f34b9a7e4dc22271a189bcf35241706f1`。因此正式任务已经越过
+  环境创建、首轮 PPO、首次保存和后续周期保存四个启动边界，当前未观察到计划外 stage、地形、
+  低层更新、显存或 checkpoint 偏差。
+
+## BUG-20260805-002：五段混训后 Maze credit 被 terminal clawback 主导且旧时钟污染修复续训
+
+- 日期：2026-08-05；状态：本地已验证，开发容器、平台 smoke 和固定种子评估待验证。
+- 影响范围：`codex/p4-maze2h-credit-repair` 的 P4 Maze warm start、奖励归因、平移 limiter、
+  Actor/Critic/Adapter 训练职责、checkpoint exact resume 和监控；不修改平台覆盖的
+  `server/isaac_env/base_env.py`，不改变 Actor85、Critic 输入、三轴动作或评估 wire。
+- 父制品：`p4maze8h10hz_1416926` 的 `mazefinal` checkpoint。模型 ID `1416926` 只用于候选
+  选择；实际加载继续校验 bundle、模块 spec、shape、有限值和冻结低层 digest。ZIP/checkpoint
+  SHA256 复用 BUG-20260805-001 已记录值，本分支尚未生成新 checkpoint。
+- 用户可见症状：五段八小时训练改善了前段通过，却使 Maze 条件成功率明显退化。失败 episode 的
+  终止回报被 frontier clawback 主导；风险一出现就把平移压到 35%，会让策略在墙前缺少绕障位移；
+  active reason4、额外 Goal/Camera fault、五段出生与跨段奖励同时变化，使 Maze 忘记无法归因。
+- 根因：
+  1. P2 frontier potential 把已获得进展在 terminal 统一回扣，Maze 中正常绕行和最终 timeout 的
+     credit 尺度被终止事件重新改写，策略难以区分“曾正确逼近”与“最终失败”。
+  2. 旧 limiter 对任意 risk 连续缩放完整平移，在高风险处最低仅保留 35%，减速机制压过了绕障。
+  3. 旧 P4 checkpoint warm start 只改 optimizer phase，却把旧 session seconds 带入继承 P2 loader，
+     使新会话在加载期按终局 schedule 校验；新 P4 `train_scope` 也会被继承 loader 的历史字符串拒绝。
+  4. 监控仍加载五段出生/frontier/Push/Goal fault 面板，单 Maze 任务产生大量空值并掩盖 credit。
+- 修复：
+  - 训练配置改为单段 `open_entry_maze`、20 列、课程关闭、75 秒 episode、128 env、7200 秒有效训练；
+    Push、额外 Camera/Goal fault、五段出生、segment frontier、route-excess、open-straight 和真实
+    stuck reset 全部关闭或置 shadow。
+  - 进展奖励改为 episode 内历史最短距离的不可重复 credit：`2.0/m`、累计上限 `+12`，terminal
+    不 clawback；success 保持 `+200`，failure/timeout `-25`，10Hz time cost `-0.02/tick`。
+  - limiter 仅在 risk `>0.75` 时进入紧急收紧，risk=1 时保留 60% `(vx,vy)`，`wz` 不缩放，
+    风险解除每个 10Hz tick 最多恢复 0.20。
+  - 冻结低层、NavigationEncoder、SafetyHead 和 Adapter；保留 Actor/LSTM 权重但重置 Actor Adam，
+    重建 Critic/return statistics，StuckHead fresh。10 分钟后按 `creditadapt/credittrain/creditfinal`
+    训练 Actor，teacher 梯度目标最高 3.5%、硬上限 5%。
+  - warm start 的兼容视图归零 session、rollout、gradient 和 optimizer phase 计数，只把旧累计训练秒
+    继承为 lifetime；P4 先校验 `maze_actor_critic_stuck_only`，再临时翻译为继承 P2 loader 所需 scope，
+    保存包不被改写。新增 `credit*` checkpoint 标签和本地 fresh-instance exact-resume round trip。
+  - P4 监控切换为单 Maze 标题，移除五段专用面板，增加非重复 credit、阶段和冻结模块面板。
+- 本地验证：
+  - `PYTHONPATH=server .../PY311test/bin/python -m pytest -q
+    server/agent_ppo/tests/test_p4_*.py`：最终审查修正后 `130 passed`。
+  - 覆盖 limiter 阈值/释放、credit 非重复和上限、shadow reason4 语义、四阶段 LR、旧父包 warm start、
+    新合同 save/resume、冻结 NavigationEncoder/SafetyHead/Adapter 和监控 route。
+  - 新增 creditwarm 无 PPO reference gradient 回归：Actor/CNN 冻结时 BCE 只更新 StuckHead，
+    不污染 Actor Adam，也不把 head-only 系数带入 10 分钟后的共享梯度校准。
+- 2026-08-05 最终审查修正：原 workflow 将 checkpoint、监控和日志耗时计入
+  `session_effective_seconds`，与“7200 秒有效训练”合同不符。现改为只累计每轮 rollout collection
+  到 PPO update 完成的活跃区间，墙钟单独保留用于周期保存；同时移除未接线的
+  `[p4_nav_ppo.actor_mean_teacher]` 伪配置，Teacher 固定权重和梯度上限只由版本化合同控制。
+  共享 `server-deploy-contract.md` 已补齐 credit-repair 的 warm-start、exact-resume、奖励、limiter、
+  shadow reset 和 checkpoint 标签边界。
+- 证据措辞更正：上述 save/resume 只是在同一 pytest 进程中新建算法实例的 local round-trip，
+  不是 fresh-process 或平台 preload 证据。尚未在开发容器使用真实 `1416926` 完成 1-env reset 与
+  8-env 32-tick PPO/save-resume；
+  尚未创建平台 smoke，也没有固定种子父包对比。因此当前只能称“本地合同已验证”，不能声称 Maze
+  完成率、碰撞、卡滞或真机能力改善。
+- 回滚：恢复 `p4maze8h10hz_1416926` 原包即可；本轮新 checkpoint 合同只允许同合同 exact resume，
+  旧 P4 包始终按结构 warm start。再次遇到 phase mismatch 先检查 high-level session seconds、
+  optimizer phase 和 train_scope，再检查模型 ID；不得新增 ID 单点硬门禁。
+- 关联 commit/PR、平台任务、新 checkpoint：均待生成。
+
+## BUG-20260805-003：P4 creditwarm 空 stuck 批次对无梯度 loss 反传导致首轮 PPO 停止
+
+- 日期：2026-08-05；状态：平台已验证。
+- 影响范围：`codex/p4-maze2h-credit-repair` 的首个 0-10 分钟 `creditwarm` PPO update；
+  不改变网络、观测、动作、奖励、checkpoint 或部署接口。
+- 父制品与任务：父模型 `p4maze8h10hz_1416926`；失败任务
+  `p4maze2h-creditfix`（任务 ID `236575`）。模型 ID 仅记录血缘，不参与修复门禁。
+- 用户可见症状：平台在 `algorithm_p2_nav_ppo.py:_run_ppo_epochs()` 的
+  `(loss * scale).backward()` 抛出
+  `RuntimeError: element 0 of tensors does not require grad and does not have a grad_fn`，训练在首次
+  PPO update 停止。
+- 根因：creditwarm 按合同冻结继承 Actor/CNN，只允许 fresh StuckHead 校准；但部分 minibatch
+  没有满足 motion-intent/mapping 条件的有效 stuck 标签。此时 PPO、SafetyHead、Teacher、Camera、
+  Mirror 和 StuckHead 项全部不连接可训练参数，组合 loss 是有限常量。公共 PPO 循环把
+  `_actor_update_enabled()` 误解为“每个 minibatch 必然存在梯度”，无条件 backward；若直接跳过
+  backward 但仍 step，还会错误增加 Actor gradient-step 并污染监控口径。
+- 修复：公共 PPO 循环按 microbatch 检查 `loss.requires_grad`，只对真实计算图反传；minibatch 至少
+  有一次真实反传才执行 Actor optimizer step、log-std clamp 和 gradient-step 递增。无梯度不是
+  non-finite，不增加 `skipped_nonfinite`；Critic 始终独立更新。后续阶段 Actor 解冻或任一有效
+  辅助监督出现时，原训练语义不变。
+- 回归防线：新增完整 32-tick、TBPTT16 的 creditwarm 空 stuck rollout，验证 Actor optimizer
+  state/step 不变、Critic gradient-step 前进、更新指标有限且不抛错；原“有效 stuck 标签只更新
+  StuckHead”测试继续保留。
+- 验证层级：本地 P4 定向回归 `131 passed`，Python 编译和 `git diff --check` 通过。修复文件同步到
+  开发容器后，使用 `env_isaaclab` Python 并显式注入 Isaac Sim 的预置 Torch 路径运行：空 stuck
+  batch 定向回归 `1 passed`、完整 recovery auxiliary `16 passed`、全部 P4 回归 `131 passed`。
+  容器代码测试已覆盖完整 32-tick/TBPTT16 PPO 更新，但尚未证明平台训练任务已经越过首轮真实
+  rollout/backward；必须以替代任务的首个 PPO update 为平台复验证据。
+- 平台复验：清理容器同步/pytest 缓存后创建替代任务 `p4maze2h-credit-r2`（任务 ID `236585`，
+  UUID `31dfe18e-26ec-42cf-95e7-c7bda5e3dce5`），父模型仍为
+  `p4maze8h10hz_1416926`，任务时长 `2h15min`。任务已运行到 `iter=4`、
+  `effective_min=1.5`、`phase=creditwarm`，越过首轮真实 rollout 和 64 次 high-level update；
+  原 `does not require grad` 异常未再出现，`lifecycle_fail=0`、`low_digest_drift=0`、
+  `low_optimizer_steps=0`。这证明启动阻断已修复，不代表两小时后的 Maze 完成率或策略效果已经改善。
+- 回滚：恢复这两个 PPO loop 条件即可；不需要回滚父模型或训练合同。再次遇到同一异常时先检查
+  当前 phase、trainable param group 和各 auxiliary valid mask，不要增加模型 ID 门禁或强行解冻 Actor。
+- 关联 commit/PR、新 checkpoint：待生成。

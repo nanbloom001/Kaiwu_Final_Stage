@@ -17,6 +17,7 @@ from agent_ppo.feature.p2_curriculum_probe import P2TrackCurriculumProbe
 from agent_ppo.feature import p2_contract, p3_contract, p4_contract
 from agent_ppo.feature.goal_features import build_track_goal_raw
 from agent_ppo.feature.p3_gait import validate_mirror_assembly
+from agent_ppo.feature.p4_spawn import install_p4_full_track_spawn
 from agent_ppo.feature.p4_stuck import MotionWallStuckTracker
 
 
@@ -52,6 +53,19 @@ def _yaw_from_wxyz(quaternion: torch.Tensor) -> torch.Tensor:
     return torch.atan2(
         2.0 * (w * z + x * y),
         1.0 - 2.0 * (y.square() + z.square()),
+    )
+
+
+def _p4_spawn_wire_state(quota, device: torch.device) -> tuple[torch.Tensor, ...]:
+    """Move CPU-owned spawn quota state before composing the worker wire."""
+    full = quota.last_full.to(device=device)
+    raw_segment = quota.last_segment.to(device=device)
+    segment = torch.where(full, torch.zeros_like(raw_segment), raw_segment)
+    return (
+        full,
+        segment,
+        quota.last_quartile.to(device=device),
+        quota.last_safe.to(device=device),
     )
 
 
@@ -107,29 +121,29 @@ def _termination_reason_codes(
         except Exception:
             success = None
     success_mask = (
-        success.to(reset.device).reshape(-1).bool()
+        success.to(reset.device).reshape(-1).bool().clone()
         if torch.is_tensor(success) and success.numel() == reset.numel()
         else torch.zeros_like(reset)
     )
     timeout_mask = (
-        time_outs.to(reset.device).reshape(-1).bool()
+        time_outs.to(reset.device).reshape(-1).bool().clone()
         if torch.is_tensor(time_outs) and time_outs.numel() == reset.numel()
         else torch.zeros_like(reset)
     )
     failure_mask = (
-        terminated.to(reset.device).reshape(-1).bool()
+        terminated.to(reset.device).reshape(-1).bool().clone()
         if torch.is_tensor(terminated) and terminated.numel() == reset.numel()
         else torch.zeros_like(reset)
     )
     wall_mask = (
-        wall_stuck.to(reset.device).reshape(-1).bool()
+        wall_stuck.to(reset.device).reshape(-1).bool().clone()
         if torch.is_tensor(wall_stuck) and wall_stuck.numel() == reset.numel()
         else torch.zeros_like(reset)
     )
-    success_mask &= reset
-    failure_mask &= reset & ~success_mask
-    wall_mask &= reset & ~success_mask & ~failure_mask
-    timeout_mask &= reset & ~success_mask & ~failure_mask & ~wall_mask
+    wall_mask &= reset
+    success_mask &= reset & ~wall_mask
+    failure_mask &= reset & ~wall_mask & ~success_mask
+    timeout_mask &= reset & ~wall_mask & ~success_mask & ~failure_mask
     # A reset with no retained termination term is a timeout at the public
     # wrapper boundary. This also recovers the known truncated/time_outs loss.
     unknown_reset = (
@@ -288,6 +302,11 @@ def install_p2_terminal_return_bridge(env) -> bool:
 class P2WorkerBridge:
     """Expose deployment-shaped feedback without owning the P2 command."""
 
+    @property
+    def _p4_enabled(self) -> bool:
+        """Derive the P4 training wire from the resolved runtime stage."""
+        return self.runtime_stage_type == "p4_nav_ppo"
+
     def __init__(self, env, *, config: dict[str, Any], seed: int = 0):
         self.env = env
         self.config = dict(config)
@@ -401,6 +420,7 @@ class P2WorkerBridge:
         ).to(self.device)
         self._last_gait_log_step = -3000
         self._p4_stuck_tracker = None
+        self._p4_spawn_controller = None
         if self.runtime_stage_type == "p4_nav_ppo":
             max_episode_length = getattr(self.env, "max_episode_length", None)
             episode_length_s = (
@@ -424,18 +444,50 @@ class P2WorkerBridge:
                 f"term_available={int(self._p4_stuck_tracker.term_available)} "
                 f"term_config_valid={int(self._p4_stuck_tracker.term_config_valid)}"
             )
+            self._p4_spawn_controller = install_p4_full_track_spawn(
+                self.env,
+                self.config.get("full_track_spawn"),
+                seed=int(self.config.get("p4_seed", seed)) + 31,
+            )
+            spawn_requested = bool(
+                isinstance(self.config.get("full_track_spawn"), dict)
+                and self.config["full_track_spawn"].get("enabled", False)
+            )
+            if spawn_requested and (
+                self._p4_spawn_controller is None
+                or not self._p4_spawn_controller.installed
+            ):
+                status = (
+                    self._p4_spawn_controller.last_status
+                    if self._p4_spawn_controller is not None
+                    else "controller_missing"
+                )
+                raise RuntimeError(
+                    "P4 full-track training requires the reset spawn hook; "
+                    f"installation failed with status={status}"
+                )
+            if self._p4_spawn_controller is not None:
+                spawn_diagnostics = self._p4_spawn_controller.diagnostics()
+                _print(
+                    "[P4FullTrackSpawnPreflight] "
+                    f"installed={spawn_diagnostics['installed']} "
+                    f"status={spawn_diagnostics['status']} "
+                    "segments=slope,slope_inv,stairs,stairs_inv,maze "
+                    f"all_position_spawn_active={spawn_diagnostics['all_position_spawn_active']}"
+                )
         terrain = getattr(getattr(self.env, "scene", None), "terrain", None)
         initial_segment, segment_status = _track_segment_index(
             terrain, robot.data.root_pos_w[:, 0], describe=True
         )
         _print(
             "[P2WorkerBridge] active owner=environment_worker "
-            f"num_envs={self.num_envs} wire={p2_contract.PRIVILEGED_WIRE_DIM} "
+            f"num_envs={self.num_envs} "
+            f"wire={(p4_contract.P4_PRIVILEGED_WIRE_DIM if self._p4_enabled else p2_contract.PRIVILEGED_WIRE_DIM)} "
             "command_owner=aisrv feedback_profile=p15_shared "
             f"runtime_stage={self.runtime_stage_type} "
             f"live_segment_status={segment_status} "
             "initial_segment_histogram="
-            f"{torch.bincount(initial_segment[initial_segment >= 0], minlength=3).tolist() if bool((initial_segment >= 0).any()) else []}"
+            f"{torch.bincount(initial_segment[initial_segment >= 0], minlength=(len(p4_contract.FULL_TRACK_SEGMENT_LABELS) if self._p4_enabled else 3)).tolist() if bool((initial_segment >= 0).any()) else []}"
         )
 
     def _robot(self):
@@ -1017,13 +1069,54 @@ class P2WorkerBridge:
                 terminal_reason=terminal_reason,
                 seconds_since_push=seconds_since_push_for_stuck,
                 episode_age_s=episode_age_s,
+                true_velocity3=true_velocity,
             )
             raw_goal_xy = build_track_goal_raw(self.env).to(self.device)
             if not bool(torch.isfinite(raw_goal_xy).all()):
                 raise RuntimeError("P4 raw metric goal contains non-finite values")
             self.last_p4_extra.zero_()
             self.last_p4_extra[:, p4_contract.RAW_GOAL_XY_SLICE] = raw_goal_xy
-            self.last_p4_extra[:, 2:] = stuck_diagnostics
+            self.last_p4_extra[:, 2:15] = stuck_diagnostics
+            # Preserve the raw termination-manager signal independently from
+            # the exclusive reason code. Wall-stuck owns overlap so a physical
+            # reset can never be counted or rewarded as success.
+            self.last_p4_extra[:, p4_contract.STUCK_RAW_TERM_INDEX] = (
+                wall_stuck_term.to(torch.float32)
+            )
+            if self._p4_spawn_controller is not None:
+                self.last_p4_extra[:, p4_contract.SPAWN_INSTALLED_INDEX] = float(
+                    self._p4_spawn_controller.installed
+                )
+                spawn = self._p4_spawn_controller.quota
+                full, segment, quartile, safe = _p4_spawn_wire_state(
+                    spawn, self.device
+                )
+                self.last_p4_extra[:, p4_contract.SPAWN_FULL_START_INDEX] = full.float()
+                self.last_p4_extra[:, p4_contract.SPAWN_SEGMENT_INDEX] = segment.float()
+                self.last_p4_extra[:, p4_contract.SPAWN_QUARTILE_INDEX] = quartile.float()
+                self.last_p4_extra[:, p4_contract.SPAWN_SAFE_POINT_INDEX] = safe.float()
+                counters = self._p4_spawn_controller.diagnostic_counts
+                for index, name in (
+                    (p4_contract.SPAWN_REASON4_RETRY_COUNT_INDEX, "reason4_retry_count"),
+                    (p4_contract.SPAWN_REASON4_EXHAUSTED_COUNT_INDEX, "reason4_exhausted_count"),
+                    (
+                        p4_contract.SPAWN_REASON4_FALLBACK_APPLIED_COUNT_INDEX,
+                        "reason4_fallback_applied_count",
+                    ),
+                    (
+                        p4_contract.SPAWN_ALL_POSITION_APPLIED_COUNT_INDEX,
+                        "all_position_applied_count",
+                    ),
+                    (
+                        p4_contract.SPAWN_VALIDATION_FAILURE_COUNT_INDEX,
+                        "spawn_validation_failure_count",
+                    ),
+                    (
+                        p4_contract.SPAWN_WRITE_FAILURE_COUNT_INDEX,
+                        "spawn_write_failure_count",
+                    ),
+                ):
+                    self.last_p4_extra[:, index] = float(counters[name])
         if self.curriculum_probe is not None:
             self.curriculum_probe.observe(self.env)
         gait_metrics = {}
@@ -1068,6 +1161,16 @@ class P2WorkerBridge:
     def p4_extra(self) -> torch.Tensor:
         self.step()
         return self.last_p4_extra.clone()
+
+    def p4_spawn_state_dict(self) -> dict[str, Any] | None:
+        if self._p4_spawn_controller is None:
+            return None
+        return self._p4_spawn_controller.state_dict()
+
+    def load_p4_spawn_state_dict(self, state: dict[str, Any]) -> None:
+        if self._p4_spawn_controller is None:
+            raise RuntimeError("P4 full-track spawn is not active in this worker")
+        self._p4_spawn_controller.load_state_dict(state)
 
 
 def _resolve_config() -> tuple[bool, dict[str, Any], int]:

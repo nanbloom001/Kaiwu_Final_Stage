@@ -6,6 +6,8 @@
 
 import torch
 
+from agent_ppo.feature import nav_contract
+
 
 def build_track_goal_raw(env) -> torch.Tensor:
     """Return the planar goal vector in the robot frame, in meters."""
@@ -38,21 +40,19 @@ def build_track_goal_raw(env) -> torch.Tensor:
 
 
 def encode_track_goal(local_goal_xy: torch.Tensor) -> torch.Tensor:
-    """Encode a metric robot-frame goal with the existing ST7 scaling."""
+    """Encode a metric robot-frame goal with the versioned Track contract."""
     if local_goal_xy.ndim != 2 or local_goal_xy.shape[-1] != 2:
         raise ValueError(
             "Track goal must have shape [num_envs, 2], "
             f"got {tuple(local_goal_xy.shape)}."
         )
 
-    # Keep the clean ST7 clipping contract so an existing checkpoint sees the
-    # same feature range. Noise is applied before this encoding in metric space.
-    local_goal = torch.clamp(local_goal_xy / 10.0, -1.0, 1.0)
+    local_goal = nav_contract.encode_goal_xy_direction_preserving(local_goal_xy)
     goal_dist = torch.clamp(
         torch.linalg.norm(local_goal_xy, dim=1),
         0.0,
-        20.0,
-    ) / 20.0
+        nav_contract.GOAL_DIST_SCALE_M,
+    ) / nav_contract.GOAL_DIST_SCALE_M
     return torch.cat((local_goal, goal_dist.unsqueeze(1)), dim=1)
 
 

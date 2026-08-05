@@ -53,7 +53,7 @@ class _Logger:
 
 
 class TestNavStageSelection(unittest.TestCase):
-    def test_p4_training_agent_init_resolves_single_maze_segment_contract(self):
+    def test_p4_training_agent_init_resolves_full_track_segment_contract(self):
         kaiwu_mod = types.ModuleType("kaiwudrl")
         interface_mod = types.ModuleType("kaiwudrl.interface")
         agent_mod = types.ModuleType("kaiwudrl.interface.agent")
@@ -81,10 +81,23 @@ class TestNavStageSelection(unittest.TestCase):
             P4NavPPOConfig,
             {
                 "p4_nav_ppo": {"p4_seed": 1, "num_learning_epochs": 4},
-                "terrain": {"track": {"sub_terrains": ["open_entry_maze"]}},
+                "terrain": {
+                    "track": {
+                        "sub_terrains": [
+                            "pyramid_slope",
+                            "pyramid_slope_inv",
+                            "pyramid_stairs",
+                            "pyramid_stairs_inv",
+                            "open_entry_maze",
+                        ]
+                    }
+                },
             },
         )
-        self.assertEqual(agent.algorithm.config["track_segment_labels"], ["maze"])
+        self.assertEqual(
+            agent.algorithm.config["track_segment_labels"],
+            ["slope", "slope_inv", "stairs", "stairs_inv", "maze"],
+        )
 
     def test_active_branch_bootstraps_worker_and_aisrv_from_configure_app(self):
         config_path = pathlib.Path(__file__).resolve().parents[2] / "conf" / "configure_app.toml"

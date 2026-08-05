@@ -3,7 +3,7 @@
 
 Run inside the Kaiwu development container from the server root:
 
-    /workspace/isaaclab/isaaclab.sh -p \
+    /workspace/isaaclab/_isaac_sim/python.sh \
       agent_ppo/tools/p2_terminal_smoke.py --num-envs 1
 
 The smoke creates the real Track+Camera environment, moves env 0 to its

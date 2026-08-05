@@ -112,6 +112,14 @@ P3_STANDARD_JOINT_PHASE_LABELS = (
 )
 
 P4_NAV_PHASE_LABELS = (
+    "creditwarm",
+    "creditadapt",
+    "credittrain",
+    "creditfinal",
+    "fullwarm",
+    "fulladapt",
+    "fulltrain",
+    "fullstabilize",
     "mazediag",
     "mazeprobe",
     "mazeattack",
@@ -128,6 +136,14 @@ P4_NAV_PHASE_LABELS = (
 # complete validation set; candidate discovery must not infer priority by
 # reversing that mixed new/legacy tuple.
 P4_NAV_CHECKPOINT_PRIORITY = (
+    "creditfinal",
+    "credittrain",
+    "creditadapt",
+    "creditwarm",
+    "fullstabilize",
+    "fulltrain",
+    "fulladapt",
+    "fullwarm",
     "mazefinal",
     "mazehard",
     "mazeattack",

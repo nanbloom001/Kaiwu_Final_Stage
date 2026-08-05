@@ -1605,7 +1605,7 @@ def test_worker_reason_codes_prioritize_success_failure_and_timeout():
     assert reasons.tolist() == [1.0, 2.0, 3.0, 3.0]
 
 
-def test_worker_reason_code_four_is_below_success_and_failure_but_above_timeout():
+def test_worker_reason_code_four_owns_all_overlapping_terminal_terms():
     manager = _TerminationManager(4)
     manager.terminated[:] = torch.tensor((False, True, False, False))
     manager.time_outs[:] = True
@@ -1616,7 +1616,7 @@ def test_worker_reason_code_four_is_below_success_and_failure_but_above_timeout(
         torch.ones(4, dtype=torch.bool),
         wall_stuck=torch.tensor((True, True, True, False)),
     )
-    assert reasons.tolist() == [1.0, 2.0, 4.0, 3.0]
+    assert reasons.tolist() == [4.0, 4.0, 4.0, 3.0]
 
 
 def test_terminal_reason_keeps_success_and_timeout_mutually_exclusive():

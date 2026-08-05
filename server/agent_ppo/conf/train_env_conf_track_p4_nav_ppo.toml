@@ -1,4 +1,4 @@
-# P4 eight-hour maze-only navigation attack over the frozen low level.
+# P4 two-hour Maze credit-assignment repair over the verified 10 Hz parent.
 
 [env]
 num_envs = 128
@@ -26,22 +26,21 @@ sub_terrains = ["open_entry_maze"]
 num_parallel_tracks = 20
 
 [domain_rand]
-enable_domain_rand = true
-randomize_friction = true
-friction_range = [0.65, 1.25]
-randomize_base_mass = true
-added_mass_range = [-0.40, 0.40]
-restitution_range = [0.0, 0.05]
-# Keep the EventTerm materialized from process creation. P4 sets its velocity
-# to zero until the two-hour boundary through EventManager's public API.
-push_robots = true
+enable_domain_rand = false
+randomize_friction = false
+friction_range = [1.0, 1.0]
+randomize_base_mass = false
+added_mass_range = [0.0, 0.0]
+restitution_range = [0.0, 0.0]
+# Keep the attribution run free from external disturbances.
+push_robots = false
 push_interval_s = 45.0
 min_push_interval_s = 30.0
 max_push_vel_xy = 0.0
 
 [noise]
-add_noise = true
-noise_level = 0.35
+add_noise = false
+noise_level = 0.0
 
 [init_state]
 pos = [0.0, 0.0, 0.35]
@@ -72,20 +71,19 @@ max_depth = 5.0
 enabled = false
 
 [p4_nav_ppo]
-run_name = "p4maze8h-10hzroute"
+run_name = "p4maze2h-credit-repair"
 # Model ID selects the intended parent candidate; structure/spec/shape/finite
 # validation remains authoritative after selection.
-parent_model_id = 1256446
-parent_model_label = "p4nav2h_1256446-F"
-load_mode = "p4_parent_or_exact_resume"
-# The first 10 minutes are read-only diagnostics and do not count toward the
-# 28,800-second gradient-training target. Keep five minutes of bounded rollout,
-# checkpoint and shutdown margin after the 8h10m minimum; the workflow exits as
-# soon as the effective target is reached.
-task_end_hours = 8.25
-target_effective_seconds = 28800
-diagnostic_seconds = 600
-maze_training_branch = "auto"
+parent_model_id = 1416926
+parent_model_label = "p4maze8h10hz_1416926-mazefinal"
+load_mode = "p4_maze_credit_repair_warm_start"
+training_profile = "maze_credit_repair"
+# All 7,200 seconds are effective training. The 0.25 hour margin is reserved
+# for checkpoint/save/normal shutdown only.
+task_end_hours = 2.25
+target_effective_seconds = 7200
+diagnostic_seconds = 0
+maze_training_branch = "credit_repair"
 nav_rollout_ticks = 32
 nav_period_frames = 5
 tbptt_sequence_length = 16
@@ -93,8 +91,8 @@ num_learning_epochs = 4
 num_mini_batches = 4
 cnn_microbatch_sequences = 4
 max_grad_norm = 1.0
-slew_rate = [0.30, 0.30, 1.00]
-slew_release_rate = [0.30, 0.60, 2.50]
+slew_rate = [0.30, 0.40, 1.50]
+slew_release_rate = [0.30, 0.80, 3.00]
 first_save_minutes = 5.0
 save_interval_minutes = 10.0
 log_interval = 1
@@ -105,22 +103,45 @@ neutral_seed = 4106
 action_seed = 4107
 vy_action_seed = 4108
 terrain_curriculum = false
+camera_fault_course_enabled = false
+goal_fault_course_enabled = false
 
 [p4_nav_ppo.stuck_reset]
 enabled = true
-mode = "active"
-confirmation_s = 7.0
-radius_m = 0.30
+# Shadow mode records physical confinement and validated non-foot wall contact
+# without creating reason-4 terminals in this attribution run.
+mode = "shadow"
+confirmation_s = 10.0
+radius_m = 0.50
 min_goal_distance_m = 0.80
 body_collision_force_n = 30.0
 wall_evidence_latch_s = 2.0
 episode_grace_s = 5.0
 push_grace_s = 2.0
-terminal_penalty = -15.0
+max_true_motion_speed_m_s = 0.08
+terminal_penalty = -25.0
+
+[p4_nav_ppo.full_track_spawn]
+enabled = false
+phase_boundaries_s = [7200.0, 21600.0]
+full_start_share = [0.70, 0.60, 0.75]
+random_segment_weights = [0.15, 0.15, 0.20, 0.20, 0.30]
+safe_point_share = 0.70
+quartiles = 4
+slope_yaw_abs = 0.35
+maze_yaw_abs = 0.50
+max_reason4_same_bucket_retries = 2
+segment_length_m = 8.0
 
 [p4_nav_ppo.push_schedule]
 term_name = "push_robot"
 resume_offset_s = 0.0
+
+[p4_nav_ppo.near_goal_capture]
+enabled = true
+freshness_min = 0.90
+distance_m = [0.65, 1.20]
+policy_goal_cosine_min = 0.70
 
 [p4_nav_ppo.response_adapter]
 learning_rate = 1.0e-5

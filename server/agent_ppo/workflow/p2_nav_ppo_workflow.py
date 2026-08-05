@@ -42,6 +42,15 @@ def _goal_history_stuck(
     return history_valid & (end_goal > 0.8) & (progress < 0.05)
 
 
+def _event_share(numerator: float | torch.Tensor, denominator: float | torch.Tensor) -> float:
+    """Return a truthful event ratio; an empty event window reports zero."""
+    numerator_value = float(numerator)
+    denominator_value = float(denominator)
+    if denominator_value <= 0.0:
+        return 0.0
+    return numerator_value / denominator_value
+
+
 def _p4_conditional_metrics(
     diagnostic_sums: dict[str, torch.Tensor], device: torch.device
 ) -> dict[str, float]:
@@ -61,6 +70,8 @@ def _p4_conditional_metrics(
     stuck_terminal = count("stuck_terminal_count")
     stuck_return_sum = count("stuck_terminal_episode_return_sum")
     stuck_nonnegative = count("stuck_terminal_nonnegative_count")
+    side_candidates = count("legitimate_side_goal_candidate_count")
+    side_selected = count("legitimate_side_goal_selected_count")
     return {
         "head_correct_samples": head_samples,
         "head_correct_actor_wrong_count": head_wrong,
@@ -79,7 +90,103 @@ def _p4_conditional_metrics(
         "stuck_terminal_nonnegative_rate": (
             stuck_nonnegative / max(stuck_terminal, 1.0)
         ),
+        "legitimate_side_goal_candidate_count": side_candidates,
+        "legitimate_side_goal_selected_count": side_selected,
+        "legitimate_side_goal_selection_rate": (
+            side_selected / max(side_candidates, 1.0)
+        ),
     }
+
+
+def _p4_recovery_event_masks(
+    active: torch.Tensor,
+    awaiting_evidence: torch.Tensor,
+    candidate: torch.Tensor,
+    duration_s: torch.Tensor,
+    transition_done: torch.Tensor,
+    evidence_valid: torch.Tensor,
+    escape_evidence: torch.Tensor,
+    completion: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Classify P4 recovery state without treating reset as a recovery."""
+    active = torch.as_tensor(active).bool().reshape(-1)
+    awaiting_evidence = torch.as_tensor(
+        awaiting_evidence, device=active.device
+    ).bool().reshape(-1)
+    candidate = torch.as_tensor(candidate, device=active.device).bool().reshape(-1)
+    duration_s = torch.as_tensor(
+        duration_s, device=active.device, dtype=torch.float32
+    ).reshape(-1)
+    transition_done = torch.as_tensor(
+        transition_done, device=active.device
+    ).bool().reshape(-1)
+    evidence_valid = torch.as_tensor(
+        evidence_valid, device=active.device
+    ).bool().reshape(-1)
+    escape_evidence = torch.as_tensor(
+        escape_evidence, device=active.device
+    ).bool().reshape(-1)
+    completion = torch.as_tensor(
+        completion, device=active.device
+    ).bool().reshape(-1)
+    if not (
+        active.shape
+        == awaiting_evidence.shape
+        == candidate.shape
+        == duration_s.shape
+        == transition_done.shape
+        == evidence_valid.shape
+        == escape_evidence.shape
+        == completion.shape
+    ):
+        raise ValueError("P4 recovery tensors must share the same flat shape")
+    entry = candidate & ~active
+    physical_exit = (
+        active
+        & ~candidate
+        & ~transition_done
+        & evidence_valid
+        & escape_evidence
+    )
+    success = physical_exit | (active & transition_done & completion)
+    terminal = active & transition_done & ~completion
+    unverified_exit = (
+        active
+        & ~candidate
+        & ~transition_done
+        & ~physical_exit
+        & ~awaiting_evidence
+    )
+    next_awaiting = (
+        (awaiting_evidence | unverified_exit)
+        & ~candidate
+        & ~physical_exit
+        & ~transition_done
+    )
+    return {
+        "entry": entry,
+        "success": success,
+        "terminal": terminal,
+        "unverified_exit": unverified_exit,
+        "early": candidate & (duration_s >= 0.8) & (duration_s < 2.0),
+        "confirmed": candidate & (duration_s >= 2.0),
+        "next_active": (candidate | next_awaiting) & ~transition_done,
+        "next_awaiting": next_awaiting,
+    }
+
+
+def _p4_reset_completion_mismatch(
+    raw_wall_reset: torch.Tensor,
+    completion: torch.Tensor,
+) -> torch.Tensor:
+    """Compare independent wall-reset evidence with scorer completion."""
+    raw_wall_reset = torch.as_tensor(raw_wall_reset).bool().reshape(-1)
+    completion = torch.as_tensor(
+        completion, device=raw_wall_reset.device
+    ).bool().reshape(-1)
+    if raw_wall_reset.shape != completion.shape:
+        raise ValueError("P4 reset/completion tensors must share shape")
+    return raw_wall_reset & completion
 
 
 class _CollisionTraceRecorder:
@@ -394,14 +501,29 @@ def _curriculum_metrics(snapshot: dict[str, object]) -> dict[str, float]:
             "curriculum_successes": float(outcome_totals[0]),
             "curriculum_failures": float(outcome_totals[1]),
             "curriculum_timeouts": float(outcome_totals[2]),
-            "curriculum_slope_inv_starts": float(sum(int(v) for v in starts[0])),
-            "curriculum_stairs_inv_starts": float(sum(int(v) for v in starts[1])),
-            "curriculum_maze_entry_starts": float(sum(int(v) for v in starts[2])),
         }
+        row_labels = (
+            p4_contract.FULL_TRACK_SEGMENT_LABELS
+            if len(starts) >= len(p4_contract.FULL_TRACK_SEGMENT_LABELS)
+            else p2_contract.TRACK_SEGMENT_METRIC_LABELS
+        )
+        for index, label in enumerate(row_labels):
+            if index >= len(starts):
+                break
+            count = float(sum(int(v) for v in starts[index]))
+            metrics[f"curriculum_{label}_starts"] = count
+        if len(row_labels) == 3:
+            metrics["curriculum_maze_entry_starts"] = metrics.get(
+                "curriculum_maze_starts", 0.0
+            )
         column_histogram = snapshot.get("last_terrain_types_histogram", ())
         column_total = max(1, sum(int(value) for value in column_histogram))
         for index, value in enumerate(column_histogram):
             metrics[f"terrain_column_l{index}_share"] = float(value) / column_total
+        low_columns = sum(int(value) for value in column_histogram[:10])
+        high_columns = sum(int(value) for value in column_histogram[10:20])
+        metrics["difficulty_l0_l9_share"] = float(low_columns) / column_total
+        metrics["difficulty_l10_l19_share"] = float(high_columns) / column_total
         row_histogram = snapshot.get("last_terrain_levels_histogram", ())
         row_total = max(1, sum(int(value) for value in row_histogram))
         for index, value in enumerate(row_histogram):
@@ -647,6 +769,14 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     segment_labels = p2_contract.canonical_track_segment_labels(
         terrain_track.get("sub_terrains", ())
     )
+    segment_metric_labels = (
+        p2_contract.TRACK_SEGMENT_METRIC_LABELS
+        if all(
+            label in p2_contract.TRACK_SEGMENT_METRIC_LABELS
+            for label in segment_labels
+        )
+        else p2_contract.CANONICAL_TRACK_SEGMENT_METRIC_LABELS
+    )
     feedback_conf = p2_conf.get("feedback_profile", {})
     if not isinstance(feedback_conf, dict):
         feedback_conf = {}
@@ -692,6 +822,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         getattr(algorithm, "session_wall_seconds", resumed_seconds)
     )
     session_started = time.monotonic()
+    p4_active_training_seconds = 0.0
     first_save_s = float(p2_conf.get("first_save_minutes", 5.0)) * 60.0
     save_interval_s = float(p2_conf.get("save_interval_minutes", 10.0)) * 60.0
     if first_save_s <= 0.0 or save_interval_s <= 0.0:
@@ -732,6 +863,34 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     agent._p2_final_save_done = False
     last_log = time.monotonic()
     p4_metric_last_seen: dict[str, float] = {}
+    p4_cumulative_counter_previous: dict[str, float] = {}
+    p4_capture_active = torch.zeros(agent.num_envs, dtype=torch.bool, device=agent.device)
+    p4_capture_entry_tick = torch.full(
+        (agent.num_envs,), -1, dtype=torch.long, device=agent.device
+    )
+    p4_recovery_active = torch.zeros(
+        agent.num_envs, dtype=torch.bool, device=agent.device
+    )
+    p4_recovery_awaiting_evidence = torch.zeros(
+        agent.num_envs, dtype=torch.bool, device=agent.device
+    )
+    p4_recovery_entry_tick = torch.full(
+        (agent.num_envs,), -1, dtype=torch.long, device=agent.device
+    )
+    p4_tick_index = 0
+    restored_recovery = getattr(algorithm, "_p4_recovery_monitor_state", {})
+    p4_recovery_event_times: deque[float] = deque(
+        float(value) for value in restored_recovery.get("event_times", ())
+    )
+    p4_recovery_event_lifetime_count = int(
+        restored_recovery.get("success_lifetime_count", 0)
+    )
+    p4_recovery_candidate_lifetime_count = int(
+        restored_recovery.get("candidate_lifetime_count", 0)
+    )
+    p4_recovery_terminal_lifetime_count = int(
+        restored_recovery.get("terminal_lifetime_count", 0)
+    )
     target_seconds = (
         p4_contract.TARGET_EFFECTIVE_SECONDS
         if is_p4
@@ -749,6 +908,22 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             diagnostic_valid_sums: dict[str, torch.Tensor] = {}
             diagnostic_count = 0
             diagnostic_valid_count = torch.zeros((), device=agent.device)
+            p4_capture_candidate_count = 0
+            p4_capture_entry_count = 0
+            p4_capture_exit_count = 0
+            p4_capture_zone_success_count = 0
+            p4_capture_zone_collision_count = 0
+            p4_capture_zone_timeout_count = 0
+            p4_capture_zone_reset_count = 0
+            p4_capture_reset_completion_error_count = 0
+            p4_capture_success_latency_s: list[float] = []
+            p4_recovery_candidate_entry_count = 0
+            p4_recovery_success_count = 0
+            p4_recovery_terminal_count = 0
+            p4_recovery_unverified_exit_count = 0
+            p4_recovery_early_sample_count = 0
+            p4_recovery_confirmed_sample_count = 0
+            p4_recovery_time_s: list[float] = []
             command_bin_counts = torch.zeros(5, 4, device=agent.device)
             command_bin_progress = torch.zeros_like(command_bin_counts)
             command_bin_tracking = torch.zeros_like(command_bin_counts)
@@ -766,7 +941,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             command_bin_vy_nonzero = torch.zeros_like(command_bin_counts)
             command_bin_abs_vy = torch.zeros_like(command_bin_counts)
             command_bin_vy_outer = torch.zeros_like(command_bin_counts)
-            row_counts = torch.zeros(3, device=agent.device)
+            row_counts = torch.zeros(len(segment_metric_labels), device=agent.device)
             row_progress = torch.zeros_like(row_counts)
             row_target_vx = torch.zeros_like(row_counts)
             row_exec_vx = torch.zeros_like(row_counts)
@@ -784,6 +959,48 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             row_success = torch.zeros_like(row_counts)
             row_failure = torch.zeros_like(row_counts)
             row_timeout = torch.zeros_like(row_counts)
+            row_reason4 = torch.zeros_like(row_counts)
+            p4_spawn_outcomes = torch.zeros(
+                len(segment_metric_labels), 4, device=agent.device
+            )
+            p4_current_outcomes = torch.zeros_like(p4_spawn_outcomes)
+            p4_episode_start_counts = torch.zeros_like(row_counts)
+            p4_spawn_reset_event_count = torch.zeros((), device=agent.device)
+            p4_spawn_full_start_event_count = torch.zeros((), device=agent.device)
+            p4_spawn_safe_point_event_count = torch.zeros((), device=agent.device)
+            p4_spawn_hard_position_event_count = torch.zeros((), device=agent.device)
+            p4_spawn_quartile_event_counts = torch.zeros(4, device=agent.device)
+            signed_chain_sums = {
+                axis: {
+                    sign: {
+                        stage: torch.zeros((), device=agent.device)
+                        for stage in (
+                            "policy_target",
+                            "limited_target",
+                            "mapped_cmd",
+                            "exec",
+                            "true",
+                        )
+                    }
+                    for sign in ("positive", "negative")
+                }
+                for axis in ("vy", "wz")
+            }
+            signed_chain_counts = {
+                axis: {
+                    sign: torch.zeros((), device=agent.device)
+                    for sign in ("positive", "negative")
+                }
+                for axis in ("vy", "wz")
+            }
+            p4_cumulative_counter_names = {
+                "spawn_reason4_retry_count",
+                "spawn_reason4_exhausted_count",
+                "spawn_reason4_fallback_applied_count",
+                "spawn_all_position_applied_count",
+                "spawn_validation_failure_count",
+                "spawn_write_failure_count",
+            }
             segment_diagnostic_count = torch.zeros((), device=agent.device)
             quantile_names = (
                 "target_vx", "target_vy", "target_wz",
@@ -1055,7 +1272,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 )
                 segment_valid = row_index >= 0
                 segment_diagnostic_count += segment_valid.float().sum()
-                valid_row_index = row_index.clamp(0, 2)
+                valid_row_index = row_index.clamp(0, len(segment_metric_labels) - 1)
                 def add_segment(target_buffer, source):
                     target_buffer.scatter_add_(
                         0, valid_row_index, source.float() * segment_valid.float()
@@ -1070,9 +1287,16 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 add_segment(row_stop, values["zero_command_rate"])
                 add_segment(row_creep, values["creep_command_rate"])
                 add_segment(row_spin, values["target_pure_yaw"])
-                add_segment(row_success, values["success_rate"])
-                add_segment(row_failure, values["failure_rate"])
-                add_segment(row_timeout, values["timeout_rate"])
+                add_segment(row_success, terminal_reason == 1)
+                add_segment(row_failure, terminal_reason == 2)
+                add_segment(row_timeout, terminal_reason == 3)
+                add_segment(row_reason4, terminal_reason == 4)
+                if is_p4:
+                    for outcome_index, reason_code in enumerate((1, 2, 3, 4)):
+                        outcome_mask = segment_valid & (terminal_reason == reason_code)
+                        p4_current_outcomes[:, outcome_index].scatter_add_(
+                            0, valid_row_index, outcome_mask.float()
+                        )
                 diagnostic_count += agent.num_envs
                 finish_critic_wire = critic_wire
                 if is_p4 and bool(transition_done.any()):
@@ -1101,6 +1325,14 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         name, torch.zeros((), device=agent.device)
                     ) + value.sum()
                 for name, value in algorithm.last_tick_diagnostics.items():
+                    if name in p4_cumulative_counter_names:
+                        diagnostic_maxima[name] = torch.maximum(
+                            diagnostic_maxima.get(
+                                name, torch.zeros((), device=agent.device)
+                            ),
+                            value.max(),
+                        )
+                        continue
                     diagnostic_sums[name] = diagnostic_sums.get(
                         name, torch.zeros((), device=agent.device)
                     ) + value.sum()
@@ -1112,6 +1344,270 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                             ),
                             value.max(),
                         )
+                if is_p4:
+                    diagnostics = algorithm.last_tick_diagnostics
+                    spawn_segment = diagnostics.get(
+                        "segment_frontier_spawn_segment",
+                        torch.full(
+                            (agent.num_envs,), -1.0, device=agent.device
+                        ),
+                    ).reshape(-1).round().long()
+                    spawn_valid = (
+                        (spawn_segment >= 0)
+                        & (spawn_segment < len(segment_metric_labels))
+                    )
+                    spawn_index = spawn_segment.clamp(
+                        0, len(segment_metric_labels) - 1
+                    )
+                    for outcome_index, reason_code in enumerate((1, 2, 3, 4)):
+                        outcome_mask = spawn_valid & (terminal_reason == reason_code)
+                        p4_spawn_outcomes[:, outcome_index].scatter_add_(
+                            0, spawn_index, outcome_mask.float()
+                        )
+
+                    new_episode = transition_done
+                    new_full_start = diagnostics.get(
+                        "spawn_full_start_share",
+                        torch.zeros(agent.num_envs, device=agent.device),
+                    ).reshape(-1) > 0.5
+                    new_safe_point = diagnostics.get(
+                        "spawn_safe_point_share",
+                        torch.zeros(agent.num_envs, device=agent.device),
+                    ).reshape(-1) > 0.5
+                    new_quartile = diagnostics.get(
+                        "spawn_position_quartile",
+                        torch.full(
+                            (agent.num_envs,), -1.0, device=agent.device
+                        ),
+                    ).reshape(-1).round().long()
+                    new_spawn_segment = diagnostics.get(
+                        "spawn_segment_index",
+                        torch.full(
+                            (agent.num_envs,), -1.0, device=agent.device
+                        ),
+                    ).reshape(-1).round().long()
+                    new_spawn_valid = (
+                        new_episode
+                        & (new_spawn_segment >= 0)
+                        & (new_spawn_segment < len(segment_metric_labels))
+                    )
+                    p4_episode_start_counts.scatter_add_(
+                        0,
+                        new_spawn_segment.clamp(0, len(segment_metric_labels) - 1),
+                        new_spawn_valid.float(),
+                    )
+                    p4_spawn_reset_event_count += new_episode.float().sum()
+                    p4_spawn_full_start_event_count += (
+                        new_episode & new_full_start
+                    ).float().sum()
+                    segment_start = new_episode & ~new_full_start
+                    p4_spawn_safe_point_event_count += (
+                        segment_start & new_safe_point
+                    ).float().sum()
+                    p4_spawn_hard_position_event_count += (
+                        segment_start & ~new_safe_point
+                    ).float().sum()
+                    quartile_valid = (
+                        segment_start & (new_quartile >= 0) & (new_quartile < 4)
+                    )
+                    p4_spawn_quartile_event_counts.scatter_add_(
+                        0,
+                        new_quartile.clamp(0, 3),
+                        quartile_valid.float(),
+                    )
+
+                    chain_values = {
+                        "policy_target": {
+                            axis: diagnostics.get(
+                                f"policy_target_{axis}",
+                                torch.zeros(agent.num_envs, device=agent.device),
+                            ).reshape(-1)
+                            for axis in ("vy", "wz")
+                        },
+                        "limited_target": {
+                            axis: diagnostics.get(
+                                f"limited_target_{axis}",
+                                torch.zeros(agent.num_envs, device=agent.device),
+                            ).reshape(-1)
+                            for axis in ("vy", "wz")
+                        },
+                        "mapped_cmd": {
+                            axis: diagnostics.get(
+                                f"mapped_cmd_{axis}",
+                                torch.zeros(agent.num_envs, device=agent.device),
+                            ).reshape(-1)
+                            for axis in ("vy", "wz")
+                        },
+                        "exec": {"vy": executed[:, 1], "wz": executed[:, 2]},
+                        "true": {
+                            "vy": diagnostic_aux[:, 13],
+                            "wz": diagnostic_aux[:, 14],
+                        },
+                    }
+                    for axis in ("vy", "wz"):
+                        policy_axis = chain_values["policy_target"][axis]
+                        for sign, mask in (
+                            ("positive", policy_axis > 1.0e-4),
+                            ("negative", policy_axis < -1.0e-4),
+                        ):
+                            signed_chain_counts[axis][sign] += mask.float().sum()
+                            for stage, by_axis in chain_values.items():
+                                signed_chain_sums[axis][sign][stage] += (
+                                    by_axis[axis] * mask.float()
+                                ).sum()
+                    capture_active = diagnostics.get(
+                        "near_goal_capture_active",
+                        torch.zeros(agent.num_envs, device=agent.device),
+                    ).reshape(-1) > 0.5
+                    capture_candidate = diagnostics.get(
+                        "near_goal_capture_candidate",
+                        torch.zeros(agent.num_envs, device=agent.device),
+                    ).reshape(-1) > 0.5
+                    capture_entry = capture_active & ~p4_capture_active
+                    capture_exit = p4_capture_active & (
+                        ~capture_active | transition_done
+                    )
+                    capture_zone = p4_capture_active | capture_active
+                    capture_success = capture_zone & (terminal_reason == 1)
+                    capture_timeout = capture_zone & (terminal_reason == 3)
+                    raw_wall_reset = diagnostics.get(
+                        "wall_stuck_raw_term",
+                        torch.zeros(agent.num_envs, device=agent.device),
+                    ).reshape(-1) > 0.5
+                    capture_reset = capture_zone & raw_wall_reset
+                    capture_collision = capture_zone & (terminal_reason == 2)
+                    p4_capture_candidate_count += int(capture_candidate.sum().item())
+                    p4_capture_entry_count += int(capture_entry.sum().item())
+                    p4_capture_exit_count += int(capture_exit.sum().item())
+                    p4_capture_zone_success_count += int(capture_success.sum().item())
+                    p4_capture_zone_collision_count += int(capture_collision.sum().item())
+                    p4_capture_zone_timeout_count += int(capture_timeout.sum().item())
+                    p4_capture_zone_reset_count += int(capture_reset.sum().item())
+                    # Terminal reasons are exclusive.  Keep this visible so a
+                    # reset can never silently inflate the completion series.
+                    p4_capture_reset_completion_error_count += int(
+                        _p4_reset_completion_mismatch(
+                            raw_wall_reset, terminal_reason == 1
+                        ).sum().item()
+                    )
+                    capture_entry_ticks = torch.where(
+                        capture_entry,
+                        torch.full_like(p4_capture_entry_tick, p4_tick_index),
+                        p4_capture_entry_tick,
+                    )
+                    success_entries = capture_entry_ticks[capture_success]
+                    p4_capture_success_latency_s.extend(
+                        (
+                            (p4_tick_index - success_entries + 1).clamp_min(0)
+                            .float()
+                            .mul(nav_dt_s)
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                    )
+                    p4_capture_entry_tick[capture_entry] = p4_tick_index
+                    p4_capture_entry_tick[transition_done] = -1
+                    p4_capture_active = capture_active & ~transition_done
+                    recovery_candidate = diagnostics.get(
+                        "wall_stuck_candidate_share",
+                        torch.zeros(agent.num_envs, device=agent.device),
+                    ).reshape(-1) > 0.5
+                    recovery_duration = diagnostics.get(
+                        "wall_stuck_duration_s",
+                        torch.zeros(agent.num_envs, device=agent.device),
+                    ).reshape(-1)
+                    recovery_mapping_valid = diagnostics.get(
+                        "wall_stuck_mapping_valid",
+                        torch.zeros(agent.num_envs, device=agent.device),
+                    ).reshape(-1) > 0.5
+                    recovery_true_xy = diagnostic_aux[:, 12:14]
+                    recovery_true_speed = torch.linalg.vector_norm(
+                        recovery_true_xy, dim=-1
+                    )
+                    recovery_progress = start_goal - end_goal
+                    recovery_evidence_valid = (
+                        recovery_mapping_valid
+                        & torch.isfinite(recovery_true_xy).all(dim=-1)
+                        & torch.isfinite(recovery_progress)
+                    )
+                    recovery_escape_evidence = (
+                        (recovery_true_speed > 0.08)
+                        | (recovery_progress > 0.02)
+                    )
+                    recovery_masks = _p4_recovery_event_masks(
+                        p4_recovery_active,
+                        p4_recovery_awaiting_evidence,
+                        recovery_candidate,
+                        recovery_duration,
+                        transition_done,
+                        recovery_evidence_valid,
+                        recovery_escape_evidence,
+                        terminal_reason == 1,
+                    )
+                    recovery_entry = recovery_masks["entry"]
+                    recovery_success = recovery_masks["success"]
+                    recovery_terminal = recovery_masks["terminal"]
+                    recovery_unverified_exit = recovery_masks["unverified_exit"]
+                    recovery_early = recovery_masks["early"]
+                    recovery_confirmed = recovery_masks["confirmed"]
+
+                    p4_recovery_candidate_entry_count += int(
+                        recovery_entry.sum().item()
+                    )
+                    p4_recovery_success_count += int(recovery_success.sum().item())
+                    p4_recovery_terminal_count += int(recovery_terminal.sum().item())
+                    p4_recovery_unverified_exit_count += int(
+                        recovery_unverified_exit.sum().item()
+                    )
+                    p4_recovery_early_sample_count += int(recovery_early.sum().item())
+                    p4_recovery_confirmed_sample_count += int(
+                        recovery_confirmed.sum().item()
+                    )
+                    p4_recovery_candidate_lifetime_count += int(
+                        recovery_entry.sum().item()
+                    )
+                    p4_recovery_terminal_lifetime_count += int(
+                        recovery_terminal.sum().item()
+                    )
+
+                    recovery_entry_ticks = torch.where(
+                        recovery_entry,
+                        torch.full_like(p4_recovery_entry_tick, p4_tick_index),
+                        p4_recovery_entry_tick,
+                    )
+                    successful_entries = recovery_entry_ticks[recovery_success]
+                    p4_recovery_time_s.extend(
+                        (
+                            (p4_tick_index - successful_entries + 1).clamp_min(0)
+                            .float()
+                            .mul(nav_dt_s)
+                            .detach()
+                            .cpu()
+                            .tolist()
+                        )
+                    )
+                    p4_recovery_entry_tick[recovery_entry] = p4_tick_index
+                    p4_recovery_entry_tick[recovery_success | recovery_terminal] = -1
+                    p4_recovery_active = recovery_masks["next_active"]
+                    p4_recovery_awaiting_evidence = recovery_masks[
+                        "next_awaiting"
+                    ]
+
+                    recovery_count = int(recovery_success.sum().item())
+                    if recovery_count:
+                        event_time = resumed_clock_seconds + (
+                            time.monotonic() - session_started
+                        )
+                        p4_recovery_event_times.extend([event_time] * recovery_count)
+                        p4_recovery_event_lifetime_count += recovery_count
+                    algorithm._p4_recovery_monitor_state = {
+                        "event_times": list(p4_recovery_event_times),
+                        "success_lifetime_count": p4_recovery_event_lifetime_count,
+                        "candidate_lifetime_count": p4_recovery_candidate_lifetime_count,
+                        "terminal_lifetime_count": p4_recovery_terminal_lifetime_count,
+                    }
+                    p4_tick_index += 1
                 collision_traces.observe(
                     iteration=algorithm.current_iteration,
                     tick=_tick,
@@ -1182,9 +1678,22 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     update_skipped_no_valid=0.0,
                 )
             now = time.monotonic()
-            algorithm.update_training_clocks(
-                resumed_clock_seconds + (now - session_started)
-            )
+            if is_p4:
+                # P4's persisted effective clock is the time spent collecting
+                # the rollout and applying its updates.  Checkpoint I/O,
+                # monitoring and logging below must not consume the 7200s
+                # gradient-training budget.
+                p4_active_training_seconds += max(0.0, now - rollout_started)
+                algorithm.update_training_clocks(
+                    resumed_clock_seconds + (now - session_started),
+                    session_effective_seconds=(
+                        resumed_seconds + p4_active_training_seconds
+                    ),
+                )
+            else:
+                algorithm.update_training_clocks(
+                    resumed_clock_seconds + (now - session_started)
+                )
             curriculum_snapshot = algorithm.curriculum_probe.state_dict()
             agent.training_elapsed_h = algorithm.effective_training_seconds / 3600.0
             unfrozen_now = algorithm.maybe_unfreeze_cnn(algorithm.session_effective_seconds)
@@ -1292,12 +1801,15 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 metrics["selected_safest_direction_rate"] = (
                     selected_safest_choices / max(eligible_safe_choices, 1.0)
                 )
-                metrics.update(
-                    {
-                        name: float(value.detach().cpu())
-                        for name, value in diagnostic_maxima.items()
-                    }
-                )
+                for name, value in diagnostic_maxima.items():
+                    current = float(value.detach().cpu())
+                    if name in p4_cumulative_counter_names:
+                        previous = p4_cumulative_counter_previous.get(name, 0.0)
+                        metrics[name] = max(0.0, current - previous)
+                        metrics[f"{name}_lifetime"] = current
+                        p4_cumulative_counter_previous[name] = current
+                    else:
+                        metrics[name] = current
             valid_count = float(diagnostic_valid_count.detach().cpu())
             if valid_count > 0.0:
                 metrics.update(
@@ -1347,7 +1859,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         metrics[f"{prefix}_{suffix}"] = float(
                             source[vx_index, wz_index]
                         ) / metric_denominator
-            for index, label in enumerate(p2_contract.TRACK_SEGMENT_METRIC_LABELS):
+            for index, label in enumerate(segment_metric_labels):
                 denominator = max(1.0, float(row_counts[index]))
                 metrics[f"{label}_sample_share"] = float(row_counts[index]) / max(
                     1.0, float(segment_diagnostic_count)
@@ -1365,6 +1877,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     ("success", row_success),
                     ("failure", row_failure),
                     ("timeout", row_timeout),
+                    ("reason4", row_reason4),
                     ("predictive_clearance_m", row_predictive_clearance),
                     ("predictive_risk", row_predictive_risk),
                     ("predictive_penalty", row_predictive_penalty),
@@ -1372,6 +1885,79 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     ("teacher_high_risk_rate", row_teacher_high_risk),
                 ):
                     metrics[f"{label}_{suffix}"] = float(source[index]) / denominator
+            if is_p4:
+                reset_event_count = float(p4_spawn_reset_event_count)
+                segment_event_count = float(
+                    p4_spawn_safe_point_event_count
+                    + p4_spawn_hard_position_event_count
+                )
+                metrics["spawn_reset_event_count"] = float(
+                    p4_spawn_reset_event_count
+                )
+                metrics["spawn_full_start_event_share"] = _event_share(
+                    p4_spawn_full_start_event_count, reset_event_count
+                )
+                metrics["spawn_segment_start_event_share"] = _event_share(
+                    segment_event_count, reset_event_count
+                )
+                metrics["spawn_safe_point_event_share"] = _event_share(
+                    p4_spawn_safe_point_event_count, segment_event_count
+                )
+                metrics["spawn_hard_position_event_share"] = _event_share(
+                    p4_spawn_hard_position_event_count, segment_event_count
+                )
+                for quartile_index in range(4):
+                    metrics[f"spawn_position_q{quartile_index + 1}_event_share"] = (
+                        _event_share(
+                            p4_spawn_quartile_event_counts[quartile_index],
+                            segment_event_count,
+                        )
+                    )
+                metrics["episode_start_count"] = float(
+                    p4_episode_start_counts.sum()
+                )
+                for axis in ("vy", "wz"):
+                    for sign in ("positive", "negative"):
+                        denominator = max(
+                            1.0, float(signed_chain_counts[axis][sign])
+                        )
+                        for stage in (
+                            "policy_target",
+                            "limited_target",
+                            "mapped_cmd",
+                            "exec",
+                            "true",
+                        ):
+                            metrics[f"{stage}_{axis}_{sign}_mean"] = float(
+                                signed_chain_sums[axis][sign][stage]
+                            ) / denominator
+                for index, label in enumerate(segment_metric_labels):
+                    metrics[f"spawn_segment_{label}_event_share"] = _event_share(
+                        p4_episode_start_counts[index], reset_event_count
+                    )
+                    metrics[f"episode_start_{label}_count"] = float(
+                        p4_episode_start_counts[index]
+                    )
+                    outcome_total = max(
+                        1.0, float(p4_spawn_outcomes[index].sum())
+                    )
+                    for outcome_index, suffix in enumerate(
+                        ("success", "failure", "timeout", "reason4")
+                    ):
+                        metrics[f"spawn_segment_{label}_{suffix}_rate"] = (
+                            float(p4_spawn_outcomes[index, outcome_index])
+                            / outcome_total
+                        )
+                    current_outcome_total = max(
+                        1.0, float(p4_current_outcomes[index].sum())
+                    )
+                    for outcome_index, suffix in enumerate(
+                        ("success", "failure", "timeout", "reason4")
+                    ):
+                        metrics[f"current_segment_{label}_{suffix}_rate"] = (
+                            float(p4_current_outcomes[index, outcome_index])
+                            / current_outcome_total
+                        )
             metrics.update(
                 {
                     "effective_training_seconds": algorithm.effective_training_seconds,
@@ -1389,6 +1975,85 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     "cnn_unfrozen": float(algorithm.cnn_unfrozen),
                 }
             )
+            if is_p4:
+                session_wall_seconds = float(algorithm.session_wall_seconds)
+                while (
+                    p4_recovery_event_times
+                    and p4_recovery_event_times[0] < session_wall_seconds - 60.0
+                ):
+                    p4_recovery_event_times.popleft()
+                metrics.update(
+                    {
+                        "session_wall_seconds": session_wall_seconds,
+                        "near_goal_capture_candidate_count": float(
+                            p4_capture_candidate_count
+                        ),
+                        "near_goal_capture_entry_count": float(p4_capture_entry_count),
+                        "near_goal_capture_exit_count": float(p4_capture_exit_count),
+                        "near_goal_capture_zone_success_count": float(
+                            p4_capture_zone_success_count
+                        ),
+                        "near_goal_capture_zone_collision_count": float(
+                            p4_capture_zone_collision_count
+                        ),
+                        "near_goal_capture_zone_timeout_count": float(
+                            p4_capture_zone_timeout_count
+                        ),
+                        "near_goal_capture_zone_reset_count": float(
+                            p4_capture_zone_reset_count
+                        ),
+                        "near_goal_capture_reset_counted_as_completion_error": float(
+                            p4_capture_reset_completion_error_count
+                        ),
+                        "near_goal_capture_entry_to_platform_success_latency_s": (
+                            sum(p4_capture_success_latency_s)
+                            / max(len(p4_capture_success_latency_s), 1)
+                        ),
+                        "recovery_event_count_60s": float(
+                            len(p4_recovery_event_times)
+                        ),
+                        "recovery_event_lifetime_count": float(
+                            p4_recovery_event_lifetime_count
+                        ),
+                        "recovery_candidate_entry_count": float(
+                            p4_recovery_candidate_entry_count
+                        ),
+                        "recovery_success_count": float(p4_recovery_success_count),
+                        "recovery_terminal_count": float(p4_recovery_terminal_count),
+                        "recovery_unverified_exit_count": float(
+                            p4_recovery_unverified_exit_count
+                        ),
+                        "recovery_success_rate": float(p4_recovery_success_count)
+                        / max(
+                            p4_recovery_success_count + p4_recovery_terminal_count,
+                            1,
+                        ),
+                        "recovery_time_s": sum(p4_recovery_time_s)
+                        / max(len(p4_recovery_time_s), 1),
+                        "recovery_early_stuck_sample_share": float(
+                            p4_recovery_early_sample_count
+                        )
+                        / max(nav_rollout_ticks * agent.num_envs, 1),
+                        "recovery_confirmed_stuck_sample_share": float(
+                            p4_recovery_confirmed_sample_count
+                        )
+                        / max(nav_rollout_ticks * agent.num_envs, 1),
+                        "recovery_safe_exit_share": float(p4_recovery_success_count)
+                        / max(p4_recovery_candidate_entry_count, 1),
+                        "recovery_candidate_lifetime_count": float(
+                            p4_recovery_candidate_lifetime_count
+                        ),
+                        "recovery_terminal_lifetime_count": float(
+                            p4_recovery_terminal_lifetime_count
+                        ),
+                    }
+                )
+                algorithm._p4_recovery_monitor_state = {
+                    "event_times": list(p4_recovery_event_times),
+                    "success_lifetime_count": p4_recovery_event_lifetime_count,
+                    "candidate_lifetime_count": p4_recovery_candidate_lifetime_count,
+                    "terminal_lifetime_count": p4_recovery_terminal_lifetime_count,
+                }
             metrics["episode_starts_per_hour"] = (
                 float(metrics.get("rollout_terminal_count", 0.0))
                 * 3600.0
@@ -1434,7 +2099,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         _final_save(
             agent,
             logger,
-            "p4_eight_session_hours_complete"
+            "p4_full_eight_session_hours_complete"
             if is_p4
             else "four_session_hours_complete",
         )
