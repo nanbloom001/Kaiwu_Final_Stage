@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: UTF-8 -*-
-"""Stage-aware dashboards for the active P4 Maze credit-repair run."""
+"""Stage-aware dashboards for the active P4 Maze closed-loop run."""
 
 from pathlib import Path
 
@@ -1526,12 +1526,12 @@ def _build_p4_monitor(training_profile=None):
     profile = str(
         training_profile or _configured_p4_training_profile()
     ).strip().lower()
-    if profile not in {"maze_credit_repair", "full_track"}:
+    if profile not in {"maze_credit_repair", "maze_closed_loop_v3", "full_track"}:
         raise ValueError(f"unsupported P4 monitor training profile {profile!r}")
     monitor = MonitorConfigBuilder()
     monitor.title(
-        "P4迷宫归因修复训练"
-        if profile == "maze_credit_repair"
+        "P4迷宫闭环强化训练"
+        if profile in {"maze_credit_repair", "maze_closed_loop_v3"}
         else "P4五段全赛道训练"
     )
     _add_p4_track_outcome_panels(monitor)
@@ -1552,13 +1552,13 @@ def _build_p4_monitor(training_profile=None):
                 ("目标距离分桶", "p4_goal_distance_buckets", ("goal_distance_0_5_share", "goal_accept_0_5", "goal_clipped_0_5", "goal_reject_0_5", "goal_distance_5_10_share", "goal_accept_5_10", "goal_clipped_5_10", "goal_reject_5_10", "goal_distance_10_plus_share", "goal_accept_10_plus", "goal_clipped_10_plus", "goal_reject_10_plus")),
                 ("目标状态", "p4_goal_state", ("goal_map_x_m", "goal_map_y_m", "goal_map_distance_m", "goal_propagated", "goal_epoch_changed", "goal_reacquire_pending", "goal_reacquisition_time_s", "goal_fault_allowed", "goal_freshness", "goal_stale_low_speed_active", "raw_goal_distance_gt10_share")),
                 ("软巡航与动态上限", "p4_soft_cruise", ("policy_target_vx", "limited_target_vx", "effective_speed_cap", "safety_speed_cap", "safety_cap_predictive_risk", "soft_cruise_clear_factor", "soft_cruise_low_error", "soft_cruise_high_error", "reward_soft_cruise", "mapper_version_valid")),
-                ("平移安全限制", "p4_translation_limiter", ("translation_safety_risk", "translation_safety_alpha_raw", "translation_safety_alpha", "near_goal_final_translation_alpha", "policy_target_vx", "policy_target_vy", "limited_target_vx", "limited_target_vy")),
-                ("近终点软捕获", "p4_near_goal_capture", ("near_goal_capture_candidate", "near_goal_capture_active", "near_goal_capture_distance_m", "near_goal_capture_alignment", "near_goal_capture_cap_m_s", "near_goal_capture_alpha")),
+                ("平移安全限制与Shadow", "p4_translation_limiter", ("translation_safety_risk", "translation_safety_alpha_raw", "translation_safety_alpha", "translation_limiter_intervention", "translation_limiter_shadow", "policy_target_vx", "policy_target_vy", "limited_target_vx", "limited_target_vy", "policy_target_wz", "limited_target_wz")),
+                ("近终点捕获Shadow", "p4_near_goal_capture", ("near_goal_capture_candidate", "near_goal_capture_active", "near_goal_capture_distance_m", "near_goal_capture_alignment", "near_goal_capture_cap_m_s", "near_goal_capture_alpha")),
                 ("近终点捕获当前上报窗口", "p4_near_goal_capture_window", ("near_goal_capture_candidate_count", "near_goal_capture_entry_count", "near_goal_capture_exit_count", "near_goal_capture_zone_success_count", "near_goal_capture_zone_collision_count", "near_goal_capture_zone_timeout_count", "near_goal_capture_zone_reset_count", "near_goal_capture_reset_counted_as_completion_error")),
                 ("近终点捕获至平台成功时延", "p4_near_goal_capture_platform_latency", ("near_goal_capture_entry_to_platform_success_latency_s",)),
                 ("动作映射", "p4_action_mapping", ("normalized_action_vx", "normalized_action_vy", "normalized_action_wz", "policy_target_vx", "policy_target_vy", "policy_target_wz", "limited_target_vx", "limited_target_vy", "limited_target_wz", "mapped_cmd_vx", "mapped_cmd_vy", "mapped_cmd_wz")),
                 ("转向抵消", "p4_yaw_cancellation", ("yaw_exec_cancellation", "yaw_true_cancellation", "yaw_exec_sign_flip", "yaw_true_sign_flip", "yaw_true_overshoot", "reward_yaw_raw")),
-                ("安全方向内目标偏好", "p4_goal_safe_preference", ("goal_safe_preference_eligible", "goal_safe_preference_gap", "goal_safe_preference_selected", "goal_safe_preference_best", "reward_goal_safe_preference")),
+                ("安全方向内目标偏好与Shadow", "p4_goal_safe_preference", ("goal_safe_preference_eligible", "goal_safe_preference_gap", "goal_safe_preference_selected", "goal_safe_preference_best", "reward_goal_safe_preference")),
                 ("路径效率", "p4_route_efficiency", ("route_path_length_m", "route_positive_progress_m", "route_excess_distance_m", "route_efficiency", "reward_route_excess")),
             ),
         ),
@@ -1569,6 +1569,8 @@ def _build_p4_monitor(training_profile=None):
                 ("视觉可分性", "p4_teacher_scene", ("teacher_scene_corridor", "teacher_scene_left_open", "teacher_scene_right_open", "teacher_scene_junction", "teacher_scene_dead_end", "teacher_scene_fuzzy", "teacher_safe_top1_clear", "scanner_valid_share", "safety_bce", "diagnostic_teacher_coverage", "diagnostic_wall_auroc", "diagnostic_wall_miss_rate", "diagnostic_safe_top1_accuracy", "diagnostic_scene_macro_f1", "diagnostic_clean_live_latent_cosine", "diagnostic_goal_wall_auroc", "diagnostic_goal_safe_top1_accuracy", "diagnostic_goal_scene_macro_f1")),
                 ("Clean与诊断故障视觉", "p4_clean_diagnostic_fault", ("diagnostic_fault_shadow_share", "diagnostic_fault_wall_auroc", "diagnostic_fault_safe_top1_accuracy", "diagnostic_fault_scene_macro_f1", "diagnostic_clean_fault_latent_cosine", "diagnostic_clean_fault_action_mae")),
                 ("SafetyHead风险", "p4_safety_head_risk", ("teacher_risk_left", "teacher_risk_center", "teacher_risk_right", "safety_head_risk_left", "safety_head_risk_center", "safety_head_risk_right", "safe_alternative_available", "selected_safest_direction")),
+                ("五方向安全教师", "p4_teacher_safe5", ("teacher_safe5_far_left", "teacher_safe5_left", "teacher_safe5_center", "teacher_safe5_right", "teacher_safe5_far_right")),
+                ("目标转向闭环", "p4_goal_yaw_closed_loop", ("legitimate_side_goal_candidate_count", "legitimate_side_goal_selected_count", "large_goal_correct_yaw_response", "vy_substitutes_yaw_count", "policy_target_vy", "policy_target_wz", "limited_target_vy", "limited_target_wz", "exec_vy", "exec_wz", "true_vy", "true_wz")),
                 ("安全决策当前上报窗口", "p4_safety_decision_window", ("head_correct_samples", "head_correct_actor_wrong_count", "head_correct_actor_wrong_rate")),
                 ("风险减速当前上报窗口", "p4_risk_deceleration_window", ("risk_event_resolved_count", "risk_decel_policy_count", "risk_decel_limited_count", "risk_no_deceleration_count", "risk_decel_policy_rate", "risk_decel_limited_rate", "risk_no_deceleration_rate", "predictive_collision_risk", "body_collision_onset", "wall_stuck_candidate_share", "wall_stuck_reset_triggered")),
                 ("LSTM记忆消融", "p4_zero_hidden_shadow", ("zero_hidden_action_mae", "zero_hidden_direction_disagreement", "camera_clean_live_action_mae", "camera_clean_live_latent_cosine")),
@@ -1582,7 +1584,7 @@ def _build_p4_monitor(training_profile=None):
             (
                 ("迷宫非重复进展", "p4_maze_credit", ("maze_new_best_credit", "maze_new_best_delta_m", "maze_new_best_episode_earned", "terminal_potential_clawback")),
                 ("安全原始项", "p4_safety_raw", ("reward_predictive_raw", "reward_missed_safe_raw", "reward_yaw_raw", "reward_goal_safe_raw", "reward_yaw_exit_raw")),
-                ("安全应用项", "p4_safety_applied", ("reward_predictive_collision_risk", "reward_missed_safe_direction", "reward_yaw_cancellation", "reward_yaw_exit_response", "reward_safety_group_scale", "reward_stuck_sustained", "reward_goal_safe_preference", "reward_stuck_reset", "reward_continuous_time_scale")),
+                ("安全奖励应用与禁用核验", "p4_safety_applied", ("reward_predictive_collision_risk", "reward_missed_safe_direction", "reward_yaw_cancellation", "reward_yaw_exit_response", "reward_safety_group_scale", "reward_stuck_sustained", "reward_goal_safe_preference", "reward_stuck_reset", "reward_continuous_time_scale")),
                 ("Frontier停滞实际与Shadow", "p4_frontier_stagnation", ("reward_frontier_stagnation", "reward_frontier_stagnation_shadow")),
                 ("奖励守恒", "p4_reward_conservation", ("reward_decomposed_total", "rollout_reward_mean", "reward_conservation_error")),
             ),
@@ -1631,7 +1633,7 @@ def _build_p4_monitor(training_profile=None):
             "p4_runtime",
             (
                 ("监控合同健康度", "p4_monitor_contract", ("p4_monitor_expected_metric_count", "p4_monitor_metric_with_data_count", "p4_monitor_empty_metric_count", "p4_monitor_longest_data_age_s")),
-                ("两小时归因阶段", "p4_credit_phase", ("credit_phase_warm", "credit_phase_adapt", "credit_phase_train", "credit_phase_final", "session_effective_seconds", "session_wall_seconds")),
+                ("八小时闭环阶段", "p4_credit_phase", ("closedloop_phase_critic_warm", "closedloop_phase_actor_adapt", "closedloop_phase_train", "closedloop_phase_stabilize", "session_effective_seconds", "session_wall_seconds")),
                 ("冻结模块", "p4_credit_frozen", ("low_digest_drift", "low_optimizer_steps", "adapter_frozen", "navigation_learning_rate", "safety_head_learning_rate", "adapter_learning_rate")),
                 ("冻结合同", "p4_frozen_contract", ("low_digest_drift", "low_optimizer_steps", "high_updates", "p4_tbptt_sequences_per_env", "p4_tbptt_nav_ticks")),
                 ("资源与吞吐", "p4_resources", ("memory_allocated", "memory_reserved", "max_memory_allocated", "max_memory_reserved", "samples_per_s")),

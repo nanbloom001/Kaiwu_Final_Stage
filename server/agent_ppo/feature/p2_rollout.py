@@ -68,6 +68,7 @@ class P2RolloutStorage:
         # P4 recovery supervision is sampled with the action transition and
         # replayed on exactly the same TBPTT16 timeline as old log-probs.
         self.teacher_safe3 = _cpu_tensor(*common, 3)
+        self.teacher_safe5 = _cpu_tensor(*common, 5)
         self.teacher_goal_xy = _cpu_tensor(*common, 2)
         self.teacher_predictive_risk = _cpu_tensor(*common, 1)
         self.teacher_mask = _cpu_tensor(*common, 1)
@@ -174,6 +175,7 @@ class P2RolloutStorage:
         )
         defaults = {
             "teacher_safe3": torch.zeros(self.num_envs, 3, device=transition["reward"].device),
+            "teacher_safe5": torch.zeros(self.num_envs, 5, device=transition["reward"].device),
             "teacher_goal_xy": torch.zeros(self.num_envs, 2, device=transition["reward"].device),
             "teacher_predictive_risk": torch.zeros(self.num_envs, 1, device=transition["reward"].device),
             "teacher_mask": torch.zeros(self.num_envs, 1, device=transition["reward"].device),

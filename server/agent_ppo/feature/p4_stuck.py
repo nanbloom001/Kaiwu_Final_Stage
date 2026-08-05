@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import copy
+import sys
+import time
 from typing import Any
 
 import torch
@@ -14,7 +16,7 @@ from agent_ppo.feature import p2_contract, p4_contract
 class MotionWallStuckTracker:
     """Detect physical confinement without command-intent or synthetic done flags."""
 
-    SPATIAL_DIAMETER_M = 0.50
+    LEGACY_SPATIAL_DIAMETER_M = 0.50
     RECOVERY_WALL_ABSENCE_S = 0.50
     RECOVERY_CENTER_DISPLACEMENT_M = 0.50
 
@@ -32,14 +34,30 @@ class MotionWallStuckTracker:
         self.device = torch.device(device)
         merged = p4_contract.normalize_stuck_reset_contract(config)
         self.enabled = bool(merged["enabled"])
-        self.mode = str(merged.get("mode", "shadow"))
-        if self.mode not in {"shadow", "active", "disabled"}:
-            raise ValueError(f"unsupported P4 stuck-reset mode {self.mode!r}")
-        self.confirmation_s = float(merged["confirmation_s"])
-        # ``radius_m`` remains checkpoint metadata only. The active detector is
-        # the stricter, fixed spatial-diameter contract requested for full Track.
+        self.requested_mode = str(merged.get("mode", "shadow"))
+        self.schedule_enabled = bool(merged["schedule_enabled"])
+        if self.requested_mode not in {"shadow", "active", "disabled"}:
+            raise ValueError(
+                f"unsupported P4 stuck-reset mode {self.requested_mode!r}"
+            )
+        self.tight_confirmation_s = float(merged["confirmation_s"])
+        self.initial_confirmation_s = float(merged["initial_confirmation_s"])
+        self.activation_delay_s = float(merged["activation_delay_s"])
+        self.tighten_after_s = float(merged["tighten_after_s"])
+        self.resume_offset_s = float(merged["resume_offset_s"])
+        self._started_monotonic = time.monotonic()
+        initial_elapsed = self.resume_offset_s
+        self.mode = self._scheduled_mode(initial_elapsed)
+        self.confirmation_s = self._scheduled_confirmation_s(initial_elapsed)
+        # Legacy profiles shipped with a fixed 0.50 m spatial diameter even
+        # though radius_m was present in checkpoint metadata. Preserve that
+        # behavior unless the new schedule contract is explicitly enabled.
         self.radius_m = float(merged["radius_m"])
-        self.spatial_diameter_m = self.SPATIAL_DIAMETER_M
+        self.spatial_diameter_m = (
+            self.radius_m
+            if self.schedule_enabled
+            else self.LEGACY_SPATIAL_DIAMETER_M
+        )
         self.min_goal_distance_m = float(merged["min_goal_distance_m"])
         self.body_collision_force_n = float(merged["body_collision_force_n"])
         self.wall_evidence_latch_s = float(merged["wall_evidence_latch_s"])
@@ -50,16 +68,23 @@ class MotionWallStuckTracker:
         self.dt_s = float(getattr(env, "step_dt", p2_contract.CONTROL_DT_S))
         self.dt_valid = abs(self.dt_s - p2_contract.CONTROL_DT_S) <= 1.0e-6
         self.confirmation_steps = max(1, round(self.confirmation_s / self.dt_s))
+        self.max_confirmation_steps = max(
+            1,
+            round(
+                max(self.initial_confirmation_s, self.tight_confirmation_s)
+                / self.dt_s
+            ),
+        )
         self.wall_latch_steps = max(1, round(self.wall_evidence_latch_s / self.dt_s))
         self.recovery_wall_absence_steps = max(
             1, round(self.RECOVERY_WALL_ABSENCE_S / self.dt_s)
         )
 
         self.position_history = torch.zeros(
-            self.confirmation_steps, self.num_envs, 2, device=self.device
+            self.max_confirmation_steps, self.num_envs, 2, device=self.device
         )
         self.position_history_valid = torch.zeros(
-            self.confirmation_steps,
+            self.max_confirmation_steps,
             self.num_envs,
             dtype=torch.bool,
             device=self.device,
@@ -97,6 +122,75 @@ class MotionWallStuckTracker:
         self._termination_config_attempts = 0
         self.last_diagnostics = torch.zeros(self.num_envs, 13, device=self.device)
         self._configure_termination()
+
+    def _elapsed_s(self) -> float:
+        return self.resume_offset_s + max(
+            0.0, time.monotonic() - self._started_monotonic
+        )
+
+    def _scheduled_mode(self, elapsed_s: float) -> str:
+        if not self.enabled or self.requested_mode == "disabled":
+            return "disabled"
+        if self.requested_mode == "shadow":
+            return "shadow"
+        if not self.schedule_enabled:
+            return self.requested_mode
+        return "shadow" if elapsed_s < self.activation_delay_s else "active"
+
+    def _scheduled_confirmation_s(self, elapsed_s: float) -> float:
+        if not self.schedule_enabled:
+            return self.tight_confirmation_s
+        return (
+            self.initial_confirmation_s
+            if elapsed_s < self.tighten_after_s
+            else self.tight_confirmation_s
+        )
+
+    def _reset_detection_state(self) -> None:
+        self.position_history.zero_()
+        self.position_history_valid.zero_()
+        self.position_history_index = 0
+        self.position_sample_count.zero_()
+        self.window_center.zero_()
+        self.window_diameter.fill_(float("inf"))
+        self.candidate_center.zero_()
+        self.candidate_active.zero_()
+        self.candidate_steps.zero_()
+        self.eligible_steps.zero_()
+        self.wall_evidence_age_steps.fill_(self.wall_latch_steps + 1)
+        self.wall_absence_steps.zero_()
+        self.wall_sequence_steps.zero_()
+        self.triggered.zero_()
+        self.shadow_event_reported.zero_()
+        self._write_counter(torch.zeros_like(self.candidate_steps))
+
+    def _refresh_schedule(self) -> None:
+        elapsed_s = self._elapsed_s()
+        next_mode = self._scheduled_mode(elapsed_s)
+        next_confirmation_s = self._scheduled_confirmation_s(elapsed_s)
+        next_steps = max(1, round(next_confirmation_s / self.dt_s))
+        if next_mode == self.mode and next_steps == self.confirmation_steps:
+            return
+        previous_mode = self.mode
+        previous_confirmation_s = self.confirmation_s
+        self.mode = next_mode
+        self.confirmation_s = next_confirmation_s
+        self.confirmation_steps = next_steps
+        self.term_config_valid = False
+        self._termination_config_attempts = 0
+        self._reset_detection_state()
+        self._configure_termination()
+        print(
+            "[P4StuckResetPhase] "
+            f"elapsed_s={elapsed_s:.3f} "
+            f"previous_mode={previous_mode} mode={self.mode} "
+            f"previous_confirmation_s={previous_confirmation_s:.3f} "
+            f"confirmation_s={self.confirmation_s:.3f} "
+            f"term_available={int(self.term_available)} "
+            f"term_config_valid={int(self.term_config_valid)}",
+            file=sys.stderr,
+            flush=True,
+        )
 
     def _configure_termination(self) -> None:
         self._termination_config_attempts += 1
@@ -161,7 +255,12 @@ class MotionWallStuckTracker:
         index = self.position_history_index
         self.position_history[index] = root_xy
         self.position_history_valid[index] = valid & ~reset
-        self.position_history_index = (index + 1) % self.confirmation_steps
+        self.position_history_index = (index + 1) % self.max_confirmation_steps
+        if self.confirmation_steps < self.max_confirmation_steps:
+            expire_index = (
+                self.position_history_index - self.confirmation_steps - 1
+            ) % self.max_confirmation_steps
+            self.position_history_valid[expire_index] = False
         self.position_sample_count = torch.where(
             valid & ~reset,
             torch.clamp(self.position_sample_count + 1, max=self.confirmation_steps),
@@ -202,6 +301,7 @@ class MotionWallStuckTracker:
         true_velocity3: torch.Tensor,
         motion_intent: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self._refresh_schedule()
         # Manager assembly can lag observation construction. Retry a bounded
         # number of real frames, but never synthesize a terminal when unavailable.
         if self.enabled and not self.term_config_valid and self._termination_config_attempts < 8:

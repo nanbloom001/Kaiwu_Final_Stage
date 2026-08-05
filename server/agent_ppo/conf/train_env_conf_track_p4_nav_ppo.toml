@@ -1,8 +1,8 @@
-# P4 two-hour Maze credit-assignment repair over the verified 10 Hz parent.
+# P4 eight-hour Maze closed-loop repair over the verified 10 Hz parent.
 
 [env]
 num_envs = 128
-episode_length_s = 75.0
+episode_length_s = 120.0
 task = "track"
 
 [env_conf]
@@ -71,19 +71,19 @@ max_depth = 5.0
 enabled = false
 
 [p4_nav_ppo]
-run_name = "p4maze2h-credit-repair"
+run_name = "p4maze8h-closedloop-r3"
 # Model ID selects the intended parent candidate; structure/spec/shape/finite
 # validation remains authoritative after selection.
 parent_model_id = 1416926
 parent_model_label = "p4maze8h10hz_1416926-mazefinal"
-load_mode = "p4_maze_credit_repair_warm_start"
-training_profile = "maze_credit_repair"
-# All 7,200 seconds are effective training. The 0.25 hour margin is reserved
+load_mode = "p4_maze_closed_loop_v3_warm_start"
+training_profile = "maze_closed_loop_v3"
+# All 28,800 seconds are effective training. The 0.25 hour margin is reserved
 # for checkpoint/save/normal shutdown only.
-task_end_hours = 2.25
-target_effective_seconds = 7200
+task_end_hours = 8.25
+target_effective_seconds = 28800
 diagnostic_seconds = 0
-maze_training_branch = "credit_repair"
+maze_training_branch = "closed_loop_v3"
 nav_rollout_ticks = 32
 nav_period_frames = 5
 tbptt_sequence_length = 16
@@ -91,8 +91,8 @@ num_learning_epochs = 4
 num_mini_batches = 4
 cnn_microbatch_sequences = 4
 max_grad_norm = 1.0
-slew_rate = [0.30, 0.40, 1.50]
-slew_release_rate = [0.30, 0.80, 3.00]
+slew_rate = [0.60, 0.60, 2.00]
+slew_release_rate = [1.20, 1.20, 4.00]
 first_save_minutes = 5.0
 save_interval_minutes = 10.0
 log_interval = 1
@@ -108,18 +108,21 @@ goal_fault_course_enabled = false
 
 [p4_nav_ppo.stuck_reset]
 enabled = true
-# Shadow mode records physical confinement and validated non-foot wall contact
-# without creating reason-4 terminals in this attribution run.
-mode = "shadow"
+mode = "active"
+schedule_enabled = true
 confirmation_s = 10.0
-radius_m = 0.50
+initial_confirmation_s = 12.0
+activation_delay_s = 1800.0
+tighten_after_s = 7200.0
+resume_offset_s = 0.0
+radius_m = 0.30
 min_goal_distance_m = 0.80
 body_collision_force_n = 30.0
 wall_evidence_latch_s = 2.0
 episode_grace_s = 5.0
 push_grace_s = 2.0
 max_true_motion_speed_m_s = 0.08
-terminal_penalty = -25.0
+terminal_penalty = -75.0
 
 [p4_nav_ppo.full_track_spawn]
 enabled = false
@@ -138,7 +141,8 @@ term_name = "push_robot"
 resume_offset_s = 0.0
 
 [p4_nav_ppo.near_goal_capture]
-enabled = true
+# Diagnostic only. It must not rewrite the sampled policy command.
+enabled = false
 freshness_min = 0.90
 distance_m = [0.65, 1.20]
 policy_goal_cosine_min = 0.70

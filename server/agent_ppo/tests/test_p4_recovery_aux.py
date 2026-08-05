@@ -5,6 +5,7 @@ from pathlib import Path
 
 import torch
 from torch import nn
+import pytest
 
 from agent_ppo.algorithm.algorithm_p2_nav_ppo import AlgorithmP2NavPPO
 from agent_ppo.algorithm.algorithm_p4_nav_ppo import AlgorithmP4NavPPO
@@ -152,6 +153,9 @@ def test_recovery_label_requires_rollout_motion_intent(monkeypatch):
         return {"is_tick": True}, torch.zeros(1, 323), torch.zeros(1, 32)
 
     monkeypatch.setattr(AlgorithmP2NavPPO, "frame_begin", fake_parent_frame_begin)
+    critic_obs = torch.zeros(1, p2_contract.CRITIC_OBS_DIM)
+    critic_obs[:, 319] = 1.0
+    monkeypatch.setattr(algorithm, "_split_transport", lambda _wire: (critic_obs, None))
     tail = algorithm._p4_worker_extra
     tail[:, p4_contract.STUCK_MAPPING_VALID_INDEX] = 1.0
     tail[:, p4_contract.STUCK_WALL_EVIDENCE_INDEX] = 1.0
@@ -169,7 +173,17 @@ def test_recovery_label_requires_rollout_motion_intent(monkeypatch):
 
 
 def test_auxiliary_gradients_are_actor_only_and_hard_capped():
-    algorithm = _algorithm(training=True)
+    algorithm = _algorithm(
+        training=True,
+        config={
+            "training_profile": "maze_credit_repair",
+            "maze_training_branch": "credit_repair",
+            "track_segment_labels": ["maze"],
+            "camera_fault_course_enabled": False,
+            "goal_fault_course_enabled": False,
+        },
+    )
+    algorithm._apply_training_schedule(7_200.0)
     timesteps, batch_size = 16, 4  # exactly the 64 teacher-step activation floor
     inputs = torch.randn(timesteps, batch_size, p2_contract.ACTOR_INPUT_DIM)
     hidden = (
@@ -185,6 +199,7 @@ def test_auxiliary_gradients_are_actor_only_and_hard_capped():
         "camera_aux_mask": torch.zeros(timesteps, batch_size, 3),
         "clean_action_mean": torch.zeros(timesteps, batch_size, 3),
         "teacher_safe3": torch.tensor([0.10, 0.90, 0.10]).repeat(timesteps, batch_size, 1),
+        "teacher_safe5": torch.tensor([0.90, 0.40, 0.10, 0.10, 0.10]).repeat(timesteps, batch_size, 1),
         "teacher_goal_xy": torch.tensor([1.0, 0.2]).repeat(timesteps, batch_size, 1),
         "teacher_predictive_risk": torch.full((timesteps, batch_size, 1), 0.8),
         "teacher_mask": torch.ones(timesteps, batch_size, 1),
@@ -279,7 +294,7 @@ def test_teacher_activation_floor_is_rollout_wide(monkeypatch):
     assert not algorithm._teacher_update_enabled
 
 
-def test_creditwarm_trains_only_stuck_head_without_ppo_reference_gradient():
+def test_creditwarm_valid_stuck_batch_updates_head_without_actor():
     algorithm = _algorithm(
         training=True,
         config={
@@ -315,15 +330,54 @@ def test_creditwarm_trains_only_stuck_head_without_ppo_reference_gradient():
         ppo_actor_loss=torch.zeros(()),
     )
     assert loss.requires_grad
-    actor_before = [parameter.detach().clone() for parameter in algorithm.actor.parameters()]
     loss.backward()
+    actor_before = [parameter.detach().clone() for parameter in algorithm.actor.parameters()]
     assert any(parameter.grad is not None for parameter in algorithm.stuck_head.parameters())
     assert all(parameter.grad is None for parameter in algorithm.actor.parameters())
-    assert "stuck" not in algorithm._auxiliary_coefficients
-    algorithm.actor_optimizer.step()
     for before, parameter in zip(actor_before, algorithm.actor.parameters()):
         torch.testing.assert_close(parameter, before)
         assert parameter not in algorithm.actor_optimizer.state
+
+
+def test_closed_loop_profile_keeps_stuck_head_diagnostic_only():
+    algorithm = _algorithm(
+        training=True,
+        config={
+            "training_profile": "maze_closed_loop_v3",
+            "maze_training_branch": "closed_loop_v3",
+            "track_segment_labels": ["maze"],
+            "camera_fault_course_enabled": False,
+            "goal_fault_course_enabled": False,
+        },
+    )
+    algorithm._apply_training_schedule(7_200.0)
+    timesteps = 16
+    normalized = torch.zeros(timesteps, 1, 3)
+    batch = {
+        "camera_aux_mask": torch.zeros(timesteps, 1, 3),
+        "clean_action_mean": torch.zeros(timesteps, 1, 3),
+        "teacher_mask": torch.zeros(timesteps, 1, 1),
+        "teacher_goal_mask": torch.zeros(timesteps, 1, 1),
+        "teacher_safe3": torch.zeros(timesteps, 1, 3),
+        "teacher_safe5": torch.zeros(timesteps, 1, 5),
+        "teacher_goal_xy": torch.zeros(timesteps, 1, 2),
+        "teacher_predictive_risk": torch.zeros(timesteps, 1, 1),
+        "teacher_weight": torch.ones(timesteps, 1, 1),
+        "stuck_mask": torch.ones(timesteps, 1, 1),
+        "stuck_label": torch.cat(
+            (torch.zeros(timesteps // 2), torch.ones(timesteps // 2))
+        ).reshape(timesteps, 1, 1),
+    }
+    loss, _metrics = algorithm._actor_auxiliary_loss(
+        normalized_mean=normalized,
+        actor_normalized_mean=normalized,
+        actor_features=torch.randn(timesteps, 1, algorithm.actor.hidden_dim),
+        batch=batch,
+        ppo_actor_loss=torch.zeros(()),
+    )
+    assert not loss.requires_grad
+    assert all(parameter.grad is None for parameter in algorithm.stuck_head.parameters())
+    assert "stuck" not in algorithm._auxiliary_coefficients
 
 
 def test_creditwarm_empty_stuck_batch_skips_actor_backward_and_updates_critic():
@@ -378,6 +432,63 @@ def test_creditwarm_empty_stuck_batch_skips_actor_backward_and_updates_critic():
                 torch.testing.assert_close(actual, value)
             else:
                 assert actual == value
+
+
+def test_detached_teacher_loss_is_skipped_instead_of_crashing_gradient_calibration(
+    monkeypatch,
+):
+    algorithm = _algorithm(
+        training=True,
+        config={
+            "training_profile": "maze_closed_loop_v3",
+            "maze_training_branch": "closed_loop_v3",
+            "track_segment_labels": ["maze"],
+            "camera_fault_course_enabled": False,
+            "goal_fault_course_enabled": False,
+        },
+    )
+    algorithm._apply_training_schedule(3_600.0)
+    steps = 64
+    mean = torch.zeros(steps, 3, requires_grad=True)
+    detached = torch.tensor(2.5)
+    monkeypatch.setattr(
+        p4_contract,
+        "teacher_guidance_loss",
+        lambda *args, **kwargs: {
+            "loss": detached,
+            "direction": detached,
+            "speed": detached,
+            "yaw": detached,
+            "teacher_valid_steps": torch.tensor(float(steps)),
+            "teacher_loss_active": torch.tensor(1.0),
+            "teacher_direction_mask": torch.ones(steps),
+            "teacher_speed_mask": torch.ones(steps),
+            "teacher_yaw_mask": torch.ones(steps),
+        },
+    )
+    batch = {
+        "camera_aux_mask": torch.zeros(steps, 3),
+        "clean_action_mean": torch.zeros(steps, 3),
+        "teacher_safe3": torch.zeros(steps, 3),
+        "teacher_safe5": torch.zeros(steps, 5),
+        "teacher_goal_xy": torch.zeros(steps, 2),
+        "teacher_predictive_risk": torch.zeros(steps, 1),
+        "teacher_mask": torch.ones(steps, 1),
+        "teacher_goal_mask": torch.ones(steps, 1),
+        "teacher_weight": torch.ones(steps, 1),
+        "stuck_label": torch.zeros(steps, 1),
+        "stuck_mask": torch.zeros(steps, 1),
+    }
+    loss, metrics = algorithm._actor_auxiliary_loss(
+        normalized_mean=torch.tanh(mean),
+        actor_normalized_mean=torch.tanh(mean),
+        actor_features=torch.zeros(steps, algorithm.actor.hidden_dim),
+        batch=batch,
+        ppo_actor_loss=mean.square().mean(),
+    )
+    assert loss.item() == 0.0
+    assert metrics["teacher_guidance_loss"] == pytest.approx(2.5)
+    assert "teacher" not in algorithm._auxiliary_coefficients
 
 
 def test_eval_assembly_does_not_create_training_stuck_head():
@@ -539,8 +650,17 @@ def test_mirror_microbatch_rejects_mid_episode_nonzero_hidden(monkeypatch):
     assert metrics["mirror_aux_sequence_share"].item() == 0.0
 
 
-def test_algorithm_mapper_applies_near_goal_vector_capture_without_yaw_scaling():
-    algorithm = _algorithm(training=False)
+def test_algorithm_mapper_keeps_near_goal_capture_shadow_only():
+    algorithm = _algorithm(
+        training=False,
+        config={
+            "training_profile": "maze_closed_loop_v3",
+            "maze_training_branch": "closed_loop_v3",
+            "track_segment_labels": ["maze"],
+            "camera_fault_course_enabled": False,
+            "goal_fault_course_enabled": False,
+        },
+    )
     algorithm._delivered_depth = torch.ones(
         1, p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH, 1
     )
@@ -560,15 +680,9 @@ def test_algorithm_mapper_applies_near_goal_vector_capture_without_yaw_scaling()
 
     policy = algorithm._last_policy_command
     diagnostics = algorithm._near_goal_capture_diagnostics
-    assert diagnostics["near_goal_capture_active"].item() == 1.0
-    torch.testing.assert_close(
-        torch.linalg.vector_norm(mapped[:, :2], dim=-1),
-        diagnostics["near_goal_capture_cap_m_s"],
-    )
-    torch.testing.assert_close(mapped[:, 2], policy[:, 2])
-    torch.testing.assert_close(
-        mapped[:, :2] / mapped[:, :1], policy[:, :2] / policy[:, :1]
-    )
+    assert diagnostics["near_goal_capture_candidate"].item() == 1.0
+    assert diagnostics["near_goal_capture_active"].item() == 0.0
+    torch.testing.assert_close(mapped, policy)
 
 
 def test_translation_limiter_risk_uses_current_candidate_not_previous_target(monkeypatch):
@@ -601,6 +715,54 @@ def test_translation_limiter_risk_uses_current_candidate_not_previous_target(mon
         "translation_safety_risk"
     ].item() > 0.75
     assert mapped[0, 1].abs().item() < algorithm._last_policy_command[0, 1].abs().item()
+
+
+def test_closed_loop_limiter_is_shadow_only(monkeypatch):
+    algorithm = _algorithm(
+        training=True,
+        config={
+            "training_profile": "maze_closed_loop_v3",
+            "maze_training_branch": "closed_loop_v3",
+            "track_segment_labels": ["maze"],
+            "camera_fault_course_enabled": False,
+            "goal_fault_course_enabled": False,
+        },
+    )
+    algorithm._delivered_depth = torch.ones(
+        1, p2_contract.DEPTH_HEIGHT, p2_contract.DEPTH_WIDTH, 1
+    )
+    algorithm.goal_belief.estimate[:] = torch.tensor([[4.0, 0.0]])
+    algorithm.reset_since_tick.zero_()
+    algorithm._goal_epoch_changed_since_tick.zero_()
+    monkeypatch.setattr(algorithm, "_predictive_command", lambda target: target)
+
+    def full_risk(_depth, command):
+        risk = torch.ones(command.shape[0])
+        zero = torch.zeros_like(risk)
+        return zero, zero, zero, risk
+
+    monkeypatch.setattr(
+        p2_contract, "predictive_collision_risk_penalty", full_risk
+    )
+    normalized = torch.tensor([[0.5, 0.5, 0.2]])
+    goal4 = torch.tensor([[4.0, 0.0, 0.0, 1.0]])
+    shadow = algorithm._map_policy_target(
+        normalized, torch.zeros_like(normalized), goal4=goal4, aux=torch.empty(1, 0)
+    )
+    torch.testing.assert_close(shadow, algorithm._last_policy_command)
+    assert algorithm._translation_limiter_diagnostics[
+        "translation_limiter_shadow"
+    ].item() == 1.0
+
+    algorithm.session_effective_seconds = 7_200.0
+    algorithm._translation_alpha_prev.fill_(1.0)
+    later = algorithm._map_policy_target(
+        normalized, torch.zeros_like(normalized), goal4=goal4, aux=torch.empty(1, 0)
+    )
+    assert algorithm._translation_limiter_diagnostics[
+        "translation_limiter_shadow"
+    ].item() == 1.0
+    torch.testing.assert_close(later, algorithm._last_policy_command)
 
 
 def test_exact_resume_restores_training_only_stuck_head_and_mirror_rng():

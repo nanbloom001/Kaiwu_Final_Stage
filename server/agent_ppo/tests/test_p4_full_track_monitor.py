@@ -203,5 +203,5 @@ def test_p4_monitor_build_routes_full_track_and_credit_profiles():
     credit_groups = {group["group_name_en"] for group in credit["groups"]}
     assert full["title"] == "P4五段全赛道训练"
     assert "p4_full_track_diagnostics" in full_groups
-    assert credit["title"] == "P4迷宫归因修复训练"
+    assert credit["title"] == "P4迷宫闭环强化训练"
     assert "p4_full_track_diagnostics" not in credit_groups

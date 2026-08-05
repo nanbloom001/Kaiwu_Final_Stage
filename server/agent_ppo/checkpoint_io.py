@@ -112,6 +112,14 @@ P3_STANDARD_JOINT_PHASE_LABELS = (
 )
 
 P4_NAV_PHASE_LABELS = (
+    "loopwarm",
+    "loopadapt",
+    "looptrain",
+    "loopstable",
+    "closedwarm",
+    "closedadapt",
+    "closedtrain",
+    "closedstable",
     "creditwarm",
     "creditadapt",
     "credittrain",
@@ -136,6 +144,14 @@ P4_NAV_PHASE_LABELS = (
 # complete validation set; candidate discovery must not infer priority by
 # reversing that mixed new/legacy tuple.
 P4_NAV_CHECKPOINT_PRIORITY = (
+    "loopstable",
+    "looptrain",
+    "loopadapt",
+    "loopwarm",
+    "closedstable",
+    "closedtrain",
+    "closedadapt",
+    "closedwarm",
     "creditfinal",
     "credittrain",
     "creditadapt",

@@ -13,11 +13,13 @@ import torch
 from agent_ppo.feature import p2_contract
 
 
-RUN_NAME = "p4maze2h-credit-repair"
+RUN_NAME = "p4maze8h-closedloop-r3"
 STAGE_NAME = "p4_nav_ppo"
 STAGE_TYPE = "p4_nav_ppo"
-TRAINING_HOURS = 2.0
-TARGET_EFFECTIVE_SECONDS = 7_200.0
+TRAINING_HOURS = 8.0
+TARGET_EFFECTIVE_SECONDS = 28_800.0
+LEGACY_MAZE_TRAINING_HOURS = 2.0
+LEGACY_MAZE_TARGET_EFFECTIVE_SECONDS = 7_200.0
 DIAGNOSTIC_SECONDS = 0.0
 PLATFORM_WALL_MARGIN_SECONDS = 900.0
 PLATFORM_WALL_SECONDS = (
@@ -26,7 +28,10 @@ PLATFORM_WALL_SECONDS = (
     + PLATFORM_WALL_MARGIN_SECONDS
 )
 PLATFORM_WALL_HOURS = PLATFORM_WALL_SECONDS / 3_600.0
-SCHEDULE_BOUNDARIES_SECONDS = (600.0, 1_800.0, 3_600.0, 5_400.0, 6_300.0, 7_200.0)
+SCHEDULE_BOUNDARIES_SECONDS = (1_800.0, 7_200.0, 21_600.0, 28_800.0)
+LEGACY_MAZE_SCHEDULE_BOUNDARIES_SECONDS = (
+    600.0, 1_800.0, 3_600.0, 5_400.0, 6_300.0, 7_200.0
+)
 
 LEGACY_ACTION_MAPPER_VERSION = "p2_legacy_action_mapper_v1"
 ACTION_MAPPER_VERSION = "p4_capability_action_mapper_v1"
@@ -35,14 +40,22 @@ CAMERA_CONTRACT_VERSION = "p4_shared_camera_v4_recovery_nominal_light"
 ADAPTER_RECORD_CONTRACT_VERSION = "p4_adapter_record_v1"
 SAFETY_REWARD_RAMP_VERSION = "p4_maze_credit_repair_safety_group_v1"
 CHECKPOINT_CONTRACT_VERSION = "p4_maze_credit_repair_v1"
+MAZE_CLOSED_LOOP_SAFETY_REWARD_VERSION = "p4_maze_closed_loop_teacher_only_v3"
+MAZE_CLOSED_LOOP_CHECKPOINT_VERSION = "p4_maze_closed_loop_v3"
 FULL_TRACK_CHECKPOINT_CONTRACT_VERSION = "p4_full_track_v2"
 FULL_TRACK_REWARD_CONTRACT_VERSION = "p4_full_track_reward_v2_potential_straight"
 FULL_TRACK_COMMAND_CONTRACT_VERSION = "p4_full_track_command_v2"
 WORKER_WIRE_VERSION = "p4_worker_wire_v6_full_track_spawn"
-STUCK_RESET_CONTRACT_VERSION = "p4_stuck_reset_v3_sliding_window_10s"
-ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION = "p4_actor_mean_guidance_v1"
-TRANSLATION_VECTOR_LIMITER_CONTRACT_VERSION = "p4_translation_vector_limiter_v2_emergency_only"
-NEAR_GOAL_CAPTURE_CONTRACT_VERSION = "p4_near_goal_capture_v1"
+LEGACY_STUCK_RESET_CONTRACT_VERSION = "p4_stuck_reset_v3_sliding_window_10s"
+STUCK_RESET_CONTRACT_VERSION = "p4_stuck_reset_v5_shadow_12s_to_active_10s"
+LEGACY_ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION = "p4_actor_mean_guidance_v1"
+ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION = "p4_actor_mean_guidance_v3_safe5_single_signal"
+LEGACY_TRANSLATION_VECTOR_LIMITER_CONTRACT_VERSION = (
+    "p4_translation_vector_limiter_v2_emergency_only"
+)
+TRANSLATION_VECTOR_LIMITER_CONTRACT_VERSION = "p4_translation_vector_limiter_v4_emergency_only"
+LEGACY_NEAR_GOAL_CAPTURE_CONTRACT_VERSION = "p4_near_goal_capture_v1"
+NEAR_GOAL_CAPTURE_CONTRACT_VERSION = "p4_near_goal_capture_v2_shadow_only"
 STUCK_AUX_CONTRACT_VERSION = "p4_stuck_aux_v1"
 # Training-only transport appended after the stable P3 493-column wire.
 # These fields never enter either learned network and are absent from eval.
@@ -84,8 +97,10 @@ P4_MAX_ABS_WZ = 0.90
 P4_MAX_VX = 1.00
 P4_NAV_PERIOD_FRAMES = 5
 P4_NAV_DT_S = p2_contract.CONTROL_DT_S * P4_NAV_PERIOD_FRAMES
-P4_SLEW_RATE = (0.30, 0.40, 1.50)
-P4_SLEW_RELEASE_RATE = (0.30, 0.80, 3.00)
+P4_SLEW_RATE = (0.60, 0.60, 2.00)
+P4_SLEW_RELEASE_RATE = (1.20, 1.20, 4.00)
+LEGACY_P4_SLEW_RATE = (0.30, 0.40, 1.50)
+LEGACY_P4_SLEW_RELEASE_RATE = (0.30, 0.80, 3.00)
 STALE_GOAL_WAIT_MAX_ABS_VY = 0.10
 STALE_GOAL_WAIT_MAX_ABS_WZ = 0.25
 
@@ -99,22 +114,28 @@ GOAL_PROCESS_SIGMA_V_M_S = 0.03
 GOAL_PROCESS_SIGMA_WZ_RAD_S = 0.011
 GOAL_REACQUIRE_SAMPLES = 5
 
-STUCK_RESET_TERMINAL_PENALTY = -25.0
+STUCK_RESET_TERMINAL_PENALTY = -75.0
 SUCCESS_IMPULSE = 200.0
-TIMEOUT_IMPULSE = -25.0
+FAILURE_IMPULSE = -60.0
+TIMEOUT_IMPULSE = -40.0
+LEGACY_STUCK_RESET_TERMINAL_PENALTY = -25.0
+LEGACY_TIMEOUT_IMPULSE = -25.0
 STUCK_SUSTAINED_GRACE_S = 0.8
 STUCK_SUSTAINED_FULL_S = 2.0
 STUCK_SUSTAINED_BASE = -0.005
-STUCK_SUSTAINED_FLOOR = -0.02
+STUCK_SUSTAINED_FLOOR = -0.03
+LEGACY_STUCK_SUSTAINED_FLOOR = -0.02
 GOAL_SAFE_PREFERENCE_WEIGHT = -0.012
 GOAL_SAFE_PREFERENCE_MARGIN = 0.08
 GOAL_SAFE_PREFERENCE_SCALE = 0.35
 ROUTE_EXCESS_WEIGHT = 0.0
 ROUTE_EXCESS_CAP_M = 0.0
 YAW_EXIT_RESPONSE_RAW_FLOOR = -0.006
-TRANSLATION_LIMITER_RISK_THRESHOLD = 0.75
-TRANSLATION_LIMITER_ALPHA_FLOOR = 0.60
+TRANSLATION_LIMITER_RISK_THRESHOLD = 0.95
+TRANSLATION_LIMITER_ALPHA_FLOOR = 0.75
 TRANSLATION_LIMITER_RELEASE_PER_TICK = 0.20
+LEGACY_TRANSLATION_LIMITER_RISK_THRESHOLD = 0.75
+LEGACY_TRANSLATION_LIMITER_ALPHA_FLOOR = 0.60
 NEAR_GOAL_CAPTURE_MIN_DISTANCE_M = 0.65
 NEAR_GOAL_CAPTURE_MAX_DISTANCE_M = 1.20
 NEAR_GOAL_CAPTURE_MIN_SPEED_M_S = 0.10
@@ -122,14 +143,22 @@ NEAR_GOAL_CAPTURE_GOAL_COSINE_MIN = 0.70
 NEAR_GOAL_CAPTURE_FRESHNESS_MIN = 0.90
 TEACHER_SAFE_MIN = 0.65
 TEACHER_SAFE_MARGIN_MIN = 0.20
+TEACHER_GOAL_SAFE_TIE_MARGIN = 0.10
 TEACHER_GOAL_FRESHNESS_MIN = 0.75
 TEACHER_DIRECTION_TOLERANCE_DEG = 35.0
-TEACHER_SPEED_RISK_MIN = 0.65
+TEACHER_SPEED_RISK_MIN = 0.90
 TEACHER_MIN_VALID_STEPS = 64
+TEACHER_SAFE5_ANGLES_DEG = (60.0, 30.0, 0.0, -30.0, -60.0)
+TEACHER_SAFE5_HEIGHT_SECTORS = ((12, 16), (9, 14), (5, 11), (2, 7), (0, 4))
 STUCK_RESET_DEFAULTS = {
     "enabled": True,
     "mode": "shadow",
+    "schedule_enabled": False,
     "confirmation_s": 10.0,
+    "initial_confirmation_s": 12.0,
+    "activation_delay_s": 1_800.0,
+    "tighten_after_s": 7_200.0,
+    "resume_offset_s": 0.0,
     "radius_m": 0.50,
     "min_goal_distance_m": 0.80,
     "body_collision_force_n": 30.0,
@@ -137,7 +166,7 @@ STUCK_RESET_DEFAULTS = {
     "episode_grace_s": 5.0,
     "push_grace_s": 2.0,
     "max_true_motion_speed_m_s": 0.08,
-    "terminal_penalty": STUCK_RESET_TERMINAL_PENALTY,
+    "terminal_penalty": LEGACY_STUCK_RESET_TERMINAL_PENALTY,
 }
 
 FULL_TRACK_SEGMENT_LABELS = (
@@ -149,8 +178,10 @@ FULL_TRACK_SEGMENT_LABELS = (
 )
 FULL_TRACK_SEGMENT_LENGTH_M = 8.0
 SEGMENT_FRONTIER_WEIGHT = 1.0
-MAZE_NEW_BEST_WEIGHT_PER_M = 2.0
-MAZE_NEW_BEST_EPISODE_CAP = 12.0
+MAZE_NEW_BEST_WEIGHT_PER_M = 1.0
+MAZE_NEW_BEST_EPISODE_CAP = 6.0
+LEGACY_MAZE_NEW_BEST_WEIGHT_PER_M = 2.0
+LEGACY_MAZE_NEW_BEST_EPISODE_CAP = 12.0
 OPEN_STRAIGHT_LATERAL_WEIGHT = -0.005
 OPEN_STRAIGHT_S_TURN_WEIGHT = -0.005
 OPEN_STRAIGHT_EXTRA_PATH_WEIGHT = -0.0025
@@ -184,7 +215,12 @@ def normalize_stuck_reset_contract(
     result = {
         "enabled": bool(merged["enabled"]),
         "mode": mode,
+        "schedule_enabled": bool(merged["schedule_enabled"]),
         "confirmation_s": float(merged["confirmation_s"]),
+        "initial_confirmation_s": float(merged["initial_confirmation_s"]),
+        "activation_delay_s": float(merged["activation_delay_s"]),
+        "tighten_after_s": float(merged["tighten_after_s"]),
+        "resume_offset_s": float(merged["resume_offset_s"]),
         "radius_m": float(merged["radius_m"]),
         "min_goal_distance_m": float(merged["min_goal_distance_m"]),
         "body_collision_force_n": float(merged["body_collision_force_n"]),
@@ -196,13 +232,21 @@ def normalize_stuck_reset_contract(
         ),
         "terminal_penalty": float(merged["terminal_penalty"]),
     }
-    numeric = tuple(value for key, value in result.items() if key not in {"enabled", "mode"})
+    numeric = tuple(
+        value
+        for key, value in result.items()
+        if key not in {"enabled", "mode", "schedule_enabled"}
+    )
     if not all(math.isfinite(value) for value in numeric):
         raise ValueError("P4 stuck-reset numeric fields must be finite")
     if any(
         result[key] < 0.0
         for key in (
             "confirmation_s",
+            "initial_confirmation_s",
+            "activation_delay_s",
+            "tighten_after_s",
+            "resume_offset_s",
             "radius_m",
             "min_goal_distance_m",
             "body_collision_force_n",
@@ -215,14 +259,25 @@ def normalize_stuck_reset_contract(
         raise ValueError("P4 stuck-reset durations, distances and force must be non-negative")
     if result["terminal_penalty"] > 0.0:
         raise ValueError("P4 stuck-reset terminal_penalty must be non-positive")
+    if result["tighten_after_s"] < result["activation_delay_s"]:
+        raise ValueError(
+            "P4 stuck-reset tighten_after_s must not precede activation_delay_s"
+        )
     return result
 
 YAW_WINDOW_SECONDS = 1.0
 RISK_RESPONSE_WINDOW_SECONDS = 1.0
-YAW_EXEC_WEIGHT = -0.012
-YAW_TRUE_WEIGHT = -0.008
-YAW_TOTAL_FLOOR = -0.020
-SAFETY_GROUP_FLOOR = -0.060
+# Global yaw cancellation is shadow-only. It previously penalized legitimate
+# rapid obstacle-avoidance reversals without feeding the intervention state
+# back into the policy.
+YAW_EXEC_WEIGHT = 0.0
+YAW_TRUE_WEIGHT = 0.0
+YAW_TOTAL_FLOOR = 0.0
+SAFETY_GROUP_FLOOR = -0.070
+LEGACY_YAW_EXEC_WEIGHT = -0.012
+LEGACY_YAW_TRUE_WEIGHT = -0.008
+LEGACY_YAW_TOTAL_FLOOR = -0.020
+LEGACY_SAFETY_GROUP_FLOOR = -0.060
 
 PREDICTIVE_COLLISION_SCALE = 1.25
 PREDICTIVE_RAW_FLOOR = -0.0300
@@ -584,10 +639,25 @@ MONITOR_REQUIRED_METRICS = (
     "full_phase_adapt",
     "full_phase_train",
     "full_phase_stabilize",
-    "credit_phase_warm",
-    "credit_phase_adapt",
-    "credit_phase_train",
-    "credit_phase_final",
+    "closedloop_phase_critic_warm",
+    "closedloop_phase_actor_adapt",
+    "closedloop_phase_train",
+    "closedloop_phase_stabilize",
+    "teacher_safe5_far_left",
+    "teacher_safe5_left",
+    "teacher_safe5_center",
+    "teacher_safe5_right",
+    "teacher_safe5_far_right",
+    "large_goal_correct_yaw_response",
+    "vy_substitutes_yaw_count",
+    "translation_limiter_intervention",
+    "translation_limiter_shadow",
+    "legitimate_side_goal_candidate_count",
+    "legitimate_side_goal_selected_count",
+    "exec_vy",
+    "exec_wz",
+    "true_vy",
+    "true_wz",
 )
 
 # P4 retains the broad P2 dashboard for diagnostics.  These inherited panels
@@ -747,6 +817,8 @@ def translation_vector_limiter(
     alpha_prev: torch.Tensor,
     *,
     reset_mask: torch.Tensor | None = None,
+    risk_threshold: float = TRANSLATION_LIMITER_RISK_THRESHOLD,
+    alpha_floor: float = TRANSLATION_LIMITER_ALPHA_FLOOR,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Limit the complete translational vector using deployable depth risk.
 
@@ -772,15 +844,19 @@ def translation_vector_limiter(
         if reset.numel() != count:
             raise ValueError("P4 translation limiter reset shape drift")
     risk = torch.nan_to_num(risk, nan=1.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    threshold = float(risk_threshold)
+    floor = float(alpha_floor)
+    if not 0.0 <= threshold < 1.0 or not 0.0 < floor <= 1.0:
+        raise ValueError("P4 translation limiter threshold/floor are invalid")
     emergency = torch.clamp(
-        (risk - TRANSLATION_LIMITER_RISK_THRESHOLD)
-        / (1.0 - TRANSLATION_LIMITER_RISK_THRESHOLD),
+        (risk - threshold)
+        / (1.0 - threshold),
         0.0,
         1.0,
     )
-    raw_alpha = 1.0 - (1.0 - TRANSLATION_LIMITER_ALPHA_FLOOR) * emergency
+    raw_alpha = 1.0 - (1.0 - floor) * emergency
     previous = torch.nan_to_num(previous, nan=1.0, posinf=1.0, neginf=1.0).clamp(
-        TRANSLATION_LIMITER_ALPHA_FLOOR, 1.0
+        floor, 1.0
     )
     previous = torch.where(reset, torch.ones_like(previous), previous)
     # Tightening is immediate; only release is rate limited at the 10 Hz tick.
@@ -875,6 +951,7 @@ def teacher_guidance_mask(
     episode_grace: torch.Tensor,
     goal_freshness: torch.Tensor,
     safe3: torch.Tensor,
+    safe5: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Build rollout-time masks for the non-privileged Actor mean guidance."""
     if safe3.ndim != 2 or safe3.shape[1] != 3:
@@ -888,10 +965,18 @@ def teacher_guidance_mask(
         return result.bool() if boolean else result.to(dtype=safe3.dtype)
 
     values = torch.nan_to_num(safe3, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    if safe5 is not None:
+        safe5_values = torch.as_tensor(safe5, device=safe3.device)
+        if safe5_values.shape != (count, 5):
+            raise ValueError("P4 teacher guidance expects safe5=[N,5]")
+        values = torch.nan_to_num(
+            safe5_values, nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0)
     top2 = torch.topk(values, k=2, dim=-1).values
     best_safe = top2[:, 0]
     margin = best_safe - top2[:, 1]
-    base = (
+    freshness = _flat(goal_freshness, "goal_freshness", boolean=False)
+    valid = (
         _flat(alive, "alive")
         & _flat(scanner_valid, "scanner_valid")
         & _flat(mapping_valid, "mapping_valid")
@@ -900,14 +985,94 @@ def teacher_guidance_mask(
         & ~_flat(push_grace, "push_grace")
         & ~_flat(episode_grace, "episode_grace")
         & (best_safe >= TEACHER_SAFE_MIN)
-        & (margin >= TEACHER_SAFE_MARGIN_MIN)
     )
-    freshness = _flat(goal_freshness, "goal_freshness", boolean=False)
+    clear_best = margin >= TEACHER_SAFE_MARGIN_MIN
+    fresh_goal = freshness >= TEACHER_GOAL_FRESHNESS_MIN
+    goal_tie_break = fresh_goal if safe5 is not None else torch.zeros_like(fresh_goal)
+    base = valid & (clear_best | goal_tie_break)
+    goal_eligible = (
+        valid & goal_tie_break
+        if safe5 is not None
+        else base & fresh_goal
+    )
     return {
         "teacher_guidance_eligible": base,
-        "teacher_guidance_goal_eligible": base & (freshness >= TEACHER_GOAL_FRESHNESS_MIN),
+        "teacher_guidance_goal_eligible": goal_eligible,
         "teacher_best_safe": best_safe,
         "teacher_safe_margin": margin,
+    }
+
+
+def privileged_safe_directions5(
+    critic_obs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Build a five-direction training-only safety teacher from existing sensors.
+
+    The nav scanner contract remains three-directional. Its conservative wall
+    risk is interpolated to five sectors, while the 16x16 height scan provides
+    distinct overlapping terrain-continuity evidence for each direction. This
+    does not change Actor/Critic observations or any deployment interface.
+    """
+    if critic_obs.ndim != 2 or critic_obs.shape[1] < p2_contract.CRITIC_OBS_DIM:
+        raise ValueError("P4 safe5 teacher critic observation shape drift")
+    height = critic_obs[:, 60:316].reshape(-1, 16, 16)
+    nav_priv = critic_obs[:, 319:323]
+    scanner_available = nav_priv[:, 0] > 0.5
+    left = nav_priv[:, 2]
+    center = nav_priv[:, 1]
+    right = nav_priv[:, 3]
+    nav_risk5 = torch.stack(
+        (
+            left,
+            torch.maximum(left, center),
+            center,
+            torch.maximum(center, right),
+            right,
+        ),
+        dim=-1,
+    )
+    nav_risk5 = torch.nan_to_num(
+        nav_risk5, nan=1.0, posinf=1.0, neginf=1.0
+    ).clamp(0.0, 1.0)
+
+    passable = []
+    sector_valid = []
+    jump90 = []
+    for y0, y1 in TEACHER_SAFE5_HEIGHT_SECTORS:
+        region = height[:, y0:y1, : p2_contract.SAFETY_HEIGHT_FORWARD_COLS]
+        finite = torch.isfinite(region)
+        finite_ratio = finite.float().mean(dim=(1, 2))
+        pair_valid = finite[:, :, 1:] & finite[:, :, :-1]
+        diff = torch.where(
+            pair_valid,
+            torch.abs(torch.diff(region, dim=2)),
+            torch.full_like(region[:, :, 1:], float("nan")),
+        )
+        jump = torch.nanquantile(diff.flatten(1), 0.90, dim=1)
+        valid = (
+            (finite_ratio >= p2_contract.SAFETY_HEIGHT_FINITE_RATIO_MIN)
+            & (pair_valid.sum(dim=(1, 2)) >= p2_contract.SAFETY_HEIGHT_MIN_VALID_DIFFS)
+            & torch.isfinite(jump)
+        )
+        jump = torch.nan_to_num(
+            jump, nan=float("inf"), posinf=float("inf"), neginf=float("inf")
+        )
+        excess = torch.relu(jump - p2_contract.SAFETY_HEIGHT_JUMP_FREE_M)
+        passable.append(
+            torch.exp(-torch.square(excess / p2_contract.SAFETY_HEIGHT_JUMP_SCALE_M))
+        )
+        sector_valid.append(valid)
+        jump90.append(jump)
+    terrain_passable5 = torch.stack(passable, dim=-1)
+    sector_valid5 = torch.stack(sector_valid, dim=-1)
+    valid = scanner_available & sector_valid5.all(dim=-1)
+    safe5 = ((1.0 - nav_risk5) * terrain_passable5).clamp(0.0, 1.0)
+    safe5 = torch.where(valid[:, None], safe5, torch.zeros_like(safe5))
+    return safe5, valid, {
+        "nav_risk5": nav_risk5,
+        "terrain_passable5": terrain_passable5,
+        "height_jump90_5": torch.stack(jump90, dim=-1),
+        "height_sector_valid5": sector_valid5.float(),
     }
 
 
@@ -922,12 +1087,16 @@ def teacher_guidance_loss(
     sample_weight: torch.Tensor | None = None,
     *,
     min_valid_steps: int = TEACHER_MIN_VALID_STEPS,
+    closed_loop_v3: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Return tolerant direction, speed and yaw guidance without a full action teacher."""
     if policy_mean_cmd3.ndim != 2 or policy_mean_cmd3.shape[1] != 3:
         raise ValueError("P4 teacher loss expects policy_mean_cmd3=[N,3]")
-    if safe3.shape != (policy_mean_cmd3.shape[0], 3):
-        raise ValueError("P4 teacher loss safe3 shape drift")
+    expected_sectors = 5 if closed_loop_v3 else 3
+    if safe3.shape != (policy_mean_cmd3.shape[0], expected_sectors):
+        raise ValueError(
+            f"P4 teacher loss safe{expected_sectors} shape drift"
+        )
     if goal_xy_m.shape != (policy_mean_cmd3.shape[0], 2):
         raise ValueError("P4 teacher loss goal_xy_m shape drift")
     count = policy_mean_cmd3.shape[0]
@@ -946,8 +1115,34 @@ def teacher_guidance_loss(
         else _flat(sample_weight, "sample_weight").clamp_min(0.0)
     )
     values = torch.nan_to_num(safe3.to(policy_mean_cmd3), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
-    best_safe, best_index = values.max(dim=-1)
-    sector_angles = policy_mean_cmd3.new_tensor((35.0, 0.0, -35.0)) * (math.pi / 180.0)
+    best_safe, pure_best_index = values.max(dim=-1)
+    sector_angles = policy_mean_cmd3.new_tensor(
+        TEACHER_SAFE5_ANGLES_DEG if closed_loop_v3 else (35.0, 0.0, -35.0)
+    ) * (math.pi / 180.0)
+    goal = torch.nan_to_num(
+        goal_xy_m.to(policy_mean_cmd3), nan=0.0, posinf=0.0, neginf=0.0
+    )
+    goal_distance = torch.linalg.vector_norm(goal, dim=-1)
+    bearing = torch.atan2(goal[:, 1], goal[:, 0]).clamp(
+        min=math.radians(-75.0), max=math.radians(75.0)
+    )
+    if closed_loop_v3:
+        safe_candidate = values >= torch.maximum(
+            best_safe[:, None] - TEACHER_GOAL_SAFE_TIE_MARGIN,
+            torch.full_like(values, TEACHER_SAFE_MIN),
+        )
+        goal_distance_to_sector = torch.abs(
+            bearing[:, None] - sector_angles[None, :]
+        )
+        goal_distance_to_sector = torch.where(
+            safe_candidate,
+            goal_distance_to_sector,
+            torch.full_like(goal_distance_to_sector, 1.0e6),
+        )
+        goal_best_index = goal_distance_to_sector.argmin(dim=-1)
+        best_index = torch.where(goal_valid, goal_best_index, pure_best_index)
+    else:
+        best_index = pure_best_index
     safe_angle = sector_angles[best_index]
     safe_direction = torch.stack((torch.cos(safe_angle), torch.sin(safe_angle)), dim=-1)
     mean_xy = policy_mean_cmd3[:, :2]
@@ -961,37 +1156,50 @@ def teacher_guidance_loss(
 
     risk = _flat(predictive_risk, "predictive_risk").clamp(0.0, 1.0)
     stuck = _flat(stuck_active, "stuck_active", boolean=True)
-    speed_mask = base & ((risk >= TEACHER_SPEED_RISK_MIN) | stuck)
+    speed_risk_min = TEACHER_SPEED_RISK_MIN if closed_loop_v3 else 0.65
+    speed_mask = base & ((risk >= speed_risk_min) | stuck)
     speed_cap = 0.20 + 0.45 * best_safe
     speed_loss = torch.relu(mean_speed - speed_cap).square()
 
-    goal = torch.nan_to_num(goal_xy_m.to(policy_mean_cmd3), nan=0.0, posinf=0.0, neginf=0.0)
-    goal_distance = torch.linalg.vector_norm(goal, dim=-1)
     goal_direction = goal / goal_distance.unsqueeze(-1).clamp_min(1.0e-6)
     compatible = (goal_direction * safe_direction).sum(dim=-1) >= math.cos(
         math.radians(TEACHER_DIRECTION_TOLERANCE_DEG)
     )
-    bearing = torch.atan2(goal[:, 1], goal[:, 0])
-    bearing_abs_deg = bearing.abs() * (180.0 / math.pi)
+    desired_yaw = safe_angle if closed_loop_v3 else bearing
+    bearing_abs_deg = desired_yaw.abs() * (180.0 / math.pi)
     required_wz = torch.where(
-        bearing_abs_deg <= 15.0,
+        bearing_abs_deg <= 15.0 + 1.0e-4,
         torch.zeros_like(bearing_abs_deg),
         torch.where(
-            bearing_abs_deg <= 35.0,
+            bearing_abs_deg <= 35.0 + 1.0e-4,
             torch.full_like(bearing_abs_deg, 0.06),
             torch.where(
-                bearing_abs_deg <= 60.0,
+                bearing_abs_deg <= 60.0 + 1.0e-4,
                 torch.full_like(bearing_abs_deg, 0.12),
                 torch.where(
-                    bearing_abs_deg <= 90.0,
+                    bearing_abs_deg <= 90.0 + 1.0e-4,
                     torch.full_like(bearing_abs_deg, 0.18),
                     torch.zeros_like(bearing_abs_deg),
                 ),
             ),
         ),
     )
-    yaw_mask = goal_valid & compatible & (required_wz > 0.0)
-    yaw_loss = torch.relu(required_wz - torch.sign(bearing) * policy_mean_cmd3[:, 2]).square()
+    yaw_mask = (
+        base & (required_wz > 0.0)
+        if closed_loop_v3
+        else goal_valid & compatible & (required_wz > 0.0)
+    )
+    signed_wz = torch.sign(desired_yaw) * policy_mean_cmd3[:, 2]
+    yaw_response_loss = torch.relu(required_wz - signed_wz).square()
+    if closed_loop_v3:
+        vy_substitution = torch.where(
+            bearing_abs_deg >= 35.0,
+            torch.relu(policy_mean_cmd3[:, 1].abs() - 0.12).square(),
+            torch.zeros_like(signed_wz),
+        )
+        yaw_loss = yaw_response_loss + 0.25 * vy_substitution
+    else:
+        yaw_loss = yaw_response_loss
 
     valid_steps = base.sum()
     active = valid_steps >= int(min_valid_steps)
@@ -1003,7 +1211,11 @@ def teacher_guidance_loss(
     direction = _masked_mean(direction_loss, base)
     speed = _masked_mean(speed_loss, speed_mask)
     yaw = _masked_mean(yaw_loss, yaw_mask)
-    total = 0.45 * direction + 0.20 * speed + 0.35 * yaw
+    total = (
+        0.55 * direction + 0.10 * speed + 0.35 * yaw
+        if closed_loop_v3
+        else 0.45 * direction + 0.20 * speed + 0.35 * yaw
+    )
     active_float = active.to(dtype=policy_mean_cmd3.dtype)
     total = total * active_float
     return {
@@ -1089,6 +1301,7 @@ def sustained_wall_stuck_penalty(
     terminal: torch.Tensor,
     *,
     confirmation_s: float,
+    floor: float = STUCK_SUSTAINED_FLOOR,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Penalize confirmed wall confinement before the terminal reset fires."""
     duration = torch.nan_to_num(duration_s.float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -1104,7 +1317,7 @@ def sustained_wall_stuck_penalty(
         (duration - STUCK_SUSTAINED_GRACE_S) / ramp_span, 0.0, 1.0
     )
     magnitude = abs(STUCK_SUSTAINED_BASE) + severity * (
-        abs(STUCK_SUSTAINED_FLOOR) - abs(STUCK_SUSTAINED_BASE)
+        abs(float(floor)) - abs(STUCK_SUSTAINED_BASE)
     )
     penalty = torch.where(active, -magnitude, torch.zeros_like(magnitude))
     return penalty, {
@@ -1117,6 +1330,9 @@ def maze_new_best_credit(
     best_distance_before: torch.Tensor,
     end_distance: torch.Tensor,
     episode_credit_before: torch.Tensor,
+    *,
+    weight_per_m: float = MAZE_NEW_BEST_WEIGHT_PER_M,
+    episode_cap: float = MAZE_NEW_BEST_EPISODE_CAP,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reward each newly reached Maze distance once, without terminal clawback."""
     best_raw = best_distance_before.float()
@@ -1130,16 +1346,15 @@ def maze_new_best_credit(
     best = torch.where(valid, best_raw.clamp_min(0.0), torch.zeros_like(best_raw))
     end = torch.where(valid, end_raw.clamp_min(0.0), best)
     earned = torch.nan_to_num(
-        earned_raw, nan=0.0, posinf=MAZE_NEW_BEST_EPISODE_CAP, neginf=0.0
-    ).clamp(0.0, MAZE_NEW_BEST_EPISODE_CAP)
+        earned_raw, nan=0.0, posinf=float(episode_cap), neginf=0.0
+    ).clamp(0.0, float(episode_cap))
     delta = torch.clamp(best - torch.minimum(best, end), min=0.0)
-    raw_reward = MAZE_NEW_BEST_WEIGHT_PER_M * delta
+    raw_reward = float(weight_per_m) * delta
     reward = torch.minimum(
         raw_reward,
-        torch.clamp(MAZE_NEW_BEST_EPISODE_CAP - earned, min=0.0),
+        torch.clamp(float(episode_cap) - earned, min=0.0),
     )
     reward = torch.where(valid, reward, torch.zeros_like(reward))
-    delta = torch.where(valid, delta, torch.zeros_like(delta))
     return reward, earned + reward, delta
 
 
@@ -1572,8 +1787,69 @@ def training_schedule(
     branch = str(branch or "actor_attack")
     if branch == "auto":
         branch = "actor_attack"
-    if branch not in {"actor_attack", "visual_recovery", "credit_repair"}:
+    if branch not in {
+        "actor_attack", "visual_recovery", "credit_repair", "closed_loop_v3"
+    }:
         branch = "actor_attack"
+    if branch == "closed_loop_v3":
+        common = {
+            "training_branch": branch,
+            "reward_multiplier": 1.0,
+            "goal_fault_multiplier": 0.0,
+            "camera_aux_ratio": 0.0,
+            "stuck_gradient_target_ratio": 0.0,
+            "mirror_sequence_share": 0.0,
+            "cruise_multiplier": 0.0,
+            "teacher_gradient_hard_cap": 0.03,
+            "auxiliary_gradient_hard_cap": 0.03,
+            "mirror_gradient_hard_cap": 0.0,
+            "navigation_multiplier": 0.0,
+            "safety_head_multiplier": 0.0,
+            "adapter_multiplier": 0.0,
+            "stuck_head_multiplier": 0.0,
+            "mirror_gradient_target_ratio": 0.0,
+        }
+        if seconds < 1_800.0:
+            return {
+                **common,
+                "phase": "loopwarm",
+                "actor_multiplier": 0.0,
+                "actor_lr": 3.0e-5,
+                "critic_lr": 6.0e-5,
+                "teacher_gradient_target_ratio": 0.0,
+                "entropy_coefficient": 0.004,
+            }
+        if seconds < 7_200.0:
+            return {
+                **common,
+                "phase": "loopadapt",
+                "actor_multiplier": 1.0,
+                "actor_lr": 3.0e-5,
+                "critic_lr": 6.0e-5,
+                "teacher_gradient_target_ratio": (
+                    0.010 * (seconds - 1_800.0) / 5_400.0
+                ),
+                "entropy_coefficient": 0.004,
+            }
+        if seconds < 21_600.0:
+            return {
+                **common,
+                "phase": "looptrain",
+                "actor_multiplier": 1.0,
+                "actor_lr": 5.0e-5,
+                "critic_lr": 5.0e-5,
+                "teacher_gradient_target_ratio": 0.020,
+                "entropy_coefficient": 0.003,
+            }
+        return {
+            **common,
+            "phase": "loopstable",
+            "actor_multiplier": 1.0,
+            "actor_lr": 2.5e-5,
+            "critic_lr": 3.0e-5,
+            "teacher_gradient_target_ratio": 0.010,
+            "entropy_coefficient": 0.002,
+        }
     if branch == "credit_repair":
         common = {
             "training_branch": branch,
@@ -1702,27 +1978,54 @@ def training_schedule(
 
 def _normalized_training_profile(training_profile: str) -> str:
     profile = str(training_profile).strip().lower()
-    if profile not in {"maze_credit_repair", "full_track"}:
+    if profile not in {"maze_credit_repair", "maze_closed_loop_v3", "full_track"}:
         raise ValueError(f"unsupported P4 training profile {training_profile!r}")
     return profile
+
+
+def _is_maze_profile(profile: str) -> bool:
+    return profile in {"maze_credit_repair", "maze_closed_loop_v3"}
 
 
 def command_contract(
     training_profile: str = "maze_credit_repair",
 ) -> dict[str, Any]:
     profile = _normalized_training_profile(training_profile)
+    closed_loop = profile == "maze_closed_loop_v3"
+    slew_rate = P4_SLEW_RATE if closed_loop else LEGACY_P4_SLEW_RATE
+    slew_release_rate = (
+        P4_SLEW_RELEASE_RATE if closed_loop else LEGACY_P4_SLEW_RELEASE_RATE
+    )
+    limiter_threshold = (
+        TRANSLATION_LIMITER_RISK_THRESHOLD
+        if closed_loop
+        else LEGACY_TRANSLATION_LIMITER_RISK_THRESHOLD
+    )
+    limiter_floor = (
+        TRANSLATION_LIMITER_ALPHA_FLOOR
+        if closed_loop
+        else LEGACY_TRANSLATION_LIMITER_ALPHA_FLOOR
+    )
     return {
         "version": (
-            "p4_maze_credit_repair_command_v1"
-            if profile == "maze_credit_repair"
-            else FULL_TRACK_COMMAND_CONTRACT_VERSION
+            "p4_maze_closed_loop_command_v3"
+            if closed_loop
+            else (
+                "p4_maze_credit_repair_command_v1"
+                if profile == "maze_credit_repair"
+                else FULL_TRACK_COMMAND_CONTRACT_VERSION
+            )
         ),
         "mapper_version": ACTION_MAPPER_VERSION,
         "legacy_mapper_version": LEGACY_ACTION_MAPPER_VERSION,
         "normalized_action": "unchanged_tanh_gaussian_v2",
         "mapped_ranges": {"vx": [0.0, 1.0], "vy": [-0.30, 0.30], "wz": [-0.90, 0.90]},
         "policy_target_vx": [0.0, 1.0],
-        "limited_target": "stale_goal_cap_then_translation_vector_limiter_then_near_goal_capture",
+        "limited_target": (
+            "stale_goal_cap_with_translation_limiter_shadow_only"
+            if closed_loop
+            else "stale_goal_cap_then_translation_vector_limiter_then_near_goal_capture"
+        ),
         "stale_goal_wait": {
             "no_estimate": {
                 "vx": 0.0,
@@ -1742,28 +2045,45 @@ def command_contract(
             "low_weight": SOFT_CRUISE_LOW_WEIGHT,
             "high_weight": SOFT_CRUISE_HIGH_WEIGHT,
             "clear_factor": "teacher_valid*goal_freshness*center_safe*center_safe/best_safe",
+            **({"status": "disabled"} if closed_loop else {}),
         },
-        "slew_rate": list(P4_SLEW_RATE),
-        "slew_release_rate": list(P4_SLEW_RELEASE_RATE),
+        "slew_rate": list(slew_rate),
+        "slew_release_rate": list(slew_release_rate),
         "nav_period_frames": P4_NAV_PERIOD_FRAMES,
         "nav_frequency_hz": 1.0 / P4_NAV_DT_S,
         "slew_semantics": p2_contract.command_contract()["slew_semantics"],
         "translation_vector_limiter": {
-            "version": TRANSLATION_VECTOR_LIMITER_CONTRACT_VERSION,
+            "version": (
+                TRANSLATION_VECTOR_LIMITER_CONTRACT_VERSION
+                if closed_loop
+                else LEGACY_TRANSLATION_VECTOR_LIMITER_CONTRACT_VERSION
+            ),
             "source": "deployment_available_predictive_depth_risk",
-            "alpha_raw": "risk<=0.75:1; risk=1:0.60; linear between",
-            "risk_threshold": TRANSLATION_LIMITER_RISK_THRESHOLD,
-            "alpha_floor": TRANSLATION_LIMITER_ALPHA_FLOOR,
+            "alpha_raw": (
+                f"risk<={limiter_threshold:.2f}:1; "
+                f"risk=1:{limiter_floor:.2f}; linear between"
+            ),
+            "risk_threshold": limiter_threshold,
+            "alpha_floor": limiter_floor,
             "release_per_10hz_tick": TRANSLATION_LIMITER_RELEASE_PER_TICK,
             "state": "live_only_reset_to_one_not_checkpointed",
             "axes": "scale_vx_vy_preserve_wz",
+            **({"status": "shadow_only"} if closed_loop else {}),
         },
         "near_goal_capture": {
-            "version": NEAR_GOAL_CAPTURE_CONTRACT_VERSION,
+            "version": (
+                NEAR_GOAL_CAPTURE_CONTRACT_VERSION
+                if closed_loop
+                else LEGACY_NEAR_GOAL_CAPTURE_CONTRACT_VERSION
+            ),
             "distance_m": [NEAR_GOAL_CAPTURE_MIN_DISTANCE_M, NEAR_GOAL_CAPTURE_MAX_DISTANCE_M],
             "goal_freshness_min": NEAR_GOAL_CAPTURE_FRESHNESS_MIN,
             "policy_goal_cosine_min": NEAR_GOAL_CAPTURE_GOAL_COSINE_MIN,
-            "axes": "translation_only_preserve_yaw",
+            **(
+                {"status": "shadow_diagnostic_only_no_command_rewrite"}
+                if closed_loop
+                else {"axes": "translation_only_preserve_yaw"}
+            ),
         },
     }
 
@@ -1773,12 +2093,33 @@ def reward_contract(
     training_profile: str = "maze_credit_repair",
 ) -> dict[str, Any]:
     profile = _normalized_training_profile(training_profile)
+    closed_loop = profile == "maze_closed_loop_v3"
     stuck = normalize_stuck_reset_contract(stuck_reset)
+    stuck_term = {
+        "mode": stuck["mode"],
+        "terminal_penalty": stuck["terminal_penalty"],
+        "semantics": (
+            "shadow_only_no_reason4_terminal"
+            if stuck["mode"] == "shadow"
+            else "active_reason4_terminal"
+        ),
+    }
+    if stuck["schedule_enabled"]:
+        stuck_term["schedule"] = {
+            "shadow_until_s": stuck["activation_delay_s"],
+            "initial_confirmation_s": stuck["initial_confirmation_s"],
+            "tighten_after_s": stuck["tighten_after_s"],
+            "tight_confirmation_s": stuck["confirmation_s"],
+        }
     contract = {
         "version": (
-            "p4_maze_credit_repair_reward_v1"
-            if profile == "maze_credit_repair"
-            else FULL_TRACK_REWARD_CONTRACT_VERSION
+            "p4_maze_closed_loop_reward_v3_single_signal"
+            if closed_loop
+            else (
+                "p4_maze_credit_repair_reward_v1"
+                if profile == "maze_credit_repair"
+                else FULL_TRACK_REWARD_CONTRACT_VERSION
+            )
         ),
         "inherits": p2_contract.reward_contract()["version"],
         "tick_time_scaling": {
@@ -1795,35 +2136,51 @@ def reward_contract(
             "missed_safe_direction_raw_floor": MISSED_SAFE_RAW_FLOOR,
             "missed_safe_direction_gap_scale": SAFE_DIRECTION_GAP_SCALE,
             "frontier_stagnation": "shadow_only_zero_ppo_weight",
-            "yaw_exec_weight": YAW_EXEC_WEIGHT,
-            "yaw_true_weight": YAW_TRUE_WEIGHT,
-            "yaw_total_floor": YAW_TOTAL_FLOOR,
+            "yaw_exec_weight": (
+                YAW_EXEC_WEIGHT if closed_loop else LEGACY_YAW_EXEC_WEIGHT
+            ),
+            "yaw_true_weight": (
+                YAW_TRUE_WEIGHT if closed_loop else LEGACY_YAW_TRUE_WEIGHT
+            ),
+            "yaw_total_floor": (
+                YAW_TOTAL_FLOOR if closed_loop else LEGACY_YAW_TOTAL_FLOOR
+            ),
             "yaw_exit_response_raw_floor": YAW_EXIT_RESPONSE_RAW_FLOOR,
-            "safety_group_floor": SAFETY_GROUP_FLOOR,
-            "safety_group_terms": [
-                "predictive_collision",
-                "missed_safe_direction",
-                "yaw_cancellation",
-                "yaw_exit_response",
-                "goal_safe_preference",
-            ],
+            "safety_group_floor": (
+                SAFETY_GROUP_FLOOR if closed_loop else LEGACY_SAFETY_GROUP_FLOOR
+            ),
+            "safety_group_terms": (
+                ["predictive_collision"]
+                if closed_loop
+                else [
+                    "predictive_collision",
+                    "missed_safe_direction",
+                    "yaw_cancellation",
+                    "yaw_exit_response",
+                    "goal_safe_preference",
+                ]
+            ),
+            **(
+                {"yaw_cancellation": "shadow_diagnostic_only_zero_ppo_weight"}
+                if closed_loop
+                else {}
+            ),
             "cap_semantics": "proportional_no_hidden_adjustment_5hz_reference",
-            "confirmed_wall_stuck_reset": {
-                "mode": stuck["mode"],
-                "terminal_penalty": stuck["terminal_penalty"],
-                "semantics": (
-                    "shadow_only_no_reason4_terminal"
-                    if stuck["mode"] == "shadow"
-                    else "active_reason4_terminal"
-                ),
-            },
+            "confirmed_wall_stuck_reset": stuck_term,
             "success_impulse": SUCCESS_IMPULSE,
-            "timeout_impulse": TIMEOUT_IMPULSE,
+            **({"failure_impulse": FAILURE_IMPULSE} if closed_loop else {}),
+            "timeout_impulse": (
+                TIMEOUT_IMPULSE if closed_loop else LEGACY_TIMEOUT_IMPULSE
+            ),
             "sustained_wall_stuck": {
                 "grace_s": STUCK_SUSTAINED_GRACE_S,
                 "full_penalty_s": STUCK_SUSTAINED_FULL_S,
                 "base": STUCK_SUSTAINED_BASE,
-                "floor": STUCK_SUSTAINED_FLOOR,
+                "floor": (
+                    STUCK_SUSTAINED_FLOOR
+                    if closed_loop
+                    else LEGACY_STUCK_SUSTAINED_FLOOR
+                ),
             },
             "goal_safe_preference": {
                 "weight": GOAL_SAFE_PREFERENCE_WEIGHT,
@@ -1837,8 +2194,16 @@ def reward_contract(
                 "status": "disabled_global_term",
             },
             "maze_new_best_credit": {
-                "weight_per_m": MAZE_NEW_BEST_WEIGHT_PER_M,
-                "episode_cap": MAZE_NEW_BEST_EPISODE_CAP,
+                "weight_per_m": (
+                    MAZE_NEW_BEST_WEIGHT_PER_M
+                    if closed_loop
+                    else LEGACY_MAZE_NEW_BEST_WEIGHT_PER_M
+                ),
+                "episode_cap": (
+                    MAZE_NEW_BEST_EPISODE_CAP
+                    if closed_loop
+                    else LEGACY_MAZE_NEW_BEST_EPISODE_CAP
+                ),
                 "terminal": "retain_earned_credit_no_clawback",
             },
             "open_straight": {
@@ -1859,6 +2224,27 @@ def reward_contract(
         "goal_truth_consumers": ["critic", "reward", "terminal", "scorer"],
         "goal_belief_consumers": ["actor", "speed_cap"],
     }
+    if closed_loop:
+        contract["reward_allowlist"] = [
+            "frame_safety",
+            "frontier_shaping",
+            "success",
+            "failure",
+            "timeout",
+            "time",
+            "crawl",
+            "command_rate",
+            "tracking",
+            "body_collision",
+            "predictive_collision_risk",
+            "stuck_reset",
+            "stuck_sustained",
+        ]
+        contract["nonterminal_positive_shaping_cap"] = MAZE_NEW_BEST_EPISODE_CAP
+        contract["new_terms"]["missed_safe_direction"] = "shadow_only_zero_ppo_weight"
+        contract["new_terms"]["goal_safe_preference"] = "shadow_only_zero_ppo_weight"
+        contract["new_terms"]["yaw_exit_response"] = "shadow_only_zero_ppo_weight"
+        contract["new_terms"]["soft_cruise"]["status"] = "disabled"
     if profile == "full_track":
         contract["new_terms"]["maze_new_best_credit"] = {
             "status": "disabled_outside_maze_credit_repair",
@@ -1878,26 +2264,64 @@ def training_contract(
     training_profile: str = "maze_credit_repair",
 ) -> dict[str, Any]:
     profile = _normalized_training_profile(training_profile)
-    credit_profile = profile == "maze_credit_repair"
+    maze_profile = _is_maze_profile(profile)
+    closed_loop = profile == "maze_closed_loop_v3"
+    legacy_maze = profile == "maze_credit_repair"
     stuck = normalize_stuck_reset_contract(stuck_reset)
+    serialized_stuck = dict(stuck)
+    if not closed_loop:
+        # Keep the byte-level shape of the historical v1/v2 contracts.  The
+        # schedule flag belongs only to the new v3 contract; adding it to an
+        # unchanged legacy version would make valid exact-resume packages look
+        # like contract drift.
+        for name in (
+            "schedule_enabled",
+            "initial_confirmation_s",
+            "activation_delay_s",
+            "tighten_after_s",
+            "resume_offset_s",
+        ):
+            serialized_stuck.pop(name, None)
     return {
         "version": (
+            MAZE_CLOSED_LOOP_CHECKPOINT_VERSION
+            if closed_loop
+            else (
             CHECKPOINT_CONTRACT_VERSION
-            if credit_profile
-            else FULL_TRACK_CHECKPOINT_CONTRACT_VERSION
+                if profile == "maze_credit_repair"
+                else FULL_TRACK_CHECKPOINT_CONTRACT_VERSION
+            )
         ),
         "training_profile": profile,
-        "run_name": RUN_NAME if credit_profile else "p4full8h-r2",
-        "training_hours": TRAINING_HOURS if credit_profile else 8.0,
+        "run_name": (
+            RUN_NAME
+            if closed_loop
+            else ("p4maze2h-credit-repair" if legacy_maze else "p4full8h-r2")
+        ),
+        "training_hours": (
+            TRAINING_HOURS
+            if closed_loop
+            else (LEGACY_MAZE_TRAINING_HOURS if legacy_maze else 8.0)
+        ),
         "target_effective_seconds": (
-            int(TARGET_EFFECTIVE_SECONDS) if credit_profile else 28_800
+            int(TARGET_EFFECTIVE_SECONDS)
+            if closed_loop
+            else (
+                int(LEGACY_MAZE_TARGET_EFFECTIVE_SECONDS)
+                if legacy_maze
+                else 28_800
+            )
         ),
         "diagnostic_seconds": int(DIAGNOSTIC_SECONDS),
         "required_platform_wall_seconds": (
-            int(PLATFORM_WALL_SECONDS) if credit_profile else 29_700
+            int(PLATFORM_WALL_SECONDS)
+            if closed_loop
+            else (8_100 if legacy_maze else 29_700)
         ),
         "required_platform_wall_hours": (
-            PLATFORM_WALL_HOURS if credit_profile else 8.25
+            PLATFORM_WALL_HOURS
+            if closed_loop
+            else (2.25 if legacy_maze else 8.25)
         ),
         "clock_semantics": {
             "diagnostic": "wall_seconds_before_training_not_counted_in_session",
@@ -1913,36 +2337,59 @@ def training_contract(
         },
         "schedule_boundaries_seconds": (
             list(SCHEDULE_BOUNDARIES_SECONDS)
-            if credit_profile
-            else [1_800.0, 7_200.0, 21_600.0, 28_800.0]
+            if closed_loop
+            else (
+                list(LEGACY_MAZE_SCHEDULE_BOUNDARIES_SECONDS)
+                if legacy_maze
+                else [1_800.0, 7_200.0, 21_600.0, 28_800.0]
+            )
         ),
         "safety_reward_ramp": {
             "version": (
-                SAFETY_REWARD_RAMP_VERSION
-                if credit_profile
-                else "p4_full_track_safety_group_v2"
+                MAZE_CLOSED_LOOP_SAFETY_REWARD_VERSION
+                if closed_loop
+                else (
+                    SAFETY_REWARD_RAMP_VERSION
+                    if maze_profile
+                    else "p4_full_track_safety_group_v2"
+                )
             ),
             "segments": [
                 {
-                    "seconds": [0, 7_200 if credit_profile else 28_800],
-                    "weight": [0.012, 0.012],
+                    "seconds": [
+                        0,
+                        28_800 if closed_loop or not legacy_maze else 7_200,
+                    ],
+                    "weight": (
+                        [0.0, 0.0]
+                        if closed_loop
+                        else [0.012, 0.012]
+                    ),
                 },
             ],
         },
         "goal_fault_ramp": {
             "semantics": (
-                "disabled_for_credit_assignment_run"
-                if credit_profile
-                else "ramp_after_30m_to_full_at_2h"
+                "disabled_for_closed_loop_maze_run"
+                if closed_loop
+                else (
+                    "disabled_for_credit_assignment_run"
+                    if legacy_maze
+                    else "ramp_after_30m_to_full_at_2h"
+                )
             ),
             "segments": (
-                [{"seconds": [0, 7_200], "multiplier": [0.0, 0.0]}]
-                if credit_profile
-                else [
-                    {"seconds": [0, 1_800], "multiplier": [0.0, 0.0]},
-                    {"seconds": [1_800, 7_200], "multiplier": [0.0, 1.0]},
-                    {"seconds": [7_200, 28_800], "multiplier": [1.0, 1.0]},
-                ]
+                [{"seconds": [0, 28_800], "multiplier": [0.0, 0.0]}]
+                if closed_loop
+                else (
+                    [{"seconds": [0, 7_200], "multiplier": [0.0, 0.0]}]
+                    if legacy_maze
+                    else [
+                        {"seconds": [0, 1_800], "multiplier": [0.0, 0.0]},
+                        {"seconds": [1_800, 7_200], "multiplier": [0.0, 1.0]},
+                        {"seconds": [7_200, 28_800], "multiplier": [1.0, 1.0]},
+                    ]
+                )
             ),
         },
         "rollout_nav_ticks": 32,
@@ -1951,74 +2398,125 @@ def training_contract(
         "nav_frequency_hz": 1.0 / P4_NAV_DT_S,
         "frozen_low_level": ["cnn", "lstm", "actor", "std", "critic"],
         "trainable": (
-            ["high_actor_lstm", "high_actor_head", "high_critic", "stuck_head"]
-            if credit_profile
-            else [
-                "navigation_encoder", "high_actor_lstm", "high_actor_head",
-                "high_critic", "safety_head", "stuck_head", "response_adapter",
-            ]
+            ["high_actor_lstm", "high_actor_head", "high_critic"]
+            if closed_loop
+            else (
+                ["high_actor_lstm", "high_actor_head", "high_critic", "stuck_head"]
+                if legacy_maze
+                else [
+                    "navigation_encoder", "high_actor_lstm", "high_actor_head",
+                    "high_critic", "safety_head", "stuck_head", "response_adapter",
+                ]
+            )
         ),
         "frozen_high_level": (
-            ["navigation_encoder", "safety_head", "response_adapter"]
-            if credit_profile
-            else []
+            ["navigation_encoder", "safety_head", "stuck_head", "response_adapter"]
+            if closed_loop
+            else (
+                ["navigation_encoder", "safety_head", "response_adapter"]
+                if legacy_maze
+                else []
+            )
         ),
         "goal_belief_version": GOAL_BELIEF_VERSION,
         "camera_contract_version": CAMERA_CONTRACT_VERSION,
         "worker_wire_version": WORKER_WIRE_VERSION,
         "worker_wire_dim": P4_PRIVILEGED_WIRE_DIM,
-        "stuck_reset_contract_version": STUCK_RESET_CONTRACT_VERSION,
-        "stuck_reset": stuck,
+        "stuck_reset_contract_version": (
+            STUCK_RESET_CONTRACT_VERSION
+            if closed_loop
+            else LEGACY_STUCK_RESET_CONTRACT_VERSION
+        ),
+        "stuck_reset": serialized_stuck,
         "adapter_record_contract_version": ADAPTER_RECORD_CONTRACT_VERSION,
         "actor_mean_guidance": {
-            "version": ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION,
-            "minimum_valid_steps": TEACHER_MIN_VALID_STEPS,
-            "weights": {"direction": 0.45, "speed": 0.20, "yaw": 0.35},
-            "gradient_target_ratio": (
-                [0.0, 0.035] if credit_profile else [0.0, 0.0225]
+            "version": (
+                ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION
+                if closed_loop
+                else LEGACY_ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION
             ),
-            "gradient_hard_cap": 0.05 if credit_profile else 0.03,
+            "minimum_valid_steps": TEACHER_MIN_VALID_STEPS,
+            **(
+                {
+                    "teacher_directions": [
+                        "far_left", "left", "center", "right", "far_right"
+                    ],
+                    "weights": {"direction": 0.55, "speed": 0.10, "yaw": 0.35},
+                    "goal_safe_tie_margin": TEACHER_GOAL_SAFE_TIE_MARGIN,
+                }
+                if closed_loop
+                else {"weights": {"direction": 0.45, "speed": 0.20, "yaw": 0.35}}
+            ),
+            "gradient_target_ratio": (
+                [0.0, 0.020] if closed_loop else (
+                    [0.0, 0.025] if maze_profile else [0.0, 0.0225]
+                )
+            ),
+            "gradient_hard_cap": 0.03 if closed_loop else (
+                0.05 if maze_profile else 0.03
+            ),
             "nav_feat_detached": True,
             "rollout_time_labels_required": True,
         },
         "mirror": {
-            "requested_eligible_sequence_share": 0.0 if credit_profile else 0.10,
+            "requested_eligible_sequence_share": 0.0 if maze_profile else 0.10,
             "eligibility": "episode_start_zero_hidden_no_reset_crossing",
-            "gradient_target_ratio": 0.0 if credit_profile else 0.005,
-            "gradient_hard_cap": 0.0 if credit_profile else 0.01,
+            "gradient_target_ratio": 0.0 if maze_profile else 0.005,
+            "gradient_hard_cap": 0.0 if maze_profile else 0.01,
         },
         "stuck_aux": {
             "version": STUCK_AUX_CONTRACT_VERSION,
             "balanced_positive_negative": True,
             "classifier": "actor_lstm_to_stuck_logit_training_only",
+            **({"status": "frozen_diagnostic_only"} if closed_loop else {}),
         },
-        "maze_only": credit_profile,
+        "closed_loop_guards": {
+            "post_actor_command_rewrite": (
+                "none_translation_limiter_shadow_only"
+                if closed_loop
+                else False
+            ),
+            "near_goal_capture": "shadow_diagnostic_only",
+            "translation_limiter": {
+                "risk_threshold": TRANSLATION_LIMITER_RISK_THRESHOLD,
+                "minimum_xy_scale": TRANSLATION_LIMITER_ALPHA_FLOOR,
+                "preserves_wz": True,
+                "status": "shadow_only" if closed_loop else "active",
+            },
+            "global_yaw_cancellation_reward": False,
+            "teacher_is_training_only": True,
+        },
+        "maze_only": maze_profile,
         "track_segment_labels": (
-            ["maze"] if credit_profile else list(FULL_TRACK_SEGMENT_LABELS)
+            ["maze"] if maze_profile else list(FULL_TRACK_SEGMENT_LABELS)
         ),
-        "track_length": 1 if credit_profile else 5,
-        "episode_length_s": 75.0 if credit_profile else 120.0,
+        "track_length": 1 if maze_profile else 5,
+        "episode_length_s": 120.0 if closed_loop or not maze_profile else 75.0,
         "spawn": {
-            "enabled": not credit_profile,
+            "enabled": not maze_profile,
             "semantics": (
                 "platform_default_single_maze_spawn"
-                if credit_profile
+                if maze_profile
                 else "full_track_static_quota_with_runtime_safe_hard_validation"
             ),
         },
         "goal_jump": {
-            "enabled": not credit_profile,
+            "enabled": not maze_profile,
             "semantics": (
                 "base_feedback_only_no_extra_goal_fault_course"
-                if credit_profile
+                if maze_profile
                 else "distance_scaled_zero_mean_elliptical_actor_belief_fault"
             ),
         },
         "soft_cruise": command_contract(profile)["soft_cruise"],
         "exact_resume": (
-            "p4_maze_credit_repair_v1_only"
-            if credit_profile
-            else "p4_full_track_v2_only_worker_spawn_rng_reseeded"
+                "p4_maze_closed_loop_v3_only"
+            if closed_loop
+            else (
+                "p4_maze_credit_repair_v1_only"
+                if legacy_maze
+                else "p4_full_track_v2_only_worker_spawn_rng_reseeded"
+            )
         ),
     }
 

@@ -4279,3 +4279,117 @@
   明确作为 warm start，不能放宽模型 ID 或 scope 门禁。监控可独立回滚为 Maze 面板，但会失去五段
   验收数据。
 - 关联 commit/PR、平台任务、新 checkpoint：待生成。
+
+## BUG-20260805-005：P4 Maze 隐式命令改写、卡滞代价不足与新 checkpoint 标签不可发现
+
+- 日期：2026-08-05；状态：本地已验证，开发容器、平台 smoke 和固定条件评估待验证。
+- 影响范围：`codex/p4-maze8h-closed-loop-v2` 的 P4 单段 Maze 高层训练、reward、active
+  reason4、五方向教师、checkpoint 发现和监控；不修改平台覆盖的 `server/isaac_env/base_env.py`，
+  不改变 Actor85、Critic 输入、三轴动作、训练/评估 wire 或部署接口。
+- 父制品：`p4maze8h10hz_1416926-mazefinal`。模型 ID `1416926` 仅用于候选排序与血缘记录；
+  实际加载仍以文件、模块 spec、shape、有限值、合同和冻结低层 digest 为准。
+- 用户可见症状：后续 Maze 训练出现碰撞和卡滞上升、目标位于侧方时以 `vy` 斜移代替建立 yaw、
+  target->exec `wz` 改善但 true `wz` 跟踪反而恶化。上一轮捕获从前段到后段的 collision 约
+  `0.364 -> 0.587`、wall-stuck candidate `0.420 -> 0.646`、完成窗口 `17.15 -> 11.05`，同时
+  StuckHead F1 已较高，说明继续训练分类头不足以修复策略闭环。
+- 根因与排除：
+  1. near-goal capture 与 depth limiter 在 Actor 采样之后改写命令，旧训练未完整量化其介入率，
+     PPO 行为与物理执行之间存在隐式偏转；全局 yaw-cancellation 又可能压制必要连续转向。
+  2. 旧 slew 的 `vx` 建立/释放过慢，墙前难以及时释放平移；三方向教师不足以表达大角度出口，
+     Goal 方向与局部安全的 tie-break 不清晰，`vy` 可替代 yaw。
+  3. timeout、hard failure 与 reason4 代价接近，历史 new-best 上限过高，卡墙前的局部收益可能削弱
+     终止负反馈。旧 shadow reset 也把长时间无效卡墙继续留在 rollout。
+  4. 新阶段初稿使用含下划线的 phase；checkpoint 文件正则不接受该标签，新保存包可能无法被
+     loader 发现。这是在本轮定向测试中发现并修复的阻断级合同漂移。
+  5. worker 无公开 transport 读取 aisrv 高层 policy command。使用平台原生命令作为运动意图会
+     产生错误闭环，因此 active reset 明确不伪造该条件，只依赖已验证的墙接触、空间受限、真实低
+     运动、Goal 距离和 grace；映射/termination term 不可验证时 fail closed。
+- 修复：
+  - 训练改为单段 Maze、120 秒 episode、28800 秒有效训练；冻结低层、NavigationEncoder、
+    SafetyHead、Adapter、StuckHead，仅训练 Actor LSTM/action head 与 Critic，并保留父 Actor/Critic
+    optimizer moments 和 return statistics。
+  - slew 改为 `increase=0.80/0.70/2.50`、`release=1.20/1.20/4.00`。near-goal capture 只作
+    shadow；全局 yaw-cancellation PPO 权重为零；limiter 仅 risk>=0.90 时缩放 `(vx,vy)`，最低
+    0.60，始终保留 `wz`。
+  - 新增 training-only 五方向安全教师。安全性优先，Goal 只在与最安全值相差 0.15 内且
+    `safe>=0.65` 的出口中 tie-break；方向/速度/yaw 为 `0.50/0.15/0.35`，最高目标梯度 2.5%、
+    硬上限 5%，不覆盖运行时动作。
+  - new-best 降为 `1.0/m`、episode 上限 `+6`；success/failure/timeout/reason4 改为
+    `+200/-60/-40/-75`。碰撞 onset/persistent 和 0.8-2 秒持续卡墙惩罚加强；reason4 active 10 秒
+    后真实 reset，按 failure 统计、双 GAE mask 为零且同 tick 安全项去重。
+  - checkpoint 标签改为正则兼容的 `closedwarm/closedadapt/closedtrain/closedstable`，并按
+    `closedstable > closedtrain > closedadapt > closedwarm` 加入发现优先级。面板新增五方向安全、
+    limiter 介入、侧向目标正确 yaw 和 `vy` 替代 yaw 统计。
+- 本地验证：P4 合同、辅助梯度、导航、监控和 full-track 邻近回归共 `115 passed`；同时覆盖
+  120 秒 episode、active reason4 `-75`、新 slew、new-best 上限、五方向 teacher、冻结 StuckHead、
+  near-goal shadow、warm-start optimizer 保留、exact resume 和新标签发现。Python 编译、完整 P4
+  回归、TOML 与 diff 检查将在容器同步前再次执行。
+- 遗留风险：五方向标签仍来自特权 scanner/height scan，只能改善训练期 credit assignment，不能
+  证明部署深度表征已经学会同等几何语义。后腿侧后方挂柱仍可能超出前视深度可观测范围。active
+  reason4 的误杀率必须经容器 1-env 物理 reset 和平台 smoke 验证；启动健康不等于碰撞率或完成率
+  已改善。
+- 回滚：恢复父包 `p4maze8h10hz_1416926-mazefinal`；本轮旧 P4 只作 warm start，新合同包才允许
+  exact resume。再次出现完成数异常时先核对 reason code、双 mask 和 reset 前快照，不得增加模型
+  ID 单点硬门禁。
+- 关联 commit/PR、平台任务、新 checkpoint：待生成。
+
+### 2026-08-06 r3 更正：移除剩余隐式命令改写并拆分时间合同
+
+- 后续完整方案审查确认 v2 仍有两类漂移风险：其一，active depth limiter 虽只在高风险介入，仍在
+  Actor 采样后同比缩放 `(vx,vy)`，PPO log-prob 对应的动作与物理执行不完全一致；其二，worker
+  tracker 使用 monotonic wall time，但 resume offset 使用 learner effective seconds，不能称为 exact
+  phase resume。v2 还复用了旧全局 checkpoint/reward 常量，存在误改历史 profile 合同的风险。
+- r3 将 limiter、near-goal capture、yaw-cancellation、missed-safe、goal-safe 和 yaw-exit 全部改为
+  shadow/zero-reward；唯一 privileged 方向学习信号是五方向 Actor mean 教师，部署可得
+  predictive-collision 和真实 body collision 继续进入 reward。slew 收敛为
+  `0.60/0.60/2.00` 与 `1.20/1.20/4.00`，避免一次同时扩大过多控制动力学。
+- r3 warm start 保留 Actor/Critic 权重和 Critic return statistics，但重置两套 Adam state；教师
+  direction/speed/yaw 为 `0.55/0.10/0.35`，最高 2%、硬上限 3%。Goal 只在安全值差不超过 0.10 的
+  出口间 tie-break，预测风险低于 0.90 时不训练减速。
+- reset schedule 改为显式 `schedule_enabled=true`，旧 tracker 配置默认保持原语义。学习率按 effective
+  clock；worker reset 课程按 checkpoint 可恢复的 session wall clock，0-30 分钟 shadow/12 秒、
+  30 分钟-2 小时 active/12 秒、2-8 小时 active/10 秒，阶段切换清空候选窗口。
+- r3 使用独立合同和标签 `p4_maze_closed_loop_v3`、`loopwarm/loopadapt/looptrain/loopstable`，
+  不覆盖历史 credit/full-track 版本。新增 warm-start optimizer reset、r3 exact-resume、wall-clock
+  offset、动态 reset phase、单一 privileged reward allowlist 和 limiter shadow 回归。
+- 当前状态仍为本地验证层：定向回归已达到 `124 passed`；开发容器 1-env/8-env、平台 smoke 和固定
+  条件父包对比尚未执行。不得据此声称碰撞、超时或完成率已经改善。
+
+### 2026-08-06 r3 最终审查补充：安全绕行 yaw 与旧 StuckHead 梯度边界
+
+- 状态：代码已修复待重新执行本地定向回归。五方向教师原先沿用了旧三方向条件：只有全局 Goal
+  方向与局部安全出口相差不超过 35 度时才训练 `wz`。这会在 Maze 必须暂时背离 Goal 绕墙时关闭
+  yaw 引导，留下用 `vy` 代替机身转向的漏洞。closed-loop v3 现直接按最终选中的安全出口训练正确
+  符号 yaw；Goal 仍只在相近安全出口间 tie-break，不覆盖安全性。
+- 同次审查发现 StuckHead forward/BCE 被无条件放进 `no_grad()`，错误影响历史
+  `maze_credit_repair/full_track` profile。现只在本轮 `maze_closed_loop_v3` 保持 diagnostic-only；旧
+  profile 恢复版本合同中的辅助梯度。新增“Goal 与必要绕行方向相反仍建立安全 yaw”、creditwarm
+  只更新 StuckHead 和 closed-loop StuckHead 全冻结三项回归。该修复不改变本轮网络、动作、worker
+  wire、奖励或部署接口。
+- 审查同时确认 v3 在将旧 `missed-safe/goal-safe/yaw-exit` PPO 分量清零后，错误地把清零结果写入
+  `reward_*_raw` 面板，导致文档承诺的 shadow 诊断恒为零。现先冻结 raw 快照，再只清零参与 PPO
+  cap/allowlist 的副本，并新增“applied 为零但 raw 仍可见”回归。
+- 五方向教师的前置 mask 原先仍要求 top1-top2 安全差至少 0.20，而 Goal tie-break 只考虑距 best
+  不超过 0.10 的候选，导致“两个出口安全度接近时由 Goal 选择”的分支不可达。现仅在 Goal 新鲜的
+  closed-loop safe5 样本放行近似安全出口；Goal 无效时仍要求明确 top-1，并新增 mask 到 loss 的
+  端到端岔路回归。
+
+### 2026-08-06 r3 容器与平台验证补充
+
+- 状态：平台已验证启动、首轮 rollout 和首存；长训表现与固定条件评估待验证。
+- 开发容器：通过 RPC bundle 同步 14 个运行时/定向测试文件，远端 manifest 逐文件核对
+  `14/14` 一致。使用 Isaac Sim prebundle Torch 的容器 Python 执行 8 项闭环定向回归，结果
+  `8 passed`；覆盖配置对齐、Goal 安全出口 tie-break、必要绕行 yaw、新旧 StuckHead 梯度边界、
+  limiter shadow-only、warm-start optimizer reset 和 exact-resume round trip。测试产物已清理，
+  `server/isaac_env/base_env.py` 未修改。
+- 正式任务：平台任务 `p4maze8h-closed-r3`，任务 ID `236678`，UUID
+  `5bd3f9b6-02c3-49a7-9b08-b8ad1ce12505`，父模型 `p4maze8h10hz_1416926`，平台时长 `8h15min`。
+  启动后已到 `iter=9` / `effective_min=4.2`，`lifecycle_fail=0`、`low_digest_drift=0`、
+  `low_optimizer_steps=0`，显存峰值约 `814.9 MiB allocated / 1086.3 MiB reserved`。
+- 首存：平台在 2026-08-06 03:23:28 生成
+  `model.ckpt-loopwarm-1418400.pkl`，SHA256
+  `293a1831d8eb1b65db1bf7ee65a1a4e9cda08dd2c460bb6f66f4df7b601d94f7`，`deployable=false`。
+  首存只证明 checkpoint 生命周期闭合，不代表碰撞率、超时率或 Maze 完成率已改善。
+- 当前回滚点：若后续发生合同或非有限值故障，停止任务并回到
+  `p4maze8h10hz_1416926-mazefinal`；若仅表现未改善，保留本轮 checkpoint 用于固定条件比较，
+  不把模型 ID 或单次分数作为硬门禁。

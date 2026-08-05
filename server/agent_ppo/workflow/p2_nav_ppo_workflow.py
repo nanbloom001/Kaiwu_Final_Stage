@@ -30,6 +30,17 @@ def _p4_worker_push_resume_offset(algorithm) -> float:
     return float(getattr(algorithm, "session_effective_seconds", 0.0))
 
 
+def _p4_worker_stuck_resume_offset(algorithm) -> float:
+    """Resume worker wall-clock safety phases without mixing clock domains."""
+    return float(
+        getattr(
+            algorithm,
+            "session_wall_seconds",
+            getattr(algorithm, "session_effective_seconds", 0.0),
+        )
+    )
+
+
 def _goal_history_stuck(
     goal_history: deque, end_goal: torch.Tensor
 ) -> torch.Tensor:
@@ -598,7 +609,9 @@ def _tick_diagnostic_values(
         "adapter_confidence": confidence.reshape(-1),
         "success_rate": (terminal_reason == 1).float(),
         "failure_rate": (
-            (terminal_reason == 2) | (hard & (terminal_reason != 1))
+            (terminal_reason == 2)
+            | (terminal_reason == 4)
+            | (hard & (terminal_reason != 1))
         ).float(),
         "timeout_rate": (done & (terminal_reason == 3)).float(),
         "wall_stuck_reset_rate": (done & (terminal_reason == 4)).float(),
@@ -687,6 +700,19 @@ def _tick_diagnostic_values(
         ),
     }
     return values, valid_values, valid
+
+
+def _terminal_outcome_count(
+    success_count: float,
+    failure_count: float,
+    timeout_count: float,
+) -> float:
+    """Count mutually exclusive terminal outcomes.
+
+    Wall-stuck reason 4 is included in ``failure_count`` and remains a
+    separate diagnostic metric; it must not be added to this denominator again.
+    """
+    return float(success_count + failure_count + timeout_count)
 
 
 def _install_sigterm_handler(logger):
@@ -796,8 +822,11 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         # replaying the initial two-hour no-Push phase.
         push_schedule = p2_conf.setdefault("push_schedule", {})
         push_schedule["resume_offset_s"] = _p4_worker_push_resume_offset(algorithm)
+        stuck_reset = p2_conf.setdefault("stuck_reset", {})
+        stuck_reset["resume_offset_s"] = _p4_worker_stuck_resume_offset(algorithm)
         logger.info(
-            "[P4Resume] worker push resume_offset_s=%.3f diagnostic_elapsed_s=%.3f",
+            "[P4Resume] worker push/stuck resume_offset_s=%.3f "
+            "diagnostic_elapsed_s=%.3f",
             push_schedule["resume_offset_s"],
             float(getattr(algorithm, "diagnostic_elapsed_seconds", 0.0)),
         )
@@ -1751,11 +1780,10 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         torch.zeros((), device=agent.device),
                     ).detach().cpu()
                 )
-                terminal_count = (
-                    success_count
-                    + failure_count
-                    + timeout_count
-                    + wall_stuck_reset_count
+                terminal_count = _terminal_outcome_count(
+                    success_count,
+                    failure_count,
+                    timeout_count,
                 )
                 metrics.update(
                     {

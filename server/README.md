@@ -19,26 +19,26 @@
 
 ## 活动基线
 
-- **当前 P4 Maze 归因修复入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
-  `codex/p4-maze2h-credit-repair`，任务 `p4maze2h-credit-repair`。父包固定为
+- **当前 P4 Maze 闭环强化入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
+  `codex/p4-maze8h-closed-loop-r3`，任务 `p4maze8h-closedloop-r3`。父包固定为
   `p4maze8h10hz_1416926` 的 `mazefinal` checkpoint；128 env、10Hz 高层、50Hz 低层、
   32-tick rollout、TBPTT16、4 PPO epochs，单段 `open_entry_maze`、20 列、课程关闭、
-  75 秒 episode，完整有效训练 `7200s`，平台任务墙钟 `2.25h`。
-  完整训练合同、平台任务和验证边界见
-  [`docs/p4-maze2h-credit-repair.md`](./docs/p4-maze2h-credit-repair.md)。
-- 本轮冻结低层、NavigationEncoder、SafetyHead 和 ResponseAdapter；保留高层 Actor/LSTM
-  权重但重置 Actor Adam，重建 Critic、Critic optimizer 和 return statistics，新建
-  training-only StuckHead。0-10 分钟只训练 Critic/StuckHead，之后按 `creditadapt ->
-  credittrain -> creditfinal` 逐步训练 Actor；模型 ID 只用于选择父包，模块/spec/shape/有限值
-  才决定兼容性。
-- Maze 进展改为每个 episode 不可重复领取的历史最短距离 credit：`2.0/m`、累计上限 `+12`，
-  terminal 不再 clawback；success `+200`，failure/timeout `-25`，10Hz 时间成本 `-0.02/tick`。
-  卡墙 reset 全程 `shadow`，只记录候选并从 0.8 秒开始轻罚，2 秒达到 `-0.02/tick`；不产生
-  reason 4 terminal。平移 limiter 仅在 risk `>0.75` 时收紧，risk=1 时仍保留 60% 平移，
-  `wz` 不缩放，解除风险每 tick 最多恢复 0.20。
-- 本轮关闭额外 Camera/Goal fault、Push、五段随机出生、segment frontier、route-excess 和
-  open-straight；保留基础反馈模拟和父模型已有安全奖励。checkpoint 使用 `creditwarm / creditadapt /
-  credittrain / creditfinal` 标签，新合同才可 exact resume；旧 P4 包只能 warm start。
+  120 秒 episode，完整有效训练 `28800s`，平台任务墙钟 `8.25h`。完整合同见
+  [`docs/p4-maze8h-closed-loop-v3.md`](./docs/p4-maze8h-closed-loop-v3.md)。
+- 本轮冻结低层、NavigationEncoder、SafetyHead、ResponseAdapter 和 StuckHead，只更新已有
+  高层 Actor LSTM/action head 与 Critic。父权重和 Critic return statistics 保留，但 Actor/Critic
+  Adam moments 按新 reward/command 合同重置；0-30 分钟只更新 Critic，之后按
+  `loopadapt -> looptrain -> loopstable` 训练 Actor。
+  模型 ID 只用于候选选择，文件、模块 spec、shape、有限值和冻结低层 digest 才决定兼容性。
+- Maze reward 使用不可重复的历史最短距离 credit：`1.0/m`、累计上限 `+6`，terminal 不 clawback；
+  success/failure/timeout/reason4 为 `+200/-60/-40/-75`。reason4 在 10 秒墙面接触与空间受限后
+  真实 reset，按 failure 统计、双 GAE mask 为零、不得计完成。持续卡墙从 0.8 秒开始，2 秒达到
+  `-0.03/tick`；碰撞 onset 为 `-0.12-0.18*severity`，持续接触为 `-0.05/tick`。
+- 五方向教师只在训练期监督 Actor mean，在多个近似安全出口中以 Goal 作 tie-breaker，不改 Actor85
+  或部署接口。全局 yaw-cancellation、near-goal capture 和平移 limiter 全程 shadow，实际命令不再
+  被 Actor 采样后的隐式机制改写；部署可得 predictive collision 与五方向 Actor mean 教师承担学习
+  信号。额外 Camera/Goal fault、Push、五段出生和低层联合训练关闭。新 checkpoint 标签为
+  `loopwarm/loopadapt/looptrain/loopstable`，旧 `closed*`/`credit*` 仅保留发现兼容性。
 
 - **历史 P4 五段全赛道入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
   `codex/p4-full8h-r2`，任务 `p4full8h-r2`，父包

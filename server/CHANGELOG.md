@@ -4,6 +4,30 @@
 
 ## [未发布]
 
+- **[P4 closed-loop 最终审查修复]** 五方向教师现在即使全局 Goal
+  与必要局部绕行方向不一致，也会要求 Actor 对安全出口建立正确符号
+  `wz`，避免用 `vy` 替代机身转向。StuckHead 的 diagnostic-only
+  `no_grad` 仅限 `maze_closed_loop_v3`，历史 credit/full-track
+  profile 恢复其版本合同中的辅助训练。被 v3 禁止写入 PPO 的旧方向
+  reward 继续保留未清零的 shadow raw 指标，避免监控面板失去反事实证据。
+  closed-loop 的 Goal tie-break mask 也允许安全度接近的岔路样本进入教师，
+  Goal 失效时仍要求安全 top-1 具备明确优势。
+- **[P4 Maze 八小时闭环强化 v3]** 新任务 `p4maze8h-closedloop-r3` 从
+  `p4maze8h10hz_1416926-mazefinal` continuation warm start，固定单段 Maze、20 列、课程关闭、
+  120 秒 episode 和 28800 秒有效训练。低层、NavigationEncoder、SafetyHead、Adapter、StuckHead
+  全程冻结，只更新 Actor LSTM/action head 与 Critic；保留父权重和 Critic return statistics，但按
+  新 reward/command 合同重置两套 Adam moments。
+- 三轴 slew 为 `0.60/0.60/2.00` 增速、`1.20/1.20/4.00` 释放。near-goal capture、全局
+  yaw-cancellation、平移 limiter 和旧方向奖励全程 shadow，避免 Actor 采样后的隐式动作改写或多个
+  privileged 信号互相竞争。新增五方向 training-only Actor mean 教师，安全优先、Goal 只在安全值
+  差不超过 0.10 的出口中 tie-break，方向/速度/yaw 比例为 0.55/0.10/0.35、梯度硬上限 3%。
+- success/failure/timeout/reason4 改为 `+200/-60/-40/-75`。active reason4 使用 10 秒滑动窗口、
+  非足端墙接触、真实低运动和 Goal 距离确认；不计完成且不 bootstrap。历史最短距离奖励降为
+  `1.0/m`、每 episode 上限 `+6`；碰撞 onset/persistent 和持续卡墙惩罚加强。新 checkpoint 标签
+  reset 采用显式 wall-clock 课程：前 30 分钟 shadow/12s，之后 active/12s，2 小时后 active/10s；
+  checkpoint 保存恢复 offset。新标签 `loopstable > looptrain > loopadapt > loopwarm` 已加入发现
+  优先级；Actor85、Critic输入、训练/评估 wire 和部署接口不变，未修改平台覆盖的 `BaseEnv`。
+
 - **[P4 profile 合同与监控路由修复]** P4 checkpoint 的 command/reward/training 元数据现在按
   `training_profile` 生成：Maze credit-repair 使用 `p4_maze_credit_repair_v1`，五段训练使用
   `p4_full_track_v2` 和 `p4_full_track_reward_v2_potential_straight`。exact resume 同时校验

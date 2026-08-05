@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused regression tests for the P4 Maze credit-repair contract."""
+"""Focused regression tests for the P4 Maze closed-loop contract."""
 
 from __future__ import annotations
 
@@ -14,48 +14,55 @@ from agent_ppo.feature import p2_contract, p4_contract
 from agent_ppo.feature.p2_command_controller import P2CommandController
 
 
-def test_two_hour_credit_repair_schedule_and_config_are_aligned():
+def test_eight_hour_closed_loop_schedule_and_config_are_aligned():
     config_path = Path(__file__).parents[1] / "conf" / "train_env_conf_track_p4_nav_ppo.toml"
     config = tomllib.loads(config_path.read_text())
     stage = config["p4_nav_ppo"]
 
-    assert p4_contract.TARGET_EFFECTIVE_SECONDS == 7_200.0
-    assert p4_contract.TRAINING_HOURS == 2.0
-    assert p4_contract.RUN_NAME == "p4maze2h-credit-repair"
-    assert p4_contract.training_contract()["required_platform_wall_seconds"] == 8_100
-    assert stage["task_end_hours"] == 2.25
+    assert p4_contract.TARGET_EFFECTIVE_SECONDS == 28_800.0
+    assert p4_contract.TRAINING_HOURS == 8.0
+    assert p4_contract.RUN_NAME == "p4maze8h-closedloop-r3"
+    assert p4_contract.training_contract(
+        stage["stuck_reset"], "maze_closed_loop_v3"
+    )["required_platform_wall_seconds"] == 29_700
+    assert stage["task_end_hours"] == 8.25
     assert stage["parent_model_id"] == 1416926
     assert tuple(stage["slew_rate"]) == p4_contract.P4_SLEW_RATE
     assert tuple(stage["slew_release_rate"]) == p4_contract.P4_SLEW_RELEASE_RATE
     assert stage["stuck_reset"]["confirmation_s"] == 10.0
+    assert stage["stuck_reset"]["schedule_enabled"] is True
+    assert p4_contract.training_contract(
+        stage["stuck_reset"], "maze_closed_loop_v3"
+    )["stuck_reset"]["schedule_enabled"] is True
     assert config["domain_rand"]["push_robots"] is False
 
-    warm = p4_contract.training_schedule(0.0, branch="credit_repair")
-    middle = p4_contract.training_schedule(600.0, branch="credit_repair")
-    train = p4_contract.training_schedule(1_800.0, branch="credit_repair")
-    final = p4_contract.training_schedule(6_300.0, branch="credit_repair")
+    warm = p4_contract.training_schedule(0.0, branch="closed_loop_v3")
+    middle = p4_contract.training_schedule(3_600.0, branch="closed_loop_v3")
+    train = p4_contract.training_schedule(7_200.0, branch="closed_loop_v3")
+    final = p4_contract.training_schedule(25_200.0, branch="closed_loop_v3")
     assert (warm["phase"], middle["phase"], train["phase"], final["phase"]) == (
-        "creditwarm",
-        "creditadapt",
-        "credittrain",
-        "creditfinal",
+        "loopwarm",
+        "loopadapt",
+        "looptrain",
+        "loopstable",
     )
     assert warm["actor_multiplier"] == 0.0
-    assert middle["actor_lr"] == pytest.approx(7.5e-5)
-    assert train["actor_lr"] == pytest.approx(1.0e-4)
-    assert final["actor_lr"] == pytest.approx(5.0e-5)
+    assert middle["actor_lr"] == pytest.approx(3.0e-5)
+    assert train["actor_lr"] == pytest.approx(5.0e-5)
+    assert final["actor_lr"] == pytest.approx(2.5e-5)
     assert warm["navigation_multiplier"] == 0.0
     assert warm["adapter_multiplier"] == 0.0
     assert warm["teacher_gradient_target_ratio"] == pytest.approx(0.0)
-    assert p4_contract.training_schedule(1_200.0, branch="credit_repair")[
+    assert p4_contract.training_schedule(4_500.0, branch="closed_loop_v3")[
         "teacher_gradient_target_ratio"
-    ] == pytest.approx(0.0125)
-    assert train["teacher_gradient_target_ratio"] == pytest.approx(0.035)
-    assert final["teacher_gradient_target_ratio"] == pytest.approx(0.020)
+    ] == pytest.approx(0.005)
+    assert train["teacher_gradient_target_ratio"] == pytest.approx(0.020)
+    assert final["teacher_gradient_target_ratio"] == pytest.approx(0.010)
     assert config["terrain"]["track"]["sub_terrains"] == ["open_entry_maze"]
     assert config["terrain"]["track"]["track_length"] == 1
-    assert config["env"]["episode_length_s"] == 75.0
-    assert stage["stuck_reset"]["mode"] == "shadow"
+    assert config["env"]["episode_length_s"] == 120.0
+    assert stage["stuck_reset"]["mode"] == "active"
+    assert stage["stuck_reset"]["terminal_penalty"] == -75.0
     assert stage["camera_fault_course_enabled"] is False
     assert stage["goal_fault_course_enabled"] is False
 
@@ -69,12 +76,12 @@ def test_recovery_slew_increase_release_and_zero_crossing():
     )
     controller.set_target(torch.tensor(((1.0, 1.0, 1.0),)))
     controller.step()
-    assert torch.allclose(controller.exec_cmd, torch.tensor(((0.006, 0.008, 0.030))))
+    assert torch.allclose(controller.exec_cmd, torch.tensor(((0.012, 0.012, 0.040))))
 
     controller.exec_cmd[:] = torch.tensor(((0.20, 0.20, 0.20)))
     controller.set_target(torch.tensor(((-1.0, -1.0, -1.0),)))
     controller.step()
-    assert torch.allclose(controller.exec_cmd, torch.tensor(((0.194, 0.184, 0.140))))
+    assert torch.allclose(controller.exec_cmd, torch.tensor(((0.176, 0.176, 0.120))))
     previous = controller.exec_cmd.clone()
     hit_zero = torch.zeros(3, dtype=torch.bool)
     entered_reverse_after_zero = torch.zeros(3, dtype=torch.bool)
@@ -95,14 +102,14 @@ def test_translation_vector_limiter_scales_xy_and_releases_only_by_tick_budget()
     limited, diagnostics = p4_contract.translation_vector_limiter(
         policy, torch.ones(1), torch.ones(1)
     )
-    assert diagnostics["translation_safety_alpha"].item() == pytest.approx(0.60)
-    assert torch.allclose(limited, torch.tensor(((0.60, 0.12, 0.70))))
+    assert diagnostics["translation_safety_alpha"].item() == pytest.approx(0.75)
+    assert torch.allclose(limited, torch.tensor(((0.75, 0.15, 0.70))))
 
     released, diagnostics = p4_contract.translation_vector_limiter(
         policy, torch.zeros(1), diagnostics["translation_safety_alpha"]
     )
-    assert diagnostics["translation_safety_alpha"].item() == pytest.approx(0.80)
-    assert torch.allclose(released, torch.tensor(((0.80, 0.16, 0.70))))
+    assert diagnostics["translation_safety_alpha"].item() == pytest.approx(0.95)
+    assert torch.allclose(released, torch.tensor(((0.95, 0.19, 0.70))))
 
     reset, diagnostics = p4_contract.translation_vector_limiter(
         policy, torch.zeros(1), torch.tensor((0.60,)), reset_mask=torch.ones(1, dtype=torch.bool)
@@ -115,10 +122,10 @@ def test_maze_new_best_credit_is_non_repeatable_and_capped_without_clawback():
     reward, earned, delta = p4_contract.maze_new_best_credit(
         torch.tensor((5.0, 5.0, 5.0)),
         torch.tensor((4.5, 5.2, 2.0)),
-        torch.tensor((0.0, 0.0, 11.0)),
+        torch.tensor((0.0, 0.0, 5.0)),
     )
-    assert torch.allclose(reward, torch.tensor((1.0, 0.0, 1.0)))
-    assert torch.allclose(earned, torch.tensor((1.0, 0.0, 12.0)))
+    assert torch.allclose(reward, torch.tensor((0.5, 0.0, 1.0)))
+    assert torch.allclose(earned, torch.tensor((0.5, 0.0, 6.0)))
     assert torch.allclose(delta, torch.tensor((0.5, 0.0, 3.0)))
 
     repeated, repeated_earned, repeated_delta = p4_contract.maze_new_best_credit(
@@ -139,7 +146,7 @@ def test_maze_new_best_credit_is_non_repeatable_and_capped_without_clawback():
 
 
 def test_maximum_credit_timeout_episode_remains_negative():
-    ticks = int(75.0 / p4_contract.P4_NAV_DT_S)
+    ticks = int(120.0 / p4_contract.P4_NAV_DT_S)
     maximum_timeout_return = (
         p4_contract.MAZE_NEW_BEST_EPISODE_CAP
         + p4_contract.TIMEOUT_IMPULSE
@@ -148,11 +155,23 @@ def test_maximum_credit_timeout_episode_remains_negative():
     assert maximum_timeout_return < 0.0
 
 
-def test_credit_repair_shadow_stuck_contract_never_claims_reason4_terminal():
-    contract = p4_contract.reward_contract({"mode": "shadow"})
+def test_maximum_credit_wall_reset_episode_remains_strictly_negative():
+    maximum_reset_return = (
+        p4_contract.MAZE_NEW_BEST_EPISODE_CAP
+        + p4_contract.STUCK_RESET_TERMINAL_PENALTY
+    )
+    assert maximum_reset_return < p4_contract.TIMEOUT_IMPULSE < 0.0
+
+
+def test_closed_loop_active_stuck_contract_is_reason4_and_worse_than_timeout():
+    contract = p4_contract.reward_contract(
+        {"mode": "active", "terminal_penalty": -75.0},
+        "maze_closed_loop_v3",
+    )
     reset = contract["new_terms"]["confirmed_wall_stuck_reset"]
-    assert reset["mode"] == "shadow"
-    assert reset["semantics"] == "shadow_only_no_reason4_terminal"
+    assert reset["mode"] == "active"
+    assert reset["semantics"] == "active_reason4_terminal"
+    assert reset["terminal_penalty"] < p4_contract.TIMEOUT_IMPULSE
 
 
 def test_yaw_exit_response_is_small_signed_and_inactive_near_goal():
@@ -236,7 +255,7 @@ def test_teacher_masks_and_tolerant_mean_loss_are_rollout_pure():
         safe3=safe3,
     )
     assert masks["teacher_guidance_eligible"].all()
-    mean = torch.tensor(((0.40, 0.20, 0.12),)).repeat(count, 1)
+    mean = torch.tensor(((0.06, 0.10, 0.12),)).repeat(count, 1)
     kwargs = dict(
         policy_mean_cmd3=mean,
         safe3=safe3,
@@ -270,6 +289,81 @@ def test_teacher_masks_and_tolerant_mean_loss_are_rollout_pure():
     assert not stale_masks["teacher_guidance_goal_eligible"].any()
     too_small = p4_contract.teacher_guidance_loss(**kwargs, min_valid_steps=count + 1)
     assert too_small["loss"].item() == 0.0
+
+
+def test_teacher_mask_uses_safe5_margin_for_closed_loop_instead_of_safe3_tie():
+    common = dict(
+        alive=torch.ones(1, dtype=torch.bool),
+        scanner_valid=torch.ones(1, dtype=torch.bool),
+        mapping_valid=torch.ones(1, dtype=torch.bool),
+        terminal=torch.zeros(1, dtype=torch.bool),
+        reset=torch.zeros(1, dtype=torch.bool),
+        push_grace=torch.zeros(1, dtype=torch.bool),
+        episode_grace=torch.zeros(1, dtype=torch.bool),
+        goal_freshness=torch.ones(1),
+        safe3=torch.tensor([[0.80, 0.79, 0.78]]),
+    )
+    masks = p4_contract.teacher_guidance_mask(**common)
+    assert not masks["teacher_guidance_eligible"].item()
+    closed = p4_contract.teacher_guidance_mask(
+        **{
+            **common,
+            "safe3": torch.tensor([[0.80, 0.79, 0.78]]),
+            "safe5": torch.tensor([[0.95, 0.30, 0.30, 0.30, 0.30]]),
+        }
+    )
+    assert closed["teacher_guidance_eligible"].item()
+    assert closed["teacher_best_safe"].item() == pytest.approx(0.95)
+
+
+def test_closed_loop_goal_tie_break_remains_reachable_for_similarly_safe_exits():
+    count = 64
+    safe3 = torch.tensor([[0.90, 0.85, 0.10]]).repeat(count, 1)
+    safe5 = torch.tensor([[0.90, 0.85, 0.10, 0.05, 0.05]]).repeat(count, 1)
+    masks = p4_contract.teacher_guidance_mask(
+        alive=torch.ones(count, dtype=torch.bool),
+        scanner_valid=torch.ones(count, dtype=torch.bool),
+        mapping_valid=torch.ones(count, dtype=torch.bool),
+        terminal=torch.zeros(count, dtype=torch.bool),
+        reset=torch.zeros(count, dtype=torch.bool),
+        push_grace=torch.zeros(count, dtype=torch.bool),
+        episode_grace=torch.zeros(count, dtype=torch.bool),
+        goal_freshness=torch.ones(count),
+        safe3=safe3,
+        safe5=safe5,
+    )
+    assert masks["teacher_safe_margin"].max().item() < 0.10
+    assert masks["teacher_guidance_eligible"].all()
+    assert masks["teacher_guidance_goal_eligible"].all()
+    guided = p4_contract.teacher_guidance_loss(
+        policy_mean_cmd3=torch.tensor([[0.30, -0.20, -0.20]]).repeat(count, 1),
+        safe3=safe5,
+        goal_xy_m=torch.tensor([[1.0, 0.577]]).repeat(count, 1),
+        predictive_risk=torch.zeros(count),
+        stuck_active=torch.zeros(count, dtype=torch.bool),
+        teacher_mask=masks["teacher_guidance_eligible"],
+        goal_mask=masks["teacher_guidance_goal_eligible"],
+        min_valid_steps=count,
+        closed_loop_v3=True,
+    )
+    assert guided["loss"].item() > 0.0
+
+
+def test_closed_loop_teacher_requires_yaw_toward_safe_detour_even_when_goal_disagrees():
+    count = 64
+    result = p4_contract.teacher_guidance_loss(
+        policy_mean_cmd3=torch.tensor([[0.20, 0.35, -0.20]]).repeat(count, 1),
+        safe3=torch.tensor([[0.95, 0.20, 0.10, 0.10, 0.05]]).repeat(count, 1),
+        goal_xy_m=torch.tensor([[1.0, -1.0]]).repeat(count, 1),
+        predictive_risk=torch.zeros(count),
+        stuck_active=torch.zeros(count, dtype=torch.bool),
+        teacher_mask=torch.ones(count, dtype=torch.bool),
+        goal_mask=torch.ones(count, dtype=torch.bool),
+        min_valid_steps=count,
+        closed_loop_v3=True,
+    )
+    assert result["teacher_yaw_mask"].all()
+    assert result["yaw"].item() > 0.0
 
 
 def test_teacher_loss_applies_recovery_weights_per_timestep():
@@ -306,8 +400,8 @@ def test_safety_group_and_route_eligibility_include_new_recovery_boundaries():
         goal_safe_raw=raw,
         yaw_exit_raw=raw,
     )
-    assert sum(term.item() for term in applied) == pytest.approx(-0.06)
-    assert scale.item() == pytest.approx(0.40)
+    assert sum(term.item() for term in applied) == pytest.approx(-0.07)
+    assert scale.item() == pytest.approx(7.0 / 15.0)
 
     penalty, diagnostics = p4_contract.route_excess_penalty(
         torch.tensor((0.20,)),

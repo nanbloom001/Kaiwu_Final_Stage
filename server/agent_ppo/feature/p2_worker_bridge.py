@@ -437,8 +437,10 @@ class P2WorkerBridge:
             )
             _print(
                 "[P4StuckResetPreflight] "
+                f"requested_mode={self._p4_stuck_tracker.requested_mode} "
                 f"mode={self._p4_stuck_tracker.mode} "
                 f"confirmation_s={self._p4_stuck_tracker.confirmation_s:.2f} "
+                f"resume_offset_s={self._p4_stuck_tracker.resume_offset_s:.2f} "
                 f"dt_s={self._p4_stuck_tracker.dt_s:.4f} "
                 f"dt_valid={int(self._p4_stuck_tracker.dt_valid)} "
                 f"term_available={int(self._p4_stuck_tracker.term_available)} "

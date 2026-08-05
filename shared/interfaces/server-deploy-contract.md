@@ -598,31 +598,35 @@ leaf、mirror RNG、auxiliary calibration、optimizer、return statistics、Adap
 以及 recovery 60 秒窗口时间戳和 lifetime 计数。镜像序列从 rollout 内任意真实 reset 起点构造，
 不得依赖 PPO 固定 chunk 恰好与 episode 边界对齐。
 
-##### 当前 `p4_maze_credit_repair_v1` 合同
+##### 当前 `p4_maze_closed_loop_v3` 合同
 
-当前训练入口为 `p4maze2h-credit-repair`，从 `p4maze8h10hz_1416926` 的 Maze 最终包做
-结构 warm start。网络和部署 I/O 不变：低层 57901/12、Track worker 385、高层 Actor85；
-`NavigationEncoder`、`SafetyHead`、低层和 `ResponseAdapter` 全程冻结，只训练已有高层
-Actor/LSTM、新建 Critic 和 training-only `StuckHead`。
+当前训练入口为 `p4maze8h-closedloop-r3`，从 `p4maze8h10hz_1416926` 的 `mazefinal` 包做
+结构 warm start。部署 I/O 不变：低层 57901/12、Track worker 385、高层 Actor85、三轴动作。
+低层、NavigationEncoder、SafetyHead、ResponseAdapter 和 StuckHead 全程冻结，只训练已有高层
+Actor LSTM/action head 与 Critic；父权重和 Critic return statistics 保留，Actor/Critic optimizer
+moments 因 reward/command dynamics 合同变化而重置。
 
-训练环境固定为单段 `open_entry_maze`、20 个静态难度列、课程关闭、75 秒 episode。P4
-session 只累计 rollout collection 与 PPO update 的活跃秒数；checkpoint、监控和日志耗时只进入
-`session_wall_seconds`，不能消耗 7200 秒有效训练预算。平台任务墙钟必须至少覆盖 7200 秒训练和
-900 秒保存/关闭余量。
+训练固定为单段 `open_entry_maze`、20 个静态难度列、课程关闭、120 秒 episode、28800 秒有效
+训练和 900 秒平台余量。额外 Camera/Goal fault、Push、五段出生和低层联合训练关闭。三轴 slew 为
+`increase=[0.60,0.60,2.00]`、`release=[1.20,1.20,4.00]`；不开放负 `vx`。
 
-reward/command/checkpoint 版本分别为 `p4_maze_credit_repair_reward_v1`、
-`p4_maze_credit_repair_command_v1` 和 `p4_maze_credit_repair_v1`。Maze 进展仅按 episode
-历史最短目标距离发放不可重复 credit（`2.0/m`，累计上限 `+12`），terminal 不再 clawback；
-success/failure/timeout 为 `+200/-25/-25`。平移 limiter 只在 risk `>0.75` 时收紧，risk=1
-仍保留 60% `(vx,vy)` 且不缩放 `wz`。卡滞 reset 固定为 shadow，只产生候选诊断和持续卡滞
-轻罚，不生成 reason4 terminal。
+五方向教师由 training-only `nav_scanner + height_scan` 生成，不进入 Actor/Critic observation。
+安全性优先，Goal 只在与最安全值相差不超过 0.10 且 `safe>=0.65` 的出口之间作 tie-breaker；教师
+只对 Actor mean 施加最高 2%、硬上限 3% 的辅助梯度，不在运行时覆盖动作。near-goal capture、
+全局 yaw-cancellation、depth limiter、missed-safe、goal-safe 和 yaw-exit 全程 shadow；实际
+`limited_target == policy_target`，所有反事实 alpha 与 policy/exec/true 链独立记录。
 
-Actor mean teacher 是固定合同而非 TOML 可调旋钮：direction/speed/yaw 权重为
-`0.45/0.20/0.35`，最少 64 个有效 step，阶段梯度目标最高 3.5%，总硬上限 5%。旧 P4 包只允许
-warm start；只有完整匹配本节 command/reward/training/stuck/camera digest 的新包才能 exact
-resume。保存标签优先级为 `creditfinal > credittrain > creditadapt > creditwarm >` 历史 P4 标签。
-Standard eval 继续只抽取低层，Track eval 加载完整 P4；training-only `StuckHead` 与
-`SafetyHead` 均不进入部署执行。
+reward 版本为 `p4_maze_closed_loop_reward_v3_single_signal`。历史最短距离 credit 为 `1.0/m`、每 episode 上限
+`+6`、terminal 不 clawback；success/failure/timeout/reason4 分别为 `+200/-60/-40/-75`。reason4
+使用独立 wall-clock 课程：前 30 分钟 shadow/12 秒，30 分钟后 active/12 秒，2 小时后 active/10 秒。
+它由空间受限、非足端墙接触、真实低运动和 Goal 距离确认，属于 failure/truncated，两个 GAE
+mask 均为零且不得进入完成统计。worker 无法取得 aisrv 的真实高层 policy command，因此该 reset
+不使用平台原生命令伪造“运动意图”；若接触映射或 termination term 不可验证则 fail closed。
+
+checkpoint 版本为 `p4_maze_closed_loop_v3`，新保存标签优先级为
+`loopstable > looptrain > loopadapt > loopwarm >` 历史 P4 标签。旧 P4 包只允许 warm
+start；完整匹配 command/reward/training/stuck/camera digest 的新包才可 exact resume。Standard eval
+仍只抽取低层，Track eval 加载完整 P4；所有 training-only 教师与诊断头均不进入部署执行。
 
 ##### 历史 `p4_maze_attack10hz_v1` 合同（非活动入口）
 

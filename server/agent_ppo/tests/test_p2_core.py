@@ -35,6 +35,7 @@ from agent_ppo.workflow.p2_nav_ppo_workflow import (
     _frame_done_masks,
     _monitor_put,
     _resolve_terminal_outcome,
+    _terminal_outcome_count,
     _terminal_safe_segment,
     _terminal_safe_tensor,
     _tick_diagnostic_values,
@@ -267,6 +268,33 @@ def test_p2_tick_diagnostics_separate_outcomes_feedback_and_motion_quality():
     assert values["stuck_penalty"].tolist() == [0.0, 0.0]
     assert valid_values["feedback_age_s"][0].item() == pytest.approx(0.2)
     assert valid_values["vx_tracking_abs_error"][0].item() == pytest.approx(0.2)
+
+
+def test_p2_tick_diagnostics_counts_wall_stuck_as_failure_separately_from_timeout():
+    aux = torch.zeros(1, p2_contract.WORKER_AUX_DIM)
+    values, _, _ = _tick_diagnostic_values(
+        target=torch.zeros(1, 3),
+        executed=torch.zeros(1, 3),
+        response_aux=aux,
+        confidence=torch.zeros(1, 1),
+        actions=torch.zeros(1, 12),
+        start_goal=torch.tensor((2.0,)),
+        end_goal=torch.tensor((2.0,)),
+        done=torch.tensor((True,)),
+        hard=torch.tensor((False,)),
+        timeout=torch.tensor((True,)),
+        terminal_reason=torch.tensor((4,)),
+        duration_frames=torch.tensor((10,)),
+        stuck=torch.tensor((True,)),
+        feedback_age_clip_s=0.8,
+    )
+    assert values["failure_rate"].item() == 1.0
+    assert values["timeout_rate"].item() == 0.0
+    assert values["wall_stuck_reset_rate"].item() == 1.0
+
+
+def test_p2_terminal_count_does_not_double_count_wall_stuck_failures():
+    assert _terminal_outcome_count(1.0, 1.0, 1.0) == 3.0
 
 
 def test_p2_action_mapper_and_initial_bias_cover_hard_boundary():
