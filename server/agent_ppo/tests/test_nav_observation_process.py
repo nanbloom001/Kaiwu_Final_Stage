@@ -14,6 +14,7 @@ import agent_ppo.tests._nav_test_stubs  # noqa: F401  平台模块 stub，必须
 import torch
 
 from agent_ppo.feature import nav_contract as nc
+from agent_ppo.feature.nav_observation_utils import nav_scanner_privileged_features
 
 
 class _Robot:
@@ -88,6 +89,75 @@ def _mk_process(cls, env, default_dim):
 
 
 class TestNavObservationProcesses(unittest.TestCase):
+    def test_scanner_validity_distinguishes_no_hit_from_malformed_ray(self):
+        env = _Env(n=2)
+        env._p2_allow_scanner_gaps = True
+        sensor = env.scene.sensors["nav_scanner"]
+        sensor.data.ray_hits_w = torch.zeros(2, 143, 3)
+        sensor.data.ray_hits_w[0, :10] = float("inf")
+        sensor.data.ray_hits_w[1, :8] = torch.tensor((float("nan"), 0.0, 0.0))
+        features, diagnostics = nav_scanner_privileged_features(
+            env, return_diagnostics=True
+        )
+        self.assertEqual(features.shape, (2, 4))
+        self.assertTrue(bool(diagnostics["available"][0]))
+        self.assertFalse(bool(diagnostics["available"][1]))
+        self.assertTrue(bool((features[1, 1:] == 0.0).all()))
+
+    def test_scanner_all_positive_inf_is_legal_no_hit_but_not_available_teacher(self):
+        env = _Env(n=1)
+        env._p2_allow_scanner_gaps = True
+        env.scene.sensors["nav_scanner"].data.ray_hits_w.fill_(float("inf"))
+        features, diagnostics = nav_scanner_privileged_features(
+            env, return_diagnostics=True
+        )
+        self.assertAlmostEqual(float(diagnostics["well_formed_ratio"][0]), 1.0)
+        self.assertAlmostEqual(float(diagnostics["finite_hit_ratio"][0]), 0.0)
+        self.assertEqual(float(features[0, 0]), 0.0)
+        self.assertTrue(bool((features[0, 1:] == 0.0).all()))
+
+    def test_scanner_platform_pattern_is_21_lateral_by_13_forward(self):
+        env = _Env(n=1)
+        pattern = SimpleNamespace(
+            size=(2.5, 2.0),
+            resolution_x=0.2,
+            resolution_y=0.1,
+            ordering="xy",
+        )
+        env.scene.sensors["nav_scanner"] = _RayScanner(
+            1, rays=273, pattern_cfg=pattern
+        )
+        _, diagnostics = nav_scanner_privileged_features(
+            env, return_diagnostics=True
+        )
+        self.assertEqual((diagnostics["rows"], diagnostics["cols"]), (21, 13))
+        self.assertEqual(diagnostics["ordering"], "xy")
+
+    def test_scanner_wall_fixtures_preserve_left_center_right_order(self):
+        y_coordinates = torch.linspace(-1.0, 1.0, 21)
+        cases = {
+            "left_positive_y": (y_coordinates >= 0.8, 2),
+            "center_zero_y": (y_coordinates.abs() <= 0.2, 1),
+            "right_negative_y": (y_coordinates <= -0.8, 3),
+        }
+        pattern = SimpleNamespace(
+            size=(2.5, 2.0),
+            resolution_x=0.2,
+            resolution_y=0.1,
+            ordering="xy",
+        )
+        for _, (rows, expected_index) in cases.items():
+            env = _Env(n=1)
+            env.scene.sensors["nav_scanner"] = _RayScanner(
+                1, rays=273, pattern_cfg=pattern
+            )
+            hits = env.scene.sensors["nav_scanner"].data.ray_hits_w.view(1, 21, 13, 3)
+            hits[:, rows, :6, 2] = 1.0
+            features = nav_scanner_privileged_features(env)
+            self.assertGreater(float(features[0, expected_index]), 0.8)
+            other = [index for index in (1, 2, 3) if index != expected_index]
+            self.assertTrue(all(float(features[0, index]) < 0.3 for index in other))
+
     def test_policy_obs_layout(self):
         from agent_ppo.feature.nav_observation_process import (
             NavPolicyObservationProcess,

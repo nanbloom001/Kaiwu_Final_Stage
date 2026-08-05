@@ -10,7 +10,13 @@ import torch
 def build_track_goal_raw(env) -> torch.Tensor:
     """Return the planar goal vector in the robot frame, in meters."""
     zeros = torch.zeros(env.num_envs, 2, device=env.device)
-    goal_positions = getattr(env, "goal_positions", None)
+    # P3 deliberately owns a short-range private subgoal while the Standard
+    # environment may still expose its native scoring goal.  Prefer the P3
+    # target whenever present so the high-level observation and its reward
+    # refer to the same objective.
+    goal_positions = getattr(env, "_p3_goal_positions", None)
+    if goal_positions is None:
+        goal_positions = getattr(env, "goal_positions", None)
     if goal_positions is None:
         return zeros
 

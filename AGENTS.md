@@ -15,6 +15,10 @@
 7. 任务包含 Bug 诊断、回归修复或线上故障处理时，再阅读
    [`shared/分析记录/Bug修复台账.md`](./shared/分析记录/Bug修复台账.md)，先检索相同症状、
    平台边界和既有回归测试，再开始修改。
+8. 任务涉及腾讯开悟容器中的 Isaac Lab、Unitree RL Lab、Unitree ROS、地形生成、
+   传感器、课程或平台运行框架时，先阅读
+   [`shared/container_source_mirror/README.md`](./shared/container_source_mirror/README.md)，
+   再检查本地镜像清单并读取相关平台源码。
 
 开始任何修改前，首先执行：
 
@@ -23,6 +27,21 @@ git status --short --branch
 ```
 
 记录已有的未提交、已暂存和未跟踪文件。它们默认属于用户，不得修改、暂存、移动或删除，除非任务明确将其纳入范围。
+
+## 平台托管源码本地镜像
+
+本地平台源码镜像固定位于
+`shared/arena_frontend_monitor/runtime/container_source_mirror/`，目录本身由 Git 忽略。
+涉及平台托管实现的分析必须先读取其中的 `mirror_manifest.json`，确认 `generated_at`、
+`remote_roots`、文件 SHA256 和目标文件是否存在，再读取镜像中的相关源码。禁止只依据仓库内
+训练代码推断平台地形、传感器、课程、重置或运行框架行为。
+
+镜像是本机只读查询缓存，不是实时容器状态，也不是 `server/` 或 `deploy/` 的运行时依赖。
+若镜像缺失、目标文件未收录、清单来自旧容器，或结论依赖当前容器运行时对象、张量 shape、
+动态配置和补丁状态，必须通过腾讯开悟 RPC 在线复核，并在结论中区分“镜像证据”与
+“当前容器证据”。刷新镜像使用
+[`shared/container_source_mirror/pull_container_source_mirror.py`](./shared/container_source_mirror/pull_container_source_mirror.py)；
+禁止提交生成出的镜像文件、Token、Cookie、`.env`、日志、模型、二进制或第三方资产。
 
 ## Bug 修复强制记录
 

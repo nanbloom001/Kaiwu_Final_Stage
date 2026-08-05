@@ -11,10 +11,17 @@ Go2 lbc_loco 学生策略部署树（楼梯测试 + 固定命令模式）。目�
 ## 与当前 Standard 训练包的边界
 
 `behavior_distill_v2`、`privileged_loco_teacher_v1` 和
-`kaiwu_train_v1`（包括 `daggerfull-16288`、`visionfull-28401` 以及
-`standard_visual_ppo` 的 `rlcritic`/`rlactor`/`rlfull` 文件）都是训练/恢复制品，
+`kaiwu_train_v1`（包括 `daggerfull-16288`、`visionfull-28401`、P1.5 `response*`、
+P2 `navwarm`/`navadapt`/`navfull` 以及 `standard_visual_ppo` 的
+`rlcritic`/`rlactor`/`rlfull` 文件）都是训练/恢复制品，
 `capabilities.deployable=false`。它们可能包含 `height_scan256`、optimizer、
 冻结教师或其他真机不可提供的状态，当前 `export_loco_onnx.py` 不接受这些格式。
+
+P2 的 `modules.high_level.component_status="complete"` 只表示训练包包含完整动作型高层，
+不表示已有部署 runtime。其输入还要求 `goal4`、`nav_nonvisual36`、
+`response_profile16`、`adapter_confidence1` 与两组 recurrent state；当前 command-v2 高层输出
+三轴 `[vx,vy,wz]`，旧二维 evaluator/exporter 不得静默补 `vy=0`。在独立完成导出、
+接口审查和真机验证前，部署端必须拒绝直接加载或通过改名伪装。
 
 默认部署路线仍只接受经过单独导出审查的 `format="lbc_loco"` 视觉策略候选；
 不得通过改名把上述训练包伪装成可部署 checkpoint。本次 R2 合入不改变 ONNX

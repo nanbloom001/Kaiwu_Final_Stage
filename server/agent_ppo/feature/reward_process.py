@@ -16,12 +16,52 @@ RewardProcessBase and are activated directly from TOML.
 通用 Isaac Lab reward 仍继承自 RewardProcessBase，并直接由 TOML 激活。
 """
 
+import math
+
 import torch
 
 from tools.base_env.base_reward import RewardProcessBase
 
 
+def p3_normalized_torque_excess(
+    absolute_torque: torch.Tensor,
+    soft_limit: torch.Tensor,
+    hard_limit: torch.Tensor,
+) -> torch.Tensor:
+    """Squared soft constraint: zero at soft limit and one at hard limit."""
+    scale = (hard_limit - soft_limit).clamp_min(1.0e-6)
+    return torch.square(
+        torch.clamp((absolute_torque - soft_limit) / scale, 0.0, 1.5)
+    )
+
+
 class RewardProcess(RewardProcessBase):
+    def _p2_goal_geometry(self):
+        goal = getattr(self.env, "goal_positions", None)
+        if not torch.is_tensor(goal):
+            zeros = torch.zeros(self.env.num_envs, 2, device=self.env.device)
+            return zeros, torch.zeros(self.env.num_envs, device=self.env.device), zeros
+        robot = self._get_robot_asset()
+        delta_w = goal[:, :2] - robot.data.root_pos_w[:, :2]
+        distance = torch.linalg.vector_norm(delta_w, dim=-1)
+        quat = robot.data.root_quat_w
+        w, x, y, z = quat.unbind(-1)
+        yaw = torch.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y.square() + z.square()),
+        )
+        cos_yaw = torch.cos(yaw)
+        sin_yaw = torch.sin(yaw)
+        local = torch.stack(
+            (
+                cos_yaw * delta_w[:, 0] + sin_yaw * delta_w[:, 1],
+                -sin_yaw * delta_w[:, 0] + cos_yaw * delta_w[:, 1],
+            ),
+            dim=-1,
+        )
+        direction = torch.nn.functional.normalize(local, dim=-1, eps=1.0e-6)
+        return local, distance, direction
+
     def _p15_contact_statistics(self, ema_tau_s: float = 1.0):
         """Return current air time and a once-per-step contact-duty EMA."""
         sensor_cfg = self._get_foot_sensor_cfg()
@@ -148,6 +188,16 @@ class RewardProcess(RewardProcessBase):
     def _reward_flat_orientation(self):
         asset = self._get_robot_asset()
         return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+
+    def _reward_p3_posture_stability(self, raw_cap: float = 0.24):
+        """Terrain-relative roll/pitch and body-rate cost without a height target."""
+        asset = self._get_robot_asset()
+        gravity = asset.data.projected_gravity_b[:, :2]
+        angular = asset.data.root_ang_vel_b[:, :2]
+        roll_like = gravity[:, 1].square()
+        pitch_like = gravity[:, 0].square()
+        raw = roll_like + 0.35 * pitch_like + 0.15 * angular.square().sum(dim=-1)
+        return torch.clamp(raw, 0.0, float(raw_cap))
 
     def _reward_joint_vel(self):
         asset = self._get_robot_asset()
@@ -324,6 +374,123 @@ class RewardProcess(RewardProcessBase):
             return torch.zeros(self.env.num_envs, device=self.env.device)
         return torch.sum(torch.abs(torque * data.joint_vel), dim=1)
 
+    def _reward_p3_sim2real_cost(
+        self,
+        sustained_weight: float = 0.05,
+        peak_weight: float = 0.02,
+        action_rate_weight: float = 0.03,
+        action_jerk_weight: float = 0.01,
+        frame_cap: float = 0.12,
+        ema_window_s: float = 0.20,
+    ):
+        """Bounded P3 low-level torque and action smoothness cost."""
+        asset = self._get_robot_asset()
+        data = asset.data
+        torque = getattr(data, "applied_torque", None)
+        if torque is None:
+            torque = getattr(data, "torque", None)
+        joint_names = list(getattr(asset, "joint_names", ()) or ())
+        valid_mapping = (
+            torch.is_tensor(torque)
+            and torque.ndim == 2
+            and torque.shape[0] == self.env.num_envs
+            and len(joint_names) == torque.shape[1]
+        )
+        groups = []
+        if valid_mapping:
+            for name in joint_names:
+                lower = str(name).lower()
+                if "hip" in lower:
+                    groups.append((17.6, 22.0))
+                elif "thigh" in lower:
+                    groups.append((17.6, 22.0))
+                elif "calf" in lower:
+                    groups.append((34.4, 43.0))
+                else:
+                    valid_mapping = False
+                    break
+        if not valid_mapping:
+            if not bool(getattr(self.env, "_p3_torque_mapping_warned", False)):
+                print(
+                    "[P3Reward] torque/joint mapping invalid; disabling P3 torque cost"
+                )
+                self.env._p3_torque_mapping_warned = True
+            self.env._p3_torque_mapping_valid = torch.zeros(
+                self.env.num_envs, dtype=torch.bool, device=self.env.device
+            )
+            return torch.zeros(self.env.num_envs, device=self.env.device)
+
+        absolute_torque = torch.abs(torque)
+        state = getattr(self.env, "_p3_sim2real_reward_state", None)
+        action_manager = getattr(self.env, "action_manager", None)
+        current_action = getattr(action_manager, "action", None)
+        previous_action = getattr(action_manager, "prev_action", None)
+        if not isinstance(state, dict) or state.get("torque_ema") is None:
+            state = {
+                "torque_ema": torch.zeros_like(absolute_torque),
+                "previous_action": (
+                    previous_action.detach().clone()
+                    if torch.is_tensor(previous_action)
+                    else None
+                ),
+            }
+            self.env._p3_sim2real_reward_state = state
+        dt_s = float(getattr(self.env, "step_dt", 0.02))
+        alpha = 1.0 - math.exp(-max(dt_s, 0.0) / max(float(ema_window_s), 1.0e-3))
+        state["torque_ema"].mul_(1.0 - alpha).add_(absolute_torque * alpha)
+        soft = torch.tensor([item[0] for item in groups], device=torque.device, dtype=torque.dtype)
+        hard = torch.tensor([item[1] for item in groups], device=torque.device, dtype=torque.dtype)
+        sustained = p3_normalized_torque_excess(
+            state["torque_ema"], soft, hard
+        ).mean(dim=1)
+        peak = p3_normalized_torque_excess(
+            absolute_torque, soft, hard
+        ).mean(dim=1)
+
+        if (
+            torch.is_tensor(current_action)
+            and torch.is_tensor(previous_action)
+            and current_action.shape == previous_action.shape
+        ):
+            older = state.get("previous_action")
+            if not torch.is_tensor(older) or older.shape != previous_action.shape:
+                older = previous_action.detach().clone()
+            rate = torch.clamp(
+                torch.abs(current_action - previous_action) / 0.25, 0.0, 1.0
+            ).mean(dim=1)
+            jerk = torch.clamp(
+                torch.abs(current_action - 2.0 * previous_action + older) / 0.25,
+                0.0,
+                1.0,
+            ).mean(dim=1)
+            state["previous_action"] = previous_action.detach().clone()
+        else:
+            rate = torch.zeros_like(sustained)
+            jerk = torch.zeros_like(sustained)
+
+        reset = getattr(self.env, "episode_length_buf", None)
+        if torch.is_tensor(reset):
+            reset = reset.reshape(-1) == 0
+            state["torque_ema"][reset] = 0.0
+            if torch.is_tensor(state.get("previous_action")) and torch.is_tensor(previous_action):
+                state["previous_action"][reset] = previous_action[reset]
+        self.env._p3_torque_mapping_valid = torch.ones(
+            self.env.num_envs, dtype=torch.bool, device=torque.device
+        )
+        self.env._p3_sim2real_components = {
+            "sustained_torque": sustained.detach(),
+            "torque_peak": peak.detach(),
+            "action_rate": rate.detach(),
+            "action_jerk": jerk.detach(),
+        }
+        total = (
+            float(sustained_weight) * sustained
+            + float(peak_weight) * peak
+            + float(action_rate_weight) * rate
+            + float(action_jerk_weight) * jerk
+        )
+        return torch.clamp(total, 0.0, float(frame_cap))
+
     def _reward_correct_base_height(self, target_height: float = 0.38):
         """Only penalize when the base is below target height."""
         asset = self._get_robot_asset()
@@ -410,15 +577,52 @@ class RewardProcess(RewardProcessBase):
         robot_pos = robot.data.root_pos_w[:, :2]
         goal_pos = self.env.goal_positions[:, :2]
         current_dist = torch.norm(goal_pos - robot_pos, dim=1)
-        if not hasattr(self.env, "_previous_goal_dist") or self.env._previous_goal_dist is None:
-            self.env._previous_goal_dist = current_dist.clone()
+        previous = getattr(self.env, "_p2_previous_goal_dist", None)
+        valid = getattr(self.env, "_p2_previous_goal_valid", None)
+        if not torch.is_tensor(previous) or previous.shape != current_dist.shape:
+            self.env._p2_previous_goal_dist = current_dist.clone()
+            self.env._p2_previous_goal_valid = torch.zeros_like(current_dist, dtype=torch.bool)
+            self.env._p2_last_goal_progress = torch.zeros_like(current_dist)
             return torch.zeros(self.env.num_envs, device=self.env.device)
-        delta_dist = current_dist - self.env._previous_goal_dist
+        if not torch.is_tensor(valid) or valid.shape != current_dist.shape:
+            valid = torch.zeros_like(current_dist, dtype=torch.bool)
+        raw_progress = previous - current_dist
         term_mgr = self.env.termination_manager
         reset_mask = term_mgr.terminated | term_mgr.time_outs
-        delta_dist[reset_mask] = 0.0
-        self.env._previous_goal_dist = current_dist.clone()
-        return -delta_dist
+        progress = torch.where(
+            valid & ~reset_mask,
+            raw_progress,
+            torch.zeros_like(raw_progress),
+        )
+        self.env._p2_previous_goal_dist = current_dist.clone()
+        self.env._p2_previous_goal_valid = ~reset_mask
+        # Curriculum diagnostics need the terminal-frame distance delta even
+        # though the reward itself masks reset boundaries.
+        self.env._p2_last_goal_progress = torch.where(
+            valid,
+            raw_progress,
+            torch.zeros_like(raw_progress),
+        ).detach().clone()
+        return progress
+
+    def _reward_goal_heading_alignment(self, std: float = 0.75):
+        _, distance, direction = self._p2_goal_geometry()
+        error = torch.atan2(direction[:, 1], direction[:, 0])
+        return torch.exp(-torch.square(error / max(float(std), 1.0e-6))) * (distance > 0.6)
+
+    def _reward_goal_velocity_projection(self, max_speed: float = 0.75):
+        robot = self._get_robot_asset()
+        _, distance, direction = self._p2_goal_geometry()
+        projection = torch.sum(robot.data.root_lin_vel_b[:, :2] * direction, dim=-1)
+        return torch.clamp(projection / max(float(max_speed), 1.0e-6), -1.0, 1.0) * (distance > 0.6)
+
+    def _reward_goal_distance(self, scale: float = 8.0):
+        _, distance, _ = self._p2_goal_geometry()
+        return torch.exp(-distance / max(float(scale), 1.0e-6))
+
+    def _reward_task_complete(self, threshold: float = 0.6):
+        _, distance, _ = self._p2_goal_geometry()
+        return (distance < float(threshold)).float()
 
     def _reward_heading_velocity(self):
         """Reward velocity projected toward the goal."""

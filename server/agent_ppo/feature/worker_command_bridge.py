@@ -10,6 +10,7 @@ from typing import Any, Callable
 import torch
 
 from agent_ppo.feature.command_schedule import CommandSchedule
+from agent_ppo.feature.p3_command_sampler import P3RecoveryCommandSampler
 
 
 _STATE_ATTR = "_agent_ppo_worker_command_bridge"
@@ -61,15 +62,23 @@ def _resolve_config() -> tuple[bool, dict[str, Any], int]:
     worker = commands.get("worker_progressive", {})
     stage_conf = usr_conf.get(stage.name, {})
     schedule_mode = str(stage_conf.get("schedule_mode", ""))
+    is_p3 = getattr(stage, "algorithm", "") == "p3_standard_joint"
     enabled = (
         not bool(is_eval)
         and bool(worker.get("enabled", False))
-        and schedule_mode == "visual_command_generalization_v1"
+        and schedule_mode in {
+            "visual_command_generalization_v1",
+            "p3_low_recovery_v1",
+            "p3_stair_memory_v1",
+            "p35_gaitfix_v1",
+        }
     )
     schedule_conf = stage_conf.get("command_schedule", {})
     if not isinstance(schedule_conf, dict):
         schedule_conf = {}
-    return enabled, dict(schedule_conf), max(1, int(worker.get("log_interval_steps", 500)))
+    schedule_conf = dict(schedule_conf)
+    schedule_conf["_sampler_type"] = "p3_recovery" if is_p3 else "generalization"
+    return enabled, schedule_conf, max(1, int(worker.get("log_interval_steps", 500)))
 
 
 class WorkerCommandBridge:
@@ -105,7 +114,9 @@ class WorkerCommandBridge:
         if current is None:
             self._disable("public base_velocity command tensor unavailable")
             return
-        self.scheduler = CommandSchedule(
+        sampler_type = str((config or {}).get("_sampler_type", "generalization"))
+        sampler_class = P3RecoveryCommandSampler if sampler_type == "p3_recovery" else CommandSchedule
+        self.scheduler = sampler_class(
             num_envs=int(current.shape[0]),
             device=current.device,
             config=config,
@@ -280,3 +291,14 @@ def apply_worker_command(env) -> None:
 
 def record_worker_command_observation(env, group: str, obs: torch.Tensor) -> None:
     worker_command_bridge(env).record_observation(group, obs)
+
+
+def worker_command_training_state(env) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Return committed P3 bucket/anchor state without creating a bridge."""
+    bridge = getattr(env, _STATE_ATTR, None)
+    scheduler = getattr(bridge, "scheduler", None)
+    bucket = getattr(scheduler, "bucket", None)
+    anchor = getattr(scheduler, "anchor_weights", None)
+    if not torch.is_tensor(bucket) or not torch.is_tensor(anchor):
+        return None, None
+    return bucket.detach(), anchor.detach()

@@ -123,14 +123,33 @@ class VisionEncoder(nn.Module):
         Returns:
             latent: [B, rnn_output_dim], L2-normalized.
         """
-        batch_size = depth_image.shape[0]
-        device = depth_image.device
-
-        # CNN encodes depth image
         cnn_features = self.cnn(depth_image)  # [B, cnn_output_dim]
+        return self.forward_from_cnn_features(
+            cnn_features,
+            proprio,
+            masks=masks,
+            detach_hidden=detach_hidden,
+        )
 
-        # LSTM 输入：cat(cnn_feat, proprio)
-        rnn_input = torch.cat([cnn_features, proprio], dim=-1)  # [B, cnn_out + proprio_dim]
+    def forward_from_cnn_features(
+        self,
+        cnn_features: torch.Tensor,
+        proprio: torch.Tensor,
+        masks: torch.Tensor = None,
+        detach_hidden: bool = True,
+    ) -> torch.Tensor:
+        """Replay the recurrent actor from frozen, precomputed CNN features."""
+        if cnn_features.ndim != 2 or cnn_features.shape[-1] != self.cnn_output_dim:
+            raise ValueError(
+                f"CNN features must be [B,{self.cnn_output_dim}], got {tuple(cnn_features.shape)}"
+            )
+        if proprio.ndim != 2 or proprio.shape[-1] != self.proprio_dim:
+            raise ValueError(
+                f"Proprio must be [B,{self.proprio_dim}], got {tuple(proprio.shape)}"
+            )
+        batch_size = cnn_features.shape[0]
+        device = cnn_features.device
+        rnn_input = torch.cat([cnn_features, proprio], dim=-1)
 
         if self.use_lstm:
             # Add sequence dim [B, 1, input_dim]

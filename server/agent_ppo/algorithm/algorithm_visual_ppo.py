@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import os
 import random
+import time
 from typing import Any
 from uuid import uuid4
 
@@ -29,6 +30,7 @@ from agent_ppo.checkpoint_io import (
     validate_low_level_spec,
 )
 from agent_ppo.feature.definition import RecurrentRolloutStorage
+from agent_ppo.feature import p3_contract
 
 # Recognized schedule modes. ``visual_anchor_anneal_v2`` is the Anchor R2 active
 # branch; the rest are kept as explicit branches so historical checkpoints can
@@ -40,6 +42,9 @@ SUPPORTED_SCHEDULE_MODES = (
     "visual_anchor_anneal_v2",
     "visual_command_generalization_v1",
     "p15_response_adapter_v1",
+    "p3_low_recovery_v1",
+    "p3_stair_memory_v1",
+    "p35_gaitfix_v1",
 )
 
 # Fixed load_mode values used in the startup log (§6). Returned by
@@ -51,6 +56,73 @@ LOAD_MODE_SCHEDULE_MIGRATION = "schedule_migration"
 
 # Legacy phase vocabulary kept for resume compatibility only.
 _LEGACY_PHASES = ("rlcritic", "rlactor", "rlfull")
+
+
+def _calibrate_auxiliary_gradients(
+    policy_loss: torch.Tensor,
+    auxiliary_specs: list[tuple[str, torch.Tensor, float]],
+    parameters: list[torch.Tensor],
+    max_ratio: float,
+) -> tuple[list[dict[str, Any]], float]:
+    """Scale the combined auxiliary gradient against the current PPO gradient."""
+    if not auxiliary_specs or not parameters:
+        return [], 0.0
+    ppo_grad = torch.autograd.grad(
+        policy_loss, parameters, retain_graph=True, allow_unused=True
+    )
+    ppo_flat = torch.cat(
+        [
+            (torch.zeros_like(parameter) if grad is None else grad).reshape(-1)
+            for parameter, grad in zip(parameters, ppo_grad)
+        ]
+    )
+    ppo_norm_raw = ppo_flat.norm()
+    ppo_norm = ppo_norm_raw.clamp_min(1.0e-12)
+    calibrated = []
+    combined_flat = torch.zeros_like(ppo_flat)
+    for name, auxiliary_loss, target_ratio in auxiliary_specs:
+        auxiliary_grad = torch.autograd.grad(
+            auxiliary_loss,
+            parameters,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        auxiliary_flat = torch.cat(
+            [
+                (torch.zeros_like(parameter) if grad is None else grad).reshape(-1)
+                for parameter, grad in zip(parameters, auxiliary_grad)
+            ]
+        )
+        auxiliary_norm_raw = auxiliary_flat.norm()
+        auxiliary_norm = auxiliary_norm_raw.clamp_min(1.0e-12)
+        has_reference_gradient = float(ppo_norm_raw) > 1.0e-12
+        has_auxiliary_gradient = float(auxiliary_norm_raw) > 1.0e-12
+        multiplier = (
+            float(target_ratio * ppo_norm / auxiliary_norm)
+            if has_reference_gradient and has_auxiliary_gradient
+            else 0.0
+        )
+        scaled_flat = auxiliary_flat * multiplier
+        combined_flat.add_(scaled_flat)
+        calibrated.append(
+            {
+                "name": name,
+                "loss": auxiliary_loss,
+                "multiplier": multiplier,
+                "component_ratio": float(scaled_flat.norm() / ppo_norm),
+                "cosine": (
+                    float(F.cosine_similarity(ppo_flat, auxiliary_flat, dim=0))
+                    if has_reference_gradient and has_auxiliary_gradient
+                    else 0.0
+                ),
+            }
+        )
+    combined_ratio = float(combined_flat.norm() / ppo_norm)
+    cap_scale = min(1.0, float(max_ratio) / max(combined_ratio, 1.0e-12))
+    for item in calibrated:
+        item["multiplier"] *= cap_scale
+        item["component_ratio"] *= cap_scale
+    return calibrated, combined_ratio * cap_scale
 
 
 class AlgorithmVisualPPO(AlgorithmPPO):
@@ -148,6 +220,14 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         self.skipped_nonfinite_updates = 0
         if self.schedule_mode == "p15_response_adapter_v1":
             self.current_phase = "responsebase"
+        elif self.schedule_mode == "p3_low_recovery_v1":
+            self.current_phase = "lowbase"
+        elif self.schedule_mode in {"p3_stair_memory_v1", "p35_gaitfix_v1"}:
+            self.current_phase = (
+                "gaitfixcalib"
+                if self.schedule_mode == "p35_gaitfix_v1"
+                else "staircalib"
+            )
         elif self.schedule_mode == "visual_command_generalization_v1":
             self.current_phase = "commandbase"
         else:
@@ -238,6 +318,9 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         if self.schedule_mode in {
             "visual_command_generalization_v1",
             "p15_response_adapter_v1",
+            "p3_low_recovery_v1",
+            "p3_stair_memory_v1",
+            "p35_gaitfix_v1",
         }:
             self.anchor_schedule_hours = None
             self.action_anchor_schedule = [self.command_anchor_action]
@@ -250,6 +333,16 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                     "responsecalib",
                 ]
                 self.anchor_phase_end_hours = [0.5, 2.0, 7.0]
+            elif self.schedule_mode == "p3_stair_memory_v1":
+                self.anchor_phase_labels = [
+                    "staircalib", "stairwarm", "stairadapt", "stairrobust", "stairfinal"
+                ]
+                self.anchor_phase_end_hours = [0.25, 0.75, 2.0, 6.0]
+            elif self.schedule_mode == "p35_gaitfix_v1":
+                self.anchor_phase_labels = [
+                    "gaitfixcalib", "repair", "pushwarm", "pushfull", "stable"
+                ]
+                self.anchor_phase_end_hours = [0.25, 1.25, 1.50, 1.75]
             else:
                 self.anchor_phase_labels = ["commandbase", "commandblend", "commandfull"]
                 self.anchor_phase_end_hours = [0.5, 3.0]
@@ -377,6 +470,17 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             if elapsed_h < 7.0:
                 return "responsefull"
             return "responsecalib"
+        if self.schedule_mode == "p3_low_recovery_v1":
+            if elapsed_h < 0.5: return "lowbase"
+            if elapsed_h < 2.0: return "lowmild"
+            if elapsed_h < 3.5: return "lowmedium"
+            if elapsed_h < 5.0: return "lowfull"
+            if elapsed_h < 6.0: return "adaptercalib"
+            if elapsed_h < 6.5: return "highadapt"
+            return "highslow"
+        if self.schedule_mode in {"p3_stair_memory_v1", "p35_gaitfix_v1"}:
+            elapsed_s = float(elapsed_h) * 3600.0
+            return p3_contract.phase_for_elapsed(elapsed_s).name
         if self.schedule_mode == "visual_anchor_anneal_v2":
             ends = self.anchor_phase_end_hours
             if elapsed_h < ends[0]:
@@ -403,6 +507,9 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         if self.schedule_mode in {
             "visual_command_generalization_v1",
             "p15_response_adapter_v1",
+            "p3_low_recovery_v1",
+            "p3_stair_memory_v1",
+            "p35_gaitfix_v1",
         }:
             return (
                 self.command_anchor_action
@@ -461,12 +568,25 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         if self.schedule_mode in {
             "visual_command_generalization_v1",
             "p15_response_adapter_v1",
+            "p3_low_recovery_v1",
+            "p3_stair_memory_v1",
+            "p35_gaitfix_v1",
         }:
-            enabled = not (
-                self.schedule_mode == "p15_response_adapter_v1"
-                and phase == "responsecalib"
-            )
-            actor_enabled, recurrent_enabled = enabled, enabled
+            if self.schedule_mode == "p3_low_recovery_v1":
+                actor_enabled = phase in {"lowbase", "lowmild", "lowmedium", "lowfull"}
+                recurrent_enabled = phase in {"lowbase", "lowmild", "lowmedium", "lowfull"}
+            elif self.schedule_mode == "p3_stair_memory_v1":
+                actor_enabled = phase != "staircalib"
+                recurrent_enabled = phase != "staircalib"
+            elif self.schedule_mode == "p35_gaitfix_v1":
+                actor_enabled = phase not in {"gaitfixcalib", "stable"}
+                recurrent_enabled = actor_enabled
+            else:
+                enabled = not (
+                    self.schedule_mode == "p15_response_adapter_v1"
+                    and phase == "responsecalib"
+                )
+                actor_enabled, recurrent_enabled = enabled, enabled
         elif self.schedule_mode == "visual_anchor_anneal_v2":
             table = {
                 "anchorcritic": (False, False),
@@ -488,9 +608,19 @@ class AlgorithmVisualPPO(AlgorithmPPO):
 
         for parameter in self.actor_critic.actor.parameters():
             parameter.requires_grad_(actor_enabled)
+        if self.schedule_mode == "p35_gaitfix_v1":
+            for parameter in self.actor_critic.actor.parameters():
+                parameter.requires_grad_(False)
+            if actor_enabled:
+                for parameter in self.actor_critic.actor[-1].parameters():
+                    parameter.requires_grad_(True)
         critic_enabled = not (
-            self.schedule_mode == "p15_response_adapter_v1"
-            and phase == "responsecalib"
+            (self.schedule_mode == "p15_response_adapter_v1" and phase == "responsecalib")
+            or (
+                self.schedule_mode == "p3_low_recovery_v1"
+                and phase in {"adaptercalib", "highadapt", "highslow"}
+            )
+            or (self.schedule_mode == "p35_gaitfix_v1" and phase == "stable")
         )
         for parameter in self.actor_critic.critic.parameters():
             parameter.requires_grad_(critic_enabled)
@@ -587,6 +717,21 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         action = self.anchor_actor(torch.cat((proprio, latent), dim=-1))
         return action, latent
 
+    def anchor_inference_from_cnn_features(
+        self,
+        proprio: torch.Tensor,
+        cnn_features: torch.Tensor,
+    ):
+        """Reuse the live frozen CNN output for the immutable anchor replay."""
+        latent = self.anchor_encoder.forward_from_cnn_features(
+            cnn_features,
+            proprio,
+            masks=None,
+            detach_hidden=True,
+        )
+        action = self.anchor_actor(torch.cat((proprio, latent), dim=-1))
+        return action, latent
+
     def reset_recurrent_states(self, dones: torch.Tensor) -> None:
         self.actor_critic.reset(dones)
         done_ids = torch.nonzero(dones.reshape(-1).bool(), as_tuple=False).flatten()
@@ -672,14 +817,34 @@ class AlgorithmVisualPPO(AlgorithmPPO):
     # Learn
     # ------------------------------------------------------------------
 
-    def learn(self, elapsed_h: float | None = None) -> dict[str, float]:
+    def _prepare_training_modules(self) -> None:
+        """Set recurrent PPO modules to modes compatible with CUDA backward."""
+        self.actor_critic.train()
+        # The visual CNN is permanently frozen.  Keep its BatchNorm statistics
+        # fixed while allowing the recurrent encoder and policy heads to run in
+        # training mode, including phases where their parameters are frozen.
+        self.actor_critic.vision_encoder.cnn.eval()
+        self.anchor_encoder.eval()
+        self.anchor_actor.eval()
+
+    def learn(
+        self,
+        elapsed_h: float | None = None,
+        *,
+        phase_override: str | None = None,
+    ) -> dict[str, float]:
+        update_started = time.perf_counter()
         elapsed_h = (
             self.anchor_session_elapsed_hours if elapsed_h is None else float(elapsed_h)
         )
         # elapsed_training_hours is maintained by the workflow as a cumulative
         # record. Only the anchor session clock drives phase decisions.
         self.anchor_session_elapsed_hours = elapsed_h
-        self.current_phase = self._phase_for_elapsed(elapsed_h)
+        self.current_phase = (
+            self._phase_for_elapsed(elapsed_h)
+            if phase_override is None
+            else str(phase_override)
+        )
         self.action_anchor_weight = self._anchor_weight_for_elapsed(
             elapsed_h, kind="action"
         )
@@ -689,14 +854,39 @@ class AlgorithmVisualPPO(AlgorithmPPO):
         hard_rate = self._update_safety_state(elapsed_h)
         self._set_trainable_phase(self.current_phase)
         self._set_phase_learning_rates(self.current_phase)
+        self._prepare_training_modules()
 
         totals = {
             "policy_loss": 0.0,
             "value_loss": 0.0,
             "entropy_loss": 0.0,
+            "approx_kl": 0.0,
+            "clip_fraction": 0.0,
             "action_anchor_loss": 0.0,
             "latent_anchor_loss": 0.0,
             "anchor_action_mse": 0.0,
+            "anchor_gradient_ratio": 0.0,
+            "anchor_gradient_cosine": 0.0,
+            "mirror_loss": 0.0,
+            "mirror_sequence_share": 0.0,
+            "mirror_gradient_ratio": 0.0,
+            "mirror_gradient_cosine": 0.0,
+            "memory_loss": 0.0,
+            "memory_fault_frame_share": 0.0,
+            "memory_action_mae": 0.0,
+            "memory_hidden_advantage": 0.0,
+            "memory_latent_cosine": 0.0,
+            "memory_gradient_ratio": 0.0,
+            "memory_gradient_cosine": 0.0,
+            "action_smooth_scale": 0.0,
+            "action_mean_rate_loss": 0.0,
+            "action_mean_jerk_loss": 0.0,
+            "action_mean_range_loss": 0.0,
+            "action_smooth_gradient_ratio": 0.0,
+            "action_range_gradient_ratio": 0.0,
+            "action_smooth_gradient_cosine": 0.0,
+            "action_range_gradient_cosine": 0.0,
+            "action_aux_combined_gradient_ratio": 0.0,
         }
         applied_updates = 0
         generator = self.storage.recurrent_mini_batch_generator(
@@ -733,9 +923,8 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             action_mean = self.actor_critic.action_mean
             latent = self.actor_critic.last_latent
 
-            ratio = torch.exp(
-                actions_log_prob - old_log_prob_batch.squeeze(-1)
-            )
+            log_ratio = actions_log_prob - old_log_prob_batch.squeeze(-1)
+            ratio = torch.exp(log_ratio)
             advantages = advantages_batch.squeeze(-1)
             surrogate = -advantages * ratio
             surrogate_clipped = -advantages * torch.clamp(
@@ -772,9 +961,118 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 policy_loss
                 + self.value_loss_coef * value_loss
                 - self.entropy_coef * entropy
-                + self.action_anchor_weight * action_anchor_loss
-                + self.latent_anchor_weight_current * latent_anchor_loss
             )
+            if self.schedule_mode != "p35_gaitfix_v1":
+                loss = (
+                    loss
+                    + self.action_anchor_weight * action_anchor_loss
+                    + self.latent_anchor_weight_current * latent_anchor_loss
+                )
+            mirror_aux = getattr(self, "p3_mirror_aux", None)
+            mirror_metrics = {}
+            mirror_loss = action_mean.new_zeros(())
+            if mirror_aux is not None:
+                mirror_loss, mirror_metrics = mirror_aux.loss(
+                    self.actor_critic,
+                    self.storage.observations[: self.storage.step],
+                    self.storage.dones[: self.storage.step],
+                )
+            memory_aux = getattr(self, "p3_memory_aux", None)
+            memory_metrics = {}
+            memory_loss = action_mean.new_zeros(())
+            if memory_aux is not None:
+                memory_loss, memory_metrics = memory_aux.loss(
+                    self.actor_critic,
+                    self.anchor_encoder,
+                    self.anchor_actor,
+                    self.storage.observations[: self.storage.step],
+                    self.storage.dones[: self.storage.step],
+                )
+            action_aux = getattr(self, "p3_action_smooth_aux", None)
+            action_metrics = {}
+            action_smooth_loss = action_mean.new_zeros(())
+            action_range_loss = action_mean.new_zeros(())
+            if action_aux is not None:
+                auxiliary_action_mean = action_aux.action_mean_with_detached_body(
+                    self.actor_critic.actor,
+                    torch.cat((obs_batch[..., :45], latent), dim=-1),
+                )
+                action_smooth_loss, action_range_loss, action_metrics = action_aux.loss(
+                    auxiliary_action_mean, masks_batch
+                )
+
+            selected_parameters = [
+                *self.actor_critic.vision_encoder.rnn.parameters(),
+                *self.actor_critic.vision_encoder.rnn_output_layer.parameters(),
+                self.actor_critic.actor[-1].weight,
+                self.actor_critic.actor[-1].bias,
+            ]
+            selected_parameters = [
+                parameter
+                for parameter in selected_parameters
+                if parameter is not None and parameter.requires_grad
+            ]
+            auxiliary_specs = []
+            if self.schedule_mode == "p35_gaitfix_v1":
+                anchor_aux_loss = action_anchor_loss + 0.25 * latent_anchor_loss
+                if anchor_aux_loss.requires_grad and float(anchor_aux_loss.detach()) > 0.0:
+                    auxiliary_specs.append(
+                        ("anchor", anchor_aux_loss, p3_contract.ANCHOR_TARGET_GRADIENT_RATIO)
+                    )
+            if mirror_aux is not None and mirror_loss.requires_grad and float(mirror_loss.detach()) > 0.0:
+                auxiliary_specs.append(
+                    ("mirror", mirror_loss, p3_contract.MIRROR_TARGET_GRADIENT_RATIO)
+                )
+            if memory_aux is not None and memory_loss.requires_grad and float(memory_loss.detach()) > 0.0:
+                auxiliary_specs.append(
+                    ("memory", memory_loss, p3_contract.MEMORY_TARGET_GRADIENT_RATIO)
+                )
+            if action_aux is not None and action_smooth_loss.requires_grad and float(action_smooth_loss.detach()) > 0.0:
+                auxiliary_specs.append(
+                    ("smooth", action_smooth_loss, p3_contract.ACTION_SMOOTH_TARGET_GRADIENT_RATIO)
+                )
+            if action_aux is not None and action_range_loss.requires_grad and float(action_range_loss.detach()) > 0.0:
+                auxiliary_specs.append(
+                    ("range", action_range_loss, p3_contract.ACTION_RANGE_TARGET_GRADIENT_RATIO)
+                )
+
+            calibrated, combined_ratio = _calibrate_auxiliary_gradients(
+                policy_loss,
+                auxiliary_specs,
+                selected_parameters,
+                p3_contract.AUXILIARY_MAX_GRADIENT_RATIO,
+            )
+            for item in calibrated:
+                name = item["name"]
+                effective_ratio = item["component_ratio"]
+                cosine = item["cosine"]
+                loss = loss + item["loss"] * item["multiplier"]
+                if name == "anchor":
+                    totals["anchor_gradient_ratio"] += effective_ratio
+                    totals["anchor_gradient_cosine"] += cosine
+                elif name == "mirror":
+                    mirror_aux.gradient_multiplier = item["multiplier"]
+                    mirror_aux.gradient_ratio = effective_ratio
+                    mirror_aux.gradient_cosine = cosine
+                    mirror_metrics.update(
+                        mirror_gradient_ratio=effective_ratio,
+                        mirror_gradient_cosine=cosine,
+                    )
+                elif name == "memory":
+                    memory_aux.gradient_multiplier = item["multiplier"]
+                    memory_aux.gradient_ratio = effective_ratio
+                    memory_aux.gradient_cosine = cosine
+                    memory_metrics.update(
+                        memory_gradient_ratio=effective_ratio,
+                        memory_gradient_cosine=cosine,
+                    )
+                else:
+                    action_aux.multipliers[name] = item["multiplier"]
+                    action_aux.gradient_ratios[name] = effective_ratio
+                    action_aux.gradient_cosines[name] = cosine
+                    action_metrics[f"action_{name}_gradient_ratio"] = effective_ratio
+                    action_metrics[f"action_{name}_gradient_cosine"] = cosine
+            action_metrics["action_aux_combined_gradient_ratio"] = combined_ratio
             if not torch.isfinite(loss):
                 self.skipped_nonfinite_updates += 1
                 if self.logger:
@@ -825,13 +1123,43 @@ class AlgorithmVisualPPO(AlgorithmPPO):
             totals["policy_loss"] += float(policy_loss.item())
             totals["value_loss"] += float(value_loss.item())
             totals["entropy_loss"] += float(entropy.item())
+            totals["approx_kl"] += float(
+                ((ratio - 1.0) - log_ratio).mean().detach().item()
+            )
+            totals["clip_fraction"] += float(
+                ((ratio - 1.0).abs() > self.clip_param)
+                .float()
+                .mean()
+                .detach()
+                .item()
+            )
             totals["action_anchor_loss"] += float(action_anchor_loss.item())
             totals["latent_anchor_loss"] += float(latent_anchor_loss.item())
             totals["anchor_action_mse"] += float(anchor_action_mse.item())
+            for name in (
+                "mirror_loss", "mirror_sequence_share", "mirror_gradient_ratio",
+                "mirror_gradient_cosine", "mirror_error_fl", "mirror_error_fr",
+                "mirror_error_rl", "mirror_error_rr",
+            ):
+                if name in mirror_metrics:
+                    totals[name] = totals.get(name, 0.0) + float(mirror_metrics[name])
+            for name, value in memory_metrics.items():
+                totals[name] = totals.get(name, 0.0) + float(value)
+            for name, value in action_metrics.items():
+                totals[name] = totals.get(name, 0.0) + float(value)
             applied_updates += 1
 
         divisor = max(1, applied_updates)
         metrics = {key: value / divisor for key, value in totals.items()}
+        action_aux = getattr(self, "p3_action_smooth_aux", None)
+        if action_aux is not None and self.storage.step:
+            metrics.update(
+                action_aux.diagnostics(
+                    self.storage.mu[: self.storage.step],
+                    self.storage.actions[: self.storage.step],
+                    self.storage.dones[: self.storage.step],
+                )
+            )
         metrics.update(
             {
                 "hard_termination_rate": hard_rate,
@@ -850,6 +1178,23 @@ class AlgorithmVisualPPO(AlgorithmPPO):
                 "anchor_weight_mean": float(
                     self.storage.anchor_weights[: self.storage.step].mean().item()
                     if self.storage.step else 1.0
+                ),
+                "low_update_time_s": time.perf_counter() - update_started,
+                "low_actor_update_active": float(
+                    any(
+                        parameter.requires_grad
+                        for parameter in (
+                            *self.actor_critic.vision_encoder.rnn.parameters(),
+                            *self.actor_critic.vision_encoder.rnn_output_layer.parameters(),
+                            *self.actor_critic.actor.parameters(),
+                        )
+                    )
+                ),
+                "low_critic_update_active": float(
+                    any(
+                        parameter.requires_grad
+                        for parameter in self.actor_critic.critic.parameters()
+                    )
                 ),
             }
         )

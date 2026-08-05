@@ -45,6 +45,17 @@ Kaiwu_Final_Stage/
 | [`shared/`](./shared/) | 官方规则镜像、跨端接口、模型与部署分析、协作文档 | 仅作资料，不参与运行时 import |
 | [`archive/`](./archive/) | 历史训练代码、旧模型资料和原始部署包 | 不得被活动训练或部署代码引用 |
 
+### 平台托管源码本地镜像
+
+Isaac Lab、Unitree RL Lab、Unitree ROS 和开悟平台运行入口的本地查询镜像位于
+`shared/arena_frontend_monitor/runtime/container_source_mirror/`。镜像数据由 Git 忽略，
+不得作为训练或部署运行时依赖，也不提交到仓库；仓库只保存刷新工具和使用规则：
+[`shared/container_source_mirror/README.md`](./shared/container_source_mirror/README.md)。
+
+涉及平台地形、课程、传感器、重置逻辑或运行框架的排查，应先检查镜像
+`mirror_manifest.json` 的生成时间、来源根和 SHA256，再读取相关文件。镜像不能证明当前
+容器动态状态；结论依赖运行时对象、张量 shape 或当前补丁时，仍需通过 RPC 在线复核。
+
 ## 训练工程
 
 训练项目位于 [`server/`](./server/)，主要组成如下：
