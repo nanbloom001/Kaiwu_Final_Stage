@@ -158,6 +158,30 @@ git diff --cached --check
 
 ## 8. 推送前检查
 
+### 固定验证档位
+
+训练端不再使用未记录的手工测试集合。从 `server/` 根目录按风险使用：
+
+```bash
+# 日常修改，同步前
+python3 -B -m agent_ppo.tools.verify_training --profile fast --reuse-valid
+
+# 开发容器中，真实父包已挂载时可加 --nav-smoke
+python3 -B -m agent_ppo.tools.verify_training --profile container
+
+# 长训、推送或合并前
+python3 -B -m agent_ppo.tools.verify_training --profile release --reuse-valid
+```
+
+有效证据必须包含 profile、Git SHA、工作区指纹、实际命令和结果。
+SHA 和指纹未变时可复用成功证据，不重复执行同一测试；任何相关输入变化
+都必须重跑。`--skip-tests` 的结果不能满足推送、正式长训或合并门禁。
+发布档中版本化的历史隔离节点必须在证据中保留精确名称和原因；
+隔离数量或内容变化属于流程合同变更，需要审查。`--include-quarantined` 只用于
+清理历史债务，其失败不得被改写为现役套件通过。
+容器档通过不替代依赖当前平台运行时的 1-env reset、128-env 显存或平台
+smoke；这些必须按当次改动风险单独记录。
+
 每次推送前，AI Agent 必须重新阅读本节。按顺序执行：
 
 ```bash

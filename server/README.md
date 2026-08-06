@@ -146,6 +146,69 @@
 - `.vscode/launch.json` 使用 `${workspaceFolder}/train_test.py`--用 VS Code 打开 `server/` 即自适应，无需改路径。
 - 不引入指向 `../shared/` 或 `../archive/` 的运行时引用。
 
+## 固定训练验证流程
+
+训练端验证统一使用 `agent_ppo.tools.verify_training`，不再为每个实验临时
+拼接一套重复命令。工具不生成 `pyc` 或 pytest cache，并把 Git SHA、工作区
+指纹、选中测试、命令、耗时和结果写入 `.verification/<profile>.json`。该目录
+已忽略，不进入同步或 Git。
+
+### 快速档
+
+每次代码或 TOML 修改后先运行：
+
+```bash
+python3 -B -m agent_ppo.tools.verify_training \
+  --profile fast \
+  --reuse-valid
+```
+
+该档执行 `git diff --check`、变更 Python 内存编译、变更 TOML 解析和按路径
+选择的定向 pytest。未安装 pytest 时会明确失败；`--skip-tests` 只能用于诊断，
+不能当作完整通过证据。使用 `--plan` 可以先查看将运行的文件和测试。
+
+### 容器档
+
+源码同步后，在开发容器 `server/` 根目录运行：
+
+```bash
+python3 -B -m agent_ppo.tools.verify_training \
+  --profile container
+```
+
+需要真实父包 preload、32-tick PPO、Adapter 和 checkpoint lifecycle 时，先确认父包
+已挂载，再运行有界 smoke：
+
+```bash
+python3 -B -m agent_ppo.tools.verify_training \
+  --profile container \
+  --nav-smoke \
+  --num-envs 8 \
+  --smoke-timeout 600
+```
+
+工具会轮询现有 `nav_full_smoke`，只有观测到 `target_reached=true` 才通过，
+且无论成功或失败都会执行有界 stop。它不修改生产 TOML、不上传模型，
+也不替代 128-env 专项和平台 smoke。带 `--nav-smoke` 的证据永不复用，
+因为容器运行时和父包状态可能在源码不变时发生变化。
+
+### 发布档
+
+正式长训、推送或合并前运行：
+
+```bash
+python3 -B -m agent_ppo.tools.verify_training \
+  --profile release \
+  --reuse-valid
+```
+
+该档对 `agent_ppo/`、`conf/`、`isaac_env/` 和 `train_test.py` 执行全量无缓存语法
+检查，解析全部 TOML，并运行 `agent_ppo/tests` 和 `server/tests` 的现役测试。
+已知绑定退役 ST9/J9/LBC 语义的历史节点会以精确名称和原因写入证据，
+不会静默消失；清理这些历史债务时可使用 `--include-quarantined` 重跑全部节点。
+`--reuse-valid` 只在 profile、HEAD 和工作区输入指纹都一致且上次成功时生效；
+任何相关文件变化都会强制重新验证。
+
 同步前可先做完全离线检查：
 
 ```bash

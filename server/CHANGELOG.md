@@ -4,6 +4,14 @@
 
 ## [未发布]
 
+- **[训练验证流程固化]** 新增 `agent_ppo.tools.verify_training`，统一 `fast`、
+  `container` 和 `release` 三档验证。日常档依据 Git 变更选择定向测试，
+  容器档可有界编排真实 `nav_full_smoke`，发布档统一执行全量内存语法检查、
+  TOML 解析与全部测试。所有档位默认禁止 `pyc`/pytest cache，以 profile、Git SHA
+  和工作区内容指纹写入原子 JSON 证据；只有输入未变的成功证据可复用。
+  release 档对绑定已退役 ST9/J9/LBC 合同的历史失效节点使用版本化隔离清单，
+  证据保留精确节点和原因，并可通过 `--include-quarantined` 显式重跑。
+
 - **[P3 Standard 双评估、径向完成与步态专项 2.5 小时课程]** 新任务
   `p3std2h30-gait-radial` 从
   `p3nav8h-r1_884257` warm start。局部目标改为相对真实出生点的 M1 `1.3-1.6m`、M2
