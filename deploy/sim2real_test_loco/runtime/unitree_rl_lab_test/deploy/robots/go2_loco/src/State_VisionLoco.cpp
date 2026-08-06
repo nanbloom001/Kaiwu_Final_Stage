@@ -204,6 +204,11 @@ State_VisionLoco::State_VisionLoco(int state_mode, std::string state_string)
         } catch (...) {}
     }
 
+    if (cfg["stuck_recovery"]) {
+        const auto recovery = cfg["stuck_recovery"];
+        stuck_recovery_enabled_ = yaml_get<bool>(recovery, "enabled", stuck_recovery_enabled_);
+    }
+
     // ---------- articulation（复用官方读取，已按策略序映射）----------
     robot_ = std::make_shared<unitree::BaseArticulation<LowState_t::SharedPtr>>(FSMState::lowstate);
     robot_->data.joint_ids_map.assign(joint_ids_map_.begin(), joint_ids_map_.end()); // vector<float>
@@ -284,6 +289,122 @@ State_VisionLoco::~State_VisionLoco()
     if (policy_thread_.joinable()) policy_thread_.join();
     if (uwb_sub_) uwb_sub_->CloseChannel();
     if (sport_sub_) sport_sub_->CloseChannel();
+}
+
+std::array<float, 3> State_VisionLoco::apply_stuck_recovery(
+    const std::array<float, 3>& requested,
+    const std::chrono::steady_clock::time_point& now,
+    float measured_wz)
+{
+    if (!stuck_recovery_enabled_)
+        return requested;
+    SportSample sport;
+    UwbSample uwb;
+    {
+        std::lock_guard<std::mutex> lk(sensor_mtx_);
+        sport = sport_;
+        uwb = uwb_;
+    }
+    const float tick_s = watchdog_last_tick_.time_since_epoch().count() == 0
+        ? step_dt_
+        : std::clamp(std::chrono::duration<float>(now - watchdog_last_tick_).count(), 0.0f, 0.10f);
+    watchdog_last_tick_ = now;
+    const bool sport_valid = sport.received &&
+        std::chrono::duration<float>(now - sport.received_at).count() <= 0.20f &&
+        std::isfinite(sport.velocity[0]) && std::isfinite(sport.velocity[1]);
+    const bool uwb_valid = uwb.velocity_valid &&
+        std::chrono::duration<float>(now - uwb.velocity_received_at).count() <= uwb_stale_timeout_s_ &&
+        std::isfinite(uwb.body_velocity[0]) && std::isfinite(uwb.body_velocity[1]);
+    const bool feedback_valid = sport_valid || uwb_valid;
+    const float measured_vx = sport_valid ? sport.velocity[0] : (uwb_valid ? uwb.body_velocity[0] : 0.0f);
+    const float measured_vy = sport_valid ? sport.velocity[1] : (uwb_valid ? uwb.body_velocity[1] : 0.0f);
+    const float measured_speed = feedback_valid ? std::hypot(measured_vx, measured_vy) : 0.0f;
+
+    // Keep only the recent executed turn direction; this is the recovery hint,
+    // not a claim about which wall is visible.
+    if (feedback_valid && std::isfinite(measured_wz)) {
+        recent_turn_integral_rad_ += measured_wz * tick_s;
+        recent_turn_window_s_ += tick_s;
+        if (recent_turn_window_s_ > 1.5f) {
+            const float excess = recent_turn_window_s_ - 1.5f;
+            recent_turn_integral_rad_ *= 1.5f / recent_turn_window_s_;
+            recent_turn_window_s_ = 1.5f;
+            (void)excess;
+        }
+    }
+
+    const bool requesting_forward = requested[0] >= 0.15f;
+    if (recovery_phase_ == RecoveryPhase::idle) {
+        if (!requesting_forward || !feedback_valid) {
+            stuck_window_s_ = 0.0f;
+            stuck_path_m_ = 0.0f;
+            stuck_low_speed_s_ = 0.0f;
+            if (!requesting_forward) {
+                recent_turn_integral_rad_ = 0.0f;
+                recent_turn_window_s_ = 0.0f;
+            }
+            return requested;
+        }
+        stuck_window_s_ += tick_s;
+        stuck_path_m_ += measured_speed * tick_s;
+        stuck_low_speed_s_ = measured_speed < 0.10f ? stuck_low_speed_s_ + tick_s : 0.0f;
+        const bool confirmed = stuck_window_s_ >= 5.0f &&
+            (stuck_path_m_ < 0.08f || stuck_low_speed_s_ >= 5.0f);
+        if (!confirmed) return requested;
+
+        recovery_phase_ = RecoveryPhase::braking;
+        recovery_progress_m_ = 0.0f;
+        recovery_effective_s_ = 0.0f;
+        recovery_low_speed_s_ = 0.0f;
+        recovery_total_s_ = 0.0f;
+        recovery_phase_started_ = now;
+        if (std::fabs(recent_turn_integral_rad_) >= 0.20f) {
+            const int turn_sign = recent_turn_integral_rad_ > 0.0f ? 1 : -1;
+            recovery_direction_ = -turn_sign;
+        } else {
+            recovery_direction_ = -last_recovery_direction_;
+        }
+        spdlog::warn("[VisionLoco] stuck recovery armed: path={:.3f}m low_speed={:.2f}s turn={:.3f}rad dir={}",
+                     stuck_path_m_, stuck_low_speed_s_, recent_turn_integral_rad_, recovery_direction_);
+        return {0.0f, 0.0f, 0.0f};
+    }
+
+    recovery_total_s_ += tick_s;
+    if (!feedback_valid || recovery_total_s_ > 1.5f) {
+        recovery_phase_ = RecoveryPhase::idle;
+        stuck_window_s_ = stuck_path_m_ = stuck_low_speed_s_ = 0.0f;
+        return {0.0f, 0.0f, 0.0f};
+    }
+    if (recovery_phase_ == RecoveryPhase::braking) {
+        recovery_low_speed_s_ = measured_speed < 0.05f ? recovery_low_speed_s_ + tick_s : 0.0f;
+        if (recovery_low_speed_s_ >= 0.30f ||
+            std::chrono::duration<float>(now - recovery_phase_started_).count() >= 0.80f) {
+            recovery_phase_ = RecoveryPhase::lateral;
+            recovery_phase_started_ = now;
+            recovery_progress_m_ = 0.0f;
+            recovery_effective_s_ = 0.0f;
+        }
+        return {0.0f, 0.0f, 0.0f};
+    }
+    if (recovery_phase_ == RecoveryPhase::lateral) {
+        if (std::fabs(measured_vy) >= 0.10f) {
+            recovery_effective_s_ += tick_s;
+            recovery_progress_m_ += recovery_direction_ * measured_vy * tick_s;
+        }
+        if (recovery_progress_m_ >= 0.10f || recovery_effective_s_ >= 0.80f) {
+            recovery_phase_ = RecoveryPhase::settling;
+            recovery_phase_started_ = now;
+        }
+        return {0.0f, recovery_direction_ * 0.30f, 0.0f};
+    }
+    if (std::chrono::duration<float>(now - recovery_phase_started_).count() >= 0.20f) {
+        spdlog::warn("[VisionLoco] stuck recovery finished: progress={:.3f}m active={:.2f}s",
+                     recovery_progress_m_, recovery_effective_s_);
+        last_recovery_direction_ = recovery_direction_;
+        recovery_phase_ = RecoveryPhase::idle;
+        stuck_window_s_ = stuck_path_m_ = stuck_low_speed_s_ = 0.0f;
+    }
+    return {0.0f, 0.0f, 0.0f};
 }
 
 void State_VisionLoco::on_uwb(const void* message)
@@ -567,6 +688,11 @@ void State_VisionLoco::enter()
     last_uwb_freshness_scale_ = 0.0f;
     last_uwb_hold_ = false;
     uwb_arrived_ = false;
+    recovery_phase_ = RecoveryPhase::idle;
+    recovery_progress_m_ = recovery_effective_s_ = recovery_low_speed_s_ = 0.0f;
+    recovery_total_s_ = stuck_window_s_ = stuck_path_m_ = stuck_low_speed_s_ = 0.0f;
+    recent_turn_integral_rad_ = recent_turn_window_s_ = 0.0f;
+    watchdog_last_tick_ = {};
     {
         std::lock_guard<std::mutex> lk(sensor_mtx_);
         uwb_filter_queue_.clear();
@@ -634,6 +760,7 @@ void State_VisionLoco::enter()
                      "feedback_source,feedback_valid,feedback_age_s,"
                      "feedback_vx,feedback_vy,feedback_vz,feedback_wz,"
                      "feedback_err_vx,feedback_err_vy,feedback_err_wz,"
+                     "recovery_phase,recovery_direction,recovery_progress_m,recovery_effective_s,recovery_total_s,"
                      "clr_L,clr_F,clr_R,"
                      "dep_inval,dep_meanv,front_inval,front_min,front_mean,"
                      "avx,avy,avz,pgx,pgy,pgz";
@@ -674,6 +801,9 @@ void State_VisionLoco::policy_loop()
         auto exec_cmd = command_for_frame(
             loop_start, goal, theory_cmd, uwb_valid, uwb_age_s, closing_speed,
             uwb_error, uwb_enabled, uwb_channel);
+        const auto& imu_w = robot_->data.root_ang_vel_b;
+        exec_cmd = apply_stuck_recovery(exec_cmd, loop_start, imu_w[2]);
+        last_exec_cmd_ = exec_cmd;
         // loco 阶段速度命令始终由外部（fixed/uwb/零）注入 proprio[6:9]。
         const bool learned_nav_active = command_source_ == "nav";
         runner_->set_cmd_override(
@@ -824,6 +954,11 @@ void State_VisionLoco::policy_loop()
                   << ',' << (feedback_valid ? feedback_vx - exec_cmd[0] : 0.0f)
                   << ',' << (feedback_valid ? feedback_vy - exec_cmd[1] : 0.0f)
                   << ',' << (feedback_valid ? feedback_wz - exec_cmd[2] : 0.0f);
+            diag_ << ',' << static_cast<int>(recovery_phase_)
+                  << ',' << recovery_direction_
+                  << ',' << recovery_progress_m_
+                  << ',' << recovery_effective_s_
+                  << ',' << recovery_total_s_;
             write_values(diag_, out.clearance);
             diag_ << ',' << ds.invalid_frac << ',' << ds.mean_valid
                   << ',' << ds.front_invalid << ',' << ds.front_min << ',' << ds.front_mean
