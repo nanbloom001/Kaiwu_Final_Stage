@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import sys
 import time
 from typing import Any
@@ -19,6 +20,9 @@ class MotionWallStuckTracker:
     LEGACY_SPATIAL_DIAMETER_M = 0.50
     RECOVERY_WALL_ABSENCE_S = 0.50
     RECOVERY_CENTER_DISPLACEMENT_M = 0.50
+    ROTATIONAL_RECOVERY_YAW_RAD = math.radians(20.0)
+    WALL_CONTACT_EMA_TAU_S = 0.20
+    ROTATIONAL_RECOVERY_WALL_EMA_RATIO = 0.70
 
     def __init__(
         self,
@@ -32,7 +36,19 @@ class MotionWallStuckTracker:
         self.env = env
         self.num_envs = int(num_envs)
         self.device = torch.device(device)
-        merged = p4_contract.normalize_stuck_reset_contract(config)
+        supplied = dict(config or {})
+        spatial_diameter_m = supplied.pop("spatial_diameter_m", None)
+        if spatial_diameter_m is not None and "radius_m" in supplied:
+            if not math.isclose(
+                float(spatial_diameter_m),
+                float(supplied["radius_m"]),
+                rel_tol=0.0,
+                abs_tol=1.0e-9,
+            ):
+                raise ValueError(
+                    "P4 stuck reset spatial_diameter_m conflicts with legacy radius_m"
+                )
+        merged = p4_contract.normalize_stuck_reset_contract(supplied)
         self.enabled = bool(merged["enabled"])
         self.requested_mode = str(merged.get("mode", "shadow"))
         self.schedule_enabled = bool(merged["schedule_enabled"])
@@ -49,15 +65,20 @@ class MotionWallStuckTracker:
         initial_elapsed = self.resume_offset_s
         self.mode = self._scheduled_mode(initial_elapsed)
         self.confirmation_s = self._scheduled_confirmation_s(initial_elapsed)
-        # Legacy profiles shipped with a fixed 0.50 m spatial diameter even
-        # though radius_m was present in checkpoint metadata. Preserve that
-        # behavior unless the new schedule contract is explicitly enabled.
+        # ``spatial_diameter_m`` is the unambiguous runtime quantity.  Older
+        # checkpoint/config payloads use ``radius_m`` as its numeric alias.
+        # Keep the latter readable, but never reinterpret it as a radius.
         self.radius_m = float(merged["radius_m"])
-        self.spatial_diameter_m = (
-            self.radius_m
-            if self.schedule_enabled
-            else self.LEGACY_SPATIAL_DIAMETER_M
+        self.spatial_diameter_m = float(
+            self.radius_m if spatial_diameter_m is None else spatial_diameter_m
         )
+        if (
+            not math.isfinite(self.spatial_diameter_m)
+            or self.spatial_diameter_m < 0.0
+        ):
+            raise ValueError(
+                "P4 stuck reset spatial_diameter_m must be finite and non-negative"
+            )
         self.min_goal_distance_m = float(merged["min_goal_distance_m"])
         self.body_collision_force_n = float(merged["body_collision_force_n"])
         self.wall_evidence_latch_s = float(merged["wall_evidence_latch_s"])
@@ -113,6 +134,14 @@ class MotionWallStuckTracker:
         self.wall_absence_steps = torch.zeros_like(self.candidate_steps)
         self.wall_sequence_steps = torch.zeros_like(self.candidate_steps)
         self.episode_age_steps = torch.zeros_like(self.candidate_steps)
+        self.wall_contact_ema = torch.zeros(self.num_envs, device=self.device)
+        self.candidate_wall_contact_ema = torch.zeros(
+            self.num_envs, device=self.device
+        )
+        self.candidate_yaw = torch.zeros(self.num_envs, device=self.device)
+        self.foot_jam_shadow = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self.triggered = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
@@ -160,6 +189,10 @@ class MotionWallStuckTracker:
         self.wall_evidence_age_steps.fill_(self.wall_latch_steps + 1)
         self.wall_absence_steps.zero_()
         self.wall_sequence_steps.zero_()
+        self.wall_contact_ema.zero_()
+        self.candidate_wall_contact_ema.zero_()
+        self.candidate_yaw.zero_()
+        self.foot_jam_shadow.zero_()
         self.triggered.zero_()
         self.shadow_event_reported.zero_()
         self._write_counter(torch.zeros_like(self.candidate_steps))
@@ -235,6 +268,10 @@ class MotionWallStuckTracker:
         setattr(self.env, "_nav_motion_stuck", value.to(self.device).float())
 
     def termination_mask(self, reset: torch.Tensor) -> torch.Tensor:
+        """Return only the platform-owned stuck timeout, never a local proxy."""
+        reset = reset.to(self.device).reshape(-1).bool()
+        if reset.numel() != self.num_envs:
+            return torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         manager = getattr(self.env, "termination_manager", None)
         getter = getattr(manager, "get_term", None)
         if callable(getter) and self.term_available:
@@ -244,7 +281,10 @@ class MotionWallStuckTracker:
                     return value.to(self.device).reshape(-1).bool() & reset
             except Exception:
                 pass
-        return reset & self.triggered
+        # ``triggered`` only records that the worker supplied a counter to a
+        # validated term.  It is not evidence that the manager actually reset
+        # this row, and must never manufacture reason 4 after a failed read.
+        return torch.zeros_like(reset)
 
     def _update_position_window(
         self, root_xy: torch.Tensor, valid: torch.Tensor, reset: torch.Tensor
@@ -300,6 +340,8 @@ class MotionWallStuckTracker:
         episode_age_s: torch.Tensor,
         true_velocity3: torch.Tensor,
         motion_intent: torch.Tensor | None = None,
+        yaw: torch.Tensor | None = None,
+        foot_jam: torch.Tensor | None = None,
     ) -> torch.Tensor:
         self._refresh_schedule()
         # Manager assembly can lag observation construction. Retry a bounded
@@ -341,10 +383,33 @@ class MotionWallStuckTracker:
             velocity_valid = torch.zeros_like(root_valid_mask)
             true_motion_low = torch.zeros_like(root_valid_mask)
 
+        if torch.is_tensor(yaw) and yaw.numel() == self.num_envs:
+            raw_yaw = yaw.to(self.device).reshape(-1)
+            yaw_valid = torch.isfinite(raw_yaw)
+            current_yaw = torch.nan_to_num(raw_yaw)
+        else:
+            yaw_valid = torch.zeros_like(root_valid_mask)
+            current_yaw = torch.zeros(self.num_envs, device=self.device)
+
         mapping = mapping_valid.to(self.device).bool().reshape(-1)
+        raw_collision = collision_force.to(self.device).reshape(-1)
+        collision_valid = raw_collision.numel() == self.num_envs
+        if collision_valid:
+            collision_valid = torch.isfinite(raw_collision)
+            safe_collision = torch.nan_to_num(raw_collision)
+        else:
+            collision_valid = torch.zeros_like(root_valid_mask)
+            safe_collision = torch.zeros(self.num_envs, device=self.device)
         wall_now = (
-            collision_force.to(self.device).reshape(-1) >= self.body_collision_force_n
-        ) & mapping
+            (safe_collision >= self.body_collision_force_n) & mapping & collision_valid
+        )
+        ema_alpha = min(1.0, self.dt_s / self.WALL_CONTACT_EMA_TAU_S)
+        self.wall_contact_ema = torch.where(
+            mapping & collision_valid,
+            self.wall_contact_ema
+            + ema_alpha * (safe_collision - self.wall_contact_ema),
+            self.wall_contact_ema,
+        )
         self.wall_evidence_age_steps = torch.where(
             wall_now,
             torch.zeros_like(self.wall_evidence_age_steps),
@@ -381,7 +446,23 @@ class MotionWallStuckTracker:
         self.candidate_center = torch.where(
             candidate_entry.unsqueeze(-1), self.window_center, self.candidate_center
         )
+        self.candidate_yaw = torch.where(
+            candidate_entry & yaw_valid, current_yaw, self.candidate_yaw
+        )
+        self.candidate_wall_contact_ema = torch.where(
+            candidate_entry,
+            self.wall_contact_ema,
+            self.candidate_wall_contact_ema,
+        )
         self.candidate_active |= candidate_entry
+        self.candidate_wall_contact_ema = torch.where(
+            self.candidate_active & wall_now,
+            torch.maximum(
+                self.candidate_wall_contact_ema,
+                self.wall_contact_ema,
+            ),
+            self.candidate_wall_contact_ema,
+        )
         self.candidate_steps = torch.where(
             self.candidate_active,
             self.candidate_steps + 1,
@@ -390,12 +471,29 @@ class MotionWallStuckTracker:
         center_displacement = torch.linalg.vector_norm(
             self.window_center - self.candidate_center, dim=-1
         )
-        recovered = (
+        translational_recovered = (
             self.candidate_active
             & structural_eligible
             & (self.wall_absence_steps >= self.recovery_wall_absence_steps)
             & (center_displacement >= self.RECOVERY_CENTER_DISPLACEMENT_M)
         )
+        yaw_delta = torch.atan2(
+            torch.sin(current_yaw - self.candidate_yaw),
+            torch.cos(current_yaw - self.candidate_yaw),
+        ).abs()
+        rotational_recovered = (
+            self.candidate_active
+            & structural_eligible
+            & yaw_valid
+            & (yaw_delta >= self.ROTATIONAL_RECOVERY_YAW_RAD)
+            & (self.candidate_wall_contact_ema > 0.0)
+            & (
+                self.wall_contact_ema
+                <= self.candidate_wall_contact_ema
+                * self.ROTATIONAL_RECOVERY_WALL_EMA_RATIO
+            )
+        )
+        recovered = translational_recovered | rotational_recovered
         # Invalid/missing evidence may suspend confirmation, but it must never
         # manufacture a recovery edge for the learner-side monitor.
         self.candidate_active &= ~recovered & ~reset
@@ -436,6 +534,15 @@ class MotionWallStuckTracker:
             torch.zeros_like(self.wall_sequence_steps),
         )
         wall_reset = reset & (reason == 4)
+
+        # Foot-jam is an optional teacher/shadow signal.  It is deliberately
+        # excluded from ``wall_now``, active counters, and reason 4.
+        self.foot_jam_shadow = (
+            foot_jam.to(self.device).reshape(-1).bool()
+            if torch.is_tensor(foot_jam) and foot_jam.numel() == self.num_envs
+            else torch.zeros_like(reset)
+        )
+        setattr(self.env, "_p4_foot_jam_shadow", self.foot_jam_shadow.clone())
 
         diagnostics = torch.zeros_like(self.last_diagnostics)
         diagnostics[:, 0] = spatially_confined.float()
@@ -480,6 +587,10 @@ class MotionWallStuckTracker:
             self.wall_absence_steps[reset] = 0
             self.wall_sequence_steps[reset] = 0
             self.episode_age_steps[reset] = 0
+            self.wall_contact_ema[reset] = 0.0
+            self.candidate_wall_contact_ema[reset] = 0.0
+            self.candidate_yaw[reset] = 0.0
+            self.foot_jam_shadow[reset] = False
             self.triggered[reset] = False
             self.shadow_event_reported[reset] = False
             counter = getattr(self.env, "_nav_motion_stuck", None)

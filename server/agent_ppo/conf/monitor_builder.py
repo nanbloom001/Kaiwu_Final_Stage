@@ -1526,12 +1526,21 @@ def _build_p4_monitor(training_profile=None):
     profile = str(
         training_profile or _configured_p4_training_profile()
     ).strip().lower()
-    if profile not in {"maze_credit_repair", "maze_closed_loop_v3", "full_track"}:
+    if profile not in {
+        "maze_credit_repair",
+        "maze_closed_loop_v3",
+        "maze_instant_command_r4",
+        "full_track",
+    }:
         raise ValueError(f"unsupported P4 monitor training profile {profile!r}")
     monitor = MonitorConfigBuilder()
     monitor.title(
         "P4迷宫闭环强化训练"
-        if profile in {"maze_credit_repair", "maze_closed_loop_v3"}
+        if profile in {
+            "maze_credit_repair",
+            "maze_closed_loop_v3",
+            "maze_instant_command_r4",
+        }
         else "P4五段全赛道训练"
     )
     _add_p4_track_outcome_panels(monitor)
@@ -1541,6 +1550,59 @@ def _build_p4_monitor(training_profile=None):
         monitor.add_group(group_name=group_name, group_name_en=group_name_en)
         for name, name_en, metrics in panels:
             _add_multi_line_panel(monitor, name, name_en, metrics)
+        monitor.end_group()
+    if profile == "maze_instant_command_r4":
+        monitor.add_group(
+            group_name="P4瞬时命令合同",
+            group_name_en="p4_instant_command_contract",
+        )
+        _add_multi_line_panel(
+            monitor,
+            "10Hz目标与执行一致性",
+            "p4_instant_command_exactness",
+            (
+                "instant_command_active",
+                "command_hold_frames",
+                "policy_limited_command_mae",
+                "policy_exec_command_mae",
+                "policy_target_delta_vx",
+                "policy_target_delta_vy",
+                "policy_target_delta_wz",
+                "policy_target_reversal_vx",
+                "policy_target_reversal_vy",
+                "policy_target_reversal_wz",
+            ),
+        )
+        _add_multi_line_panel(
+            monitor,
+            "R4训练阶段",
+            "p4_instant_training_phase",
+            (
+                "instant_phase_warm",
+                "instant_phase_adapt",
+                "instant_phase_correct",
+                "instant_phase_stable",
+                "instant_phase_frozen",
+                "session_effective_seconds",
+                "actor_learning_rate",
+                "critic_learning_rate",
+                "adapter_learning_rate",
+                "adapter_frozen",
+            ),
+        )
+        _add_multi_line_panel(
+            monitor,
+            "父策略锚定",
+            "p4_parent_policy_anchor",
+            (
+                "parent_anchor_loss",
+                "parent_anchor_valid_steps",
+                "parent_anchor_gradient_ratio",
+                "teacher_guidance_loss",
+                "teacher_guidance_gradient_ratio",
+                "teacher_guidance_valid_steps",
+            ),
+        )
         monitor.end_group()
     groups = (
         (

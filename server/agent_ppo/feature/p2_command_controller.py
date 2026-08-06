@@ -44,6 +44,10 @@ def slew_step(
 
 
 class P2CommandController:
+    _SLEW_MODE = "slew"
+    _INSTANT_HOLD_10HZ_MODE = "instant_hold_10hz"
+    _INSTANT_HOLD_10HZ_FRAMES = 5
+
     def __init__(
         self,
         num_envs: int,
@@ -51,9 +55,20 @@ class P2CommandController:
         *,
         slew_rate=(0.30, 0.30, 1.00),
         slew_release_rate=(0.30, 0.60, 2.50),
+        command_transition_mode: str = _SLEW_MODE,
     ):
+        if command_transition_mode not in {
+            self._SLEW_MODE,
+            self._INSTANT_HOLD_10HZ_MODE,
+        }:
+            raise ValueError(
+                "Unsupported P2 command transition mode: "
+                f"{command_transition_mode!r}"
+            )
         self.num_envs = int(num_envs)
         self.device = torch.device(device)
+        self.command_transition_mode = command_transition_mode
+        self.hold_frames = self._INSTANT_HOLD_10HZ_FRAMES
         self.slew_rate = torch.tensor(slew_rate, device=self.device).reshape(1, 3)
         self.slew_release_rate = torch.tensor(
             slew_release_rate, device=self.device
@@ -66,6 +81,8 @@ class P2CommandController:
         if target_cmd3.shape != self.active_target.shape:
             raise ValueError(f"P2 target shape drift: {tuple(target_cmd3.shape)}")
         self.active_target.copy_(target_cmd3.to(self.device))
+        if self.command_transition_mode == self._INSTANT_HOLD_10HZ_MODE:
+            self.exec_cmd.copy_(self.active_target)
         self.command_epoch += 1
 
     def inject(self, policy_obs: torch.Tensor, critic_obs: torch.Tensor) -> None:
@@ -75,6 +92,8 @@ class P2CommandController:
         critic_obs[:, c0:c1] = self.exec_cmd.to(critic_obs)
 
     def step(self) -> None:
+        if self.command_transition_mode == self._INSTANT_HOLD_10HZ_MODE:
+            return
         self.exec_cmd.copy_(
             slew_step(
                 self.exec_cmd,
@@ -91,9 +110,16 @@ class P2CommandController:
         self.exec_cmd[env_ids] = 0.0
 
     def state_dict(self) -> dict[str, object]:
-        return {
+        state = {
             "command_epoch": int(self.command_epoch),
-            "slew_rate": self.slew_rate.detach().cpu().flatten().tolist(),
-            "slew_release_rate": self.slew_release_rate.detach().cpu().flatten().tolist(),
+            "command_transition_mode": self.command_transition_mode,
             "live_state_persisted": False,
         }
+        if self.command_transition_mode == self._INSTANT_HOLD_10HZ_MODE:
+            state["hold_frames"] = int(self.hold_frames)
+        else:
+            state["slew_rate"] = self.slew_rate.detach().cpu().flatten().tolist()
+            state["slew_release_rate"] = (
+                self.slew_release_rate.detach().cpu().flatten().tolist()
+            )
+        return state

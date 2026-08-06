@@ -1254,6 +1254,7 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
         duration = torch.zeros(agent.num_envs, dtype=torch.long, device=agent.device)
         hard = torch.zeros(agent.num_envs, dtype=torch.bool, device=agent.device)
         timeout = torch.zeros_like(hard)
+        unattributed_boundary = torch.zeros_like(hard)
         reason = torch.zeros(agent.num_envs, dtype=torch.long, device=agent.device)
         active = torch.ones_like(hard)
         frame_reward = torch.zeros(agent.num_envs, device=agent.device)
@@ -1318,6 +1319,7 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
             reason[new_done] = resolved[new_done]
             hard |= new_hard
             timeout |= new_timeout
+            unattributed_boundary |= new_done & (resolved == 0)
             event = next_aux[:, p2_contract.CURRENT_SEGMENT_INDEX].round().long()
             reached = active & (event == p3_contract.SUBGOAL_EVENT_REACHED)
             expired = active & (event == p3_contract.SUBGOAL_EVENT_TIMEOUT)
@@ -1337,7 +1339,7 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
         _, live_aux = split_p2_transport(critic_wire)
         live_goal = live_aux[:, p2_contract.PRE_STEP_GOAL_DISTANCE_INDEX]
         end_goal = torch.where(torch.isfinite(event_goal), event_goal, live_goal)
-        transition_done = hard | timeout
+        transition_done = hard | timeout | unattributed_boundary
         diagnostic_pose = torch.where(
             transition_done.unsqueeze(-1), terminal_aux[:, 15:17], live_aux[:, 15:17]
         )
@@ -1378,6 +1380,7 @@ def _collect_high_rollout(env, agent, obs, critic_wire):
             duration_frames=duration,
             hard_terminated=hard,
             timeout=timeout,
+            unattributed_boundary=unattributed_boundary,
             terminal_safe_aux=diagnostic_aux,
             terminal_safe_exec_cmd=exec_cmd,
             frontier_settle_mask=local_timeout,

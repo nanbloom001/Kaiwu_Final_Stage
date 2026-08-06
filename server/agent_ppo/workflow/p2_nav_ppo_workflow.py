@@ -411,11 +411,13 @@ def _frame_done_masks(terminated, truncated, infos, device, *, worker_aux=None):
         reason = worker_aux[:, 25].round().long()
         worker_timeout = (reason == 3) | (reason == 4)
         worker_hard = (reason == 1) | (reason == 2)
-        # Any reset not explained by a hard terminal is a timeout. This
-        # recovers the platform wrapper's known truncated/time_outs erasure.
-        timeout |= worker_timeout | (reset & ~worker_hard & ~terminated)
-        terminated |= worker_hard
-    done = terminated | truncated | timeout
+        # The worker snapshot is authoritative for rows that actually reset.
+        # A reason-0 reset is an unattributed episode boundary, not a timeout.
+        timeout = torch.where(reset, worker_timeout, timeout)
+        terminated = torch.where(reset, worker_hard, terminated)
+    else:
+        reset = torch.zeros_like(terminated)
+    done = terminated | truncated | timeout | reset
     return done, timeout
 
 
@@ -428,7 +430,7 @@ def _resolve_terminal_outcome(
     fallback_reason = torch.where(
         frame_timeout,
         torch.full_like(raw_reason, 3),
-        torch.full_like(raw_reason, 2),
+        torch.zeros_like(raw_reason),
     )
     valid_reason = (raw_reason >= 1) & (raw_reason <= 4)
     reason = torch.where(valid_reason, raw_reason, fallback_reason)
@@ -1079,6 +1081,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                 path_length_m = torch.zeros(agent.num_envs, device=agent.device)
                 hard = torch.zeros(agent.num_envs, dtype=torch.bool, device=agent.device)
                 timeout = torch.zeros_like(hard)
+                unattributed_boundary = torch.zeros_like(hard)
                 terminal_reason = torch.zeros(
                     agent.num_envs, dtype=torch.long, device=agent.device
                 )
@@ -1161,6 +1164,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         ]
                     hard |= new_hard
                     timeout |= new_timeout
+                    unattributed_boundary |= new_done & (reason == 0)
                     active &= ~frame_done
                     algorithm.frame_end(aux, frame_done)
                     obs, critic_wire = next_obs, next_critic
@@ -1182,7 +1186,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     critic_wire[:, nav_contract.CRITIC_GOAL3_START + 2]
                     * nav_contract.GOAL_DIST_SCALE_M
                 )
-                transition_done = hard | timeout
+                transition_done = hard | timeout | unattributed_boundary
                 end_goal = torch.where(
                     transition_done & torch.isfinite(terminal_goal),
                     terminal_goal,
@@ -1344,6 +1348,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     duration_frames=duration,
                     hard_terminated=hard,
                     timeout=timeout,
+                    unattributed_boundary=unattributed_boundary,
                     terminal_safe_aux=diagnostic_aux,
                     terminal_safe_exec_cmd=executed,
                     path_length_m=path_length_m,

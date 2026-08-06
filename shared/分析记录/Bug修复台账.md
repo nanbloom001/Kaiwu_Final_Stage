@@ -2,7 +2,7 @@
 
 > 维护规则：本文件是仓库级 Bug 根因与修复知识库，长期追加，不按训练阶段另起一份。
 > `server/CHANGELOG.md` 记录“改了什么”，本文件记录“为什么坏、如何证明修好、如何防复发”。
-> 最近更新：2026-07-27。
+> 最近更新：2026-08-07。
 
 ## 1. 使用方法
 
@@ -50,6 +50,81 @@
 ```
 
 ## 2. 历史恢复条目
+
+## BUG-20260807-001：P4 高层 slew 隐式延迟、恢复后合同回退与卡滞伪恢复
+
+- 状态：本地已验证；开发容器尚未同步最新补丁，平台 smoke、八小时训练和固定条件评估未执行。
+- 影响：P4 Maze 高层命令执行、PPO 数据闭环、checkpoint exact resume、卡滞 reason4 归因和监控；
+  不修改平台覆盖的 `server/isaac_env/base_env.py`，不改变 Actor85、Critic 输入、三轴动作范围、
+  worker/eval wire 或当前稳定低层部署接口。
+- 首次发现：2026-08-07，对 `p4maze8h-closed-r3` 与后续计划复盘时确认上一轮约 3h50 已开始
+  同步劣化；用户要求取消候选 slew 和父 slew fallback，固定完全取消 slew。
+- 症状：高层已请求转向或反向时，旧 50Hz slew、零交叉和 post-Actor limiter 会使真实 exec 建立
+  延迟；Actor observation/log-prob 对应 policy target，但物理命令可能处于另一条轨迹。初版 R4 虽
+  创建 instant controller，`reset_live_state()` 在 checkpoint load/resume 后又用默认参数重建为旧
+  slew。卡滞 tracker 还曾以瞬时 40N 峰值作为候选墙接触 EMA 基准，持续相同接触时仅转过 20 度
+  就可能满足“EMA 已下降 30%”并误报恢复。
+- 根因：命令 transition mode 没有成为 controller 重建和 exact-resume 的完整状态合同；历史控制器
+  默认值是 slew。卡滞旋转恢复的参考量混用了瞬时接触峰值与低通 EMA，量纲虽相同但动态尺度不同。
+  未分类 wrapper reset 的旧兼容路径还会直接补成 timeout，污染终止统计。初版 instant controller
+  又在低层动作已计算后才切换 target，使高层 tick 的首个 50Hz 帧继续执行旧命令。评估只校验
+  mapper、Adapter replay 只校验旧 response 字段，也分别允许 R4 包落入旧 slew runtime、旧 slew
+  records 混入 instant-command 适配。
+- 排除项：不使用候选 slew A/B、父 slew fallback、无限大 slew 近似、两次反向确认或运行时硬
+  recovery override；模型 ID/标签不作为单点门禁；不把 foot-jam shadow 直接升级为物理 reset。
+- 修复：
+  - 新增 `instant_hold_10hz`：每个 10Hz policy target 经有限值和硬范围处理后立即复制到 exec，
+    随后 5 个低层帧保持；关闭 slew、零交叉、反向确认、runtime limiter、near-goal rewrite 和
+    recovery override。`reset_live_state()` 显式继承 `command_transition_mode`。
+  - R4 command/checkpoint 合同只记录 instant mode 与 hold frames，不记录候选/回退 slew；旧 slew
+    合同只能 warm start。exact resume 保存不可变父 Actor anchor/source SHA/digest；Track eval 必须
+    与当前 R4 runtime 的完整 command contract 相等。
+  - tick 边界先设置新 instant target，再以同一 exec patch 低层 proprio、critic 和 worker aux 后计算
+    低层动作，保证首帧与后续四帧均执行本 tick 命令。
+  - Adapter record 合同加入 command digest、`instant_hold_10hz` 和 hold frames；R4 明确拒绝缺少
+    instant provenance 的旧 completed records，不把父 slew 动力学当作新执行响应训练。
+  - R4 Actor capability 固定使用真实硬 mapper 上限，不再复用旧 Goal/safety speed cap；历史变化率
+    槽以 10Hz 单周期完整轴范围 `[10,6,18]` 表达即时可达，避免全零被父 Actor85 误解为命令不可变。
+    该向量只进入 observation，不被 controller 消费。freshness 和 risk 仍是独立输入，避免
+    “Actor 认为会限速，实际 exec 却不限速”的新隐式偏置。
+  - 根据 3h50 退化证据，3h 开始降低 Actor LR，3.5h 固定冻结 Actor、Teacher、Anchor 和 Adapter，
+    后续仅校准 Critic。failure/timeout/reason4 精确回收 episode new-best credit。
+  - reason4 只接受平台 termination manager 的实际 `nav_stuck_timeout` readback；unknown reset 改为
+    无奖励、无 bootstrap、无跨 episode GAE 的无效 terminal row，并由 `valid_mask=0` 从 Actor/Critic
+    loss、advantage/return normalization、return statistics 和全部辅助项中排除，避免零奖励仍生成
+    `-old_value` 伪梯度。旋转恢复以持续接触期 EMA 峰值为基准，yaw>=20 度且 EMA 至少下降 30%才
+    清除；foot-jam 仅作 shadow。
+- 验证：新增 controller 立即反向/五帧保持、完整 `frame_begin` 首帧命令一致、R4 runtime
+  target=limited=exec、capability 与真实硬 mapper/有限即时变化率一致、terminal exact clawback、
+  reason0 全训练路径排除、Adapter legacy record 拒绝、
+  R4 eval runtime mismatch 拒绝、parent-anchor exact resume、term read failure fail-closed 和旋转恢复
+  回归。最终审查修复 capability 编码与 unknown-reset 全训练路径排除后，本地测试：P2/P3/P4/Nav
+  现役套件 `597 passed, 5 skipped, 3 subtests passed`；R4 command/runtime/contract 与 P2 核心重点
+  回归 `125 passed`。最后一项回归明确验证 P4 自定义 Actor surrogate、entropy、KL、clip fraction、
+  SafetyHead 与 hard-positive 指标均只使用 `valid_mask=1` 的样本，reason=0 行不会经 P4 override
+  重新进入 PPO 梯度或指标；camera auxiliary、teacher、anchor 和 StuckHead 也使用同一有效行掩码，
+  camera fault/teacher edge/recovery 激活率的分母不再包含 reason=0 行。新增真实 SafetyHead 与
+  teacher 辅助路径的混合有效/无效 transition 回归，定向套件 `30 passed`。所有变更 Python文件
+  编译、活动 P4 TOML 解析和
+  `git diff --check` 均通过。该父分支尚未包含后来加入的统一 `verify_training` 模块，因此没有伪造
+  fast/release profile 证据。开发容器此前同步的是较早补丁，不能作为当前工作区证据；平台和评估
+  均未执行。
+- 2026-08-07 容器同步补充：开发容器的用户自有 `conf/.env` 曾被误加入一行
+  `sh .../conf/start_tongbu.sh`，而启动脚本会 source 该文件，导致递归拉起 shell 并触发 IDE 资源
+  回收。已只删除该非凭证命令行，未清理或输出任何凭证；同步 RPC `/health` 随后恢复 200。
+  这仅证明容器环境恢复，不等于当前 R4 代码已同步或 Isaac smoke 已通过，后两项仍待执行。
+- 防复发：监控必须同时上报 transition mode、hold frames、policy-limited/exec MAE、三轴正负 delta/
+  reversal、phase、Actor/Adapter freeze、parent anchor loss、unknown reset、reason4 和墙接触 EMA 恢复。
+  exact-resume 测试必须实际 load 后再次检查 controller mode，并逐值验证冻结期 Actor/Adapter 参数
+  与 Adam state 不变；不能只比合同字典。评估必须校验完整 command contract，Adapter record 必须
+  携带命令 transition provenance。
+- 血缘：分支 `codex/p4-maze8h-instant-command-r4`，父代码 `33e5d52`，父 checkpoint
+  `p4maze8h10hz_1416926-mazefinal`；本地未在本条中重新取得父 checkpoint SHA256。commit/PR、
+  容器任务与新 checkpoint 待生成。
+- 回滚：停止 R4 任务并回到父 checkpoint；代码层回滚本条 command/controller/contract/schedule/
+  anchor/stuck 修改即可恢复 `maze_closed_loop_v3`。不得只改 TOML 为 slew 后继续加载 R4 exact 包。
+- 再遇检查：checkpoint command digest -> reset 后 controller mode -> policy/limited/exec MAE ->
+  command reversal 时序 -> termination term readback -> wall EMA/yaw recovery -> 3h-4h Actor step。
 
 ## BUG-20260806-002：P4 转弯后侧后方受困时持续前顶
 
@@ -4382,7 +4457,7 @@
 - r3 使用独立合同和标签 `p4_maze_closed_loop_v3`、`loopwarm/loopadapt/looptrain/loopstable`，
   不覆盖历史 credit/full-track 版本。新增 warm-start optimizer reset、r3 exact-resume、wall-clock
   offset、动态 reset phase、单一 privileged reward allowlist 和 limiter shadow 回归。
-- 当前状态仍为本地验证层：定向回归已达到 `124 passed`；开发容器 1-env/8-env、平台 smoke 和固定
+- 当前状态仍为本地验证层：历史 r3 定向回归达到 `124 passed`；开发容器 1-env/8-env、平台 smoke 和固定
   条件父包对比尚未执行。不得据此声称碰撞、超时或完成率已经改善。
 
 ### 2026-08-06 r3 最终审查补充：安全绕行 yaw 与旧 StuckHead 梯度边界

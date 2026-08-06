@@ -1158,6 +1158,53 @@ def test_finish_tick_attributes_tracking_penalty_to_end_feedback():
     )
 
 
+def test_finish_tick_zeroes_unattributed_reset_reward_and_terminates_gae():
+    algorithm = AlgorithmP2NavPPO.__new__(AlgorithmP2NavPPO)
+    algorithm.device = torch.device("cpu")
+    algorithm.num_envs = 1
+    algorithm.nav_period_frames = p2_contract.NAV_PERIOD_FRAMES
+    algorithm.command = SimpleNamespace(
+        active_target=torch.tensor([[1.0, 0.0, 0.0]]),
+        exec_cmd=torch.tensor([[1.0, 0.0, 0.0]]),
+        inject=lambda _obs, _critic: None,
+    )
+    algorithm.critic = _ZeroCritic()
+    algorithm.critic_hidden = None
+    algorithm.reset_since_tick = torch.ones(1, dtype=torch.bool)
+    algorithm.rollout = _TransitionCapture()
+    algorithm.rollout_invalid = False
+    algorithm.invalid_transition_count = 0
+    algorithm.gait_baseline = P2GaitBaseline()
+    algorithm.gait_baseline.finalize()
+    algorithm.best_goal_distance = torch.tensor((2.0,))
+    algorithm.pending_tick = {
+        "command_penalty": torch.tensor([[-0.1]]),
+        "tick_penalty": torch.tensor([[-0.1]]),
+        "target_cmd3": torch.tensor([[1.0, 0.0, 0.0]]),
+    }
+
+    algorithm.finish_tick(
+        torch.zeros(1, nav_contract.POLICY_OBS_DIM),
+        torch.zeros(1, p2_contract.PRIVILEGED_WIRE_DIM),
+        frame_safety_reward=torch.tensor((5.0,)),
+        start_goal_distance=torch.tensor((3.0,)),
+        end_goal_distance=torch.tensor((2.0,)),
+        terminal_reason=torch.zeros(1, dtype=torch.long),
+        duration_frames=torch.full((1,), p2_contract.NAV_PERIOD_FRAMES),
+        hard_terminated=torch.zeros(1, dtype=torch.bool),
+        timeout=torch.zeros(1, dtype=torch.bool),
+        unattributed_boundary=torch.ones(1, dtype=torch.bool),
+    )
+
+    transition = algorithm.rollout.transition
+    assert transition["reward"].item() == 0.0
+    assert transition["bootstrap_mask"].item() == 0.0
+    assert transition["continuation_mask"].item() == 0.0
+    assert transition["valid_mask"].item() == 0.0
+    assert algorithm.last_tick_diagnostics["unattributed_reset_boundary"].item() == 1.0
+    assert not algorithm.rollout_invalid
+
+
 def test_finish_tick_sanitizes_invalid_reward_rows_before_rollout_storage():
     algorithm = AlgorithmP2NavPPO.__new__(AlgorithmP2NavPPO)
     algorithm.device = torch.device("cpu")
@@ -1373,6 +1420,39 @@ def test_variable_duration_gae_supports_an_explicit_terminal_bootstrap_value():
     expected_second = 2.0
     assert torch.allclose(storage.returns[0], torch.tensor([[expected_first]]), atol=1e-6)
     assert torch.allclose(storage.returns[1], torch.tensor([[expected_second]]), atol=1e-6)
+
+
+def test_invalid_transition_is_excluded_from_gae_and_return_target():
+    storage = P2RolloutStorage(1, num_ticks=2, sequence_length=1, store_depth=False)
+    first = _transition(
+        1,
+        reward=1.0,
+        value=0.2,
+        bootstrap=0.8,
+        duration=5,
+        bootstrap_mask=1.0,
+        continuation=0.0,
+    )
+    second = _transition(
+        1,
+        reward=999.0,
+        value=7.0,
+        bootstrap=999.0,
+        duration=10,
+        bootstrap_mask=1.0,
+        continuation=1.0,
+    )
+    second["valid_mask"] = torch.zeros(1, 1)
+    storage.add(**first)
+    storage.add(**second)
+    storage.compute_returns()
+
+    discount = p2_contract.GAMMA_FRAME ** 5
+    assert torch.allclose(
+        storage.returns[0], torch.tensor([[1.0 + discount * 0.8]]), atol=1e-6
+    )
+    assert storage.advantages[1].item() == 0.0
+    assert storage.returns[1].item() == pytest.approx(7.0)
 
 
 class _ConstantCritic:
@@ -1623,14 +1703,14 @@ def test_aisrv_curriculum_reset_logs_are_aggregated_once_per_minute():
     assert '"timeout": 1' in logger.infos[0]
 
 
-def test_worker_reason_codes_prioritize_success_failure_and_timeout():
+def test_worker_reason_codes_do_not_classify_unknown_reset_as_timeout():
     manager = _TerminationManager(4)
     manager.terminated[:] = torch.tensor((True, True, False, False))
     manager.time_outs[:] = torch.tensor((False, False, True, False))
     manager.goal[:] = torch.tensor((True, False, False, False))
     env = SimpleNamespace(termination_manager=manager)
     reasons = _termination_reason_codes(env, torch.ones(4, dtype=torch.bool))
-    assert reasons.tolist() == [1.0, 2.0, 3.0, 3.0]
+    assert reasons.tolist() == [1.0, 2.0, 3.0, 0.0]
 
 
 def test_worker_reason_code_four_owns_all_overlapping_terminal_terms():
@@ -1656,8 +1736,8 @@ def test_terminal_reason_keeps_success_and_timeout_mutually_exclusive():
         wrapper_timeout,
         raw_reason,
     )
-    assert reason.tolist() == [1, 3, 2, 4]
-    assert hard.tolist() == [True, False, True, False]
+    assert reason.tolist() == [1, 3, 0, 4]
+    assert hard.tolist() == [True, False, False, False]
     assert timeout.tolist() == [False, True, False, True]
     assert not bool((hard & timeout).any())
 
@@ -1924,6 +2004,26 @@ def test_worker_aux_recovers_timeout_when_wrapper_erases_truncated_and_infos():
     )
     assert done.tolist() == [True, True]
     assert timeout.tolist() == [True, False]
+
+
+def test_worker_reason_zero_is_an_unattributed_boundary_not_timeout():
+    aux = torch.zeros(1, 30)
+    aux[0, 24] = 1.0
+    done, timeout = _frame_done_masks(
+        torch.zeros(1, dtype=torch.bool),
+        torch.ones(1, dtype=torch.bool),
+        {"time_outs": torch.ones(1, dtype=torch.bool)},
+        "cpu",
+        worker_aux=aux,
+    )
+    reason, hard, attributed_timeout = _resolve_terminal_outcome(
+        done, timeout, aux[:, 25].long()
+    )
+    assert done.item()
+    assert not timeout.item()
+    assert reason.item() == 0
+    assert not hard.item()
+    assert not attributed_timeout.item()
 
 
 class _SaveLogger:

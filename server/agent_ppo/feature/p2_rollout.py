@@ -65,6 +65,12 @@ class P2RolloutStorage:
         # update semantics while allowing clean/live camera supervision.
         self.clean_action_mean = _cpu_tensor(*common, 3)
         self.camera_aux_mask = _cpu_tensor(*common, 3)
+        # Immutable P4 parent distribution anchors are training-only replay
+        # targets. P2/P3 leave them at zero and retain their existing policy
+        # and action interfaces.
+        self.parent_normalized_mean = _cpu_tensor(*common, 3)
+        self.parent_log_std = _cpu_tensor(*common, 3)
+        self.parent_anchor_mask = _cpu_tensor(*common, 1)
         # P4 recovery supervision is sampled with the action transition and
         # replayed on exactly the same TBPTT16 timeline as old log-probs.
         self.teacher_safe3 = _cpu_tensor(*common, 3)
@@ -86,6 +92,12 @@ class P2RolloutStorage:
         self.bootstrap_value = _cpu_tensor(*common, 1)
         self.bootstrap_mask = _cpu_tensor(*common, 1)
         self.continuation_mask = _cpu_tensor(*common, 1)
+        self.valid_mask = _cpu_tensor(*common, 1)
+        # Existing callers and test fixtures predate explicit row validity.
+        # A stored transition always overwrites this slot; defaulting the
+        # unused capacity to valid preserves the historical behavior for
+        # direct metric/normalization inspection before collection.
+        self.valid_mask.fill_(1.0)
         self.reset_mask = _cpu_tensor(*common, dtype=torch.bool)
         self.actor_h = _cpu_tensor(self.num_ticks, actor_layers, self.num_envs, actor_hidden)
         self.actor_c = _cpu_tensor(self.num_ticks, actor_layers, self.num_envs, actor_hidden)
@@ -156,9 +168,15 @@ class P2RolloutStorage:
             ("bootstrap_value", "bootstrap_value"),
             ("bootstrap_mask", "bootstrap_mask"),
             ("continuation_mask", "continuation_mask"),
+            ("valid_mask", "valid_mask"),
             ("reset_mask", "reset_mask"),
         ):
-            self._copy(getattr(self, name)[index], transition[source])
+            value = transition.get(source)
+            if value is None and source == "valid_mask":
+                value = torch.ones(
+                    self.num_envs, 1, device=transition["reward"].device
+                )
+            self._copy(getattr(self, name)[index], value)
         self._copy(
             self.clean_action_mean[index],
             transition.get(
@@ -174,6 +192,9 @@ class P2RolloutStorage:
             ),
         )
         defaults = {
+            "parent_normalized_mean": torch.zeros(self.num_envs, 3, device=transition["reward"].device),
+            "parent_log_std": torch.zeros(self.num_envs, 3, device=transition["reward"].device),
+            "parent_anchor_mask": torch.zeros(self.num_envs, 1, device=transition["reward"].device),
             "teacher_safe3": torch.zeros(self.num_envs, 3, device=transition["reward"].device),
             "teacher_safe5": torch.zeros(self.num_envs, 5, device=transition["reward"].device),
             "teacher_goal_xy": torch.zeros(self.num_envs, 2, device=transition["reward"].device),
@@ -200,6 +221,7 @@ class P2RolloutStorage:
             raise RuntimeError("cannot compute P2 GAE before rollout is full")
         next_gae = torch.zeros(self.num_envs, 1)
         for step in reversed(range(self.num_ticks)):
+            valid = self.valid_mask[step]
             discount = torch.pow(
                 torch.tensor(p2_contract.GAMMA_FRAME),
                 self.duration_frames[step].to(torch.float32),
@@ -211,7 +233,7 @@ class P2RolloutStorage:
                 * self.bootstrap_value[step]
                 - self.old_value[step]
             )
-            next_gae = (
+            next_gae = valid * (
                 delta
                 + self.continuation_mask[step]
                 * discount
@@ -219,7 +241,13 @@ class P2RolloutStorage:
                 * next_gae
             )
             self.advantages[step] = next_gae
-        self.returns.copy_(self.advantages + self.old_value)
+        self.returns.copy_(
+            torch.where(
+                self.valid_mask > 0.5,
+                self.advantages + self.old_value,
+                self.old_value,
+            )
+        )
 
     def sequence_refs(self, generator: torch.Generator | None = None) -> list[SequenceRef]:
         refs = [

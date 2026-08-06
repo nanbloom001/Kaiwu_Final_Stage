@@ -628,6 +628,42 @@ checkpoint 版本为 `p4_maze_closed_loop_v3`，新保存标签优先级为
 start；完整匹配 command/reward/training/stuck/camera digest 的新包才可 exact resume。Standard eval
 仍只抽取低层，Track eval 加载完整 P4；所有 training-only 教师与诊断头均不进入部署执行。
 
+##### 活动 `p4_maze_instant_command_r4` 合同
+
+R4 保持 Actor85、Critic 输入、三轴 tanh-Gaussian、物理动作范围和训练/评估 wire 不变，但明确
+取消高低层之间的命令 slew。每个 10Hz 高层 tick 产生的 `policy_target_cmd3` 只经过有限值处理和
+硬边界映射 `vx=[0,1.0]`、`vy=+-0.30`、`wz=+-0.90`，随后立即成为 `exec_cmd3`，并在接下来的
+5 个 50Hz 低层帧保持。反向命令允许在 tick 边界直接换符号；不存在零交叉等待、反向确认、
+translation limiter、near-goal rewrite 或 recovery command override。PPO log-prob、rollout action、
+tracking 目标和低层 observation command 因此对应同一个 policy target。command contract 必须记录
+`command_transition_mode=instant_hold_10hz` 与 `hold_frames=5`，不得写入候选 slew 或父 slew
+回退结果；R4 exact resume 遇到旧 slew command contract 必须拒绝，旧包只可 warm start。
+Actor85 没有独立的 instant-mode 输入位；历史 capability 变化率槽统一写为 10Hz 单周期完整轴范围
+`[10,6,18]`，表示每个 tick 可到达任意合法 `vx/vy/wz`，只用于 observation，不得被运行时重新解释
+成 slew 参数。未知 reason-0 reset 行保留 recurrent boundary，但必须通过 rollout validity mask 从
+PPO、Critic、return statistics 和所有训练辅助项中完全排除。
+
+R4 从 `p4maze8h10hz_1416926-mazefinal` 继承低层、高层 Actor、Critic、NavigationEncoder、
+SafetyHead 与 ResponseAdapter 权重。低层、NavigationEncoder、SafetyHead、StuckHead 全程冻结。
+0-30 分钟只更新 Critic；30 分钟-2 小时以 `actor=1.5e-5/critic=6e-5/adapter=5e-6` 校准；
+2-3 小时改为 `actor=1e-5/critic=4e-5`；3-3.5 小时改为 `actor=5e-6/critic=3e-5`；由于实测
+退化约在 3h50 已经出现，3.5 小时后 Actor、Teacher、父分布 anchor 和 Adapter 固定冻结，Critic
+以 `1e-5` 继续到 8 小时。父 Actor anchor 是 training-only leaf，保存来源 SHA256 与 digest，
+只在 scanner 有效、Goal 新鲜、低风险、无接触/卡滞/grace 的样本约束 mean/log-std 漂移；评估和
+部署不调用该 leaf。
+
+R4 reward 保持 success/failure/timeout/reason4=`+200/-60/-40/-75`。Maze new-best credit 为
+`1.0/m`、每 episode 上限 `+6`；failure、timeout 和 reason4 terminal 精确回收本 episode 已发放
+credit，success 保留。碰撞 onset=`-0.16-0.24*severity`、persistent=`-0.06/tick`；卡滞候选
+0.8 秒后开始，2 秒达到 `-0.04/tick`。reason4 仍由平台拥有的 `nav_stuck_timeout` 完成物理 reset，
+只接受 termination manager 的实际 term readback，不根据本地候选伪造；未分类 reset 也不得改记
+timeout。仅 yaw 改变不能证明脱困，必须同时看到墙接触 EMA 比候选持续接触峰值下降至少 30%。
+
+当前稳定部署树 `deploy/sim2real_test_loco` 仍是独立 Actor80 低层路线，不执行上述 P4 高层控制器。
+因此本合同只约束 server 训练和 Track eval；P4 checkpoint 继续 `deployable=false`。在完成高层导出、
+Jetson runtime、ONNX 数值和真机验证前，不得声称真机已采用 instant-command 语义，也不得在低层
+部署代码中用不匹配的 command clamp 伪装实现。
+
 ##### 历史 `p4_maze_attack10hz_v1` 合同（非活动入口）
 
 历史 P4 Maze 八小时强化父包为 `p4nav2h_1256446-F`（平台模型 ID `1256446`，checkpoint SHA256

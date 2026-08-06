@@ -31,6 +31,12 @@ P4 训练 checkpoint 不是本部署树的可部署候选：尚未完成与此 A
 输入兼容的导出审查、ONNX 数值校验和 Jetson/真机验证前，必须保持
 `capabilities.deployable=false`，不得作为本路线的 `policy.onnx` 或通过改名加载。
 
+活动实验 `p4_maze_instant_command_r4` 在 server/Track eval 中使用 10Hz
+`instant_hold_10hz` 高层合同：高层 target 在 tick 边界立即成为 exec，并保持 5 个低层帧，不经过
+slew、反向确认或 post-Actor limiter。当前部署树没有 P4 高层 Actor85 runtime，因此既没有实现也
+不得宣称已经验证该合同。未来若导出完整 P4 高层，必须另行实现同一 tick/hold 语义并完成 ONNX、
+Jetson 和真机闭环验证；不能把现有低层 `fixed_cmd` clamp 当成等价实现。
+
 `State_VisionLoco` 包含可配置的运行时卡滞恢复覆盖器：仅在持续前进且有效运动反馈连续
 5 秒没有进展时，先下发零速度，再按卡滞前实测转向反号直接覆盖 `vy=+/-0.30 m/s`。横移的
 完成以实测横向速度积分为准，不改变 ONNX 输入、输出或 checkpoint 合同。该保护尚未经过

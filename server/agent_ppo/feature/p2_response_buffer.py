@@ -328,6 +328,15 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
                 if not isinstance(copied.get("record_contract"), dict) and isinstance(
                     self.current_record_contract, dict
                 ):
+                    if (
+                        self.current_record_contract.get("command_transition_mode")
+                        == "instant_hold_10hz"
+                    ):
+                        reason = "legacy_missing_instant_command_provenance"
+                        self.legacy_parent_migration_rejections[reason] = (
+                            self.legacy_parent_migration_rejections.get(reason, 0) + 1
+                        )
+                        continue
                     rejection = self._legacy_parent_payload_rejection(copied)
                     if rejection is not None:
                         self.legacy_parent_migration_rejections[rejection] = (
@@ -521,6 +530,9 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
             "action_mapper",
             "observation_layout",
             "label_layout",
+            "command_contract_digest",
+            "command_transition_mode",
+            "command_hold_frames",
         ):
             if actual.get(key) != expected.get(key):
                 reason = f"mismatch_{key}"

@@ -4,6 +4,39 @@
 
 ## [未发布]
 
+- **[P4 Maze R4 完全取消 slew]** 新入口 `p4maze8h-instant-r4` 从
+  `p4maze8h10hz_1416926-mazefinal` warm start，固定单段 Maze、128 env、10Hz 高层和
+  28800 秒有效训练。三轴 policy target 在每个高层 tick 只做有限值与硬动作边界处理后立即成为
+  exec command，并在 5 个低层帧保持；取消 slew、零交叉、反向确认、运行时 limiter、near-goal
+  rewrite 和 recovery override。`reset_live_state()` 现在保留 transition mode，避免 checkpoint
+  load/resume 后静默退回旧 slew。R4 command/checkpoint 合同和新 phase 标签明确与旧 P4 slew 包
+  exact-resume 不兼容。
+- **[P4 R4 后段劣化保护与奖励闭环]** 依据上一轮约 3h50 已开始劣化的证据，R4 在 3 小时开始
+  降低 Actor LR，3.5 小时固定冻结 Actor/Teacher/父策略 anchor/Adapter，后续只校准 Critic直到
+  8 小时结束。新增不可变父 Actor 分布 anchor；failure、timeout 和 reason4 精确回收 episode 内
+  已发放的 Maze new-best credit。碰撞提高到 `-0.16-0.24*severity/-0.06 persistent`，持续卡滞
+  2 秒达到 `-0.04/tick`，reason4 保持 `-75` 且不计完成。
+- **[P4 R4 命令与 episode 边界闭环]** 修复 instant target 原先在高层 tick 的首个 50Hz 帧仍由
+  旧 exec 驱动低层策略的一帧错位；现在 tick 边界先设置瞬时命令，再把同一 exec 写入低层
+  proprio、critic 与 worker aux，边界帧起连续 5 帧完全一致。R4 Track eval 现在要求 checkpoint
+  的完整 command contract 与运行 profile 相等，不能把 R4 包装配到旧 full-track/slew runtime。
+  wrapper 触发但 worker reason 为 0 的未知 reset 作为无奖励、无 bootstrap、无跨 episode GAE 的
+  无效边界行处理，并从 Actor/Critic loss、advantage/return normalization 和辅助损失中排除，不再
+  以人工零回报训练 `-V`，也不伪造 timeout/failure。Adapter completed record 合同加入 instant-command
+  provenance 和 command digest；缺少该证据的旧 slew records 在 R4 replay 中明确拒绝。
+- **[P4 R4 冻结期 exact-resume 防线]** 新增 3.5 小时冻结阶段的 save/resume 回归：Actor 与 Adapter
+  参数及 Adam `step/exp_avg/exp_avg_sq` 在更新调用前后逐值不变，Critic 仍可更新。该检查覆盖
+  fresh process exact resume，防止只把 LR 置零却继续积累 optimizer moments。
+- **[P4 R4 capability 真值闭环]** instant-command 的 Actor capability 与诊断现在始终报告
+  真实硬映射边界 `vx<=1.0`。历史六个变化率槽以 10Hz 单周期完整轴范围的有限值
+  `[10,6,18]` 表达即时可达，避免零值被父 Actor85 误解为完全不能改变命令；这些值只用于观测，
+  controller 不消费。Goal freshness 和 predictive risk 继续作为独立观测/诊断，不再在实际无
+  limiter 时向 Actor85 泄漏一个旧的、较小的“有效速度上限”。
+- **[P4 卡滞恢复证据修复]** unclassified reset 不再伪造成 timeout；reason4 只接受平台
+  `nav_stuck_timeout` term 的实际 readback。仅旋转 20 度不再自动清除卡滞，必须同时观察到墙接触
+  EMA 至少下降 30%；候选基准跟踪持续接触期间的 EMA 峰值。foot-jam 仅作 shadow 诊断，不触发
+  active reset。
+
 - **[P4 卡墙平移脱困训练]** closed-loop Safety teacher 在训练期已确认
   “执行平移命令但真实位移/速度不足”的样本中，先约束 Actor 降低 `vx`；仅在
   `safe5` 左右侧净空存在明确差异时，再引导与安全侧同符号的 `vy`。response 卡滞标签

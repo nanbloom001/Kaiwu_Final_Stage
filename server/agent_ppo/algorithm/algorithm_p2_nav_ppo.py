@@ -208,11 +208,15 @@ class AlgorithmP2NavPPO:
         self.command_slew_release_rate = tuple(
             self.config.get("slew_release_rate", (0.30, 0.60, 2.50))
         )
+        self.command_transition_mode = str(
+            self.config.get("command_transition_mode", "slew")
+        )
         self.command = P2CommandController(
             self.num_envs,
             self.device,
             slew_rate=self.command_slew_rate,
             slew_release_rate=self.command_slew_release_rate,
+            command_transition_mode=self.command_transition_mode,
         )
         self.rollout = (
             P2RolloutStorage(
@@ -809,30 +813,8 @@ class AlgorithmP2NavPPO:
         c0, c1 = nav_contract.CRITIC_CMD_SLICE
         parts["proprio"][:, p0:p1] = self.command.exec_cmd.to(parts["proprio"])
         critic_obs[:, c0:c1] = self.command.exec_cmd.to(critic_obs)
-        low_action, low_metadata = self._low_level_frame(parts, critic_obs)
-        low_hidden = self.low_level_encoder.get_hidden_state()
-        if low_hidden is not None:
-            self.low_level_encoder.set_hidden_state(
-                tuple(state.clone() for state in low_hidden)
-            )
-        low_finite = torch.isfinite(low_action).all(dim=-1)
-        if not bool(low_finite.all()):
-            invalid_low_count = int((~low_finite).sum())
-            self.low_level_encoder.reset_hidden_state_for_envs(
-                (~low_finite).nonzero(as_tuple=False).reshape(-1)
-            )
-            low_action = torch.where(
-                low_finite.unsqueeze(-1), low_action, torch.zeros_like(low_action)
-            )
-            self.nonfinite_action_fallbacks += invalid_low_count
-            self.invalid_transition_count += invalid_low_count
-            self.rollout_invalid |= self.training_enabled
-        result = {
-            "actions": low_action,
-            "is_tick": False,
-            "tick_penalty": None,
-            **low_metadata,
-        }
+        is_tick = False
+        tick_penalty = None
         if self.frame_count % self.nav_period_frames == 0:
             reset = self.reset_since_tick.clone()
             self.actor_hidden = self._mask_hidden(self.actor_hidden, reset)
@@ -1097,7 +1079,42 @@ class AlgorithmP2NavPPO:
             self.command.set_target(target)
             self.reset_since_tick.zero_()
             self.nav_ticks += self.num_envs
-            result.update({"is_tick": True, "tick_penalty": command_penalty})
+            is_tick = True
+            tick_penalty = command_penalty
+
+        # A 10 Hz instant command belongs to the current boundary frame. Patch
+        # the freshly selected exec command before the 50 Hz low-level policy
+        # runs; legacy slew mode is unchanged because set_target() does not
+        # advance its exec command.
+        aux = patch_owned_commands(
+            aux, self.command.active_target, self.command.exec_cmd, self.command.command_epoch
+        )
+        parts["proprio"][:, p0:p1] = self.command.exec_cmd.to(parts["proprio"])
+        critic_obs[:, c0:c1] = self.command.exec_cmd.to(critic_obs)
+        low_action, low_metadata = self._low_level_frame(parts, critic_obs)
+        low_hidden = self.low_level_encoder.get_hidden_state()
+        if low_hidden is not None:
+            self.low_level_encoder.set_hidden_state(
+                tuple(state.clone() for state in low_hidden)
+            )
+        low_finite = torch.isfinite(low_action).all(dim=-1)
+        if not bool(low_finite.all()):
+            invalid_low_count = int((~low_finite).sum())
+            self.low_level_encoder.reset_hidden_state_for_envs(
+                (~low_finite).nonzero(as_tuple=False).reshape(-1)
+            )
+            low_action = torch.where(
+                low_finite.unsqueeze(-1), low_action, torch.zeros_like(low_action)
+            )
+            self.nonfinite_action_fallbacks += invalid_low_count
+            self.invalid_transition_count += invalid_low_count
+            self.rollout_invalid |= self.training_enabled
+        result = {
+            "actions": low_action,
+            "is_tick": is_tick,
+            "tick_penalty": tick_penalty,
+            **low_metadata,
+        }
         self.frame_count += 1
         return result, critic_obs, aux
 
@@ -1147,6 +1164,7 @@ class AlgorithmP2NavPPO:
         duration_frames: torch.Tensor,
         hard_terminated: torch.Tensor,
         timeout: torch.Tensor,
+        unattributed_boundary: torch.Tensor | None = None,
         terminal_safe_aux: torch.Tensor | None = None,
         terminal_safe_exec_cmd: torch.Tensor | None = None,
         frontier_settle_mask: torch.Tensor | None = None,
@@ -1166,7 +1184,12 @@ class AlgorithmP2NavPPO:
         bootstrap_value, _ = self.critic(next_input, self.critic_hidden, self.reset_since_tick)
         hard = hard_terminated.to(self.device).reshape(-1, 1).bool()
         timed = timeout.to(self.device).reshape(-1, 1).bool()
-        terminal = hard | timed
+        unattributed = (
+            torch.zeros_like(hard)
+            if unattributed_boundary is None
+            else unattributed_boundary.to(self.device).reshape(-1, 1).bool()
+        )
+        terminal = hard | timed | unattributed
         bootstrap_finite = torch.isfinite(bootstrap_value).reshape(-1, 1)
         invalid_rows = ~bootstrap_finite.reshape(-1)
         bootstrap_value = torch.where(
@@ -1386,6 +1409,10 @@ class AlgorithmP2NavPPO:
         component_stack = torch.nan_to_num(
             component_stack, nan=0.0, posinf=0.0, neginf=0.0
         )
+        # Wrapper-driven reason-0 resets terminate recurrence and GAE, but do
+        # not invent a failure/timeout reward or retain partial old-episode
+        # shaping. Keep the row usable as a neutral terminal transition.
+        component_stack[:, unattributed.reshape(-1)] = 0.0
         component_stack[:, invalid_rows] = 0.0
         components = {
             name: component_stack[index]
@@ -1512,6 +1539,7 @@ class AlgorithmP2NavPPO:
             "reward_conservation_error": (
                 total_reward - torch.stack(tuple(components.values()), dim=0).sum(dim=0)
             ).abs().detach().reshape(-1, 1),
+            "unattributed_reset_boundary": unattributed.float().detach(),
             **self._extra_tick_diagnostics(),
         }
         transition = dict(self.pending_tick)
@@ -1545,6 +1573,13 @@ class AlgorithmP2NavPPO:
                 # no-bootstrap fallback instead of the post-reset episode.
                 "bootstrap_mask": (~terminal).float(),
                 "continuation_mask": (~terminal).float(),
+                # A reason-0 reset is a real recurrent boundary but has no
+                # attributable outcome. Exclude that row from every PPO/value
+                # statistic instead of training it toward an artificial zero
+                # return.
+                "valid_mask": (~unattributed & ~invalid_rows)
+                .float()
+                .reshape(-1, 1),
             }
         )
         self.rollout.add(**transition)
@@ -1689,6 +1724,7 @@ class AlgorithmP2NavPPO:
                 "pre_tanh_action",
                 "old_log_prob",
                 "advantages",
+                "valid_mask",
                 "reset_mask",
                 "safety_target",
                 "safety_valid",
@@ -1696,7 +1732,7 @@ class AlgorithmP2NavPPO:
                 "camera_aux_mask",
             )
         }
-        batch["advantages"] = (
+        batch["advantages"] = batch["valid_mask"] * (
             batch["advantages"] - float(advantage_mean)
         ) / float(advantage_std)
         if self.rollout.store_depth:
@@ -1720,7 +1756,7 @@ class AlgorithmP2NavPPO:
         transfer_started = time.perf_counter()
         batch = {
             name: self._stack_refs(name, refs)
-            for name in ("critic_input", "returns", "reset_mask")
+            for name in ("critic_input", "returns", "valid_mask", "reset_mask")
         }
         batch["critic_hidden"] = (
             torch.stack(
@@ -1736,7 +1772,15 @@ class AlgorithmP2NavPPO:
         return batch
 
     def _rollout_advantage_stats(self) -> tuple[float, float]:
-        values = self.rollout.advantages[: self.rollout.step].float()
+        valid_storage = getattr(
+            self.rollout,
+            "valid_mask",
+            torch.ones_like(self.rollout.advantages),
+        )
+        valid = valid_storage[: self.rollout.step] > 0.5
+        values = self.rollout.advantages[: self.rollout.step].float()[valid]
+        if not values.numel():
+            return 0.0, 1.0
         return float(values.mean()), float(
             values.std(unbiased=False).clamp_min(1.0e-8)
         )
@@ -1764,10 +1808,14 @@ class AlgorithmP2NavPPO:
             batch["reset_mask"],
         )
         ratio = torch.exp(log_prob - batch["old_log_prob"])
-        surrogate = -torch.minimum(
+        surrogate_element = -torch.minimum(
             ratio * batch["advantages"],
             torch.clamp(ratio, 0.8, 1.2) * batch["advantages"],
-        ).mean()
+        )
+        valid_mask = batch.get(
+            "valid_mask", torch.ones_like(batch["old_log_prob"])
+        ) > 0.5
+        surrogate = self._masked_mean(surrogate_element, valid_mask)
         if getattr(self, "track_safety_enabled", True):
             safety_logits = self.safety_head(feat)
             safety_element_loss = F.binary_cross_entropy_with_logits(
@@ -1775,13 +1823,23 @@ class AlgorithmP2NavPPO:
                 batch["safety_target"],
                 reduction="none",
             )
-            safety_mask = batch["safety_valid"].expand_as(safety_element_loss)
+            safety_mask = (
+                batch["safety_valid"] * valid_mask.to(batch["safety_valid"].dtype)
+            ).expand_as(safety_element_loss)
             safety_denominator = safety_mask.sum()
             safety_loss = (
                 (safety_element_loss * safety_mask).sum()
                 / safety_denominator.clamp_min(1.0)
             )
-            student_risk = torch.sigmoid(safety_logits).mean(dim=(0, 1))
+            risk_probability = torch.sigmoid(safety_logits)
+            student_risk = torch.stack(
+                tuple(
+                    self._masked_mean(
+                        risk_probability[..., index], valid_mask
+                    )
+                    for index in range(3)
+                )
+            )
         else:
             safety_loss = surrogate.new_zeros(())
             student_risk = torch.zeros(3, device=surrogate.device)
@@ -1792,21 +1850,28 @@ class AlgorithmP2NavPPO:
         )
         total_loss = (
             surrogate
-            - self.entropy_coefficient * entropy.mean()
+            - self.entropy_coefficient * self._masked_mean(entropy, valid_mask)
             + p2_contract.SAFETY_BCE_WEIGHT * safety_loss
             + auxiliary_loss
         )
         with torch.no_grad():
             log_ratio = log_prob - batch["old_log_prob"]
-            approx_kl = ((torch.exp(log_ratio) - 1.0) - log_ratio).mean()
-            clip_fraction = ((ratio - 1.0).abs() > 0.2).float().mean()
+            approx_kl = self._masked_mean(
+                (torch.exp(log_ratio) - 1.0) - log_ratio, valid_mask
+            )
+            clip_fraction = self._masked_mean(
+                ((ratio - 1.0).abs() > 0.2).float(), valid_mask
+            )
+            entropy_mean = self._masked_mean(entropy, valid_mask)
         return total_loss, {
             "surrogate_loss": surrogate.detach(),
-            "entropy": entropy.mean().detach(),
+            "entropy": entropy_mean.detach(),
             "approx_kl": approx_kl.detach(),
             "clip_fraction": clip_fraction.detach(),
             "safety_bce": safety_loss.detach(),
-            "scanner_valid_share": batch["safety_valid"].float().mean().detach(),
+            "scanner_valid_share": self._masked_mean(
+                batch["safety_valid"].float(), valid_mask
+            ).detach(),
             "safety_head_risk_left": student_risk[0].detach(),
             "safety_head_risk_center": student_risk[1].detach(),
             "safety_head_risk_right": student_risk[2].detach(),
@@ -1817,7 +1882,10 @@ class AlgorithmP2NavPPO:
         values, _ = self.critic(
             batch["critic_input"], batch["critic_hidden"], batch["reset_mask"]
         )
-        return F.mse_loss(values, batch["returns"])
+        return self._masked_mean(
+            (values - batch["returns"]) ** 2,
+            batch.get("valid_mask", torch.ones_like(batch["returns"])) > 0.5,
+        )
 
     def _run_ppo_epochs(self) -> dict[str, float]:
         refs = self.rollout.sequence_refs(self.ppo_generator)
@@ -1866,7 +1934,22 @@ class AlgorithmP2NavPPO:
                 minibatch = refs[
                     minibatch_start : minibatch_start + minibatch_sequences
                 ]
-                minibatch_steps = len(minibatch) * self.rollout.sequence_length
+                if hasattr(self.rollout, "valid_mask"):
+                    minibatch_valid_steps = sum(
+                        int(
+                            self.rollout.valid_mask[
+                                ref.start : ref.start + self.rollout.sequence_length,
+                                ref.env,
+                            ].sum().item()
+                        )
+                        for ref in minibatch
+                    )
+                else:
+                    minibatch_valid_steps = (
+                        len(minibatch) * self.rollout.sequence_length
+                    )
+                if minibatch_valid_steps <= 0:
+                    continue
                 actor_started = time.perf_counter()
                 actor_enabled = bool(self._actor_update_enabled())
                 self.actor_optimizer.zero_grad(set_to_none=True)
@@ -1879,9 +1962,12 @@ class AlgorithmP2NavPPO:
                         advantage_mean=advantage_mean,
                         advantage_std=advantage_std,
                     )
+                    micro_valid_steps = int(actor_batch["valid_mask"].sum().item())
+                    if micro_valid_steps <= 0:
+                        continue
                     loss, actor_metrics = self._actor_micro_loss(actor_batch)
                     scale = P2RolloutStorage.microbatch_loss_scale(
-                        actor_batch["advantages"].numel(), minibatch_steps
+                        micro_valid_steps, minibatch_valid_steps
                     )
                     if not bool(torch.isfinite(loss)):
                         actor_finite = False
@@ -1928,9 +2014,16 @@ class AlgorithmP2NavPPO:
                 for micro_start in range(0, len(minibatch), self.micro_sequences):
                     micro = minibatch[micro_start : micro_start + self.micro_sequences]
                     critic_batch = self._critic_sequence_batch(micro)
+                    micro_valid_steps = int(
+                        critic_batch.get(
+                            "valid_mask", torch.ones_like(critic_batch["returns"])
+                        ).sum().item()
+                    )
+                    if micro_valid_steps <= 0:
+                        continue
                     loss = self._critic_micro_loss(critic_batch)
                     scale = P2RolloutStorage.microbatch_loss_scale(
-                        critic_batch["returns"].numel(), minibatch_steps
+                        micro_valid_steps, minibatch_valid_steps
                     )
                     if not bool(torch.isfinite(loss)):
                         critic_finite = False
@@ -1980,6 +2073,13 @@ class AlgorithmP2NavPPO:
     @staticmethod
     def _masked_mean(value, mask):
         mask = mask.to(value.dtype)
+        while mask.ndim > value.ndim and mask.shape[-1] == 1:
+            mask = mask.squeeze(-1)
+        if mask.ndim > value.ndim:
+            raise ValueError(
+                "P2 masked mean received a mask with incompatible rank: "
+                f"value={tuple(value.shape)} mask={tuple(mask.shape)}"
+            )
         while mask.ndim < value.ndim:
             mask = mask.unsqueeze(-1)
         return (value * mask).sum() / mask.expand_as(value).sum().clamp_min(1.0)
@@ -2269,6 +2369,22 @@ class AlgorithmP2NavPPO:
         }
 
     def _training_monitor_metrics(self) -> dict[str, float]:
+        valid = getattr(
+            self.rollout,
+            "valid_mask",
+            torch.ones_like(self.rollout.rewards),
+        ) > 0.5
+
+        def valid_mean(value: torch.Tensor) -> float:
+            selected = value.float()[valid]
+            return float(selected.mean()) if selected.numel() else 0.0
+
+        def valid_std(value: torch.Tensor) -> float:
+            selected = value.float()[valid]
+            return (
+                float(selected.std(unbiased=False)) if selected.numel() else 0.0
+            )
+
         main_action_std = torch.exp(
             torch.clamp(
                 self.actor.log_std.detach(),
@@ -2307,16 +2423,13 @@ class AlgorithmP2NavPPO:
             if group.get("name") == "navigation_safety_head"
         )
         return {
-            "rollout_reward_mean": float(self.rollout.rewards.float().mean()),
-            "rollout_reward_std": float(
-                self.rollout.rewards.float().std(unbiased=False)
-            ),
-            "rollout_return_mean": float(self.rollout.returns.float().mean()),
-            "rollout_value_mean": float(self.rollout.old_value.float().mean()),
-            "rollout_advantage_mean": float(self.rollout.advantages.float().mean()),
-            "rollout_advantage_std": float(
-                self.rollout.advantages.float().std(unbiased=False)
-            ),
+            "rollout_reward_mean": valid_mean(self.rollout.rewards),
+            "rollout_reward_std": valid_std(self.rollout.rewards),
+            "rollout_return_mean": valid_mean(self.rollout.returns),
+            "rollout_value_mean": valid_mean(self.rollout.old_value),
+            "rollout_advantage_mean": valid_mean(self.rollout.advantages),
+            "rollout_advantage_std": valid_std(self.rollout.advantages),
+            "rollout_valid_share": float(valid.float().mean()),
             "action_std_vx": float(main_action_std[0]),
             "action_std_vy": vy_action_std,
             "action_std_wz": float(main_action_std[1]),
@@ -2345,7 +2458,14 @@ class AlgorithmP2NavPPO:
         }
 
     def _update_return_statistics(self) -> None:
-        values = self.rollout.returns.detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+        valid = getattr(
+            self.rollout,
+            "valid_mask",
+            torch.ones_like(self.rollout.returns),
+        ).detach().to(device="cpu") > 0.5
+        values = self.rollout.returns.detach().to(
+            device="cpu", dtype=torch.float64
+        )[valid]
         if not values.numel():
             return
         batch_count = int(values.numel())
@@ -2462,6 +2582,7 @@ class AlgorithmP2NavPPO:
             self.device,
             slew_rate=self.command_slew_rate,
             slew_release_rate=self.command_slew_release_rate,
+            command_transition_mode=self.command_transition_mode,
         )
         self.best_goal_distance.fill_(float("inf"))
         self.episode_start_goal_distance.fill_(float("inf"))

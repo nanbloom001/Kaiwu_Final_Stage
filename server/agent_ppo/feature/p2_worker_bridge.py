@@ -144,15 +144,12 @@ def _termination_reason_codes(
     success_mask &= reset & ~wall_mask
     failure_mask &= reset & ~wall_mask & ~success_mask
     timeout_mask &= reset & ~wall_mask & ~success_mask & ~failure_mask
-    # A reset with no retained termination term is a timeout at the public
-    # wrapper boundary. This also recovers the known truncated/time_outs loss.
-    unknown_reset = (
-        reset & ~success_mask & ~failure_mask & ~wall_mask & ~timeout_mask
-    )
     result[success_mask] = 1.0
     result[failure_mask] = 2.0
     result[wall_mask] = 4.0
-    result[timeout_mask | unknown_reset] = 3.0
+    # An unclassified wrapper reset has no trustworthy attribution.  In
+    # particular, it must not become a synthetic timeout or reason 4.
+    result[timeout_mask] = 3.0
     return result
 
 
@@ -1072,6 +1069,7 @@ class P2WorkerBridge:
                 seconds_since_push=seconds_since_push_for_stuck,
                 episode_age_s=episode_age_s,
                 true_velocity3=true_velocity,
+                yaw=yaw,
             )
             raw_goal_xy = build_track_goal_raw(self.env).to(self.device)
             if not bool(torch.isfinite(raw_goal_xy).all()):

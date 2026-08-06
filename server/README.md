@@ -19,26 +19,33 @@
 
 ## 活动基线
 
-- **当前 P4 Maze 闭环强化入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
-  `codex/p4-maze8h-closed-loop-r3`，任务 `p4maze8h-closedloop-r3`。父包固定为
+- **当前 P4 Maze 即时命令修复入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
+  `codex/p4-maze8h-instant-command-r4`，任务 `p4maze8h-instant-r4`。父包固定为
   `p4maze8h10hz_1416926` 的 `mazefinal` checkpoint；128 env、10Hz 高层、50Hz 低层、
   32-tick rollout、TBPTT16、4 PPO epochs，单段 `open_entry_maze`、20 列、课程关闭、
   120 秒 episode，完整有效训练 `28800s`，平台任务墙钟 `8.25h`。完整合同见
-  [`docs/p4-maze8h-closed-loop-v3.md`](./docs/p4-maze8h-closed-loop-v3.md)。
-- 本轮冻结低层、NavigationEncoder、SafetyHead、ResponseAdapter 和 StuckHead，只更新已有
-  高层 Actor LSTM/action head 与 Critic。父权重和 Critic return statistics 保留，但 Actor/Critic
-  Adam moments 按新 reward/command 合同重置；0-30 分钟只更新 Critic，之后按
-  `loopadapt -> looptrain -> loopstable` 训练 Actor。
+  [`docs/p4-maze8h-instant-command-r4.md`](./docs/p4-maze8h-instant-command-r4.md)。
+- 本轮固定 `instant_hold_10hz`：每个高层 tick 的三轴 policy target 只做有限值和硬范围处理后立即
+  成为 exec command，并在随后的 5 个低层帧保持；不执行 slew、零交叉、反向确认、运行时 limiter、
+  near-goal rewrite 或 recovery override。checkpoint 与 exact resume 必须记录并恢复这一合同，旧
+  slew P4 包只能 warm start，不能按 R4 exact resume。
+- 低层、NavigationEncoder、SafetyHead 和 StuckHead 全程冻结。0-30 分钟只校准 Critic；30 分钟至
+  2 小时低学习率校准 Actor 与 Adapter；2-3 小时继续 Actor 修正；3-3.5 小时收敛；根据上一轮约
+  3h50 已开始同步劣化的证据，3.5 小时后固定冻结 Actor/Teacher/Anchor/Adapter，只以 `1e-5`
+  更新 Critic直到 8 小时结束。父 Actor 分布作为不可变 training-only anchor，仅在低风险样本约束
+  漂移，不进入评估或部署输入。
   模型 ID 只用于候选选择，文件、模块 spec、shape、有限值和冻结低层 digest 才决定兼容性。
-- Maze reward 使用不可重复的历史最短距离 credit：`1.0/m`、累计上限 `+6`，terminal 不 clawback；
+- Maze reward 使用不可重复的历史最短距离 credit：`1.0/m`、累计上限 `+6`；failure、timeout 和
+  reason4 精确回收该 episode 已发放 credit，success 不回收。
   success/failure/timeout/reason4 为 `+200/-60/-40/-75`。reason4 在 10 秒墙面接触与空间受限后
   真实 reset，按 failure 统计、双 GAE mask 为零、不得计完成。持续卡墙从 0.8 秒开始，2 秒达到
-  `-0.03/tick`；碰撞 onset 为 `-0.12-0.18*severity`，持续接触为 `-0.05/tick`。
+  `-0.04/tick`；碰撞 onset 为 `-0.16-0.24*severity`，持续接触为 `-0.06/tick`。
 - 五方向教师只在训练期监督 Actor mean，在多个近似安全出口中以 Goal 作 tie-breaker，不改 Actor85
   或部署接口。全局 yaw-cancellation、near-goal capture 和平移 limiter 全程 shadow，实际命令不再
   被 Actor 采样后的隐式机制改写；部署可得 predictive collision 与五方向 Actor mean 教师承担学习
   信号。额外 Camera/Goal fault、Push、五段出生和低层联合训练关闭。新 checkpoint 标签为
-  `loopwarm/loopadapt/looptrain/loopstable`，旧 `closed*`/`credit*` 仅保留发现兼容性。
+  `instantwarm/instantadapt/instantcorrect/instantstable/instantfrozen`，旧 `loop*`/`closed*`/`credit*`
+  仅保留发现和 warm-start 兼容性。
 
 - **历史 P4 五段全赛道入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
   `codex/p4-full8h-r2`，任务 `p4full8h-r2`，父包

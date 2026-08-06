@@ -21,19 +21,18 @@ def test_eight_hour_closed_loop_schedule_and_config_are_aligned():
 
     assert p4_contract.TARGET_EFFECTIVE_SECONDS == 28_800.0
     assert p4_contract.TRAINING_HOURS == 8.0
-    assert p4_contract.RUN_NAME == "p4maze8h-closedloop-r3"
-    assert p4_contract.training_contract(
+    legacy_training = p4_contract.training_contract(
         stage["stuck_reset"], "maze_closed_loop_v3"
-    )["required_platform_wall_seconds"] == 29_700
+    )
+    legacy_command = p4_contract.command_contract("maze_closed_loop_v3")
+    assert legacy_training["required_platform_wall_seconds"] == 29_700
     assert stage["task_end_hours"] == 8.25
     assert stage["parent_model_id"] == 1416926
-    assert tuple(stage["slew_rate"]) == p4_contract.P4_SLEW_RATE
-    assert tuple(stage["slew_release_rate"]) == p4_contract.P4_SLEW_RELEASE_RATE
+    assert tuple(legacy_command["slew_rate"]) == p4_contract.P4_SLEW_RATE
+    assert tuple(legacy_command["slew_release_rate"]) == p4_contract.P4_SLEW_RELEASE_RATE
     assert stage["stuck_reset"]["confirmation_s"] == 10.0
     assert stage["stuck_reset"]["schedule_enabled"] is True
-    assert p4_contract.training_contract(
-        stage["stuck_reset"], "maze_closed_loop_v3"
-    )["stuck_reset"]["schedule_enabled"] is True
+    assert legacy_training["stuck_reset"]["schedule_enabled"] is True
     assert config["domain_rand"]["push_robots"] is False
 
     warm = p4_contract.training_schedule(0.0, branch="closed_loop_v3")

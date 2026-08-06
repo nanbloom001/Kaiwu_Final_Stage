@@ -112,6 +112,11 @@ P3_STANDARD_JOINT_PHASE_LABELS = (
 )
 
 P4_NAV_PHASE_LABELS = (
+    "instantwarm",
+    "instantadapt",
+    "instantcorrect",
+    "instantstable",
+    "instantfrozen",
     "loopwarm",
     "loopadapt",
     "looptrain",
@@ -144,6 +149,11 @@ P4_NAV_PHASE_LABELS = (
 # complete validation set; candidate discovery must not infer priority by
 # reversing that mixed new/legacy tuple.
 P4_NAV_CHECKPOINT_PRIORITY = (
+    "instantfrozen",
+    "instantstable",
+    "instantcorrect",
+    "instantadapt",
+    "instantwarm",
     "loopstable",
     "looptrain",
     "loopadapt",
@@ -680,6 +690,23 @@ def validate_p4_eval_bundle(bundle: dict[str, Any], *, mode: str) -> dict[str, A
     command = (bundle.get("contracts", {}).get("command") or {})
     if command.get("mapper_version") != "p4_capability_action_mapper_v1":
         raise ValueError("P4 evaluation action mapper contract mismatch")
+    transition_mode = command.get("command_transition_mode", "slew")
+    if transition_mode == "instant_hold_10hz":
+        if command.get("version") != "p4_maze_instant_command_r4":
+            raise ValueError("P4 instant evaluation command version mismatch")
+        if int(command.get("hold_frames", 0)) != 5:
+            raise ValueError("P4 instant evaluation requires hold_frames=5")
+        if int(command.get("nav_period_frames", 0)) != 5:
+            raise ValueError("P4 instant evaluation requires nav_period_frames=5")
+        if "slew_rate" in command or "slew_release_rate" in command:
+            raise ValueError("P4 instant evaluation contract must not contain slew rates")
+    elif transition_mode == "slew":
+        if "slew_rate" not in command or "slew_release_rate" not in command:
+            raise ValueError("P4 slew evaluation contract is missing slew rates")
+    else:
+        raise ValueError(
+            f"P4 evaluation command transition mode unsupported: {transition_mode!r}"
+        )
     # Reuse the structural low/high leaf validator without making P4 pretend
     # that P3 is the only accepted stage family.
     structural = dict(bundle)

@@ -3,6 +3,7 @@
 
 import ast
 from collections import deque
+import math
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -145,11 +146,13 @@ def test_p4_auto_branch_can_initialize_before_diagnostic_buffers_exist():
     assert hasattr(algorithm, "_maze_diag_risk_positive_hist")
 
 
-def _p4_eval_algorithm(num_envs=1):
+def _p4_eval_algorithm(num_envs=1, config=None):
     low_actor = nn.Sequential(
         nn.Linear(77, 512), nn.ELU(), nn.Linear(512, 256), nn.ELU(),
         nn.Linear(256, 128), nn.ELU(), nn.Linear(128, 12),
     )
+    runtime_config = {"p4_seed": 17}
+    runtime_config.update(config or {})
     return AlgorithmP4NavPPO(
         low_level_encoder=VisionEncoder(),
         low_level_actor=low_actor,
@@ -161,7 +164,7 @@ def _p4_eval_algorithm(num_envs=1):
         response_buffer=None,
         num_envs=num_envs,
         device="cpu",
-        config={"p4_seed": 17},
+        config=runtime_config,
         training=False,
     )
 
@@ -784,6 +787,25 @@ def test_p4_missing_contract_current_records_remain_incompatible():
     assert buffer.compatibility_rejections["missing_contract"] == 1
 
 
+def test_r4_adapter_rejects_legacy_slew_records_without_command_provenance():
+    buffer = P2ResponseAuxBuffer(1, "cpu", capacity_steps=64)
+    buffer.set_low_level_version("b" * 64, 0)
+    contract = p4_contract.adapter_record_contract(
+        low_level_digest="b" * 64,
+        feedback_digest="feedback",
+        training_profile="maze_instant_command_r4",
+    )
+    buffer.set_record_contract(contract)
+    buffer.enable_p4_compatible_replay()
+
+    assert contract["command_transition_mode"] == "instant_hold_10hz"
+    assert contract["command_hold_frames"] == 5
+    assert buffer.load_parent_completed_records(_legacy_parent_response_state()) == 0
+    assert buffer.legacy_parent_migration_rejections == {
+        "legacy_missing_instant_command_provenance": 32
+    }
+
+
 def test_p4_credit_repair_contract_and_soft_cruise_are_explicit():
     warm = p4_contract.training_schedule(0.0)
     assert warm["phase"] == "fullwarm"
@@ -923,8 +945,14 @@ def test_p4_auto_branch_uses_accumulated_perception_metrics_not_last_tick():
 def test_p4_checkpoint_priority_prefers_new_maze_labels():
     candidates = p4_nav_checkpoint_candidates("/models", 42)
     labels = [Path(candidate).stem.split("-")[-2] for candidate in candidates]
-    assert labels[:4] == ["loopstable", "looptrain", "loopadapt", "loopwarm"]
-    assert labels[16:22] == [
+    assert labels[:5] == [
+        "instantfrozen",
+        "instantstable",
+        "instantcorrect",
+        "instantadapt",
+        "instantwarm",
+    ]
+    assert labels[21:27] == [
         "mazefinal",
         "mazehard",
         "mazeattack",
@@ -932,6 +960,7 @@ def test_p4_checkpoint_priority_prefers_new_maze_labels():
         "mazeprobe",
         "mazediag",
     ]
+    assert labels.index("instantfrozen") < labels.index("loopstable")
     assert labels.index("loopstable") < labels.index("mazefinal")
 
 
@@ -961,13 +990,14 @@ def test_p4_configuration_and_monitor_route_are_explicit():
     root = Path(__file__).resolve().parents[1]
     config = toml.load(root / "conf/train_env_conf_track_p4_nav_ppo.toml")
     app_config = toml.load(root.parent / "conf/configure_app.toml")
-    assert config["p4_nav_ppo"]["run_name"] == "p4maze8h-closedloop-r3"
+    assert config["p4_nav_ppo"]["run_name"] == "p4maze8h-instant-r4"
     assert config["p4_nav_ppo"]["target_effective_seconds"] == 28_800
     assert config["p4_nav_ppo"]["task_end_hours"] == pytest.approx(8.25)
     assert p4_contract.PLATFORM_WALL_MARGIN_SECONDS == 900.0
     assert p4_contract.PLATFORM_WALL_SECONDS == 29_700.0
-    assert config["p4_nav_ppo"]["maze_training_branch"] == "closed_loop_v3"
-    assert config["p4_nav_ppo"]["training_profile"] == "maze_closed_loop_v3"
+    assert config["p4_nav_ppo"]["maze_training_branch"] == "instant_command_r4"
+    assert config["p4_nav_ppo"]["training_profile"] == "maze_instant_command_r4"
+    assert config["p4_nav_ppo"]["command_transition_mode"] == "instant_hold_10hz"
     assert config["p4_nav_ppo"]["nav_period_frames"] == 5
     assert config["env"]["num_envs"] == 128
     assert config["env"]["episode_length_s"] == 120.0
@@ -1078,9 +1108,7 @@ def test_p4_layered_eval_validator_requires_mapper_and_supports_both_modes():
     bundle = _p3_fixture_bundle(
         mode="track", stage_type="p4_nav_ppo", phase_label="pnavstable"
     )
-    bundle["contracts"] = {
-        "command": {"mapper_version": p4_contract.ACTION_MAPPER_VERSION}
-    }
+    bundle["contracts"] = {"command": p4_contract.command_contract("full_track")}
     standard = validate_p4_eval_bundle(bundle, mode="standard")
     track = validate_p4_eval_bundle(bundle, mode="track")
     assert standard["stage_type"] == "p4_nav_ppo"
@@ -1314,6 +1342,32 @@ def test_p4_stuck_tracker_explicit_schedule_resumes_at_the_right_phase(
     assert manager.cfg.params["max_stuck"] == round(expected_confirmation_s / 0.02)
 
 
+def test_p4_stuck_tracker_uses_spatial_diameter_and_accepts_legacy_alias():
+    manager = _FakeTerminationManager(1)
+    env = SimpleNamespace(step_dt=0.02, termination_manager=manager)
+    modern = MotionWallStuckTracker(
+        env,
+        num_envs=1,
+        device="cpu",
+        config={"spatial_diameter_m": 0.32},
+    )
+    legacy = MotionWallStuckTracker(
+        env,
+        num_envs=1,
+        device="cpu",
+        config={"radius_m": 0.32},
+    )
+    assert modern.spatial_diameter_m == pytest.approx(0.32)
+    assert legacy.spatial_diameter_m == pytest.approx(0.32)
+    with pytest.raises(ValueError, match="conflicts"):
+        MotionWallStuckTracker(
+            env,
+            num_envs=1,
+            device="cpu",
+            config={"spatial_diameter_m": 0.32, "radius_m": 0.31},
+        )
+
+
 def test_p4_stuck_tracker_shadow_and_active_contract():
     manager = _FakeTerminationManager(1)
     env = SimpleNamespace(step_dt=0.02, termination_manager=manager)
@@ -1375,6 +1429,85 @@ def test_p4_active_stuck_reset_does_not_depend_on_command_intent():
     assert getattr(env, "_nav_motion_stuck").item() >= 2.0
     manager.value.fill_(True)
     assert tracker.termination_mask(torch.ones(1, dtype=torch.bool)).item()
+
+
+def test_p4_stuck_term_read_failure_is_fail_closed_even_after_local_trigger():
+    manager = _FakeTerminationManager(1)
+    tracker = MotionWallStuckTracker(
+        SimpleNamespace(step_dt=0.02, termination_manager=manager),
+        num_envs=1,
+        device="cpu",
+        config={"mode": "active", "confirmation_s": 0.04},
+    )
+    tracker.triggered.fill_(True)
+    manager.get_term = lambda _name: (_ for _ in ()).throw(
+        RuntimeError("unavailable")
+    )
+    assert not tracker.termination_mask(torch.ones(1, dtype=torch.bool)).item()
+
+
+def test_p4_rotation_only_does_not_clear_stuck_without_wall_ema_relief():
+    tracker = MotionWallStuckTracker(
+        SimpleNamespace(step_dt=0.02, termination_manager=None),
+        num_envs=1,
+        device="cpu",
+        config={"mode": "shadow", "confirmation_s": 0.04},
+    )
+    common = {
+        "root_xy": torch.zeros(1, 2),
+        "goal_distance": torch.ones(1),
+        "mapping_valid": torch.ones(1, dtype=torch.bool),
+        "reset": torch.zeros(1, dtype=torch.bool),
+        "terminal_reason": torch.zeros(1),
+        "seconds_since_push": torch.full((1,), 10.0),
+        "episode_age_s": torch.full((1,), 10.0),
+        "true_velocity3": torch.zeros(1, 3),
+    }
+    for _ in range(3):
+        tracker.update(
+            **common,
+            collision_force=torch.full((1,), 40.0),
+            yaw=torch.zeros(1),
+        )
+    diagnostics = tracker.update(
+        **common,
+        collision_force=torch.full((1,), 40.0),
+        yaw=torch.full((1,), math.radians(25.0)),
+    )
+    assert diagnostics[0, 2].item() == 1.0
+    for _ in range(4):
+        diagnostics = tracker.update(
+            **common,
+            collision_force=torch.zeros(1),
+            yaw=torch.full((1,), math.radians(25.0)),
+        )
+    assert diagnostics[0, 2].item() == 0.0
+
+
+def test_p4_foot_jam_remains_shadow_only():
+    manager = _FakeTerminationManager(1)
+    env = SimpleNamespace(step_dt=0.02, termination_manager=manager)
+    tracker = MotionWallStuckTracker(
+        env,
+        num_envs=1,
+        device="cpu",
+        config={"mode": "active", "confirmation_s": 0.04},
+    )
+    diagnostics = tracker.update(
+        root_xy=torch.zeros(1, 2),
+        goal_distance=torch.ones(1),
+        collision_force=torch.zeros(1),
+        mapping_valid=torch.ones(1, dtype=torch.bool),
+        reset=torch.zeros(1, dtype=torch.bool),
+        terminal_reason=torch.zeros(1),
+        seconds_since_push=torch.full((1,), 10.0),
+        episode_age_s=torch.full((1,), 10.0),
+        true_velocity3=torch.zeros(1, 3),
+        foot_jam=torch.ones(1, dtype=torch.bool),
+    )
+    assert env._p4_foot_jam_shadow.item()
+    assert diagnostics[0, 4].item() == 0.0
+    assert not tracker.triggered.item()
 
 
 def test_p4_stuck_tracker_retries_after_termination_manager_assembly():
