@@ -940,8 +940,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
 
         teacher_raw = zero
         teacher = {
-            "direction": zero, "speed": zero, "yaw": zero,
+            "direction": zero, "speed": zero, "yaw": zero, "edge": zero,
+            "recovery": zero,
             "teacher_valid_steps": zero, "teacher_loss_active": zero,
+            "teacher_edge_active_share": zero,
+            "teacher_recovery_active_share": zero,
         }
         teacher_mask = batch["teacher_mask"].reshape(-1) > 0.5
         if self._teacher_update_enabled and bool(teacher_mask.any()):
@@ -1277,6 +1280,14 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "teacher_direction_loss": teacher["direction"].detach(),
             "teacher_speed_loss": teacher["speed"].detach(),
             "teacher_yaw_loss": teacher["yaw"].detach(),
+            "teacher_edge_loss": teacher.get("edge", zero).detach(),
+            "teacher_edge_active_share": teacher.get(
+                "teacher_edge_active_share", zero
+            ).detach(),
+            "teacher_recovery_loss": teacher.get("recovery", zero).detach(),
+            "teacher_recovery_active_share": teacher.get(
+                "teacher_recovery_active_share", zero
+            ).detach(),
         }
 
     @staticmethod
@@ -1401,6 +1412,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "teacher_direction_loss",
             "teacher_speed_loss",
             "teacher_yaw_loss",
+            "teacher_edge_loss",
+            "teacher_edge_active_share",
+            "teacher_recovery_loss",
+            "teacher_recovery_active_share",
             "stuck_aux_loss",
             "stuck_aux_valid_steps",
             "stuck_aux_gradient_ratio",
@@ -1781,10 +1796,13 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             )
             components["body_collision"] = torch.where(
                 collision_onset,
-                -0.12 - 0.18 * severity,
+                p4_contract.P4_BODY_COLLISION_ONSET_BASE
+                + p4_contract.P4_BODY_COLLISION_ONSET_SEVERITY * severity,
                 torch.where(
                     collision_active,
-                    torch.full_like(severity, -0.05),
+                    torch.full_like(
+                        severity, p4_contract.P4_BODY_COLLISION_PERSISTENT
+                    ),
                     torch.zeros_like(severity),
                 ),
             )

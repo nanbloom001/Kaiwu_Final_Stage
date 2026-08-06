@@ -1770,6 +1770,22 @@ def test_p2_response_done_invalidates_current_future_and_resets_following_record
     assert second["episode_start"].tolist() == [True, False]
 
 
+def test_p2_stuck_label_separates_translation_and_yaw_response():
+    buffer = P2ResponseAuxBuffer(2, "cpu")
+    for step in range(51):
+        aux = _response_aux()
+        if step == 0:
+            aux[0, 3] = 0.25
+            aux[1, 5] = 0.30
+        # Both environments can yaw. Env 0 still fails its commanded vx;
+        # Env 1 accumulates enough yaw displacement to be a healthy turn.
+        aux[:, 14] = 0.30
+        aux[1, 17] = 0.003 * step
+        buffer.append(aux, torch.zeros(2, dtype=torch.bool))
+    record = buffer._records[0]
+    assert record["stuck"].reshape(-1).tolist() == [1.0, 0.0]
+
+
 def test_p2_response_buffer_is_cpu_backed_and_resume_clears_future_history():
     buffer = P2ResponseAuxBuffer(2, "cpu")
     for _ in range(51):

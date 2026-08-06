@@ -366,6 +366,60 @@ def test_closed_loop_teacher_requires_yaw_toward_safe_detour_even_when_goal_disa
     assert result["yaw"].item() > 0.0
 
 
+def test_closed_loop_teacher_penalizes_motion_aimed_at_a_low_clearance_edge():
+    count = 64
+    # The left sector is safe, but the current straight-ahead travel direction
+    # has poor clearance. The 35 degree normal direction tolerance accepts the
+    # 30 degree difference, so this specifically exercises edge clearance.
+    result = p4_contract.teacher_guidance_loss(
+        policy_mean_cmd3=torch.tensor([[0.55, 0.0, 0.10]]).repeat(count, 1),
+        safe3=torch.tensor([[0.40, 0.95, 0.30, 0.20, 0.20]]).repeat(count, 1),
+        goal_xy_m=torch.tensor([[1.0, 0.0]]).repeat(count, 1),
+        predictive_risk=torch.zeros(count),
+        stuck_active=torch.zeros(count, dtype=torch.bool),
+        teacher_mask=torch.ones(count, dtype=torch.bool),
+        goal_mask=torch.zeros(count, dtype=torch.bool),
+        min_valid_steps=count,
+        closed_loop_v3=True,
+    )
+    assert result["direction"].item() == pytest.approx(0.0, abs=1.0e-7)
+    assert result["edge"].item() > 0.0
+    assert result["teacher_edge_active_share"].item() == pytest.approx(1.0)
+
+
+def test_closed_loop_teacher_uses_lateral_translation_to_leave_confirmed_stuck_state():
+    count = 64
+    common = dict(
+        safe3=torch.tensor([[0.95, 0.80, 0.20, 0.10, 0.05]]).repeat(count, 1),
+        goal_xy_m=torch.tensor([[1.0, 0.0]]).repeat(count, 1),
+        predictive_risk=torch.ones(count),
+        stuck_active=torch.ones(count, dtype=torch.bool),
+        teacher_mask=torch.ones(count, dtype=torch.bool),
+        goal_mask=torch.zeros(count, dtype=torch.bool),
+        min_valid_steps=count,
+        closed_loop_v3=True,
+    )
+    trapped = p4_contract.teacher_guidance_loss(
+        policy_mean_cmd3=torch.tensor([[0.50, 0.0, 0.0]]).repeat(count, 1),
+        **common,
+    )
+    escaped = p4_contract.teacher_guidance_loss(
+        policy_mean_cmd3=torch.tensor([[0.10, 0.15, 0.0]]).repeat(count, 1),
+        **common,
+    )
+    assert trapped["teacher_recovery_active_share"].item() == pytest.approx(1.0)
+    assert trapped["recovery"].item() > 0.0
+    assert escaped["recovery"].item() == pytest.approx(0.0, abs=1.0e-7)
+
+
+def test_closed_loop_stuck_and_collision_penalties_are_stronger_than_previous_contract():
+    assert p4_contract.STUCK_SUSTAINED_BASE <= -0.010
+    assert p4_contract.STUCK_SUSTAINED_FLOOR <= -0.05
+    assert p4_contract.P4_BODY_COLLISION_ONSET_BASE <= -0.20
+    assert p4_contract.P4_BODY_COLLISION_ONSET_SEVERITY <= -0.30
+    assert p4_contract.P4_BODY_COLLISION_PERSISTENT <= -0.08
+
+
 def test_teacher_loss_applies_recovery_weights_per_timestep():
     count = 64
     safe3 = torch.tensor(((0.90, 0.40, 0.10),)).repeat(count, 1)

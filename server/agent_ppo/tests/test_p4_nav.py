@@ -348,8 +348,12 @@ def test_p4_stuck_goal_safe_and_route_rewards_have_bounded_semantics():
         confirmation_s=7.0,
     )
     assert stuck[0].item() == 0.0
-    assert stuck[1].item() == pytest.approx(-0.0091666667)
-    assert stuck[2].item() == pytest.approx(-0.03)
+    assert stuck[1].item() == pytest.approx(
+        p4_contract.STUCK_SUSTAINED_BASE
+        + (1.0 / 6.0)
+        * (p4_contract.STUCK_SUSTAINED_FLOOR - p4_contract.STUCK_SUSTAINED_BASE)
+    )
+    assert stuck[2].item() == pytest.approx(p4_contract.STUCK_SUSTAINED_FLOOR)
     assert stuck[3].item() == 0.0
     assert stuck[4].item() == 0.0
     assert stuck_diag["wall_stuck_sustained_active"].tolist() == [0, 1, 1, 0, 0]

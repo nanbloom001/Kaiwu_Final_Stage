@@ -4,6 +4,21 @@
 
 ## [未发布]
 
+- **[P4 卡墙平移脱困训练]** closed-loop Safety teacher 在训练期已确认
+  “执行平移命令但真实位移/速度不足”的样本中，先约束 Actor 降低 `vx`；仅在
+  `safe5` 左右侧净空存在明确差异时，再引导与安全侧同符号的 `vy`。response 卡滞标签
+  同步拆分为平移与 yaw 两条证据，避免正常转动掩盖 `vx/vy` 失效。这不是运行时
+  硬覆盖，接触力和特权 scan 都不进入部署 Actor；Actor/Critic 输入、wire、ONNX I/O
+  和 command mapper 不变。闭环机身碰撞的 onset/persistent 值提升至
+  `-0.20-0.30*severity` / `-0.08`，持续卡墙提升至 `-0.010` 到 `-0.05` 每 10Hz tick，
+  reason4 终止 tick 仍去重。监控增加 recovery loss 与激活比例。
+- **[P4 墙边缘前瞻避障]** 五方向 training-only Safety teacher 新增
+  action-conditioned edge-clearance 引导：当 Actor 的平移朝低净空扇区运动时，
+  以更窄的偏转容差同时约束速度与朝向，修复原 35 度方向容差会接受
+  “从安全扇区斜切向墙边”的盲区。该项复用既有 `safe5` 特权标签，只更新
+  训练期 Actor auxiliary loss；Actor/Critic 输入、训练 wire、部署接口和运行时
+  command mapper 均不变。监控新增 edge loss 与激活比例，定向回归覆盖低净空
+  边缘而普通方向损失为零的样本。
 - **[P4 closed-loop 最终审查修复]** 五方向教师现在即使全局 Goal
   与必要局部绕行方向不一致，也会要求 Actor 对安全出口建立正确符号
   `wz`，避免用 `vy` 替代机身转向。StuckHead 的 diagnostic-only

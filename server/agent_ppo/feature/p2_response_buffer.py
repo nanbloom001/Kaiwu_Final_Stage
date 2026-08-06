@@ -193,10 +193,27 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
         pose_push_valid &= seconds_since_push_history[0] >= 1.0
         self.push_pose_rejections += int((pose_mask & ~pose_push_valid).sum())
         pose_mask &= pose_push_valid
-        commanded = torch.linalg.vector_norm(current[:, 3:6], dim=-1) > 0.10
-        response_speed = torch.linalg.vector_norm(history[50][:, 12:15], dim=-1)
-        displacement = torch.linalg.vector_norm(pose[:, :2], dim=-1)
-        stuck = commanded & (response_speed < 0.08) & (displacement < 0.08)
+        translation_commanded = (
+            torch.linalg.vector_norm(current[:, 3:5], dim=-1) > 0.10
+        )
+        translation_response = torch.linalg.vector_norm(
+            history[50][:, 12:14], dim=-1
+        )
+        translation_displacement = torch.linalg.vector_norm(pose[:, :2], dim=-1)
+        translation_stuck = (
+            translation_commanded
+            & (translation_response < 0.08)
+            & (translation_displacement < 0.08)
+        )
+        yaw_commanded = current[:, 5].abs() > 0.10
+        yaw_stuck = (
+            yaw_commanded
+            & (history[50][:, 14].abs() < 0.08)
+            & (pose[:, 2].abs() < 0.08)
+        )
+        # Keep the one-bit wire layout but make its evidence axis-specific:
+        # a healthy yaw response must not hide a failed vx/vy command.
+        stuck = translation_stuck | yaw_stuck
         self._records.append(
             {
                 "aux": current.clone(),

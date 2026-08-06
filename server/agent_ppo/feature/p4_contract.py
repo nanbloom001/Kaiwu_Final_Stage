@@ -40,7 +40,7 @@ CAMERA_CONTRACT_VERSION = "p4_shared_camera_v4_recovery_nominal_light"
 ADAPTER_RECORD_CONTRACT_VERSION = "p4_adapter_record_v1"
 SAFETY_REWARD_RAMP_VERSION = "p4_maze_credit_repair_safety_group_v1"
 CHECKPOINT_CONTRACT_VERSION = "p4_maze_credit_repair_v1"
-MAZE_CLOSED_LOOP_SAFETY_REWARD_VERSION = "p4_maze_closed_loop_teacher_only_v3"
+MAZE_CLOSED_LOOP_SAFETY_REWARD_VERSION = "p4_maze_closed_loop_recovery_translation_v4"
 MAZE_CLOSED_LOOP_CHECKPOINT_VERSION = "p4_maze_closed_loop_v3"
 FULL_TRACK_CHECKPOINT_CONTRACT_VERSION = "p4_full_track_v2"
 FULL_TRACK_REWARD_CONTRACT_VERSION = "p4_full_track_reward_v2_potential_straight"
@@ -49,7 +49,7 @@ WORKER_WIRE_VERSION = "p4_worker_wire_v6_full_track_spawn"
 LEGACY_STUCK_RESET_CONTRACT_VERSION = "p4_stuck_reset_v3_sliding_window_10s"
 STUCK_RESET_CONTRACT_VERSION = "p4_stuck_reset_v5_shadow_12s_to_active_10s"
 LEGACY_ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION = "p4_actor_mean_guidance_v1"
-ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION = "p4_actor_mean_guidance_v3_safe5_single_signal"
+ACTOR_MEAN_GUIDANCE_CONTRACT_VERSION = "p4_actor_mean_guidance_v5_safe5_recovery_translation"
 LEGACY_TRANSLATION_VECTOR_LIMITER_CONTRACT_VERSION = (
     "p4_translation_vector_limiter_v2_emergency_only"
 )
@@ -122,9 +122,12 @@ LEGACY_STUCK_RESET_TERMINAL_PENALTY = -25.0
 LEGACY_TIMEOUT_IMPULSE = -25.0
 STUCK_SUSTAINED_GRACE_S = 0.8
 STUCK_SUSTAINED_FULL_S = 2.0
-STUCK_SUSTAINED_BASE = -0.005
-STUCK_SUSTAINED_FLOOR = -0.03
+STUCK_SUSTAINED_BASE = -0.010
+STUCK_SUSTAINED_FLOOR = -0.05
 LEGACY_STUCK_SUSTAINED_FLOOR = -0.02
+P4_BODY_COLLISION_ONSET_BASE = -0.20
+P4_BODY_COLLISION_ONSET_SEVERITY = -0.30
+P4_BODY_COLLISION_PERSISTENT = -0.08
 GOAL_SAFE_PREFERENCE_WEIGHT = -0.012
 GOAL_SAFE_PREFERENCE_MARGIN = 0.08
 GOAL_SAFE_PREFERENCE_SCALE = 0.35
@@ -146,6 +149,13 @@ TEACHER_SAFE_MARGIN_MIN = 0.20
 TEACHER_GOAL_SAFE_TIE_MARGIN = 0.10
 TEACHER_GOAL_FRESHNESS_MIN = 0.75
 TEACHER_DIRECTION_TOLERANCE_DEG = 35.0
+TEACHER_EDGE_DIRECTION_TOLERANCE_DEG = 20.0
+TEACHER_EDGE_SAFE_MIN = 0.65
+TEACHER_EDGE_SPEED_CAP_MIN = 0.15
+TEACHER_EDGE_SPEED_CAP_RANGE = 0.55
+TEACHER_RECOVERY_MAX_VX = 0.12
+TEACHER_RECOVERY_MIN_ABS_VY = 0.12
+TEACHER_RECOVERY_SIDE_MARGIN = 0.10
 TEACHER_SPEED_RISK_MIN = 0.90
 TEACHER_MIN_VALID_STEPS = 64
 TEACHER_SAFE5_ANGLES_DEG = (60.0, 30.0, 0.0, -30.0, -60.0)
@@ -302,6 +312,10 @@ MONITOR_REQUIRED_METRICS = (
     "teacher_direction_loss",
     "teacher_speed_loss",
     "teacher_yaw_loss",
+    "teacher_edge_loss",
+    "teacher_edge_active_share",
+    "teacher_recovery_loss",
+    "teacher_recovery_active_share",
     "teacher_guidance_valid_steps",
     "teacher_guidance_gradient_ratio",
     "mirror_aux_gradient_ratio",
@@ -1154,8 +1168,57 @@ def teacher_guidance_loss(
     )
     direction_loss = direction_error.square()
 
-    risk = _flat(predictive_risk, "predictive_risk").clamp(0.0, 1.0)
+    # The regular direction term tolerates a 35 degree deviation so the Actor
+    # can follow a goal through a wide corridor. At a wall edge that tolerance
+    # permits forward motion aimed between a safe sector and an unsafe one.
+    # Compute the safety value of the actual translation heading and use a
+    # narrower, continuous correction only when that heading lacks clearance.
+    heading = torch.atan2(mean_xy[:, 1], mean_xy[:, 0])
+    heading_alignment = torch.cos(
+        heading[:, None] - sector_angles[None, :]
+    )
+    heading_weights = torch.softmax(8.0 * heading_alignment, dim=-1)
+    heading_safe = (heading_weights * values).sum(dim=-1)
+    edge_danger = torch.relu(TEACHER_EDGE_SAFE_MIN - heading_safe) / TEACHER_EDGE_SAFE_MIN
+    edge_mask = base & (mean_speed > 0.10) & (heading_safe < TEACHER_EDGE_SAFE_MIN)
+    edge_direction_error = torch.relu(
+        math.cos(math.radians(TEACHER_EDGE_DIRECTION_TOLERANCE_DEG))
+        - direction_cosine
+    )
+    edge_speed_cap = TEACHER_EDGE_SPEED_CAP_MIN + (
+        TEACHER_EDGE_SPEED_CAP_RANGE * heading_safe
+    )
+    edge_loss = edge_danger * (
+        edge_direction_error.square()
+        + torch.relu(mean_speed - edge_speed_cap).square()
+    )
+
+    # ``stuck_active`` is a delayed label built from the executed command and
+    # measured motion.  During those samples continuing to command forward
+    # motion only presses the body further into the wall.  If safe5 identifies
+    # one lateral side as clearly clearer than the other, train the Actor mean
+    # to reduce vx and issue a small vy escape command on that side.  This is
+    # training-only guidance: no contact, scanner, or command override enters
+    # the deployed Actor path.
     stuck = _flat(stuck_active, "stuck_active", boolean=True)
+    recovery_mask = torch.zeros_like(base)
+    recovery_loss = torch.zeros_like(mean_speed)
+    if closed_loop_v3:
+        left_clearance = values[:, :2].amax(dim=-1)
+        right_clearance = values[:, 3:].amax(dim=-1)
+        side_difference = left_clearance - right_clearance
+        side_sign = torch.sign(side_difference)
+        side_clear = (
+            torch.maximum(left_clearance, right_clearance) >= TEACHER_SAFE_MIN
+        ) & (side_difference.abs() >= TEACHER_RECOVERY_SIDE_MARGIN)
+        recovery_mask = base & stuck & side_clear
+        signed_vy = side_sign * policy_mean_cmd3[:, 1]
+        recovery_loss = (
+            torch.relu(policy_mean_cmd3[:, 0] - TEACHER_RECOVERY_MAX_VX).square()
+            + torch.relu(TEACHER_RECOVERY_MIN_ABS_VY - signed_vy).square()
+        )
+
+    risk = _flat(predictive_risk, "predictive_risk").clamp(0.0, 1.0)
     speed_risk_min = TEACHER_SPEED_RISK_MIN if closed_loop_v3 else 0.65
     speed_mask = base & ((risk >= speed_risk_min) | stuck)
     speed_cap = 0.20 + 0.45 * best_safe
@@ -1211,8 +1274,10 @@ def teacher_guidance_loss(
     direction = _masked_mean(direction_loss, base)
     speed = _masked_mean(speed_loss, speed_mask)
     yaw = _masked_mean(yaw_loss, yaw_mask)
+    edge = _masked_mean(edge_loss, edge_mask)
+    recovery = _masked_mean(recovery_loss, recovery_mask)
     total = (
-        0.55 * direction + 0.10 * speed + 0.35 * yaw
+        0.40 * direction + 0.10 * speed + 0.25 * yaw + 0.15 * edge + 0.10 * recovery
         if closed_loop_v3
         else 0.45 * direction + 0.20 * speed + 0.35 * yaw
     )
@@ -1223,11 +1288,19 @@ def teacher_guidance_loss(
         "direction": direction * active_float,
         "speed": speed * active_float,
         "yaw": yaw * active_float,
+        "edge": edge * active_float,
+        "recovery": recovery * active_float,
         "teacher_valid_steps": valid_steps.to(dtype=policy_mean_cmd3.dtype),
         "teacher_loss_active": active_float,
         "teacher_direction_mask": base.to(dtype=policy_mean_cmd3.dtype),
         "teacher_speed_mask": speed_mask.to(dtype=policy_mean_cmd3.dtype),
         "teacher_yaw_mask": yaw_mask.to(dtype=policy_mean_cmd3.dtype),
+        "teacher_edge_mask": edge_mask.to(dtype=policy_mean_cmd3.dtype),
+        "teacher_edge_active_share": edge_mask.to(dtype=policy_mean_cmd3.dtype).mean(),
+        "teacher_recovery_mask": recovery_mask.to(dtype=policy_mean_cmd3.dtype),
+        "teacher_recovery_active_share": recovery_mask.to(
+            dtype=policy_mean_cmd3.dtype
+        ).mean(),
     }
 
 
@@ -2182,6 +2255,21 @@ def reward_contract(
                     else LEGACY_STUCK_SUSTAINED_FLOOR
                 ),
             },
+            "closed_loop_collision": {
+                "onset_base": P4_BODY_COLLISION_ONSET_BASE,
+                "onset_severity": P4_BODY_COLLISION_ONSET_SEVERITY,
+                "persistent": P4_BODY_COLLISION_PERSISTENT,
+            },
+            "recovery_translation_teacher": {
+                "status": (
+                    "active_training_only_safe5_lateral_egress"
+                    if closed_loop
+                    else "disabled"
+                ),
+                "max_vx_m_s": TEACHER_RECOVERY_MAX_VX,
+                "min_abs_vy_m_s": TEACHER_RECOVERY_MIN_ABS_VY,
+                "side_clearance_margin": TEACHER_RECOVERY_SIDE_MARGIN,
+            },
             "goal_safe_preference": {
                 "weight": GOAL_SAFE_PREFERENCE_WEIGHT,
                 "margin": GOAL_SAFE_PREFERENCE_MARGIN,
@@ -2551,7 +2639,7 @@ def adapter_record_contract(
     response_capability[7] = P4_MAX_ABS_VY
     return {
         "version": ADAPTER_RECORD_CONTRACT_VERSION,
-        "schema": "response_aux30_future_labels_v2",
+        "schema": "response_aux30_axis_specific_stuck_labels_v3",
         "low_level_digest": str(low_level_digest),
         "feedback_digest": str(feedback_digest),
         "capability_digest": stable_digest(response_capability),

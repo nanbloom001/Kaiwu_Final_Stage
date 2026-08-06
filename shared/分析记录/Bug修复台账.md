@@ -51,6 +51,36 @@
 
 ## 2. 历史恢复条目
 
+## BUG-20260806-002：P4 转弯后侧后方受困时持续前顶
+
+- 状态：本地已验证。
+- 影响：P4 `maze_closed_loop_v3` 的训练行为、奖励合同和 checkpoint 恢复；部署输入、ONNX I/O 与运行时 command mapper 不变。
+- 首次发现：2026-08-06，迷宫转弯后肩部、机身侧面或后腿可能接触墙角；相机未必能看见接触位置，策略仍可能持续输出前进命令。
+- 症状：原闭环教师可在接触前按深度避墙、可对 `wz` 安全出口施加约束，但没有针对 `vx/vy` 执行后真实平移不足的训练梯度；原碰撞和持续卡滞惩罚不足以优先压制持续顶墙。
+- 根因：训练期已有 response buffer 用执行命令、真实速度和 1 秒位移生成卡滞标签，但旧实现以三轴范数合并证据，正常 yaw 响应可能掩盖 `vx/vy` 失效，且 `teacher_guidance_loss()` 未将该标签转成平移脱困动作；单一最大接触力不能可靠指明肩、髋或后腿接触位置，不能直接作为部署控制输入。
+- 排除项：不把训练期接触或 height scan 无声加入 Actor，不做未记录的 hard command override，不在未单独验证低层倒退步态前开放负 `vx`。
+- 修复：`p2_response_buffer.py` 将单一标签拆为平移 `vx/vy` 的真实平移速度/位移证据和 `wz` 的角速度/偏航位移证据，wire 形状不变但 record schema 升至 v3。`p4_contract.py` 升级 Actor guidance 合同为 v5。对确认卡滞样本先限制 Actor mean 的 `vx<=0.12m/s`；仅当特权 `safe5` 左右侧净空至少相差 `0.10` 且更优侧不低于 `0.65` 时，要求同符号 `vy>=0.12m/s`。所有恢复意图仍由策略采样并经过既有 `policy_cmd -> limited_cmd -> exec_cmd` 链路。closed-loop 碰撞 onset/persistent 改为 `-0.20-0.30*severity` / `-0.08`，持续卡滞改为 `-0.010` 到 `-0.05`；reason4 tick 继续排除重复惩罚。`algorithm_p4_nav_ppo.py` 记录 recovery 指标，回归验证前顶动作受罚而低前速+安全侧平移不受该项惩罚。
+- 验证：本地定向单元测试与 Python 编译已执行；容器、平台训练、固定种子 Maze 对比和真机验证未执行。
+- 防复发：训练面板同时检查 `teacher_recovery_loss`、`teacher_recovery_active_share`、`body_collision_onset`、`reward_stuck_sustained`、reason4、timeout 和成功率；若 recovery 激活率高而首次机身接触率未降，检查 response 标签与低层 `vy` 跟踪，而不是继续增大惩罚。
+- 血缘：分支 `codex/p4-v2-edge-avoid`，父分支 `origin/codex/p4-v2-integration@2062f41`；父 checkpoint `p4maze8h10hz_1416926-mazefinal`，SHA256 未在本次本地修改中核验。
+- 回滚：回退本条涉及的 Actor guidance、奖励常量、算法监控和测试；保留既有 safe5 edge-clearance 与 reason4 合同。
+- 再遇检查：`stuck_label` 的 command/true-motion 证据 -> 左右 safe5 差值 -> recovery mask 激活率 -> `vy` 执行误差 -> 首次机身接触率 -> reason4/timeout。
+
+## BUG-20260806-001：P4 五方向教师容许斜向贴墙
+
+- 状态：本地已验证。
+- 影响：P4 `maze_closed_loop_v3` 的训练行为与 checkpoint 合同；不改变部署输入、ONNX I/O 或运行时 command mapper。
+- 首次发现：2026-08-06，迷宫中机器人可能以持续前进命令斜向接近墙边缘，随后由碰撞/卡滞链兜底。
+- 症状：已有 `safe5` 教师能识别更安全的侧向出口，但 35 度通用方向容差会接受相距 30 度的前进方向；当该前进方向对应扇区净空不足时，Actor 没有专门的训练梯度在接触前降低速度并向安全扇区偏转。
+- 根因：`teacher_guidance_loss()` 只比较动作方向与选定安全扇区的夹角，不计算动作实际指向方向的连续 `safe5` 净空；风险仅在动作映射中 shadow 记录，不能补足这个训练盲区。
+- 排除项：不启用未记录的硬 command 覆盖，不向部署 Actor 注入 scanner/height 特权输入，不把卡滞 reset 误作脱困学习。
+- 修复：`server/agent_ppo/feature/p4_contract.py` 将 Actor guidance 合同升至 v4；以五方向角度软分配计算 action-conditioned heading safety，在平移速度大于 `0.10m/s` 且朝向净空低于 `0.65` 时施加连续 edge loss（严格朝向与速度上限）。`algorithm_p4_nav_ppo.py` 记录 edge 指标并兼容旧 teacher diagnostic stub；`test_p4_recovery_contract.py` 覆盖“常规方向误差为零、但朝低净空墙边运动”场景。
+- 验证：本地 `PYTHONUTF8=1` 且以 `tomli` 提供 Python 3.9 的 `tomllib` 兼容时，`test_p4_nav.py`、`test_p4_recovery_contract.py`、`test_p4_recovery_aux.py`、`test_p4_recovery_monitor.py` 共 126 passed；Python 编译通过。容器、平台训练、固定种子评估和真机验证未执行。
+- 防复发：保留 action-conditioned edge regression；训练面板必须同时审查 `teacher_edge_loss`、`teacher_edge_active_share`、首次机身接触率与 reason4 比率，不得只看总 reward 或成功数。
+- 血缘：分支 `codex/p4-v2-edge-avoid`，父分支 `origin/codex/p4-v2-integration@2062f41`；父 checkpoint `p4maze8h10hz_1416926-mazefinal`，SHA256 未在本次本地修改中核验。
+- 回滚：回退本条涉及的 `p4_contract.py`、`algorithm_p4_nav_ppo.py` 与对应测试；不回退既有 safe5、wall-stuck 或 command mapper 合同。
+- 再遇检查：`safe5` 扇区顺序与角度 -> edge mask 占比 -> teacher gradient ratio -> 首次墙接触率 -> reason4/timeout 分母。
+
 以下内容由 Git 历史、`server/CHANGELOG.md`、既有复盘文档、平台日志和 2026-07-22 至
 2026-07-26 的连续排障记录恢复。较早条目若缺少模型 SHA，会明确标为未知，不补造数据。
 
