@@ -1205,6 +1205,51 @@ def test_finish_tick_zeroes_unattributed_reset_reward_and_terminates_gae():
     assert not algorithm.rollout_invalid
 
 
+def test_finish_tick_valid_mask_does_not_cross_broadcast_environment_rows():
+    algorithm = AlgorithmP2NavPPO.__new__(AlgorithmP2NavPPO)
+    algorithm.device = torch.device("cpu")
+    algorithm.num_envs = 2
+    algorithm.nav_period_frames = p2_contract.NAV_PERIOD_FRAMES
+    algorithm.command = SimpleNamespace(
+        active_target=torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        exec_cmd=torch.tensor([[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+        inject=lambda _obs, _critic: None,
+    )
+    algorithm.critic = _ZeroCritic()
+    algorithm.critic_hidden = None
+    algorithm.reset_since_tick = torch.zeros(2, dtype=torch.bool)
+    algorithm.rollout = _TransitionCapture()
+    algorithm.rollout_invalid = False
+    algorithm.invalid_transition_count = 0
+    algorithm.gait_baseline = P2GaitBaseline()
+    algorithm.gait_baseline.finalize()
+    algorithm.best_goal_distance = torch.full((2,), float("inf"))
+    algorithm.pending_tick = {
+        "command_penalty": torch.zeros(2, 1),
+        "tick_penalty": torch.zeros(2, 1),
+        "target_cmd3": torch.tensor(
+            [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]
+        ),
+    }
+
+    algorithm.finish_tick(
+        torch.zeros(2, nav_contract.POLICY_OBS_DIM),
+        torch.zeros(2, p2_contract.PRIVILEGED_WIRE_DIM),
+        frame_safety_reward=torch.zeros(2),
+        start_goal_distance=torch.full((2,), 2.0),
+        end_goal_distance=torch.full((2,), 2.0),
+        terminal_reason=torch.zeros(2, dtype=torch.long),
+        duration_frames=torch.full((2,), p2_contract.NAV_PERIOD_FRAMES),
+        hard_terminated=torch.zeros(2, dtype=torch.bool),
+        timeout=torch.zeros(2, dtype=torch.bool),
+        unattributed_boundary=torch.tensor((False, True)),
+    )
+
+    valid_mask = algorithm.rollout.transition["valid_mask"]
+    assert valid_mask.shape == (2, 1)
+    assert torch.equal(valid_mask, torch.tensor([[1.0], [0.0]]))
+
+
 def test_finish_tick_sanitizes_invalid_reward_rows_before_rollout_storage():
     algorithm = AlgorithmP2NavPPO.__new__(AlgorithmP2NavPPO)
     algorithm.device = torch.device("cpu")

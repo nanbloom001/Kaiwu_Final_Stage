@@ -1577,7 +1577,7 @@ class AlgorithmP2NavPPO:
                 # attributable outcome. Exclude that row from every PPO/value
                 # statistic instead of training it toward an artificial zero
                 # return.
-                "valid_mask": (~unattributed & ~invalid_rows)
+                "valid_mask": (~unattributed.reshape(-1) & ~invalid_rows.reshape(-1))
                 .float()
                 .reshape(-1, 1),
             }

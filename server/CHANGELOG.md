@@ -36,6 +36,11 @@
   `nav_stuck_timeout` term 的实际 readback。仅旋转 20 度不再自动清除卡滞，必须同时观察到墙接触
   EMA 至少下降 30%；候选基准跟踪持续接触期间的 EMA 峰值。foot-jam 仅作 shadow 诊断，不触发
   active reset。
+- **[P4 R4 容器回归修复]** 修复 `finish_tick()` 将 `[E,1]` 的 unknown-reset mask 与 `[E]`
+  的 invalid-row mask 直接组合时广播成 `[E,E]` 的问题，保证 rollout `valid_mask` 始终为
+  `[E,1]`。R4 最小 smoke 同步支持单段 Maze reason4 reset、instant-command warm start、禁用的
+  mirror 辅助，以及 ResponseAdapter 的 51 帧 future-label 加 24 条 recurrent record 最小历史，
+  防止旧测试夹具把合法配置误报为训练故障。
 
 - **[P4 卡墙平移脱困训练]** closed-loop Safety teacher 在训练期已确认
   “执行平移命令但真实位移/速度不足”的样本中，先约束 Actor 降低 `vx`；仅在

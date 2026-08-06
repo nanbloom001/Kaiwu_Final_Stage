@@ -58,13 +58,19 @@ def _seed_response_records(algorithm: AlgorithmP4NavPPO) -> None:
     aux[:, 3] = 0.5
     aux[:, 9] = 1.0
     aux[:, 12] = 0.3
-    for frame in range(64):
+    # The adapter sampler needs 51 future-label frames before it can emit a
+    # record, then 8 burn-in + 16 training records for one recurrent batch.
+    for frame in range(80):
         sample = aux.clone()
         sample[:, 15] = 0.006 * frame
         algorithm.response_buffer.append(
             sample,
             torch.zeros(num_envs, dtype=torch.bool),
             current_segment=torch.full((num_envs,), 2.0),
+        )
+    if not algorithm.response_buffer.ready:
+        raise AssertionError(
+            "response smoke fixture did not produce a complete adapter sequence"
         )
 
 
@@ -317,9 +323,17 @@ def main() -> int:
     args = parser.parse_args()
 
     with Path(args.config).open("rb") as stream:
-        config = tomllib.load(stream)["p4_nav_ppo"]
-    config = dict(config)
-    config["maze_training_branch"] = "auto"
+        full_config = tomllib.load(stream)
+    config = dict(full_config["p4_nav_ppo"])
+    config["track_segment_labels"] = list(
+        p2_contract.canonical_track_segment_labels(
+            full_config["terrain"]["track"]["sub_terrains"]
+        )
+    )
+    instant_r4 = config.get("training_profile") == "maze_instant_command_r4"
+    config["maze_training_branch"] = (
+        "instant_command_r4" if instant_r4 else "auto"
+    )
 
     checkpoint = Path(args.checkpoint).resolve()
     output = Path(args.output).resolve()
@@ -341,14 +355,29 @@ def main() -> int:
     mode = algorithm.load_bundle(
         str(checkpoint), platform_model_id=platform_model_id
     )
-    if mode != "p4_full_track_warm_start":
+    expected_warm_start = (
+        "p4_maze_instant_r4_warm_start"
+        if instant_r4
+        else "p4_full_track_warm_start"
+    )
+    if mode != expected_warm_start:
         raise AssertionError(f"unexpected warm-start mode: {mode}")
-    _exercise_fp16_mirror_auxiliary(algorithm)
+    if not instant_r4:
+        _exercise_fp16_mirror_auxiliary(algorithm)
     low_digest_before = _module_digest(algorithm)
 
-    algorithm._resolved_maze_training_branch = "actor_attack"
-    algorithm.update_training_clocks(p4_contract.DIAGNOSTIC_SECONDS)
-    if algorithm.current_phase not in {"fullwarm", "fulladapt", "fulltrain", "fullstabilize"}:
+    algorithm._resolved_maze_training_branch = (
+        "instant_command_r4" if instant_r4 else "actor_attack"
+    )
+    algorithm.update_training_clocks(
+        1_800.0 if instant_r4 else p4_contract.DIAGNOSTIC_SECONDS
+    )
+    valid_phases = (
+        {"instantadapt"}
+        if instant_r4
+        else {"fullwarm", "fulladapt", "fulltrain", "fullstabilize"}
+    )
+    if algorithm.current_phase not in valid_phases:
         raise AssertionError("P4 smoke failed to enter the full-track schedule")
     _seed_response_records(algorithm)
     _fill_rollout(algorithm)
@@ -387,7 +416,11 @@ def main() -> int:
                 "critic_gradient_steps": algorithm.critic_gradient_steps,
                 "adapter_gradient_steps": algorithm.adapter_gradient_steps,
                 "low_digest_unchanged": low_digest_before == low_digest_after,
-                "fp16_mirror_auxiliary": "PASS",
+                "fp16_mirror_auxiliary": (
+                    "not_applicable_disabled_by_r4_contract"
+                    if instant_r4
+                    else "PASS"
+                ),
                 "memory_allocated": (
                     torch.cuda.memory_allocated(cuda_index) if cuda_smoke else 0
                 ),

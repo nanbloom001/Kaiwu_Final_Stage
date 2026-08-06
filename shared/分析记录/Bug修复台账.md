@@ -53,7 +53,7 @@
 
 ## BUG-20260807-001：P4 高层 slew 隐式延迟、恢复后合同回退与卡滞伪恢复
 
-- 状态：本地已验证；开发容器尚未同步最新补丁，平台 smoke、八小时训练和固定条件评估未执行。
+- 状态：开发容器最小 smoke 已验证；平台训练 smoke、八小时训练和固定条件评估未执行。
 - 影响：P4 Maze 高层命令执行、PPO 数据闭环、checkpoint exact resume、卡滞 reason4 归因和监控；
   不修改平台覆盖的 `server/isaac_env/base_env.py`，不改变 Actor85、Critic 输入、三轴动作范围、
   worker/eval wire 或当前稳定低层部署接口。
@@ -113,6 +113,32 @@
   `sh .../conf/start_tongbu.sh`，而启动脚本会 source 该文件，导致递归拉起 shell 并触发 IDE 资源
   回收。已只删除该非凭证命令行，未清理或输出任何凭证；同步 RPC `/health` 随后恢复 200。
   这仅证明容器环境恢复，不等于当前 R4 代码已同步或 Isaac smoke 已通过，后两项仍待执行。
+- 2026-08-07 R4 容器联合 smoke 补充：172 个同步文件与本地 manifest SHA256 全部一致；父 ZIP
+  `p4maze8h10hz_1416926.zip` SHA256 为
+  `106908c8830f4fc7989125372f6ed397366f7ca1b4aac071128dccf71add0f6c`，包内
+  `model.ckpt-mazefinal-1416926.pkl` SHA256 为
+  `0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`。前两次启动分别在
+  环境 reset 前因多进程未继承 IsaacLab 源码路径、Kit Python 缺少平台 Conda `dynaconf` 而停止；
+  已确认正确开发容器入口是先 source `_isaac_sim/setup_conda_env.sh`，再使用其
+  `/opt/conda/envs/env_isaaclab/bin/python3` 并补 IsaacLab source `PYTHONPATH`。第三次已跨过真实
+  `env.reset`，在首个 `finish_tick` 暴露 `unattributed[E,1]` 与 `invalid_rows[E]` 按位运算被广播成
+  `[E,E]`，8 环境因此生成 64 行 `valid_mask`。修复为两者先显式压平再组合；新增两环境回归，
+  验证输出严格为 `[2,1]` 且只有 reason0 行为零。定向本地回归 `3 passed`。
+- 2026-08-07 R4 容器最终最小验证：修复后的 1-env 真实 Isaac smoke 已确认
+  `track_length=1`、`open_entry_maze`、`nav_stuck_timeout` active、`dt=0.02s`、reason4 触发物理
+  reset、worker reason 保持为 4，且单段 Maze reset 后 row 仍为 0。8-env 联合 smoke 使用同一父
+  checkpoint 完成 32 个高层 tick、4 个 PPO epoch、Actor/Critic 各 16 次梯度更新、1 次 Adapter
+  update、save 和 fresh-process exact resume；结果 `status=PASS`、phase=`instantadapt`、
+  warm-start=`p4_maze_instant_r4_warm_start`、resume=`p4_exact_resume_history_reset`，低层 digest
+  全程不变。Adapter 首次显示 0 update 的原因不是生产 replay 故障，而是 smoke 只注入 64 个低层
+  帧：等待 51 帧 future label 后只剩 14 条 completed records，少于 `8 burn-in + 16 train`。测试夹具
+  改为 80 帧并在 update 前断言 buffer ready 后通过。单段 Maze 不安装 full-track spawn hook、R4
+  使用 `initial_confirmation_s`、完整 TOML 才含 terrain labels、R4 禁用 mirror auxiliary，均已写入
+  smoke 工具以避免继续把旧 profile 假设误报为训练故障。测试临时 checkpoint 与提取父 checkpoint
+  已从容器清理，父 ZIP 保留。最终本地现役套件为 `601 passed, 5 skipped, 3 subtests passed`；其中
+  `nav_full_smoke` 的单个用例在临时 worktree 根运行时因不存在平台根级 `train_test.py` 失败，从
+  正确的 `server/` 项目根单独重跑后 `1 passed`。变更 Python 编译、活动 P4 TOML 解析与
+  `git diff --check` 均通过。该证据只覆盖开发容器装配和单轮更新，不等于平台长训表现已验证。
 - 防复发：监控必须同时上报 transition mode、hold frames、policy-limited/exec MAE、三轴正负 delta/
   reversal、phase、Actor/Adapter freeze、parent anchor loss、unknown reset、reason4 和墙接触 EMA 恢复。
   exact-resume 测试必须实际 load 后再次检查 controller mode，并逐值验证冻结期 Actor/Adapter 参数

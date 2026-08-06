@@ -28,6 +28,7 @@ def _config(confirmation_s: float) -> dict:
         {
             "mode": "active",
             "confirmation_s": float(confirmation_s),
+            "initial_confirmation_s": float(confirmation_s),
             "episode_grace_s": 0.0,
             "push_grace_s": 0.0,
         }
@@ -52,6 +53,7 @@ def main() -> int:
             {
                 "mode": "active",
                 "confirmation_s": float(args.confirmation_s),
+                "initial_confirmation_s": float(args.confirmation_s),
                 "episode_grace_s": 0.0,
                 "push_grace_s": 0.0,
             }
@@ -77,14 +79,20 @@ def main() -> int:
         spawn_controller = getattr(
             unwrapped, "_agent_ppo_p4_full_track_spawn", None
         )
-        if spawn_controller is None or not spawn_controller.installed:
-            raise RuntimeError("P4 full-track spawn hook is not installed")
-        maze_row = int(spawn_controller._terrain_rows()[0][4])
-        spawn_controller.quota.last_full[0] = False
-        spawn_controller.quota.last_segment[0] = 4
-        spawn_controller.quota.last_quartile[0] = 1
-        spawn_controller.quota.last_safe[0] = False
-        spawn_controller.quota.reason4_retries[0] = 0
+        spawn_hook_installed = bool(
+            spawn_controller is not None and spawn_controller.installed
+        )
+        terrain_level_before_reset = int(
+            unwrapped.scene.terrain.terrain_levels.reshape(-1)[0].item()
+        )
+        maze_row = terrain_level_before_reset
+        if spawn_hook_installed:
+            maze_row = int(spawn_controller._terrain_rows()[0][4])
+            spawn_controller.quota.last_full[0] = False
+            spawn_controller.quota.last_segment[0] = 4
+            spawn_controller.quota.last_quartile[0] = 1
+            spawn_controller.quota.last_safe[0] = False
+            spawn_controller.quota.reason4_retries[0] = 0
         before_episode_len = int(unwrapped.episode_length_buf[0].item())
         unwrapped._nav_motion_stuck = torch.full(
             (1,), float(max_stuck), device=unwrapped.device
@@ -101,7 +109,15 @@ def main() -> int:
         ]
         worker_reset = bool(worker_aux[0, 24] > 0.5)
         worker_reason = int(worker_aux[0, 25].round().item())
-        spawn_diagnostics = spawn_controller.diagnostics()
+        spawn_diagnostics = (
+            spawn_controller.diagnostics()
+            if spawn_hook_installed
+            else {
+                "raycast_status": "not_required_single_segment",
+                "all_position_applied_count": 0,
+                "spawn_write_failure_count": 0,
+            }
+        )
         terrain_level = int(
             unwrapped.scene.terrain.terrain_levels.reshape(-1)[0].item()
         )
@@ -116,7 +132,7 @@ def main() -> int:
             "truncated": bool(torch.as_tensor(truncated).reshape(-1)[0]),
             "worker_reset": worker_reset,
             "worker_reason": worker_reason,
-            "spawn_hook_installed": int(spawn_controller.installed),
+            "spawn_hook_installed": int(spawn_hook_installed),
             "spawn_raycast_status": spawn_diagnostics["raycast_status"],
             "spawn_all_position_applied_count": int(
                 spawn_diagnostics["all_position_applied_count"]
@@ -140,10 +156,13 @@ def main() -> int:
             raise AssertionError("wall-stuck termination did not auto-reset the env")
         if not payload["worker_reset"] or payload["worker_reason"] != 4:
             raise AssertionError("worker did not preserve wall-stuck terminal reason 4")
-        if payload["spawn_all_position_applied_count"] < 1:
-            raise AssertionError("reason4 reset did not apply a validated all-position spawn")
-        if payload["spawn_write_failure_count"] != 0:
-            raise AssertionError("reason4 spawn reported a physical writer failure")
+        if spawn_hook_installed:
+            if payload["spawn_all_position_applied_count"] < 1:
+                raise AssertionError(
+                    "reason4 reset did not apply a validated all-position spawn"
+                )
+            if payload["spawn_write_failure_count"] != 0:
+                raise AssertionError("reason4 spawn reported a physical writer failure")
         if payload["terrain_level_after_reset"] != payload["expected_maze_row"]:
             raise AssertionError("reason4 reset did not place the env in the requested Maze row")
         print("P4_STUCK_RUNTIME_SMOKE_PASS", flush=True)
