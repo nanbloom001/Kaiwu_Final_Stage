@@ -56,6 +56,10 @@ private:
     std::vector<float> build_proprio();   // 45, 策略序
     void on_uwb(const void* message);
     void on_sport_state(const void* message);
+    std::array<float, 3> apply_stuck_recovery(
+        const std::array<float, 3>& requested,
+        const std::chrono::steady_clock::time_point& now,
+        float measured_wz);
     std::array<float, 3> command_for_frame(
         const std::chrono::steady_clock::time_point& now,
         std::vector<float>& goal,
@@ -101,6 +105,7 @@ private:
     std::string sport_topic_ = "rt/sportmodestate";
     bool uwb_diagnostic_feedback_ = true;
     float uwb_velocity_alpha_ = 0.20f;
+    bool stuck_recovery_enabled_ = true;
 
     // ---- 逐帧诊断日志（CSV），进 VisionLoco 态自动开 ----
     bool logging_enabled_ = true;
@@ -178,6 +183,23 @@ private:
     int consecutive_errors_ = 0;
     long deadline_misses_ = 0;
     long frame_ = 0;
+
+    // Runtime-only safety override. It never changes the ONNX contract.
+    enum class RecoveryPhase { idle, braking, lateral, settling };
+    RecoveryPhase recovery_phase_ = RecoveryPhase::idle;
+    int recovery_direction_ = 1;
+    int last_recovery_direction_ = -1;
+    float recovery_progress_m_ = 0.0f;
+    float recovery_effective_s_ = 0.0f;
+    float recovery_low_speed_s_ = 0.0f;
+    float recovery_total_s_ = 0.0f;
+    float stuck_window_s_ = 0.0f;
+    float stuck_path_m_ = 0.0f;
+    float stuck_low_speed_s_ = 0.0f;
+    float recent_turn_integral_rad_ = 0.0f;
+    float recent_turn_window_s_ = 0.0f;
+    std::chrono::steady_clock::time_point watchdog_last_tick_{};
+    std::chrono::steady_clock::time_point recovery_phase_started_{};
 };
 
 REGISTER_FSM(State_VisionLoco)

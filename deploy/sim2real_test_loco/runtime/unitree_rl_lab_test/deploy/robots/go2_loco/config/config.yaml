@@ -54,6 +54,9 @@ FSM:
     #          仅保留分支以复用 State；正式 loco 测试请用 fixed / uwb。
     command_source: uwb
     fixed_cmd: [0.7, 0.0, 0.0]   # vx, vy, wz (楼梯测试, 和训练速度一致)
+    # 仅在持续前进但实测 5 秒几乎无水平运动时启用；模型 I/O 不变。
+    stuck_recovery:
+      enabled: true
     uwb:
       topic: rt/uwbstate
       sport_state_topic: rt/sportmodestate
