@@ -665,6 +665,30 @@ R4 的五方向 Teacher 与父 Actor anchor 共用 `auxiliary_gradient_hard_cap=
 之和最大为 `0.0275`；checkpoint/监控必须保存并上报目标比例与实际梯度比例。若有效样本和 raw loss
 非零而实际比例长期为零，应视为训练合同失效，不能把它解释为教师已经参与策略更新。
 
+##### 活动 `p4_maze_instant_repair2h_v1` 训练合同
+
+`p4maze2h-instant-repair-r1` 继续使用上节的
+`p4_maze_instant_command_r4_inputfix` command contract，因此 Actor85、Critic 输入、三轴动作范围、
+10Hz hold、worker/eval wire 和部署接口均不变化。新 training/reward contract 分别为
+`p4_maze_instant_repair2h_v1` 与 `p4_maze_reward_v5_instant_credit_repair`；旧 R4 包只能 warm start，
+只有三份合同及 stuck-reset 合同完整一致的新包才能 exact resume。
+
+本 profile 有效训练 7200 秒，平台任务预留到 2.25 小时，单段 `open_entry_maze`、20 列、128 env、
+75 秒 episode。低层、NavigationEncoder、SafetyHead 和 StuckHead 全程冻结；Actor/LSTM、Critic
+和低学习率 ResponseAdapter 按 `repaircollect/repairadapt/repairtrain/repairstable` 四阶段训练。
+command-rate 与 tracking 权重仅在该 profile 覆盖为 `-0.003/-0.002`；Maze new-best 为 `1.0/m`、
+每 episode 上限 `+6`，terminal 不回扣，success/failure/timeout 为 `+200/-60/-40`。卡滞 reset
+固定 shadow、12 秒确认，不生成 reason4；`terminal_penalty=-75` 仅作为未来 active 合同记录。
+
+Adapter 只采样当前 command digest、低层 digest、反馈和 capability 全部兼容的本轮 completed
+records，父记录回放比例为 0；非 exact warm start 必须清空源 checkpoint 的 completed records，
+exact resume 才允许恢复同一 repair session 的 records。仍保留 10% neutral-profile dropout。Goal stale 和 near-goal Teacher
+仅约束 Actor mean：前者限制过期目标下的建议平移/yaw，后者只在目标扇区本身安全时抑制横向偏离
+并平滑降速；两者不得重写 policy target 或 exec command。Standard eval 只加载低层，不校验无关
+高层 command contract；Track eval 必须严格校验 inputfix command contract。P4 bundle 继续
+`deployable=false`，默认 Track 入口不得接受历史 slew P4 bundle；训练代码修复只有经过新 checkpoint
+保存后才会进入平台评估包。
+
 当前稳定部署树 `deploy/sim2real_test_loco` 仍是独立 Actor80 低层路线，不执行上述 P4 高层控制器。
 因此本合同只约束 server 训练和 Track eval；P4 checkpoint 继续 `deployable=false`。在完成高层导出、
 Jetson runtime、ONNX 数值和真机验证前，不得声称真机已采用 instant-command 语义，也不得在低层

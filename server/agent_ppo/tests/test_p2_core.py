@@ -1758,7 +1758,7 @@ def test_worker_reason_codes_do_not_classify_unknown_reset_as_timeout():
     assert reasons.tolist() == [1.0, 2.0, 3.0, 0.0]
 
 
-def test_worker_reason_code_four_owns_all_overlapping_terminal_terms():
+def test_worker_terminal_reason_priority_preserves_success_and_hard_failure():
     manager = _TerminationManager(4)
     manager.terminated[:] = torch.tensor((False, True, False, False))
     manager.time_outs[:] = True
@@ -1769,7 +1769,7 @@ def test_worker_reason_code_four_owns_all_overlapping_terminal_terms():
         torch.ones(4, dtype=torch.bool),
         wall_stuck=torch.tensor((True, True, True, False)),
     )
-    assert reasons.tolist() == [4.0, 4.0, 4.0, 3.0]
+    assert reasons.tolist() == [1.0, 2.0, 4.0, 3.0]
 
 
 def test_terminal_reason_keeps_success_and_timeout_mutually_exclusive():

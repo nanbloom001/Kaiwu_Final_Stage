@@ -1530,6 +1530,7 @@ def _build_p4_monitor(training_profile=None):
         "maze_credit_repair",
         "maze_closed_loop_v3",
         "maze_instant_command_r4",
+        "maze_instant_repair2h",
         "full_track",
     }:
         raise ValueError(f"unsupported P4 monitor training profile {profile!r}")
@@ -1540,6 +1541,7 @@ def _build_p4_monitor(training_profile=None):
             "maze_credit_repair",
             "maze_closed_loop_v3",
             "maze_instant_command_r4",
+            "maze_instant_repair2h",
         }
         else "P4五段全赛道训练"
     )
@@ -1551,7 +1553,7 @@ def _build_p4_monitor(training_profile=None):
         for name, name_en, metrics in panels:
             _add_multi_line_panel(monitor, name, name_en, metrics)
         monitor.end_group()
-    if profile == "maze_instant_command_r4":
+    if profile in {"maze_instant_command_r4", "maze_instant_repair2h"}:
         monitor.add_group(
             group_name="P4瞬时命令合同",
             group_name_en="p4_instant_command_contract",
@@ -1597,12 +1599,30 @@ def _build_p4_monitor(training_profile=None):
             (
                 "parent_anchor_loss",
                 "parent_anchor_valid_steps",
+                "parent_anchor_valid_share",
                 "parent_anchor_gradient_ratio",
                 "teacher_guidance_loss",
                 "teacher_guidance_gradient_ratio",
                 "teacher_guidance_valid_steps",
             ),
         )
+        if profile == "maze_instant_repair2h":
+            _add_multi_line_panel(
+                monitor,
+                "Repair2h训练阶段",
+                "p4_instant_repair_phase",
+                (
+                    "repair_phase_collect",
+                    "repair_phase_adapt",
+                    "repair_phase_train",
+                    "repair_phase_stable",
+                    "session_effective_seconds",
+                    "actor_learning_rate",
+                    "critic_learning_rate",
+                    "adapter_learning_rate",
+                    "adapter_frozen",
+                ),
+            )
         monitor.end_group()
     groups = (
         (
@@ -1619,6 +1639,10 @@ def _build_p4_monitor(training_profile=None):
                 ("近终点捕获当前上报窗口", "p4_near_goal_capture_window", ("near_goal_capture_candidate_count", "near_goal_capture_entry_count", "near_goal_capture_exit_count", "near_goal_capture_zone_success_count", "near_goal_capture_zone_collision_count", "near_goal_capture_zone_timeout_count", "near_goal_capture_zone_reset_count", "near_goal_capture_reset_counted_as_completion_error")),
                 ("近终点捕获至平台成功时延", "p4_near_goal_capture_platform_latency", ("near_goal_capture_entry_to_platform_success_latency_s",)),
                 ("动作映射", "p4_action_mapping", ("normalized_action_vx", "normalized_action_vy", "normalized_action_wz", "policy_target_vx", "policy_target_vy", "policy_target_wz", "limited_target_vx", "limited_target_vy", "limited_target_wz", "mapped_cmd_vx", "mapped_cmd_vy", "mapped_cmd_wz")),
+                ("正横移命令链", "p4_vy_positive_chain", ("policy_target_vy_positive_mean", "limited_target_vy_positive_mean", "mapped_cmd_vy_positive_mean", "exec_vy_positive_mean", "true_vy_positive_mean")),
+                ("负横移命令链", "p4_vy_negative_chain", ("policy_target_vy_negative_mean", "limited_target_vy_negative_mean", "mapped_cmd_vy_negative_mean", "exec_vy_negative_mean", "true_vy_negative_mean")),
+                ("正转向命令链", "p4_wz_positive_chain", ("policy_target_wz_positive_mean", "limited_target_wz_positive_mean", "mapped_cmd_wz_positive_mean", "exec_wz_positive_mean", "true_wz_positive_mean")),
+                ("负转向命令链", "p4_wz_negative_chain", ("policy_target_wz_negative_mean", "limited_target_wz_negative_mean", "mapped_cmd_wz_negative_mean", "exec_wz_negative_mean", "true_wz_negative_mean")),
                 ("转向抵消", "p4_yaw_cancellation", ("yaw_exec_cancellation", "yaw_true_cancellation", "yaw_exec_sign_flip", "yaw_true_sign_flip", "yaw_true_overshoot", "reward_yaw_raw")),
                 ("安全方向内目标偏好与Shadow", "p4_goal_safe_preference", ("goal_safe_preference_eligible", "goal_safe_preference_gap", "goal_safe_preference_selected", "goal_safe_preference_best", "reward_goal_safe_preference")),
                 ("路径效率", "p4_route_efficiency", ("route_path_length_m", "route_positive_progress_m", "route_excess_distance_m", "route_efficiency", "reward_route_excess")),
@@ -1637,6 +1661,7 @@ def _build_p4_monitor(training_profile=None):
                 ("风险减速当前上报窗口", "p4_risk_deceleration_window", ("risk_event_resolved_count", "risk_decel_policy_count", "risk_decel_limited_count", "risk_no_deceleration_count", "risk_decel_policy_rate", "risk_decel_limited_rate", "risk_no_deceleration_rate", "predictive_collision_risk", "body_collision_onset", "wall_stuck_candidate_share", "wall_stuck_reset_triggered")),
                 ("LSTM记忆消融", "p4_zero_hidden_shadow", ("zero_hidden_action_mae", "zero_hidden_direction_disagreement", "camera_clean_live_action_mae", "camera_clean_live_latent_cosine")),
                 ("Actor教师与辅助梯度", "p4_actor_auxiliary", ("teacher_guidance_loss", "teacher_direction_loss", "teacher_speed_loss", "teacher_yaw_loss", "teacher_guidance_valid_steps", "teacher_guidance_gradient_ratio", "camera_aux_gradient_ratio", "mirror_aux_gradient_ratio", "stuck_aux_gradient_ratio", "auxiliary_gradient_ratio", "mirror_aux_sequence_share", "mirror_aux_eligible_sequence_count", "mirror_aux_scheduled_sequence_share", "safety_hard_positive_share")),
+                ("Goal状态教师", "p4_goal_teacher_aux", ("teacher_stale_goal_loss", "teacher_stale_goal_active_share", "teacher_near_goal_loss", "teacher_near_goal_active_share", "teacher_guidance_gradient_ratio", "teacher_guidance_valid_steps")),
                 ("Actor卡滞分类质量", "p4_actor_stuck_quality", ("stuck_aux_loss", "stuck_aux_valid_steps", "actor_stuck_pr_auc", "actor_stuck_precision", "actor_stuck_recall", "actor_stuck_f1", "actor_stuck_threshold", "actor_stuck_positive_share")),
             ),
         ),
@@ -1649,6 +1674,8 @@ def _build_p4_monitor(training_profile=None):
                 ("安全奖励应用与禁用核验", "p4_safety_applied", ("reward_predictive_collision_risk", "reward_missed_safe_direction", "reward_yaw_cancellation", "reward_yaw_exit_response", "reward_safety_group_scale", "reward_stuck_sustained", "reward_goal_safe_preference", "reward_stuck_reset", "reward_continuous_time_scale")),
                 ("Frontier停滞实际与Shadow", "p4_frontier_stagnation", ("reward_frontier_stagnation", "reward_frontier_stagnation_shadow")),
                 ("奖励守恒", "p4_reward_conservation", ("reward_decomposed_total", "rollout_reward_mean", "reward_conservation_error")),
+                ("命令变化逐轴贡献", "p4_command_rate_axes", ("reward_command_rate_vx", "reward_command_rate_vy", "reward_command_rate_wz", "reward_command_rate_vy_positive", "reward_command_rate_vy_negative", "reward_command_rate_wz_positive", "reward_command_rate_wz_negative")),
+                ("真实跟踪逐轴贡献", "p4_tracking_axes", ("reward_tracking_vx", "reward_tracking_vy", "reward_tracking_wz", "reward_tracking_vy_positive", "reward_tracking_vy_negative", "reward_tracking_wz_positive", "reward_tracking_wz_negative")),
             ),
         ),
         (
@@ -1665,6 +1692,7 @@ def _build_p4_monitor(training_profile=None):
             "p4_stuck_reset",
             (
                 ("卡滞证据", "p4_stuck_evidence", ("motion_confined_share", "wall_evidence_share", "wall_stuck_candidate_share", "wall_stuck_duration_s", "wall_stuck_duration_p50_s", "wall_stuck_duration_p90_s", "wall_stuck_mapping_valid")),
+                ("卡滞与运动意图", "p4_stuck_motion_intent", ("wall_stuck_candidate_with_motion_intent_share", "wall_stuck_candidate_without_motion_intent_share", "wall_stuck_candidate_share", "wall_stuck_would_reset", "wall_stuck_reset_triggered")),
                 ("持续卡墙惩罚", "p4_stuck_sustained", ("wall_stuck_sustained_active", "wall_stuck_sustained_severity", "reward_stuck_sustained")),
                 ("卡滞回收当前上报窗口", "p4_stuck_window_outcome", ("wall_stuck_would_reset", "wall_stuck_reset_triggered", "wall_stuck_raw_term", "wall_stuck_reset_rate", "rollout_wall_stuck_reset_count", "wall_stuck_saved_seconds", "rollout_wall_stuck_saved_seconds", "collision_to_stuck_reset_delay_s", "reset_after_push_share", "episode_starts_per_hour")),
                 ("卡滞终止回报当前上报窗口", "p4_stuck_terminal_window", ("stuck_terminal_episode_return_mean", "stuck_terminal_nonnegative_rate")),

@@ -11,12 +11,16 @@ import torch
 
 from agent_ppo.checkpoint_io import (
     P3_EVAL_LOW_LEVEL_SPEC,
-    P4_INSTANT_COMMAND_R4_INPUTFIX_CONTRACT,
     P4_INSTANT_COMMAND_R4_INPUTFIX_VERSION,
     p4_eval_selection_metadata,
     p4_nav_eval_candidates,
     validate_p4_eval_bundle,
 )
+from agent_ppo.feature import p4_contract
+
+
+def _command_contract() -> dict:
+    return p4_contract.command_contract("maze_instant_repair2h")
 
 
 def _leaf(spec: dict) -> dict:
@@ -70,7 +74,7 @@ def _p4_bundle(*, command: dict | None = None) -> dict:
         },
         "contracts": {
             "command": copy.deepcopy(
-                P4_INSTANT_COMMAND_R4_INPUTFIX_CONTRACT if command is None else command
+                _command_contract() if command is None else command
             )
         },
         "modules": {
@@ -99,19 +103,29 @@ def test_track_accepts_current_inputfix_contract_and_reports_digest():
 
 
 def test_track_strictly_rejects_stale_or_slew_inputfix_contract():
-    stale = copy.deepcopy(P4_INSTANT_COMMAND_R4_INPUTFIX_CONTRACT)
+    stale = _command_contract()
     stale["version"] = "p4_maze_instant_command_r4"
     with pytest.raises(ValueError, match="version"):
         validate_p4_eval_bundle(_p4_bundle(command=stale), mode="track")
 
-    slew = copy.deepcopy(P4_INSTANT_COMMAND_R4_INPUTFIX_CONTRACT)
+    slew = _command_contract()
     slew["slew_rate"] = [1.0, 1.0, 1.0]
     with pytest.raises(ValueError, match="slew"):
         validate_p4_eval_bundle(_p4_bundle(command=slew), mode="track")
 
+    legacy_slew = {
+        "version": "p4_maze_closed_loop_command_v3",
+        "mapper_version": "p4_capability_action_mapper_v1",
+        "command_transition_mode": "slew",
+        "slew_rate": [0.30, 0.30, 1.00],
+        "slew_release_rate": [0.30, 0.60, 2.50],
+    }
+    with pytest.raises(ValueError, match="requires the active inputfix"):
+        validate_p4_eval_bundle(_p4_bundle(command=legacy_slew), mode="track")
+
 
 def test_standard_uses_low_level_only_and_ignores_high_level_command_version():
-    stale = copy.deepcopy(P4_INSTANT_COMMAND_R4_INPUTFIX_CONTRACT)
+    stale = _command_contract()
     stale["version"] = "future_track_command_contract"
     result = validate_p4_eval_bundle(_p4_bundle(command=stale), mode="standard")
     assert result["loaded_modules"] == [
@@ -131,11 +145,11 @@ def test_requested_id_is_preferred_then_unique_mode_compatible_discovery(tmp_pat
     exact = tmp_path / "model.ckpt-repairtrain-1416926.pkl"
     torch.save({"not": "validated until selected"}, exact)
     preferred = p4_nav_eval_candidates(str(tmp_path), "1416926", mode="track")
-    assert preferred[0] == str(exact)
+    assert next(path for path in preferred if Path(path).is_file()) == str(exact)
 
 
 def test_discovery_is_mode_sensitive_and_rejects_multiple_compatible_bundles(tmp_path: Path):
-    stale = copy.deepcopy(P4_INSTANT_COMMAND_R4_INPUTFIX_CONTRACT)
+    stale = _command_contract()
     stale["version"] = "future_track_command_contract"
     standard_only = tmp_path / "model.ckpt-repairstable-999999.pkl"
     torch.save(_p4_bundle(command=stale), standard_only)
@@ -156,12 +170,14 @@ def test_discovery_is_mode_sensitive_and_rejects_multiple_compatible_bundles(tmp
 def test_selection_metadata_has_filename_payload_id_phase_command_digest_and_sha(tmp_path: Path):
     path = tmp_path / "model.ckpt-repairstable-999999.pkl"
     bundle = _p4_bundle()
+    bundle["platform_model_id"] = "payload-123"
     torch.save(bundle, path)
 
     metadata = p4_eval_selection_metadata(
         str(path), bundle, requested_model_id="1416926"
     )
-    assert metadata["payload_id"] == "999999"
+    assert metadata["payload_id"] == "payload-123"
+    assert metadata["filename_model_id"] == "999999"
     assert metadata["phase_label"] == "repairstable"
     assert metadata["requested_model_id"] == "1416926"
     assert metadata["selected_path"] == str(path.resolve())
@@ -170,3 +186,10 @@ def test_selection_metadata_has_filename_payload_id_phase_command_digest_and_sha
     assert P4_INSTANT_COMMAND_R4_INPUTFIX_VERSION in str(
         bundle["contracts"]["command"]
     )
+
+
+def test_track_rejects_drift_in_any_canonical_command_field():
+    changed = _command_contract()
+    changed["instant_physical_change_rate_per_s"] = [0.0, 0.0, 0.0]
+    with pytest.raises(ValueError, match="instant_physical_change_rate_per_s"):
+        validate_p4_eval_bundle(_p4_bundle(command=changed), mode="track")

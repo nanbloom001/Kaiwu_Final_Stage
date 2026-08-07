@@ -281,6 +281,8 @@ def test_teacher_activation_floor_is_rollout_wide(monkeypatch):
     algorithm._apply_training_schedule(1_800.0)
     algorithm.rollout.teacher_mask = torch.zeros(32, 4, 1)
     algorithm.rollout.teacher_mask[:16] = 1.0
+    algorithm.rollout.valid_mask = torch.ones(32, 4, 1)
+    algorithm.rollout.continuation_mask = torch.ones(32, 4, 1)
     algorithm.rollout.step = 32
     monkeypatch.setattr(
         AlgorithmP2NavPPO,

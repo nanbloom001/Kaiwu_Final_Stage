@@ -140,10 +140,10 @@ def _termination_reason_codes(
         if torch.is_tensor(wall_stuck) and wall_stuck.numel() == reset.numel()
         else torch.zeros_like(reset)
     )
-    wall_mask &= reset
-    success_mask &= reset & ~wall_mask
-    failure_mask &= reset & ~wall_mask & ~success_mask
-    timeout_mask &= reset & ~wall_mask & ~success_mask & ~failure_mask
+    success_mask &= reset
+    failure_mask &= reset & ~success_mask
+    wall_mask &= reset & ~success_mask & ~failure_mask
+    timeout_mask &= reset & ~success_mask & ~failure_mask & ~wall_mask
     result[success_mask] = 1.0
     result[failure_mask] = 2.0
     result[wall_mask] = 4.0

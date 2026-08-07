@@ -810,11 +810,40 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         feedback_conf = {}
     feedback_age_clip_s = float(feedback_conf.get("age_clip_s", 0.8))
     algorithm = agent.algorithm
+    p4_training_contract = None
+    if is_p4:
+        p4_training_contract = p4_contract.training_contract(
+            getattr(algorithm, "stuck_reset_contract", p2_conf.get("stuck_reset", {})),
+            getattr(
+                algorithm,
+                "training_profile",
+                p2_conf.get("training_profile", "full_track"),
+            ),
+        )
+        target_seconds = float(p4_training_contract["target_effective_seconds"])
+        configured_target = float(p2_conf.get("target_effective_seconds", target_seconds))
+        if configured_target != target_seconds:
+            raise ValueError(
+                "P4 target_effective_seconds conflicts with the active profile: "
+                f"configured={configured_target} contract={target_seconds}"
+            )
+        configured_wall_hours = float(
+            p2_conf.get("task_end_hours", target_seconds / 3600.0)
+        )
+        if configured_wall_hours * 3600.0 < target_seconds:
+            raise ValueError(
+                "P4 task_end_hours is shorter than the effective training target: "
+                f"task_end_hours={configured_wall_hours} target_seconds={target_seconds}"
+            )
+        target_hours = float(p4_training_contract["training_hours"])
+    else:
+        target_seconds = p2_contract.TRAINING_HOURS * 3600.0
+        target_hours = p2_contract.TRAINING_HOURS
     logger.info(
         "[P2NavPPO] start "
         f"conf={conf_path} envs={agent.num_envs} parent={agent._p2_parent_model_id} "
         "rollout=32 ticks tbptt=16 minibatch=64seq microbatch=4seq "
-        f"target_hours={(p4_contract.TRAINING_HOURS if is_p4 else p2_contract.TRAINING_HOURS):.1f} "
+        f"target_hours={target_hours:.1f} "
         "performance_gates=none"
     )
     if is_p4:
@@ -879,7 +908,12 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     )
     goal_history = deque(maxlen=max(2, int(round(2.0 / nav_dt_s)) + 1))
     schedule_boundaries = (
-        p4_contract.SCHEDULE_BOUNDARIES_SECONDS
+        (
+            p4_contract.INSTANT_REPAIR_CHECKPOINT_BOUNDARIES_SECONDS
+            if getattr(algorithm, "training_profile", "")
+            == "maze_instant_repair2h"
+            else p4_contract.SCHEDULE_BOUNDARIES_SECONDS
+        )
         if is_p4
         else (
             p2_contract.SAFETY_WARM_END_SECONDS,
@@ -922,12 +956,6 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
     p4_recovery_terminal_lifetime_count = int(
         restored_recovery.get("terminal_lifetime_count", 0)
     )
-    target_seconds = (
-        p4_contract.TARGET_EFFECTIVE_SECONDS
-        if is_p4
-        else p2_contract.TRAINING_HOURS * 3600.0
-    )
-
     try:
         while algorithm.session_effective_seconds < target_seconds:
             if hasattr(algorithm, "begin_rollout"):
@@ -1508,7 +1536,8 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                         "wall_stuck_raw_term",
                         torch.zeros(agent.num_envs, device=agent.device),
                     ).reshape(-1) > 0.5
-                    capture_reset = capture_zone & raw_wall_reset
+                    assigned_wall_reset = terminal_reason == 4
+                    capture_reset = capture_zone & assigned_wall_reset
                     capture_collision = capture_zone & (terminal_reason == 2)
                     p4_capture_candidate_count += int(capture_candidate.sum().item())
                     p4_capture_entry_count += int(capture_entry.sum().item())
@@ -1521,7 +1550,7 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
                     # reset can never silently inflate the completion series.
                     p4_capture_reset_completion_error_count += int(
                         _p4_reset_completion_mismatch(
-                            raw_wall_reset, terminal_reason == 1
+                            assigned_wall_reset, terminal_reason == 1
                         ).sum().item()
                     )
                     capture_entry_ticks = torch.where(
@@ -2132,9 +2161,11 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
         _final_save(
             agent,
             logger,
-            "p4_full_eight_session_hours_complete"
-            if is_p4
-            else "four_session_hours_complete",
+            (
+                f"{p4_training_contract['run_name']}_session_complete"
+                if p4_training_contract is not None
+                else "four_session_hours_complete"
+            ),
         )
     except (SystemExit, KeyboardInterrupt) as exc:
         _final_save(agent, logger, type(exc).__name__)

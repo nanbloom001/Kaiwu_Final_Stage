@@ -24,7 +24,7 @@ from agent_ppo.model.response_adapter import CommandResponseAdapter
 from agent_ppo.model.vision_encoder import VisionEncoder
 
 
-def _algorithm() -> AlgorithmP4NavPPO:
+def _algorithm(profile: str = "maze_instant_command_r4") -> AlgorithmP4NavPPO:
     low_actor = nn.Sequential(
         nn.Linear(77, 512),
         nn.ELU(),
@@ -48,17 +48,21 @@ def _algorithm() -> AlgorithmP4NavPPO:
         config={
             "p4_seed": 17,
             "num_learning_epochs": 4,
-            "training_profile": "maze_instant_command_r4",
-            "maze_training_branch": "instant_command_r4",
+            "training_profile": profile,
+            "maze_training_branch": (
+                "instant_repair2h"
+                if profile == "maze_instant_repair2h"
+                else "instant_command_r4"
+            ),
             "track_segment_labels": ["maze"],
             "command_transition_mode": "instant_hold_10hz",
             "camera_fault_course_enabled": False,
             "goal_fault_course_enabled": False,
             "stuck_reset": {
                 "enabled": True,
-                "mode": "active",
-                "schedule_enabled": True,
-                "confirmation_s": 10.0,
+                "mode": "shadow" if profile == "maze_instant_repair2h" else "active",
+                "schedule_enabled": profile != "maze_instant_repair2h",
+                "confirmation_s": 12.0 if profile == "maze_instant_repair2h" else 10.0,
                 "initial_confirmation_s": 12.0,
                 "activation_delay_s": 1_800.0,
                 "tighten_after_s": 7_200.0,
@@ -66,6 +70,20 @@ def _algorithm() -> AlgorithmP4NavPPO:
             },
         },
     )
+
+
+def _completed_response_record(buffer: P2ResponseAuxBuffer) -> dict[str, object]:
+    return {
+        "aux": torch.zeros(1, p2_contract.RESPONSE_AUX_DIM),
+        "episode_start": torch.ones(1, dtype=torch.bool),
+        "current_segment": torch.zeros(1),
+        "velocity": torch.zeros(1, 3, 3),
+        "pose": torch.zeros(1, 3),
+        "stuck": torch.zeros(1, 1),
+        "horizon_mask": torch.ones(1, 3, dtype=torch.bool),
+        "pose_mask": torch.ones(1, 1, dtype=torch.bool),
+        "record_contract": copy.deepcopy(buffer.current_record_contract),
+    }
 
 
 def _eval_algorithm(profile: str) -> AlgorithmP4NavPPO:
@@ -482,6 +500,139 @@ def test_r4_frozen_phase_preserves_actor_adapter_adam_before_and_after_resume():
 
     _assert_frozen_phase_updates_critic_only(algorithm)
     _assert_frozen_phase_updates_critic_only(resumed)
+
+
+def test_repair_warm_start_drops_inherited_completed_adapter_records():
+    parent = _algorithm()
+    parent._initial_low_digest = parent._module_digest(
+        (("vision", parent.low_level_encoder), ("actor", parent.low_level_actor))
+    )
+    parent.low_level_state_digest = parent._initial_low_digest
+    parent._configure_adapter_contract()
+    parent._freeze_parent_anchor_from_current_actor(source_sha256="d" * 64)
+    parent.response_buffer._records.append(
+        _completed_response_record(parent.response_buffer)
+    )
+    parent.response_buffer.total_sequences = 1
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "model.ckpt-instantfrozen-42.pkl"
+        parent.save_training_bundle(str(path), platform_model_id="42")
+        resumed = _algorithm("maze_instant_repair2h")
+        mode = resumed.load_bundle(str(path), platform_model_id="42")
+
+    assert mode == "p4_maze_instant_repair2h_warm_start"
+    assert len(resumed.response_buffer._records) == 0
+    assert len(resumed.response_buffer._parent_records) == 0
+    assert resumed.response_buffer.total_sequences == 0
+    assert resumed.response_buffer.replay_policy == "p4_current_only"
+
+
+def test_repair_exact_resume_preserves_current_session_completed_records():
+    algorithm = _algorithm("maze_instant_repair2h")
+    algorithm._initial_low_digest = algorithm._module_digest(
+        (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
+    )
+    algorithm.low_level_state_digest = algorithm._initial_low_digest
+    algorithm._configure_adapter_contract()
+    algorithm._freeze_parent_anchor_from_current_actor(source_sha256="e" * 64)
+    algorithm.response_buffer._records.append(
+        _completed_response_record(algorithm.response_buffer)
+    )
+    algorithm.response_buffer.total_sequences = 1
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "model.ckpt-repairadapt-42.pkl"
+        algorithm.save_training_bundle(str(path), platform_model_id="42")
+        resumed = _algorithm("maze_instant_repair2h")
+        mode = resumed.load_bundle(str(path), platform_model_id="42")
+
+    assert mode == "p4_exact_resume_history_reset"
+    assert len(resumed.response_buffer._records) == 1
+    assert resumed.response_buffer.total_sequences == 1
+    assert resumed.response_buffer.replay_policy == "p4_current_only"
+
+
+def test_repair_teacher_runs_for_stale_context_without_direction_mask():
+    algorithm = _algorithm("maze_instant_repair2h")
+    algorithm.update_training_clocks(300.0)
+    with torch.no_grad():
+        algorithm.actor.mean_head.bias.copy_(torch.tensor((2.0, 1.0)))
+        algorithm.actor.vy_mean_head.bias.fill_(1.0)
+    ticks = 2
+    batch = {
+        "nav_feat": torch.zeros(ticks, 1, p2_contract.NAV_FEATURE_DIM),
+        "nav_nonvisual": torch.zeros(ticks, 1, p2_contract.NAV_NONVISUAL_DIM),
+        "response_profile": torch.zeros(ticks, 1, p2_contract.RESPONSE_PROFILE_DIM),
+        "confidence": torch.ones(ticks, 1, 1),
+        "pre_tanh_action": torch.zeros(ticks, 1, p2_contract.ACTION_DIM),
+        "actor_hidden": (
+            torch.zeros(algorithm.actor.num_layers, 1, algorithm.actor.hidden_dim),
+            torch.zeros(algorithm.actor.num_layers, 1, algorithm.actor.hidden_dim),
+        ),
+        "reset_mask": torch.zeros(ticks, 1, dtype=torch.bool),
+        "old_log_prob": torch.zeros(ticks, 1, 1),
+        "advantages": torch.zeros(ticks, 1, 1),
+        "valid_mask": torch.ones(ticks, 1, 1),
+        "safety_target": torch.zeros(ticks, 1, 3),
+        "safety_valid": torch.zeros(ticks, 1, 1),
+        "camera_aux_mask": torch.zeros(ticks, 1, 3),
+        "clean_action_mean": torch.zeros(ticks, 1, 3),
+        "teacher_safe3": torch.ones(ticks, 1, 3),
+        "teacher_safe5": torch.ones(ticks, 1, 5),
+        "teacher_goal_xy": torch.tensor([2.0, 0.0]).repeat(ticks, 1, 1),
+        "teacher_goal_freshness": torch.zeros(ticks, 1, 1),
+        "teacher_predictive_risk": torch.zeros(ticks, 1, 1),
+        "teacher_mask": torch.zeros(ticks, 1, 1),
+        "teacher_context_mask": torch.ones(ticks, 1, 1),
+        "teacher_goal_mask": torch.ones(ticks, 1, 1),
+        "teacher_weight": torch.ones(ticks, 1, 1),
+        "stuck_label": torch.zeros(ticks, 1, 1),
+        "stuck_mask": torch.zeros(ticks, 1, 1),
+        "parent_normalized_mean": torch.zeros(ticks, 1, 3),
+        "parent_log_std": torch.zeros(ticks, 1, 3),
+        "parent_anchor_mask": torch.zeros(ticks, 1, 1),
+    }
+    loss, metrics = algorithm._actor_micro_loss(batch)
+    loss.backward()
+    assert metrics["teacher_stale_goal_active_share"].item() == 1.0
+    assert metrics["teacher_guidance_loss"].item() > 0.0
+    assert any(parameter.grad is not None for parameter in algorithm.actor.parameters())
+
+
+def test_repair_epoch_gate_counts_stale_context_without_direction_mask(monkeypatch):
+    algorithm = _algorithm("maze_instant_repair2h")
+    algorithm.update_training_clocks(300.0)
+    algorithm.rollout.teacher_mask = torch.zeros(32, 4, 1)
+    algorithm.rollout.teacher_context_mask = torch.ones(32, 4, 1)
+    algorithm.rollout.valid_mask = torch.ones(32, 4, 1)
+    algorithm.rollout.continuation_mask = torch.ones(32, 4, 1)
+    algorithm.rollout.step = 32
+    monkeypatch.setattr(
+        AlgorithmP2NavPPO,
+        "_run_ppo_epochs",
+        lambda _self: {"updates": 0.0},
+    )
+    algorithm._run_ppo_epochs()
+    assert algorithm._teacher_update_enabled
+
+    algorithm.rollout.continuation_mask.zero_()
+    algorithm._run_ppo_epochs()
+    assert not algorithm._teacher_update_enabled
+    algorithm.rollout.continuation_mask.fill_(1.0)
+    algorithm.rollout.valid_mask.zero_()
+    algorithm._run_ppo_epochs()
+    assert not algorithm._teacher_update_enabled
+
+    legacy = _algorithm()
+    legacy.update_training_clocks(1_800.0)
+    legacy.rollout.teacher_mask = torch.zeros(32, 4, 1)
+    legacy.rollout.teacher_context_mask = torch.ones(32, 4, 1)
+    legacy.rollout.valid_mask = torch.ones(32, 4, 1)
+    legacy.rollout.continuation_mask = torch.ones(32, 4, 1)
+    legacy.rollout.step = 32
+    legacy._run_ppo_epochs()
+    assert not legacy._teacher_update_enabled
 
 
 def test_r4_actor_loss_and_gradient_ignore_invalid_reason_zero_row():

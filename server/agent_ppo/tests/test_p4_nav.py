@@ -3,6 +3,7 @@
 
 import ast
 from collections import deque
+import copy
 import math
 from pathlib import Path
 import tempfile
@@ -945,14 +946,19 @@ def test_p4_auto_branch_uses_accumulated_perception_metrics_not_last_tick():
 def test_p4_checkpoint_priority_prefers_new_maze_labels():
     candidates = p4_nav_checkpoint_candidates("/models", 42)
     labels = [Path(candidate).stem.split("-")[-2] for candidate in candidates]
-    assert labels[:5] == [
+    assert labels[:9] == [
+        "repairstable",
+        "repairtrain",
+        "repairadapt",
+        "repaircollect",
         "instantfrozen",
         "instantstable",
         "instantcorrect",
         "instantadapt",
         "instantwarm",
     ]
-    assert labels[21:27] == [
+    maze_start = labels.index("mazefinal")
+    assert labels[maze_start : maze_start + 6] == [
         "mazefinal",
         "mazehard",
         "mazeattack",
@@ -990,17 +996,15 @@ def test_p4_configuration_and_monitor_route_are_explicit():
     root = Path(__file__).resolve().parents[1]
     config = toml.load(root / "conf/train_env_conf_track_p4_nav_ppo.toml")
     app_config = toml.load(root.parent / "conf/configure_app.toml")
-    assert config["p4_nav_ppo"]["run_name"] == "p4maze8h-instant-r4-inputfix"
-    assert config["p4_nav_ppo"]["target_effective_seconds"] == 28_800
-    assert config["p4_nav_ppo"]["task_end_hours"] == pytest.approx(8.25)
-    assert p4_contract.PLATFORM_WALL_MARGIN_SECONDS == 900.0
-    assert p4_contract.PLATFORM_WALL_SECONDS == 29_700.0
-    assert config["p4_nav_ppo"]["maze_training_branch"] == "instant_command_r4"
-    assert config["p4_nav_ppo"]["training_profile"] == "maze_instant_command_r4"
+    assert config["p4_nav_ppo"]["run_name"] == "p4maze2h-instant-repair-r1"
+    assert config["p4_nav_ppo"]["target_effective_seconds"] == 7_200
+    assert config["p4_nav_ppo"]["task_end_hours"] == pytest.approx(2.25)
+    assert config["p4_nav_ppo"]["maze_training_branch"] == "instant_repair2h"
+    assert config["p4_nav_ppo"]["training_profile"] == "maze_instant_repair2h"
     assert config["p4_nav_ppo"]["command_transition_mode"] == "instant_hold_10hz"
     assert config["p4_nav_ppo"]["nav_period_frames"] == 5
     assert config["env"]["num_envs"] == 128
-    assert config["env"]["episode_length_s"] == 120.0
+    assert config["env"]["episode_length_s"] == 75.0
     assert config["terrain"]["track"]["track_length"] == 1
     assert config["terrain"]["track"]["sub_terrains"] == ["open_entry_maze"]
     assert config["p4_nav_ppo"]["parent_model_id"] == 1416926
@@ -1102,7 +1106,7 @@ def test_p4_monitor_panels_obey_platform_line_limits():
     assert len(panel_names) == len(set(panel_names))
 
 
-def test_p4_layered_eval_validator_requires_mapper_and_supports_both_modes():
+def test_p4_layered_eval_validator_separates_standard_and_active_track_contracts():
     from agent_ppo.tests.test_p3_eval import _p3_fixture_bundle
 
     bundle = _p3_fixture_bundle(
@@ -1110,16 +1114,22 @@ def test_p4_layered_eval_validator_requires_mapper_and_supports_both_modes():
     )
     bundle["contracts"] = {"command": p4_contract.command_contract("full_track")}
     standard = validate_p4_eval_bundle(bundle, mode="standard")
-    track = validate_p4_eval_bundle(bundle, mode="track")
     assert standard["stage_type"] == "p4_nav_ppo"
-    assert "high_level.actor" in track["loaded_modules"]
-    bundle["phase_label"] = "renamed-but-structurally-compatible"
-    renamed = validate_p4_eval_bundle(bundle, mode="track")
+    with pytest.raises(ValueError, match="active inputfix instant command"):
+        validate_p4_eval_bundle(bundle, mode="track")
+
+    active = copy.deepcopy(bundle)
+    active["contracts"]["command"] = p4_contract.command_contract(
+        "maze_instant_repair2h"
+    )
+    active["phase_label"] = "renamed-but-structurally-compatible"
+    renamed = validate_p4_eval_bundle(active, mode="track")
+    assert "high_level.actor" in renamed["loaded_modules"]
     assert renamed["phase_label"] == "renamed-but-structurally-compatible"
     assert not renamed["phase_label_known"]
-    bundle["contracts"]["command"]["mapper_version"] = "legacy"
+    active["contracts"]["command"]["mapper_version"] = "legacy"
     with pytest.raises(ValueError, match="mapper"):
-        validate_p4_eval_bundle(bundle, mode="track")
+        validate_p4_eval_bundle(active, mode="track")
 
 
 def test_p4_does_not_modify_platform_base_env():
@@ -1227,7 +1237,7 @@ def test_p4_terminal_wire_keeps_old_raw_goal_and_stuck_diagnostics():
     assert torch.equal(p4_tail[1], live[1, p3_contract.P3_PRIVILEGED_WIRE_DIM :])
 
 
-def test_p4_wall_stuck_owns_success_overlap_and_preserves_raw_term():
+def test_p4_success_owns_wall_stuck_overlap_and_preserves_priority():
     class _TerminationManager:
         active_terms = ("goal_reached", "nav_stuck_timeout")
         terminated = torch.tensor([False])
@@ -1242,7 +1252,7 @@ def test_p4_wall_stuck_owns_success_overlap_and_preserves_raw_term():
     reset = torch.tensor([True])
     raw_wall_term = torch.tensor([True])
     reason = _termination_reason_codes(env, reset, wall_stuck=raw_wall_term)
-    assert reason.tolist() == [4.0]
+    assert reason.tolist() == [1.0]
     assert raw_wall_term.tolist() == [True]
 
     live = torch.zeros(1, p4_contract.P4_PRIVILEGED_WIRE_DIM)
@@ -1252,8 +1262,9 @@ def test_p4_wall_stuck_owns_success_overlap_and_preserves_raw_term():
     preserved_raw_term = safe[
         :, p3_contract.P3_PRIVILEGED_WIRE_DIM + p4_contract.STUCK_RAW_TERM_INDEX
     ] > 0.5
+    assert preserved_raw_term.tolist() == [True]
     assert _p4_reset_completion_mismatch(
-        preserved_raw_term, reason == 1
+        reason == 4, reason == 1
     ).tolist() == [False]
 
 

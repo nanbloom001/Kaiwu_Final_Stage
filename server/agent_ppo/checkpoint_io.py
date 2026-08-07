@@ -619,26 +619,15 @@ def _validate_p3_eval_leaf(leaf: Any, name: str, expected: dict[str, Any], *, co
 
 
 P4_INSTANT_COMMAND_R4_INPUTFIX_VERSION = "p4_maze_instant_command_r4_inputfix"
-P4_ACTION_MAPPER_VERSION = "p4_capability_action_mapper_v1"
-P4_INSTANT_COMMAND_R4_INPUTFIX_CONTRACT = {
-    "version": P4_INSTANT_COMMAND_R4_INPUTFIX_VERSION,
-    "mapper_version": P4_ACTION_MAPPER_VERSION,
-    "mapped_ranges": {"vx": [0.0, 1.0], "vy": [-0.30, 0.30], "wz": [-0.90, 0.90]},
-    "policy_target_vx": [0.0, 1.0],
-    "command_transition_mode": "instant_hold_10hz",
-    "hold_frames": 5,
-    "nav_period_frames": 5,
-    "policy_target_equals_exec": "at_10hz_tick_boundary",
-    "command_rewrites": {
-        "slew": "disabled",
-        "zero_cross_guard": "disabled",
-        "reversal_guard": "disabled",
-        "runtime_limiter": "disabled",
-        "near_goal_rewrite": "disabled",
-        "recovery_override": "disabled",
-    },
-    "hard_action_ranges_only": True,
-}
+
+
+def _canonical_p4_instant_command_contract() -> dict[str, Any]:
+    # Keep checkpoint discovery and the runtime loader on one source of truth.
+    # The local import avoids making the generic checkpoint module part of the
+    # feature package's import cycle.
+    from agent_ppo.feature import p4_contract
+
+    return p4_contract.command_contract("maze_instant_repair2h")
 
 
 def p4_nav_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
@@ -670,6 +659,31 @@ def _p4_nav_discovery_candidates(path: str, *, mode: str) -> list[str]:
     return compatible
 
 
+def _p4_nav_training_discovery_candidates(path: str) -> list[str]:
+    """Discover one structurally complete P4 parent across command generations."""
+    discovered: list[str] = []
+    for label in P4_NAV_CHECKPOINT_PRIORITY:
+        discovered.extend(
+            sorted(glob.glob(os.path.join(path, f"model.ckpt-{label}-*.pkl")))
+        )
+    compatible: list[str] = []
+    for candidate in dict.fromkeys(discovered):
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            payload = torch.load(candidate, weights_only=False, map_location="cpu")
+            if not isinstance(payload, dict) or payload.get("stage_type") != "p4_nav_ppo":
+                continue
+            structural = dict(payload)
+            structural["stage_type"] = "p3_standard_joint"
+            structural["phase_label"] = P3_STANDARD_JOINT_PHASE_LABELS[-1]
+            validate_p3_eval_bundle(structural, mode="track")
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            continue
+        compatible.append(candidate)
+    return compatible
+
+
 def p4_nav_training_candidates(
     path: str,
     model_id: str | int,
@@ -681,7 +695,7 @@ def p4_nav_training_candidates(
     for candidate in p4_nav_checkpoint_candidates(path, parent_model_id):
         if candidate not in result:
             result.append(candidate)
-    discovered = _p4_nav_discovery_candidates(path, mode="track")
+    discovered = _p4_nav_training_discovery_candidates(path)
     selected_paths = {os.path.abspath(candidate) for candidate in result}
     discovered = [
         candidate
@@ -781,10 +795,17 @@ def p4_eval_selection_metadata(
     The loader owns emission, but this helper makes the selected filename,
     payload ID, phase, canonical command digest and on-disk SHA256 explicit.
     """
+    lineage = bundle.get("lineage") or {}
+    payload_id = bundle.get("platform_model_id")
+    if payload_id in (None, ""):
+        payload_id = lineage.get("platform_model_id")
+    if payload_id in (None, ""):
+        payload_id = lineage.get("source_parent_model_id")
     return {
         "selected_path": os.path.abspath(path),
         "requested_model_id": str(requested_model_id),
-        "payload_id": _checkpoint_filename_model_id(path),
+        "filename_model_id": _checkpoint_filename_model_id(path),
+        "payload_id": None if payload_id in (None, "") else str(payload_id),
         "phase_label": _optional_string(bundle.get("phase_label")),
         "command_digest": _p4_command_digest(
             ((bundle.get("contracts") or {}).get("command"))
@@ -796,12 +817,23 @@ def p4_eval_selection_metadata(
 def _validate_p4_track_command_contract(command: Any) -> None:
     if not isinstance(command, dict):
         raise ValueError("P4 Track evaluation missing command contract")
-    for field, expected in P4_INSTANT_COMMAND_R4_INPUTFIX_CONTRACT.items():
-        if command.get(field) != expected:
-            raise ValueError(
-                "P4 Track evaluation command contract mismatch: "
-                f"{field}={command.get(field)!r}, expected={expected!r}"
-            )
+    transition_mode = command.get("command_transition_mode", "slew")
+    if transition_mode != "instant_hold_10hz":
+        raise ValueError(
+            "P4 Track evaluation requires the active inputfix instant command "
+            f"contract, got transition mode {transition_mode!r}"
+        )
+    expected = _canonical_p4_instant_command_contract()
+    if command != expected:
+        mismatched = sorted(
+            key
+            for key in set(command).union(expected)
+            if command.get(key) != expected.get(key)
+        )
+        raise ValueError(
+            "P4 Track evaluation command contract mismatch: "
+            f"fields={mismatched}"
+        )
     forbidden = {"slew_rate", "slew_release_rate"}.intersection(command)
     if forbidden:
         raise ValueError(

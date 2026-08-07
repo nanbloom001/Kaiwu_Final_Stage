@@ -1,8 +1,8 @@
-# P4 eight-hour Maze instant-command repair over the verified 10 Hz parent.
+# P4 two-hour instant-command credit and control repair over the verified parent.
 
 [env]
 num_envs = 128
-episode_length_s = 120.0
+episode_length_s = 75.0
 task = "track"
 
 [env_conf]
@@ -71,19 +71,18 @@ max_depth = 5.0
 enabled = false
 
 [p4_nav_ppo]
-run_name = "p4maze8h-instant-r4-inputfix"
+run_name = "p4maze2h-instant-repair-r1"
 # Model ID selects the intended parent candidate; structure/spec/shape/finite
 # validation remains authoritative after selection.
 parent_model_id = 1416926
 parent_model_label = "p4maze8h10hz_1416926-mazefinal"
-load_mode = "p4_maze_instant_r4_warm_start"
-training_profile = "maze_instant_command_r4"
-# All 28,800 seconds are effective training. The 0.25 hour margin is reserved
+training_profile = "maze_instant_repair2h"
+# All 7,200 seconds are effective training. The 0.25 hour margin is reserved
 # for checkpoint/save/normal shutdown only.
-task_end_hours = 8.25
-target_effective_seconds = 28800
+task_end_hours = 2.25
+target_effective_seconds = 7200
 diagnostic_seconds = 0
-maze_training_branch = "instant_command_r4"
+maze_training_branch = "instant_repair2h"
 nav_rollout_ticks = 32
 nav_period_frames = 5
 tbptt_sequence_length = 16
@@ -108,11 +107,11 @@ goal_fault_course_enabled = false
 
 [p4_nav_ppo.stuck_reset]
 enabled = true
-mode = "active"
-schedule_enabled = true
-confirmation_s = 10.0
+mode = "shadow"
+schedule_enabled = false
+confirmation_s = 12.0
 initial_confirmation_s = 12.0
-activation_delay_s = 1800.0
+activation_delay_s = 0.0
 tighten_after_s = 7200.0
 resume_offset_s = 0.0
 radius_m = 0.30
@@ -148,7 +147,7 @@ distance_m = [0.65, 1.20]
 policy_goal_cosine_min = 0.70
 
 [p4_nav_ppo.response_adapter]
-learning_rate = 5.0e-6
+learning_rate = 2.5e-6
 max_grad_norm = 0.5
 capacity_steps = 4096
 sequence_length = 16

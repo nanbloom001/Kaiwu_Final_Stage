@@ -746,6 +746,12 @@ class AlgorithmP2NavPPO:
     def _predictive_command(self, target: torch.Tensor) -> torch.Tensor:
         return target
 
+    def _command_rate_weight(self) -> float:
+        return float(p2_contract.COMMAND_RATE_WEIGHT)
+
+    def _tracking_error_weight(self) -> float:
+        return float(p2_contract.TRACKING_ERROR_WEIGHT)
+
     def _response_append_kwargs(self) -> dict[str, object]:
         return {}
 
@@ -973,10 +979,30 @@ class AlgorithmP2NavPPO:
                         f"fallbacks={self.nonfinite_action_fallbacks}"
                     )
             command_penalty = (
-                p2_contract.COMMAND_RATE_WEIGHT
+                self._command_rate_weight()
                 * p2_contract.normalized_command_rate(
                     target, self.command.active_target
                 )
+            )
+            command_scale = torch.tensor(
+                p2_contract.COMMAND_NORMALIZATION,
+                device=target.device,
+                dtype=target.dtype,
+            )
+            command_axis_weights = torch.tensor(
+                p2_contract.COMMAND_RATE_AXIS_WEIGHTS,
+                device=target.device,
+                dtype=target.dtype,
+            )
+            command_delta = torch.clamp(
+                (target - self.command.active_target) / command_scale,
+                -1.0,
+                1.0,
+            )
+            command_rate_axis_penalty = (
+                self._command_rate_weight()
+                * command_delta.square()
+                * command_axis_weights
             )
             if self.training_enabled:
                 if getattr(self, "track_safety_enabled", True):
@@ -1041,6 +1067,7 @@ class AlgorithmP2NavPPO:
                     "actor_hidden": tuple(item.detach() for item in actor_initial),
                     "critic_hidden": tuple(item.detach() for item in critic_initial),
                     "command_penalty": command_penalty,
+                    "command_rate_axis_penalty": command_rate_axis_penalty.detach(),
                     "predictive_collision_penalty": (
                         predictive_collision_penalty.detach()
                     ),
@@ -1285,7 +1312,7 @@ class AlgorithmP2NavPPO:
             self.pending_tick["target_cmd3"],
             reward_aux,
         )
-        tracking_penalty = p2_contract.TRACKING_ERROR_WEIGHT * (
+        tracking_penalty = self._tracking_error_weight() * (
             p2_contract.normalized_true_tracking_error(
                 reward_exec_cmd,
                 reward_source_aux[:, 12:15],
@@ -1400,6 +1427,8 @@ class AlgorithmP2NavPPO:
             end_goal_distance=end_goal,
             duration_frames=duration,
             path_length_m=path_length_m,
+            invalid_rows=invalid_rows,
+            unattributed=unattributed.reshape(-1),
         )
         component_names = tuple(components)
         component_stack = torch.stack(

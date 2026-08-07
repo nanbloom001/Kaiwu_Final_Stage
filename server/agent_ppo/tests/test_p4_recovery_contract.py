@@ -14,24 +14,32 @@ from agent_ppo.feature import p2_contract, p4_contract
 from agent_ppo.feature.p2_command_controller import P2CommandController
 
 
-def test_eight_hour_closed_loop_schedule_and_config_are_aligned():
+def test_legacy_closed_loop_schedule_and_current_repair_config_are_aligned():
     config_path = Path(__file__).parents[1] / "conf" / "train_env_conf_track_p4_nav_ppo.toml"
     config = tomllib.loads(config_path.read_text())
     stage = config["p4_nav_ppo"]
 
     assert p4_contract.TARGET_EFFECTIVE_SECONDS == 28_800.0
     assert p4_contract.TRAINING_HOURS == 8.0
+    legacy_stuck = {
+        **stage["stuck_reset"],
+        "mode": "active",
+        "schedule_enabled": True,
+        "confirmation_s": 10.0,
+        "activation_delay_s": 1_800.0,
+    }
     legacy_training = p4_contract.training_contract(
-        stage["stuck_reset"], "maze_closed_loop_v3"
+        legacy_stuck, "maze_closed_loop_v3"
     )
     legacy_command = p4_contract.command_contract("maze_closed_loop_v3")
     assert legacy_training["required_platform_wall_seconds"] == 29_700
-    assert stage["task_end_hours"] == 8.25
+    assert stage["task_end_hours"] == 2.25
     assert stage["parent_model_id"] == 1416926
     assert tuple(legacy_command["slew_rate"]) == p4_contract.P4_SLEW_RATE
     assert tuple(legacy_command["slew_release_rate"]) == p4_contract.P4_SLEW_RELEASE_RATE
-    assert stage["stuck_reset"]["confirmation_s"] == 10.0
-    assert stage["stuck_reset"]["schedule_enabled"] is True
+    assert stage["stuck_reset"]["confirmation_s"] == 12.0
+    assert stage["stuck_reset"]["mode"] == "shadow"
+    assert stage["stuck_reset"]["schedule_enabled"] is False
     assert legacy_training["stuck_reset"]["schedule_enabled"] is True
     assert config["domain_rand"]["push_robots"] is False
 
@@ -59,8 +67,7 @@ def test_eight_hour_closed_loop_schedule_and_config_are_aligned():
     assert final["teacher_gradient_target_ratio"] == pytest.approx(0.010)
     assert config["terrain"]["track"]["sub_terrains"] == ["open_entry_maze"]
     assert config["terrain"]["track"]["track_length"] == 1
-    assert config["env"]["episode_length_s"] == 120.0
-    assert stage["stuck_reset"]["mode"] == "active"
+    assert config["env"]["episode_length_s"] == 75.0
     assert stage["stuck_reset"]["terminal_penalty"] == -75.0
     assert stage["camera_fault_course_enabled"] is False
     assert stage["goal_fault_course_enabled"] is False

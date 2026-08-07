@@ -4,6 +4,21 @@
 
 ## [未发布]
 
+- **[P4 Maze Instant 2h 闭环修复]** 新入口 `p4maze2h-instant-repair-r1` 从
+  `p4maze8h10hz_1416926-mazefinal` warm start，保持 10Hz instant command、Actor85 和全部
+  部署 I/O 不变。P4 专用 command-rate/tracking 权重降为 `-0.003/-0.002`，Maze new-best
+  credit 改为 terminal 不回扣；success/failure/timeout 保持 `+200/-60/-40`，75 秒 episode，
+  卡滞 reset 全程 shadow。Actor Mean Teacher 新增 Goal 过期谨慎运动和目标方向安全时的近终点
+  捕获约束，均只进入 Actor 辅助梯度，不改写实际命令。Adapter 回放只使用本轮 command-digest
+  兼容的 completed records，父记录比例为 0；新增 5/15/30/60/90/120 分钟保存边界、逐轴正负
+  奖励/命令链、Teacher mask、anchor 覆盖率和卡滞运动意图监控。非 exact warm start 会清空源包
+  completed records，只有本轮新 records 可训练 Adapter；exact resume 仍恢复本轮 records。
+- **[P4 双评估 inputfix 合同修复]** Track 评估严格校验
+  `p4_maze_instant_command_r4_inputfix`，Standard 仅加载并校验冻结低层；候选优先 runtime ID，
+  缺失时只允许唯一结构兼容 fallback，多候选明确报歧义。日志记录选中路径、payload ID、phase、
+  command digest 和文件 SHA256；默认开发候选从旧 `34728` 改为 `1416926`。默认 Track 入口明确
+  拒绝历史 slew P4 bundle，避免唯一 fallback 静默改变控制动力学。
+
 - **[P4 R4 Actor 输入兼容修复]** 新入口 `p4maze8h-instant-r4-inputfix` 修复父模型 warm start 的
   capability15 分布偏移：instant controller 的真实变化率 `[10,6,18]` 不再直接写入未归一化
   Actor85 输入，策略继续看到父模型训练时的 `up=[0.30,0.30,1.00]`、

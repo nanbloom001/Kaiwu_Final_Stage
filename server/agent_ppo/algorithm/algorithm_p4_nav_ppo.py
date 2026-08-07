@@ -41,7 +41,9 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         "maze_credit_repair",
         "maze_closed_loop_v3",
         "maze_instant_command_r4",
+        "maze_instant_repair2h",
     }
+    INSTANT_PROFILES = {"maze_instant_command_r4", "maze_instant_repair2h"}
 
     def __init__(self, *args, **kwargs):
         early_config = dict(kwargs.get("config") or {})
@@ -734,6 +736,16 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self._last_goal_freshness = goal4[:, 3].detach()
         return limited
 
+    def _command_rate_weight(self) -> float:
+        if self.training_profile == "maze_instant_repair2h":
+            return float(p4_contract.INSTANT_REPAIR_COMMAND_RATE_WEIGHT)
+        return super()._command_rate_weight()
+
+    def _tracking_error_weight(self) -> float:
+        if self.training_profile == "maze_instant_repair2h":
+            return float(p4_contract.INSTANT_REPAIR_TRACKING_ERROR_WEIGHT)
+        return super()._tracking_error_weight()
+
     def _predictive_command(self, target: torch.Tensor) -> torch.Tensor:
         if self.command.command_transition_mode == "instant_hold_10hz":
             return target
@@ -794,6 +806,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         closed_loop_profile = self.training_profile in {
             "maze_closed_loop_v3",
             "maze_instant_command_r4",
+            "maze_instant_repair2h",
         }
         mapping_valid = (
             self._p4_worker_extra[:, p4_contract.STUCK_MAPPING_VALID_INDEX] > 0.5
@@ -813,6 +826,8 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         policy_or_exec_intent = (
             torch.linalg.vector_norm(policy_xy, dim=-1) > 0.10
         ) | (torch.linalg.vector_norm(exec_xy, dim=-1) > 0.08)
+        policy_or_exec_intent |= self._last_policy_command[:, 2].abs() > 0.10
+        policy_or_exec_intent |= self.command.exec_cmd[:, 2].abs() > 0.10
         true_motion_low = torch.linalg.vector_norm(true_xy, dim=-1) < 0.08
         push_grace = self.seconds_since_push < float(
             self.stuck_reset_contract.get("push_grace_s", 0.0)
@@ -862,6 +877,14 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         goal_mask = (
             guidance["teacher_guidance_goal_eligible"].reshape(-1).bool()
             & (safe5_valid if closed_loop_profile else scanner_valid)
+        )
+        teacher_context_mask = (
+            alive
+            & mapping_valid
+            & (safe5_valid if closed_loop_profile else scanner_valid)
+            & ~reset
+            & ~push_grace
+            & ~episode_grace
         )
         teacher_values = safe5 if closed_loop_profile else safe3
         sector_angles = pending["target_cmd3"].new_tensor(
@@ -934,11 +957,14 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 "teacher_safe3": safe3.detach(),
                 "teacher_safe5": safe5.detach(),
                 "teacher_goal_xy": self.goal_belief.estimate.detach(),
+                "teacher_goal_freshness": self._last_goal_freshness.detach().unsqueeze(-1),
                 "teacher_predictive_risk": pending["predictive_collision_risk"].reshape(-1, 1),
                 "teacher_mask": teacher_mask.float().unsqueeze(-1),
+                "teacher_context_mask": teacher_context_mask.float().unsqueeze(-1),
                 "teacher_goal_mask": goal_mask.float().unsqueeze(-1),
                 "teacher_weight": stuck_weight.unsqueeze(-1),
                 "stuck_label": stuck_label.float().unsqueeze(-1),
+                "stuck_motion_intent": policy_or_exec_intent.float().unsqueeze(-1),
                 "stuck_mask": stuck_mask.float().unsqueeze(-1),
                 "parent_anchor_mask": self._parent_anchor_mask.detach(),
                 "teacher_normal_mask": normal_teacher_mask.float().unsqueeze(-1),
@@ -1156,10 +1182,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         teacher_raw = zero
         teacher = {
             "direction": zero, "speed": zero, "yaw": zero, "edge": zero,
-            "recovery": zero,
+            "recovery": zero, "stale_goal": zero, "near_goal": zero,
             "teacher_valid_steps": zero, "teacher_loss_active": zero,
             "teacher_edge_active_share": zero,
             "teacher_recovery_active_share": zero,
+            "teacher_stale_goal_active_share": zero,
+            "teacher_near_goal_active_share": zero,
         }
         teacher_mask = (
             batch["teacher_mask"].reshape(-1) > 0.5
@@ -1167,7 +1195,14 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         teacher_goal_mask = (
             batch["teacher_goal_mask"].reshape(-1) > 0.5
         ) & valid_flat
-        if self._teacher_update_enabled and bool(teacher_mask.any()):
+        teacher_context_mask = (
+            batch.get("teacher_context_mask", batch["teacher_mask"]).reshape(-1)
+            > 0.5
+        ) & valid_flat
+        teacher_update_mask = teacher_mask
+        if self.training_profile == "maze_instant_repair2h":
+            teacher_update_mask = teacher_update_mask | teacher_context_mask
+        if self._teacher_update_enabled and bool(teacher_update_mask.any()):
             full_cap = torch.full(
                 actor_normalized_mean.shape[:-1], p4_contract.P4_MAX_VX,
                 dtype=actor_normalized_mean.dtype,
@@ -1181,6 +1216,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 if self.training_profile in {
                     "maze_closed_loop_v3",
                     "maze_instant_command_r4",
+                    "maze_instant_repair2h",
                 }
                 else batch["teacher_safe3"]
             )
@@ -1193,9 +1229,17 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 teacher_mask,
                 teacher_goal_mask,
                 sample_weight=batch["teacher_weight"].reshape(-1),
+                goal_freshness=batch.get(
+                    "teacher_goal_freshness",
+                    torch.ones_like(batch["teacher_mask"]),
+                ).reshape(-1),
+                context_mask=batch.get(
+                    "teacher_context_mask", batch["teacher_mask"]
+                ).reshape(-1) > 0.5,
                 min_valid_steps=1,
                 closed_loop_v3=(self.training_profile == "maze_closed_loop_v3"),
-                instant_r4=(self.training_profile == "maze_instant_command_r4"),
+                instant_r4=(self.training_profile in self.INSTANT_PROFILES),
+                instant_repair=(self.training_profile == "maze_instant_repair2h"),
             )
             edge_mask = teacher.get("teacher_edge_mask")
             if edge_mask is not None:
@@ -1258,6 +1302,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             stuck_frozen = self.training_profile in {
                 "maze_closed_loop_v3",
                 "maze_instant_command_r4",
+                "maze_instant_repair2h",
             }
             if stuck_frozen:
                 # The closed-loop run freezes StuckHead. Keep its quality
@@ -1530,7 +1575,11 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "teacher_guidance_valid_steps": teacher["teacher_valid_steps"].detach(),
             "teacher_guidance_gradient_ratio": zero.new_tensor(ratios.get("teacher", 0.0)),
             "parent_anchor_loss": anchor_raw.detach(),
-            "parent_anchor_valid_steps": zero.new_tensor(float(anchor_mask.sum())),
+            "parent_anchor_valid_steps": anchor_mask.to(zero.dtype).sum().detach(),
+            "parent_anchor_valid_share": (
+                anchor_mask.to(zero.dtype).sum()
+                / valid_flat.to(zero.dtype).sum().clamp_min(1.0)
+            ).detach(),
             "parent_anchor_gradient_ratio": zero.new_tensor(ratios.get("anchor", 0.0)),
             "stuck_aux_loss": stuck_raw.detach(),
             "stuck_aux_valid_steps": zero.new_tensor(float(stuck_mask.sum())),
@@ -1563,6 +1612,14 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "teacher_recovery_loss": teacher.get("recovery", zero).detach(),
             "teacher_recovery_active_share": teacher.get(
                 "teacher_recovery_active_share", zero
+            ).detach(),
+            "teacher_stale_goal_loss": teacher.get("stale_goal", zero).detach(),
+            "teacher_stale_goal_active_share": teacher.get(
+                "teacher_stale_goal_active_share", zero
+            ).detach(),
+            "teacher_near_goal_loss": teacher.get("near_goal", zero).detach(),
+            "teacher_near_goal_active_share": teacher.get(
+                "teacher_near_goal_active_share", zero
             ).detach(),
         }
 
@@ -1714,6 +1771,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "teacher_guidance_gradient_ratio",
             "parent_anchor_loss",
             "parent_anchor_valid_steps",
+            "parent_anchor_valid_share",
             "parent_anchor_gradient_ratio",
             "teacher_direction_loss",
             "teacher_speed_loss",
@@ -1722,6 +1780,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "teacher_edge_active_share",
             "teacher_recovery_loss",
             "teacher_recovery_active_share",
+            "teacher_stale_goal_loss",
+            "teacher_stale_goal_active_share",
+            "teacher_near_goal_loss",
+            "teacher_near_goal_active_share",
             "stuck_aux_loss",
             "stuck_aux_valid_steps",
             "stuck_aux_gradient_ratio",
@@ -1745,8 +1807,9 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             refs, advantage_mean=advantage_mean, advantage_std=advantage_std
         )
         for name in (
-            "teacher_safe3", "teacher_safe5", "teacher_goal_xy", "teacher_predictive_risk",
-            "teacher_mask", "teacher_goal_mask", "teacher_weight",
+            "teacher_safe3", "teacher_safe5", "teacher_goal_xy", "teacher_goal_freshness",
+            "teacher_predictive_risk", "teacher_mask", "teacher_context_mask",
+            "teacher_goal_mask", "teacher_weight",
             "stuck_label", "stuck_mask", "mirror_eligible",
             "parent_normalized_mean", "parent_log_std", "parent_anchor_mask",
         ):
@@ -1756,6 +1819,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "safety_valid",
             "camera_aux_mask",
             "teacher_mask",
+            "teacher_context_mask",
             "teacher_goal_mask",
             "teacher_weight",
             "stuck_mask",
@@ -1763,6 +1827,13 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "parent_anchor_mask",
         ):
             batch[name] = batch[name] * valid
+        if "continuation_mask" in batch:
+            nonterminal = batch["continuation_mask"] > 0.5
+            batch["teacher_mask"] = batch["teacher_mask"] * nonterminal
+            batch["teacher_context_mask"] = (
+                batch["teacher_context_mask"] * nonterminal
+            )
+            batch["teacher_goal_mask"] = batch["teacher_goal_mask"] * nonterminal
         if self._mirror_batch_cursor < len(self._mirror_batch_schedule):
             mirror_ref = self._mirror_batch_schedule[self._mirror_batch_cursor]
             self._mirror_batch_cursor += 1
@@ -1844,9 +1915,17 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 )
 
     def _run_ppo_epochs(self) -> dict[str, float]:
-        valid_teacher_steps = int(
-            self.rollout.teacher_mask[: self.rollout.step].sum().item()
+        teacher_activation_mask = self.rollout.teacher_mask[: self.rollout.step] > 0.5
+        if self.training_profile == "maze_instant_repair2h":
+            teacher_activation_mask = teacher_activation_mask | (
+                self.rollout.teacher_context_mask[: self.rollout.step] > 0.5
+            )
+        teacher_activation_mask = teacher_activation_mask & (
+            self.rollout.valid_mask[: self.rollout.step] > 0.5
+        ) & (
+            self.rollout.continuation_mask[: self.rollout.step] > 0.5
         )
+        valid_teacher_steps = int(teacher_activation_mask.sum().item())
         schedule = p4_contract.training_schedule(
             self.session_effective_seconds,
             branch=self._effective_maze_branch(self.session_effective_seconds),
@@ -1879,7 +1958,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         return float(schedule.get("actor_multiplier", 0.0)) > 0.0
 
     def _adapter_update(self) -> dict[str, float]:
-        if self.training_profile == "maze_instant_command_r4":
+        if self.training_profile in self.INSTANT_PROFILES:
             schedule = p4_contract.training_schedule(
                 self.session_effective_seconds,
                 branch=self._effective_maze_branch(self.session_effective_seconds),
@@ -1909,7 +1988,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             duration_frames / float(p2_contract.NAV_PERIOD_FRAMES), 0.0, 1.0
         )
         maze_profile = self.training_profile in self.MAZE_PROFILES
-        instant_profile = self.training_profile == "maze_instant_command_r4"
+        instant_profile = self.training_profile in self.INSTANT_PROFILES
         closed_loop_profile = self.training_profile == "maze_closed_loop_v3"
         single_signal_profile = closed_loop_profile or instant_profile
         if maze_profile:
@@ -1948,7 +2027,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                     | (context["reason"].reshape(-1) == 3)
                     | (context["reason"].reshape(-1) == 4)
                 )
-                & instant_profile,
+                & (self.training_profile == "maze_instant_command_r4"),
                 -maze_credit_after,
                 torch.zeros_like(maze_credit_after),
             )
@@ -2355,6 +2434,63 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         )
         self._push_recovery_time[recovered] = self.seconds_since_push[recovered]
         self._push_recovery_pending[recovered | terminal] = False
+        tracking_scale = torch.tensor(
+            p2_contract.COMMAND_NORMALIZATION,
+            device=exec_cmd.device,
+            dtype=exec_cmd.dtype,
+        )
+        tracking_axis_weights = torch.tensor(
+            p2_contract.TRACKING_ERROR_AXIS_WEIGHTS,
+            device=exec_cmd.device,
+            dtype=exec_cmd.dtype,
+        )
+        tracking_axis_penalty = (
+            self._tracking_error_weight()
+            * torch.clamp(
+                (exec_cmd - source_aux[:, 12:15]) / tracking_scale,
+                -1.0,
+                1.0,
+            ).square()
+            * tracking_axis_weights
+        )
+        tracking_axis_penalty = torch.where(
+            terminal.unsqueeze(-1),
+            torch.zeros_like(tracking_axis_penalty),
+            tracking_axis_penalty,
+        )
+        tracking_axis_penalty = torch.where(
+            grace.unsqueeze(-1),
+            tracking_axis_penalty * 0.5,
+            tracking_axis_penalty,
+        )
+        command_rate_axis_penalty = self.pending_tick.get(
+            "command_rate_axis_penalty",
+            torch.zeros(self.num_envs, 3, device=self.device),
+        )
+        reward_row_valid = ~torch.as_tensor(
+            context.get(
+                "invalid_rows",
+                torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
+            ),
+            device=self.device,
+        ).reshape(-1).bool()
+        reward_row_valid &= ~torch.as_tensor(
+            context.get(
+                "unattributed",
+                torch.zeros(self.num_envs, dtype=torch.bool, device=self.device),
+            ),
+            device=self.device,
+        ).reshape(-1).bool()
+        tracking_axis_penalty = torch.where(
+            reward_row_valid.unsqueeze(-1),
+            tracking_axis_penalty,
+            torch.zeros_like(tracking_axis_penalty),
+        )
+        command_rate_axis_penalty = torch.where(
+            reward_row_valid.unsqueeze(-1),
+            command_rate_axis_penalty,
+            torch.zeros_like(command_rate_axis_penalty),
+        )
         self._p4_reward_diagnostics = {
             "reward_predictive_raw": predictive_raw.detach(),
             "reward_missed_safe_raw": missed_shadow_raw,
@@ -2370,6 +2506,52 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "frontier_potential_before": maze_credit_before.detach(),
             "frontier_potential_after": maze_credit_after.detach(),
             "terminal_potential_clawback": terminal_clawback.detach(),
+            "reward_command_rate_vx": command_rate_axis_penalty[:, 0].detach(),
+            "reward_command_rate_vy": command_rate_axis_penalty[:, 1].detach(),
+            "reward_command_rate_wz": command_rate_axis_penalty[:, 2].detach(),
+            "reward_tracking_vx": tracking_axis_penalty[:, 0].detach(),
+            "reward_tracking_vy": tracking_axis_penalty[:, 1].detach(),
+            "reward_tracking_wz": tracking_axis_penalty[:, 2].detach(),
+            "reward_command_rate_vy_positive": torch.where(
+                self.pending_tick["target_cmd3"][:, 1] >= 0.0,
+                command_rate_axis_penalty[:, 1],
+                torch.zeros_like(command_rate_axis_penalty[:, 1]),
+            ).detach(),
+            "reward_command_rate_vy_negative": torch.where(
+                self.pending_tick["target_cmd3"][:, 1] < 0.0,
+                command_rate_axis_penalty[:, 1],
+                torch.zeros_like(command_rate_axis_penalty[:, 1]),
+            ).detach(),
+            "reward_command_rate_wz_positive": torch.where(
+                self.pending_tick["target_cmd3"][:, 2] >= 0.0,
+                command_rate_axis_penalty[:, 2],
+                torch.zeros_like(command_rate_axis_penalty[:, 2]),
+            ).detach(),
+            "reward_command_rate_wz_negative": torch.where(
+                self.pending_tick["target_cmd3"][:, 2] < 0.0,
+                command_rate_axis_penalty[:, 2],
+                torch.zeros_like(command_rate_axis_penalty[:, 2]),
+            ).detach(),
+            "reward_tracking_vy_positive": torch.where(
+                exec_cmd[:, 1] >= 0.0,
+                tracking_axis_penalty[:, 1],
+                torch.zeros_like(tracking_axis_penalty[:, 1]),
+            ).detach(),
+            "reward_tracking_vy_negative": torch.where(
+                exec_cmd[:, 1] < 0.0,
+                tracking_axis_penalty[:, 1],
+                torch.zeros_like(tracking_axis_penalty[:, 1]),
+            ).detach(),
+            "reward_tracking_wz_positive": torch.where(
+                exec_cmd[:, 2] >= 0.0,
+                tracking_axis_penalty[:, 2],
+                torch.zeros_like(tracking_axis_penalty[:, 2]),
+            ).detach(),
+            "reward_tracking_wz_negative": torch.where(
+                exec_cmd[:, 2] < 0.0,
+                tracking_axis_penalty[:, 2],
+                torch.zeros_like(tracking_axis_penalty[:, 2]),
+            ).detach(),
             "yaw_exec_cancellation": exec_cancel.detach(),
             "yaw_true_cancellation": true_cancel.detach(),
             "yaw_exec_sign_flip": exec_sign_flip.float(),
@@ -2798,6 +2980,13 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         )
         goal_diagnostics = self.goal_belief.last_diagnostics
         pending = getattr(self, "pending_tick", {}) or {}
+        stuck_motion_intent = pending.get(
+            "stuck_motion_intent",
+            torch.zeros(self.num_envs, 1, device=self.device),
+        ).reshape(-1) > 0.5
+        stuck_candidate = (
+            self._p4_worker_extra[:, p4_contract.STUCK_CANDIDATE_INDEX] > 0.5
+        )
         safe3 = pending.get("safe3", torch.zeros(self.num_envs, 3, device=self.device))
         safe5 = pending.get(
             "teacher_safe5", torch.zeros(self.num_envs, 5, device=self.device)
@@ -3143,6 +3332,18 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "instant_phase_frozen": raw_goal_distance.new_full(
                 (self.num_envs,), float(schedule["phase"] == "instantfrozen")
             ),
+            "repair_phase_collect": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "repaircollect")
+            ),
+            "repair_phase_adapt": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "repairadapt")
+            ),
+            "repair_phase_train": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "repairtrain")
+            ),
+            "repair_phase_stable": raw_goal_distance.new_full(
+                (self.num_envs,), float(schedule["phase"] == "repairstable")
+            ),
             "spawn_safe_point_share": self._p4_worker_extra[
                 :, p4_contract.SPAWN_SAFE_POINT_INDEX
             ],
@@ -3213,6 +3414,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             "wall_stuck_candidate_share": self._p4_worker_extra[
                 :, p4_contract.STUCK_CANDIDATE_INDEX
             ],
+            "wall_stuck_candidate_with_motion_intent_share": (
+                stuck_candidate & stuck_motion_intent
+            ).float(),
+            "wall_stuck_candidate_without_motion_intent_share": (
+                stuck_candidate & ~stuck_motion_intent
+            ).float(),
             "wall_stuck_duration_s": self._p4_worker_extra[
                 :, p4_contract.STUCK_DURATION_S_INDEX
             ],
@@ -3541,7 +3748,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 training_profile=self.training_profile,
             )
         )
-        self.response_buffer.enable_p4_compatible_replay()
+        if self.training_profile == "maze_instant_repair2h":
+            self.response_buffer.enable_p4_current_only_replay()
+        else:
+            self.response_buffer.enable_p4_compatible_replay()
 
     def _migrate_previous_p4_actor_optimizer(
         self, old_state: dict
@@ -3717,8 +3927,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             if exact_compatible:
                 saved_scope = global_state.get("train_scope")
                 expected_scope = (
-                    "maze_instant_command_r4_actor_critic_adapter_calibration"
-                    if self.training_profile == "maze_instant_command_r4"
+                    (
+                        "maze_instant_repair2h_actor_critic_adapter_calibration"
+                        if self.training_profile == "maze_instant_repair2h"
+                        else "maze_instant_command_r4_actor_critic_adapter_calibration"
+                    )
+                    if self.training_profile in self.INSTANT_PROFILES
                     else (
                     "maze_closed_loop_v3_actor_critic_only"
                     if self.training_profile == "maze_closed_loop_v3"
@@ -3749,6 +3963,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 if self.training_profile in {
                     "maze_closed_loop_v3",
                     "maze_instant_command_r4",
+                    "maze_instant_repair2h",
                 }:
                     optimizers["high_level_actor"] = copy.deepcopy(
                         self.actor_optimizer.state_dict()
@@ -3756,7 +3971,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                     optimizers["high_level_critic"] = copy.deepcopy(
                         self.critic_optimizer.state_dict()
                     )
-                    if self.training_profile == "maze_instant_command_r4":
+                    if self.training_profile in self.INSTANT_PROFILES:
                         optimizers["response_adapter"] = copy.deepcopy(
                             self.response_optimizer.state_dict()
                         )
@@ -3808,9 +4023,13 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                             "instant_command_r4"
                             if self.training_profile == "maze_instant_command_r4"
                             else (
+                            "instant_repair2h"
+                            if self.training_profile == "maze_instant_repair2h"
+                            else (
                             "closed_loop_v3"
                             if self.training_profile == "maze_closed_loop_v3"
                             else ("credit_repair" if maze_profile else "actor_attack")
+                            )
                             )
                         ),
                     )
@@ -3844,6 +4063,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                     if self.training_profile in {
                         "maze_credit_repair",
                         "maze_instant_command_r4",
+                        "maze_instant_repair2h",
                     }:
                         high_state["return_statistics"] = {
                             "count": 0,
@@ -3904,7 +4124,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             )
             high = (bundle.get("modules") or {}).get("high_level") or {}
             if exact_compatible:
-                if self.training_profile == "maze_instant_command_r4":
+                if self.training_profile in self.INSTANT_PROFILES:
                     self._load_leaf(
                         high,
                         "parent_actor_anchor",
@@ -3932,6 +4152,8 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 )
                 self._load_p4_state(original_p4_state)
             else:
+                if self.training_profile == "maze_instant_repair2h":
+                    self.response_buffer.clear_completed_records_for_new_session()
                 self._freeze_parent_anchor_from_current_actor(
                     source_sha256=self._sha256(path)
                 )
@@ -3989,8 +4211,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 self.reset_live_state()
                 if self.logger:
                     warm_profile = (
-                        "Maze instant-command r4"
-                        if self.training_profile == "maze_instant_command_r4"
+                        (
+                            "Maze instant repair2h"
+                            if self.training_profile == "maze_instant_repair2h"
+                            else "Maze instant-command r4"
+                        )
+                        if self.training_profile in self.INSTANT_PROFILES
                         else (
                         "Maze closed-loop v3"
                         if self.training_profile == "maze_closed_loop_v3"
@@ -4008,7 +4234,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                         else (
                             "Actor/Critic/Adapter optimizer moments and return "
                             "statistics reset; network weights preserved"
-                            if self.training_profile == "maze_instant_command_r4"
+                            if self.training_profile in self.INSTANT_PROFILES
                             else (
                                 "Actor/Critic optimizer moments and return statistics reset; "
                                 "network weights preserved"
@@ -4025,8 +4251,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             if exact_compatible:
                 return f"p4_{mode}"
             warm_disposition = (
-                "maze_instant_r4_warm_start"
-                if self.training_profile == "maze_instant_command_r4"
+                (
+                    "maze_instant_repair2h_warm_start"
+                    if self.training_profile == "maze_instant_repair2h"
+                    else "maze_instant_r4_warm_start"
+                )
+                if self.training_profile in self.INSTANT_PROFILES
                 else (
                 "maze_closed_loop_v3_warm_start"
                 if self.training_profile == "maze_closed_loop_v3"
@@ -4196,7 +4426,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             },
             "optimizer_group_freeze_summary": frozen_groups,
         }
-        if self.training_profile == "maze_instant_command_r4":
+        if self.training_profile in self.INSTANT_PROFILES:
             state.update(
                 parent_anchor_source_sha256=self.parent_anchor_source_sha256,
                 parent_anchor_digest=self.parent_anchor_digest,
@@ -4215,7 +4445,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 "P4 exact resume stuck-reset contract mismatch: "
                 f"saved={saved_stuck!r} runtime={self.stuck_reset_contract!r}"
             )
-        if self.training_profile == "maze_instant_command_r4":
+        if self.training_profile in self.INSTANT_PROFILES:
             saved_anchor_sha = state.get("parent_anchor_source_sha256")
             saved_anchor_digest = state.get("parent_anchor_digest")
             if not isinstance(saved_anchor_sha, str) or not saved_anchor_sha:
@@ -4375,7 +4605,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             },
         }
         payload["training_states"]["p4"] = self._p4_state()
-        if self.training_profile == "maze_instant_command_r4":
+        if self.training_profile in self.INSTANT_PROFILES:
             if not self.parent_anchor_source_sha256 or not self.parent_anchor_digest:
                 raise RuntimeError(
                     "P4 instant-command checkpoint requires a loaded immutable parent anchor"
@@ -4390,8 +4620,12 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
                 parent_anchor_leaf
             )
         payload["training_states"]["global"]["train_scope"] = (
-            "maze_instant_command_r4_actor_critic_adapter_calibration"
-            if self.training_profile == "maze_instant_command_r4"
+            (
+                "maze_instant_repair2h_actor_critic_adapter_calibration"
+                if self.training_profile == "maze_instant_repair2h"
+                else "maze_instant_command_r4_actor_critic_adapter_calibration"
+            )
+            if self.training_profile in self.INSTANT_PROFILES
             else (
             "maze_closed_loop_v3_actor_critic_only"
             if self.training_profile == "maze_closed_loop_v3"

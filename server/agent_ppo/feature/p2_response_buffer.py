@@ -73,6 +73,9 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
     def enable_p4_compatible_replay(self) -> None:
         self.replay_policy = "p4_compatible_50_25_25"
 
+    def enable_p4_current_only_replay(self) -> None:
+        self.replay_policy = "p4_current_only"
+
     def set_p3_replay_ratios(
         self, latest: float, recent: float, parent: float
     ) -> None:
@@ -88,6 +91,23 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
         self._history_push_epoch.clear()
         self._history_seconds_since_push.clear()
         self._next_episode_start.fill_(True)
+
+    def clear_completed_records_for_new_session(self) -> None:
+        """Drop inherited replay while preserving the active module contract."""
+        self.clear_unfinished_history()
+        self._records.clear()
+        self._parent_records.clear()
+        self.total_sequences = 0
+        self.append_calls = 0
+        self.version_reset_count = 0
+        self.max_history_length = 0
+        self.valid_horizon_counts.zero_()
+        self.resized_completed_records = 0
+        self.compatibility_rejections.clear()
+        self.legacy_parent_records_migrated = 0
+        self.legacy_parent_migration_rejections.clear()
+        self.push_horizon_rejections.zero_()
+        self.push_pose_rejections = 0
 
     def _capability_for_record(self, record) -> torch.Tensor:
         contract = record.get("record_contract")
@@ -380,6 +400,10 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
         return ResponseBatch(**values)
 
     def sample(self, *, batch_envs: int, generator=None) -> ResponseBatch | None:
+        if self.replay_policy == "p4_current_only":
+            return self._sample_p4_current_only(
+                batch_envs=batch_envs, generator=generator
+            )
         if self.replay_policy.startswith("p4_compatible"):
             return self._sample_p4_compatible(batch_envs=batch_envs, generator=generator)
         if self.replay_policy.startswith("p3_versioned"):
@@ -612,6 +636,31 @@ class P2ResponseAuxBuffer(ResponseAuxBuffer):
             earlier_lineage_actual_ratio=actual[2] / total,
             compatible_current_records=len(current),
             compatible_parent_records=len(parent),
+            rejected_records=sum(self.compatibility_rejections.values()),
+        )
+        return result
+
+    def _sample_p4_current_only(self, *, batch_envs: int, generator=None):
+        requested = max(1, int(batch_envs))
+        self.compatibility_rejections.clear()
+        current = deque(
+            (record for record in self._records if self._contract_compatible(record)),
+            maxlen=self.capacity_steps,
+        )
+        result = self._sample_pool(current, requested, generator)
+        if result is None:
+            return None
+        actual = int(result.observations.shape[1])
+        result.metadata.update(
+            replay_origin="p4_current_only_filtered",
+            p4_current_batch_envs=actual,
+            p35_parent_batch_envs=0,
+            earlier_lineage_batch_envs=0,
+            p4_current_actual_ratio=1.0,
+            p35_parent_actual_ratio=0.0,
+            earlier_lineage_actual_ratio=0.0,
+            compatible_current_records=len(current),
+            compatible_parent_records=0,
             rejected_records=sum(self.compatibility_rejections.values()),
         )
         return result

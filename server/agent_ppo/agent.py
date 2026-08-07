@@ -48,6 +48,7 @@ from agent_ppo.checkpoint_io import (
     p3_standard_joint_candidates,
     p3_standard_joint_eval_candidates,
     validate_p3_eval_bundle,
+    p4_eval_selection_metadata,
     p4_nav_eval_candidates,
     p4_nav_training_candidates,
     validate_p4_eval_bundle,
@@ -2266,7 +2267,8 @@ class Agent(BaseAgent):
         if not path:
             raise FileNotFoundError("[P4 eval] preload path is empty")
         requested = str(id)
-        candidates = p4_nav_eval_candidates(path, requested)
+        mode = "standard" if self.is_p4_standard_eval else "track"
+        candidates = p4_nav_eval_candidates(path, requested, mode=mode)
         selected = next(
             (candidate for candidate in candidates if os.path.isfile(candidate)), None
         )
@@ -2275,8 +2277,10 @@ class Agent(BaseAgent):
                 f"[P4 eval] no P4 checkpoint for requested_id={requested}; tried={candidates}"
             )
         raw = torch.load(selected, weights_only=False, map_location="cpu")
-        mode = "standard" if self.is_p4_standard_eval else "track"
         disposition = validate_p4_eval_bundle(raw, mode=mode)
+        selection = p4_eval_selection_metadata(
+            selected, raw, requested_model_id=requested
+        )
         if not disposition.get("phase_label_known", False):
             self.logger.warning(
                 "[P4 eval] phase label is not recognized; continuing because "
@@ -2303,7 +2307,10 @@ class Agent(BaseAgent):
         self.cur_model_name = selected
         self.logger.info(
             f"[P4 eval] loaded mode={mode} phase={disposition['phase_label']} "
-            f"selected={selected}"
+            f"selected={selection['selected_path']} payload_id={selection['payload_id']} "
+            f"filename_model_id={selection['filename_model_id']} "
+            f"requested_id={selection['requested_model_id']} "
+            f"command_digest={selection['command_digest']} sha256={selection['sha256']}"
         )
 
     def _load_p3_eval(self, path=None, id="1"):

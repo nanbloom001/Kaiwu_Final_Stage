@@ -181,6 +181,32 @@
 - 再遇检查：checkpoint command digest -> reset 后 controller mode -> policy/limited/exec MAE ->
   command reversal 时序 -> termination term readback -> wall EMA/yaw recovery -> 3h-4h Actor step。
 
+### 2026-08-07 追加：P4 Maze Instant 2h 闭环修复
+
+- 状态：**本地已验证，容器、平台与评估待验证**。
+- 分支/任务：`codex/p4-maze2h-instant-repair-r1` / `p4maze2h-instant-repair-r1`；父模型
+  `p4maze8h10hz_1416926-mazefinal`。模型 ID 只参与候选选择，不作为结构正确时的单点硬门禁。
+- 新发现的闭环缺口：inputfix 已修复 instant capability 输入偏移，但活动路径仍继承较强的
+  command-rate/tracking 代价、失败/超时 terminal clawback 和 50/25/25 Adapter 父回放；这些语义
+  会分别抑制快速 yaw 建立、让 terminal 负回报被历史 credit 回扣放大、并把旧命令动力学 records
+  混入 instant Adapter。原终止编码还让 wall-stuck 覆盖 success/hard failure，评估 loader 也只按
+  旧 instant version 校验且开发默认仍指向 `34728`。
+- 修复：仅新 profile 使用 command-rate/tracking=`-0.003/-0.002`；new-best `1.0/m`、上限 `+6`
+  且 terminal 不 clawback；Adapter 改为 current-only compatible replay，父比例 0；终止优先级改为
+  success > hard failure > wall-stuck > timeout。卡滞全程 shadow、75 秒 episode。Teacher 加入
+  Goal stale 与 near-goal 两项，near-goal 必须验证目标方向扇区安全；所有 Teacher 仍只约束 Actor
+  mean，不改写 command。repair 非 exact warm start 清空源包 completed records，exact resume 才恢复
+  同一 session records。Track/Standard 评估分别采用严格 inputfix command 与低层-only 校验；默认
+  Track 入口拒绝历史 slew bundle。
+- 本地证据：全部 P4 测试 `198 passed`；共享 P2/P3 rollout、worker bridge、checkpoint 与 Adapter
+  相邻回归 `186 passed, 5 skipped`，统一执行为 `384 passed, 5 skipped`。涉及文件 Python 编译、
+  TOML 解析、monitor panel/required-metric 合同和 `git diff --check` 均通过。尚未同步开发容器，
+  未运行 1-env/8-env smoke，未生成新 checkpoint，也没有平台训练或固定种子评估证据，因此不得
+  宣称训练效果已经改善。
+- 回滚：切回 `codex/p4-maze8h-instant-command-r4-inputfix` 并使用原 R4 profile；不得让 repair2h
+  checkpoint 按旧 R4 exact resume。若 Adapter current-only 样本不足，只允许记录 skip 并继续收集，
+  不得恢复不兼容父 records 以掩盖数据不足。
+
 ## BUG-20260806-002：P4 转弯后侧后方受困时持续前顶
 
 - 状态：本地已验证。
