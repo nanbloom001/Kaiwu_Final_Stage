@@ -20,7 +20,7 @@
 ## 活动基线
 
 - **当前 P4 Maze 即时命令修复入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
-  `codex/p4-maze8h-instant-command-r4`，任务 `p4maze8h-instant-r4`。父包固定为
+  `codex/p4-maze8h-instant-command-r4-inputfix`，任务 `p4maze8h-instant-r4-inputfix`。父包固定为
   `p4maze8h10hz_1416926` 的 `mazefinal` checkpoint；128 env、10Hz 高层、50Hz 低层、
   32-tick rollout、TBPTT16、4 PPO epochs，单段 `open_entry_maze`、20 列、课程关闭、
   120 秒 episode，完整有效训练 `28800s`，平台任务墙钟 `8.25h`。完整合同见
@@ -29,6 +29,10 @@
   成为 exec command，并在随后的 5 个低层帧保持；不执行 slew、零交叉、反向确认、运行时 limiter、
   near-goal rewrite 或 recovery override。checkpoint 与 exact resume 必须记录并恢复这一合同，旧
   slew P4 包只能 warm start，不能按 R4 exact resume。
+- Actor85 的 capability15 末六维保持父模型训练时的变化率语义
+  `up=[0.30,0.30,1.00]`、`release=[0.30,0.60,2.50]`；instant controller 的真实物理变化率
+  `[10,6,18]` 只写 command contract 和诊断，不能直接写入未归一化 Actor 输入。父 Actor anchor
+  仅约束旧 slew 在一个 10Hz tick 内可达且不反向的样本，避免把旧 target 动力学强加给瞬时执行策略。
 - 低层、NavigationEncoder、SafetyHead 和 StuckHead 全程冻结。0-30 分钟只校准 Critic；30 分钟至
   2 小时低学习率校准 Actor 与 Adapter；2-3 小时继续 Actor 修正；3-3.5 小时收敛；根据上一轮约
   3h50 已开始同步劣化的证据，3.5 小时后固定冻结 Actor/Teacher/Anchor/Adapter，只以 `1e-5`

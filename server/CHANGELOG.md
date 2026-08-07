@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+- **[P4 R4 Actor 输入兼容修复]** 新入口 `p4maze8h-instant-r4-inputfix` 修复父模型 warm start 的
+  capability15 分布偏移：instant controller 的真实变化率 `[10,6,18]` 不再直接写入未归一化
+  Actor85 输入，策略继续看到父模型训练时的 `up=[0.30,0.30,1.00]`、
+  `release=[0.30,0.60,2.50]`；真实 instant 速率只进入 command contract/诊断。父 Actor anchor
+  同时限制为旧 slew 在一个 10Hz tick 内可达且不反向的样本。网络维度、三轴硬范围、
+  `policy_target==exec` 和 instant hold 语义不变。
+
 - **[P4 Maze R4 完全取消 slew]** 新入口 `p4maze8h-instant-r4` 从
   `p4maze8h10hz_1416926-mazefinal` warm start，固定单段 Maze、128 env、10Hz 高层和
   28800 秒有效训练。三轴 policy target 在每个高层 tick 只做有限值与硬动作边界处理后立即成为
@@ -27,11 +34,10 @@
 - **[P4 R4 冻结期 exact-resume 防线]** 新增 3.5 小时冻结阶段的 save/resume 回归：Actor 与 Adapter
   参数及 Adam `step/exp_avg/exp_avg_sq` 在更新调用前后逐值不变，Critic 仍可更新。该检查覆盖
   fresh process exact resume，防止只把 LR 置零却继续积累 optimizer moments。
-- **[P4 R4 capability 真值闭环]** instant-command 的 Actor capability 与诊断现在始终报告
-  真实硬映射边界 `vx<=1.0`。历史六个变化率槽以 10Hz 单周期完整轴范围的有限值
-  `[10,6,18]` 表达即时可达，避免零值被父 Actor85 误解为完全不能改变命令；这些值只用于观测，
-  controller 不消费。Goal freshness 和 predictive risk 继续作为独立观测/诊断，不再在实际无
-  limiter 时向 Actor85 泄漏一个旧的、较小的“有效速度上限”。
+- **[P4 R4 capability 真值闭环，已由 inputfix 更正]** instant-command 的 Actor capability 与诊断
+  报告真实硬映射边界 `vx<=1.0`。初版把 `[10,6,18]` 写入历史变化率槽；平台行为和父 checkpoint
+  A/B 证明该未归一化输入会显著扰动旧 Actor，现已按上方 inputfix 保留父输入语义，并将真实速率
+  移至 command contract/诊断。
 - **[P4 卡滞恢复证据修复]** unclassified reset 不再伪造成 timeout；reason4 只接受平台
   `nav_stuck_timeout` term 的实际 readback。仅旋转 20 度不再自动清除卡滞，必须同时观察到墙接触
   EMA 至少下降 30%；候选基准跟踪持续接触期间的 EMA 峰值。foot-jam 仅作 shadow 诊断，不触发

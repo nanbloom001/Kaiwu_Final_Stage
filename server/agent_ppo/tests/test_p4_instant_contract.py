@@ -45,7 +45,7 @@ def test_r4_config_and_command_contract_are_instant_only():
         "sub_terrains": ["open_entry_maze"],
         "num_parallel_tracks": 20,
     }
-    assert stage["run_name"] == "p4maze8h-instant-r4"
+    assert stage["run_name"] == "p4maze8h-instant-r4-inputfix"
     assert stage["parent_model_id"] == 1416926
     assert stage["parent_model_label"] == "p4maze8h10hz_1416926-mazefinal"
     assert stage["load_mode"] == "p4_maze_instant_r4_warm_start"
@@ -59,7 +59,7 @@ def test_r4_config_and_command_contract_are_instant_only():
     assert "slew_release_rate" not in stage
 
     command = p4_contract.command_contract(R4_PROFILE)
-    assert command["version"] == "p4_maze_instant_command_r4"
+    assert command["version"] == "p4_maze_instant_command_r4_inputfix"
     assert command["mapped_ranges"] == {
         "vx": [0.0, 1.0],
         "vy": [-0.30, 0.30],
@@ -68,6 +68,13 @@ def test_r4_config_and_command_contract_are_instant_only():
     assert command["command_transition_mode"] == "instant_hold_10hz"
     assert command["hold_frames"] == 5
     assert command["policy_target_equals_exec"] == "at_10hz_tick_boundary"
+    assert command["actor_capability_profile15"] == {
+        "values": list(p4_contract.INSTANT_ACTOR_CAPABILITY_PROFILE15),
+        "semantics": "frozen_parent_observation_compatibility_not_controller_rate",
+    }
+    assert command["instant_physical_change_rate_per_s"] == list(
+        p4_contract.INSTANT_CAPABILITY_CHANGE_RATE
+    )
     assert command["command_rewrites"] == {
         "slew": "disabled",
         "zero_cross_guard": "disabled",
@@ -172,6 +179,7 @@ def test_r4_reward_checkpoint_and_stuck_contract_are_separate_from_slew_profiles
 
     training = p4_contract.training_contract(stuck, R4_PROFILE)
     assert training["version"] == p4_contract.INSTANT_COMMAND_CHECKPOINT_CONTRACT_VERSION
+    assert training["run_name"] == "p4maze8h-instant-r4-inputfix"
     assert training["checkpoint_phase_labels"] == list(
         p4_contract.INSTANT_COMMAND_PHASE_LABELS
     )
@@ -186,7 +194,7 @@ def test_r4_reward_checkpoint_and_stuck_contract_are_separate_from_slew_profiles
         p4_contract.INSTANT_COMMAND_STUCK_RESET_CONTRACT_VERSION
     )
     assert training["exact_resume"] == (
-        "p4_maze_instant_command_r4_only_incompatible_with_slew_profiles"
+        "p4_maze_instant_command_r4_inputfix_only"
     )
     assert training["exact_resume_incompatible_command_transition_modes"] == ["slew"]
     assert p4_contract.training_contract(

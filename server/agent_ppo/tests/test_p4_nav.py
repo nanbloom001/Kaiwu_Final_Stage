@@ -990,7 +990,7 @@ def test_p4_configuration_and_monitor_route_are_explicit():
     root = Path(__file__).resolve().parents[1]
     config = toml.load(root / "conf/train_env_conf_track_p4_nav_ppo.toml")
     app_config = toml.load(root.parent / "conf/configure_app.toml")
-    assert config["p4_nav_ppo"]["run_name"] == "p4maze8h-instant-r4"
+    assert config["p4_nav_ppo"]["run_name"] == "p4maze8h-instant-r4-inputfix"
     assert config["p4_nav_ppo"]["target_effective_seconds"] == 28_800
     assert config["p4_nav_ppo"]["task_end_hours"] == pytest.approx(8.25)
     assert p4_contract.PLATFORM_WALL_MARGIN_SECONDS == 900.0

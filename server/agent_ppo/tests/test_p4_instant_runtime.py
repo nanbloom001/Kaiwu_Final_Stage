@@ -83,7 +83,7 @@ def _eval_algorithm(profile: str) -> AlgorithmP4NavPPO:
         "training_profile": profile,
         "track_segment_labels": (
             ["maze"]
-            if profile == "maze_instant_command_r4"
+            if profile in AlgorithmP4NavPPO.MAZE_PROFILES
             else list(p4_contract.FULL_TRACK_SEGMENT_LABELS)
         ),
     }
@@ -165,7 +165,7 @@ def test_r4_policy_target_is_the_exec_command_for_all_held_low_frames():
     assert torch.equal(algorithm.command.exec_cmd, reversed_target)
 
 
-def test_r4_actor_capability_always_reports_the_true_hard_mapper_range():
+def test_r4_actor_capability_preserves_parent_rate_inputs_and_hard_mapper_range():
     algorithm = _algorithm()
     algorithm.effective_speed_cap.fill_(0.05)
     algorithm.safety_speed_cap.fill_(0.10)
@@ -173,9 +173,83 @@ def test_r4_actor_capability_always_reports_the_true_hard_mapper_range():
     capability = algorithm._nav_capability(1)
 
     assert capability[0, 6].item() == pytest.approx(p4_contract.P4_MAX_VX)
-    expected_rate = torch.tensor(p4_contract.INSTANT_CAPABILITY_CHANGE_RATE)
-    assert torch.allclose(capability[0, 9:12], expected_rate)
-    assert torch.allclose(capability[0, 12:15], expected_rate)
+    expected = torch.tensor(p4_contract.INSTANT_ACTOR_CAPABILITY_PROFILE15)
+    assert torch.equal(capability[0, 9:15], expected[9:15])
+    assert not torch.equal(
+        capability[0, 9:12],
+        torch.tensor(p4_contract.INSTANT_CAPABILITY_CHANGE_RATE),
+    )
+
+
+def test_r4_parent_anchor_rejects_unreachable_or_reversing_legacy_targets():
+    previous = torch.tensor(
+        (
+            (0.40, 0.10, 0.20),
+            (0.40, 0.10, 0.20),
+            (0.40, 0.10, 0.20),
+            (0.40, 0.10, 0.20),
+        )
+    )
+    parent = torch.tensor(
+        (
+            (0.42, 0.12, 0.25),
+            (0.50, 0.12, 0.25),
+            (0.42, -0.10, 0.25),
+            (0.38, 0.05, 0.00),
+        )
+    )
+
+    reachable = p4_contract.instant_parent_anchor_reachable(parent, previous)
+
+    assert reachable.tolist() == [True, False, False, True]
+
+
+def test_r4_next_tick_anchors_from_the_command_that_was_actually_executed():
+    algorithm = _algorithm()
+    algorithm.command.exec_cmd.copy_(torch.tensor(((0.20, 0.0, 0.0),)))
+    # Model a sampled target that was later rejected by the base finite-row
+    # fallback and therefore never reached the controller.
+    algorithm._last_policy_command.fill_(float("nan"))
+    algorithm._delivered_depth = torch.ones(1, 180, 320, 1)
+
+    normalized = torch.tensor(((0.0, 0.0, 0.0),))
+    goal4 = torch.tensor(((1.0, 0.0, 0.5, 1.0),))
+    algorithm._map_policy_target(normalized, None, goal4=goal4, aux={})
+
+    assert torch.isnan(algorithm._previous_policy_command).all()
+    assert torch.equal(
+        algorithm._previous_exec_command,
+        torch.tensor(((0.20, 0.0, 0.0),)),
+    )
+    parent_target = torch.tensor(((0.22, 0.0, 0.0),))
+    assert p4_contract.instant_parent_anchor_reachable(
+        parent_target,
+        algorithm._previous_exec_command,
+    ).item()
+
+
+def test_slew_profile_keeps_policy_target_history_separate_from_exec_history():
+    algorithm = _eval_algorithm("maze_closed_loop_v3")
+    algorithm._delivered_depth = torch.ones(1, 180, 320, 1)
+    algorithm.goal_belief.estimate[:] = torch.tensor(((4.0, 0.0),))
+    algorithm.command.exec_cmd.copy_(torch.tensor(((0.20, 0.0, 0.0),)))
+    algorithm._last_policy_command.copy_(torch.tensor(((0.70, 0.10, 0.20),)))
+
+    algorithm._map_policy_target(
+        torch.zeros(1, 3),
+        None,
+        goal4=torch.tensor(((4.0, 0.0, 0.5, 1.0),)),
+        aux={},
+    )
+
+    assert torch.equal(
+        algorithm._previous_policy_command,
+        torch.tensor(((0.70, 0.10, 0.20),)),
+    )
+    assert torch.equal(
+        algorithm._previous_exec_command,
+        torch.tensor(((0.20, 0.0, 0.0),)),
+    )
 
 
 def test_r4_boundary_frame_low_policy_reads_new_command_without_one_frame_delay():

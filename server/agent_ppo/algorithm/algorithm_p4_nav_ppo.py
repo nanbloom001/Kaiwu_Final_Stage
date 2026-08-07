@@ -170,6 +170,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         self.effective_speed_cap = self.user_speed_cap.clone()
         self._last_policy_command = torch.zeros(self.num_envs, 3, device=self.device)
         self._previous_policy_command = torch.zeros_like(self._last_policy_command)
+        self._previous_exec_command = torch.zeros_like(self._last_policy_command)
         self._last_limited_command = torch.zeros_like(self._last_policy_command)
         self._last_goal_freshness = torch.zeros(self.num_envs, device=self.device)
         self._zero_hidden_action_mae = torch.zeros(self.num_envs, device=self.device)
@@ -464,6 +465,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
     def _prepare_policy_parts(self, parts, critic_obs, aux, reset):
         worker_reset = aux[:, 24] > 0.5
         self._previous_policy_command[worker_reset | reset] = 0.0
+        self._previous_exec_command[worker_reset | reset] = 0.0
         self._last_policy_command[worker_reset | reset] = 0.0
         self._last_limited_command[worker_reset | reset] = 0.0
         self._translation_alpha_prev[worker_reset | reset] = 1.0
@@ -579,8 +581,13 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             cap = torch.full((batch,), p4_contract.P4_MAX_VX, device=self.device)
         else:
             cap = self.effective_speed_cap
+        capability_values = (
+            p4_contract.INSTANT_ACTOR_CAPABILITY_PROFILE15
+            if self.command.command_transition_mode == "instant_hold_10hz"
+            else p2_contract.NAV_CAPABILITY_PROFILE15
+        )
         result = torch.tensor(
-            p2_contract.NAV_CAPABILITY_PROFILE15,
+            capability_values,
             device=self.device,
             dtype=dtype,
         ).expand(batch, -1).clone()
@@ -592,18 +599,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
         result[:, 6] = cap.to(dtype)
         result[:, 7] = p4_contract.P4_MAX_ABS_VY
         result[:, 8] = p4_contract.P4_MAX_ABS_WZ
-        if self.command.command_transition_mode == "instant_hold_10hz":
-            # Actor85 has no transition-mode bit, so zero would retain the old
-            # meaning "this command cannot change". Encode the actual finite
-            # maximum change over one 10 Hz hold period instead. These values
-            # describe capability only; the instant controller never consumes
-            # them as slew limits.
-            rate = result.new_tensor(
-                p4_contract.INSTANT_CAPABILITY_CHANGE_RATE
-            )
-            result[:, 9:12] = rate
-            result[:, 12:15] = rate
-        else:
+        if self.command.command_transition_mode != "instant_hold_10hz":
             result[:, 9:12] = result.new_tensor(self.command_slew_rate)
             result[:, 12:15] = result.new_tensor(self.command_slew_release_rate)
         return result
@@ -618,6 +614,10 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
     def _map_policy_target(self, normalized, legacy_target, *, goal4, aux):
         del legacy_target, aux
         self._previous_policy_command.copy_(self._last_policy_command)
+        # The base algorithm may sanitize a non-finite sampled target after
+        # this hook returns.  Keep a separate physical history for the instant
+        # parent anchor without changing legacy policy-target diagnostics.
+        self._previous_exec_command.copy_(self.command.exec_cmd)
         full_cap = torch.full(
             (normalized.shape[0],), p4_contract.P4_MAX_VX,
             device=normalized.device, dtype=normalized.dtype,
@@ -915,6 +915,16 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             & ~push_grace
             & ~episode_grace
         )
+        if self.command.command_transition_mode == "instant_hold_10hz":
+            parent_target = p4_contract.map_normalized_action(
+                self._parent_anchor_normalized_mean,
+                p4_contract.P4_MAX_VX,
+                goal_freshness=None,
+            )
+            anchor_mask &= p4_contract.instant_parent_anchor_reachable(
+                parent_target,
+                self._previous_exec_command,
+            )
         self._parent_anchor_mask.copy_(anchor_mask.float().unsqueeze(-1))
         mirror_eligible = (
             alive & mapping_valid & ~push_grace & ~worker_candidate
@@ -3491,6 +3501,7 @@ class AlgorithmP4NavPPO(AlgorithmP2NavPPO):
             self._parent_anchor_log_std.zero_()
             self._parent_anchor_mask.zero_()
             self._previous_policy_command.zero_()
+            self._previous_exec_command.zero_()
             self._goal_epoch_changed_since_tick.zero_()
             self._risk_event_active.zero_()
             self._risk_event_age_ticks.zero_()

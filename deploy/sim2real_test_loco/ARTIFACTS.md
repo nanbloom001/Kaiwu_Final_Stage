@@ -31,7 +31,7 @@ P4 训练 checkpoint 不是本部署树的可部署候选：尚未完成与此 A
 输入兼容的导出审查、ONNX 数值校验和 Jetson/真机验证前，必须保持
 `capabilities.deployable=false`，不得作为本路线的 `policy.onnx` 或通过改名加载。
 
-活动实验 `p4_maze_instant_command_r4` 在 server/Track eval 中使用 10Hz
+活动实验 `p4_maze_instant_command_r4_inputfix` 在 server/Track eval 中使用 10Hz
 `instant_hold_10hz` 高层合同：高层 target 在 tick 边界立即成为 exec，并保持 5 个低层帧，不经过
 slew、反向确认或 post-Actor limiter。当前部署树没有 P4 高层 Actor85 runtime，因此既没有实现也
 不得宣称已经验证该合同。未来若导出完整 P4 高层，必须另行实现同一 tick/hold 语义并完成 ONNX、

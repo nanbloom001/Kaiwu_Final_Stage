@@ -53,7 +53,8 @@
 
 ## BUG-20260807-001：P4 高层 slew 隐式延迟、恢复后合同回退与卡滞伪恢复
 
-- 状态：开发容器最小 smoke 已验证；平台训练 smoke、八小时训练和固定条件评估未执行。
+- 状态：旧 R4 开发容器最小 smoke 已验证、平台长训运行中但行为失败；inputfix 本地定向测试已验证，
+  容器、平台和固定条件评估待验证。
 - 影响：P4 Maze 高层命令执行、PPO 数据闭环、checkpoint exact resume、卡滞 reason4 归因和监控；
   不修改平台覆盖的 `server/isaac_env/base_env.py`，不改变 Actor85、Critic 输入、三轴动作范围、
   worker/eval wire 或当前稳定低层部署接口。
@@ -94,7 +95,8 @@
     loss、advantage/return normalization、return statistics 和全部辅助项中排除，避免零奖励仍生成
     `-old_value` 伪梯度。旋转恢复以持续接触期 EMA 峰值为基准，yaw>=20 度且 EMA 至少下降 30%才
     清除；foot-jam 仅作 shadow。
-- 验证：新增 controller 立即反向/五帧保持、完整 `frame_begin` 首帧命令一致、R4 runtime
+- 验证（以下为 inputfix 之前的初版 R4 证据）：新增 controller 立即反向/五帧保持、完整
+  `frame_begin` 首帧命令一致、R4 runtime
   target=limited=exec、capability 与真实硬 mapper/有限即时变化率一致、terminal exact clawback、
   reason0 全训练路径排除、Adapter legacy record 拒绝、
   R4 eval runtime mismatch 拒绝、parent-anchor exact resume、term read failure fail-closed 和旋转恢复
@@ -139,13 +141,31 @@
   `nav_full_smoke` 的单个用例在临时 worktree 根运行时因不存在平台根级 `train_test.py` 失败，从
   正确的 `server/` 项目根单独重跑后 `1 passed`。变更 Python 编译、活动 P4 TOML 解析与
   `git diff --check` 均通过。该证据只覆盖开发容器装配和单轮更新，不等于平台长训表现已验证。
+- 2026-08-07 平台行为更正：正式任务 `p4maze8h-instant-r4` 已确认
+  `policy_target==exec`、无 OOM/生命周期故障、checkpoint 周期保存正常，但约 148 分钟、3488 次
+  高层更新后 P2 与 curriculum probe 均仍为零成功。进一步读取真实父 checkpoint 并做固定权重
+  A/B，确认初版把 instant 物理变化率 `[10,6,18]` 写入 Actor85 未归一化 capability15，会使仅改变
+  这六维时 normalized action MAE 达到约 `[0.283,0.274,0.710]`，`wz` 符号分歧约 32.7%，LSTM
+  gate preactivation RMS 变化约 3.36。此前“该值只用于 observation 因而安全”的判断错误：
+  observation 本身就是策略输入。新分支 `codex/p4-maze8h-instant-command-r4-inputfix` 保留父模型
+  末六维 `up=[0.30,0.30,1.00]`、`release=[0.30,0.60,2.50]`，真实 instant 速率只进入 command
+  contract/诊断；父 Actor anchor 仅用于旧 slew 一步可达且不反向的样本。该修复当前状态为
+  **本地定向测试已验证，容器和平台待验证**；正在运行的旧 R4 任务不能作为 inputfix 行为证据。
+  inputfix 当前证据：定向 command/runtime/anchor 套件 `24 passed`；P2/P4 command、nav、recovery、
+  full-track 与 inputfix 最终集成套件 `281 passed`；
+  Python 编译、活动 TOML 解析与 `git diff --check` 已通过。独立审查发现并已修复 checkpoint
+  `run_name` 仍为旧值，以及非有限 sampled target 未执行时 anchor 错用缓存 policy target 的边界；
+  后者现在以 pre-tick `command.exec_cmd` 为唯一上一物理命令来源，并有定向回归。
 - 防复发：监控必须同时上报 transition mode、hold frames、policy-limited/exec MAE、三轴正负 delta/
   reversal、phase、Actor/Adapter freeze、parent anchor loss、unknown reset、reason4 和墙接触 EMA 恢复。
   exact-resume 测试必须实际 load 后再次检查 controller mode，并逐值验证冻结期 Actor/Adapter 参数
   与 Adam state 不变；不能只比合同字典。评估必须校验完整 command contract，Adapter record 必须
   携带命令 transition provenance。
-- 血缘：分支 `codex/p4-maze8h-instant-command-r4`，父代码 `33e5d52`，父 checkpoint
-  `p4maze8h10hz_1416926-mazefinal`；本地未在本条中重新取得父 checkpoint SHA256。commit/PR、
+- 血缘：初版分支 `codex/p4-maze8h-instant-command-r4`；inputfix 分支
+  `codex/p4-maze8h-instant-command-r4-inputfix`，基线 commit
+  `1fd242dd84ada60d0b0996e41bf942a5e152ceef`。父 checkpoint
+  `p4maze8h10hz_1416926-mazefinal`，已核验 checkpoint SHA256
+  `0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`。inputfix commit/PR、
   容器任务与新 checkpoint 待生成。
 - 回滚：停止 R4 任务并回到父 checkpoint；代码层回滚本条 command/controller/contract/schedule/
   anchor/stuck 修改即可恢复 `maze_closed_loop_v3`。不得只改 TOML 为 slew 后继续加载 R4 exact 包。

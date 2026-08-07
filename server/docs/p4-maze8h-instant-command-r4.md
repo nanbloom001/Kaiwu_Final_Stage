@@ -2,7 +2,7 @@
 
 ## 目标与父模型
 
-- 任务：`p4maze8h-instant-r4`
+- 任务：`p4maze8h-instant-r4-inputfix`
 - 父模型：`p4maze8h10hz_1416926-mazefinal`
 - 有效训练：`28800s`；平台墙钟 `8.25h`
 - 目标：消除高层 target 到低层 exec 之间未被 Actor 观察的控制延迟，降低大半径转弯、碰撞后持续
@@ -34,11 +34,15 @@ normalized action
 action 和实际 exec 使用同一个 target。命令硬范围和 command-rate penalty 保留。旧 slew 包只能
 作为 warm start；R4 exact resume 必须携带完全相同的 command digest。
 
-Actor capability 同样始终表达真实硬映射范围：`vx` 上限为 `1.0m/s`。Actor85 没有单独的
-“instant mode”位，因此六个历史变化率槽不用零哨兵，而以 10Hz 一个周期可跨完整轴范围的有限值
-`[10,6,18]`（增大/释放相同）表达“本 tick 可立即达到任意合法命令”。这些值只进入 observation，
-不被 controller 消费，也不构成新的 slew。Goal freshness 和预测风险保留在各自的观测/诊断通道，
-不得通过一个与实际 mapper 不一致的隐式 speed cap 改变策略行为。
+Actor capability 同样始终表达真实硬映射范围：`vx` 上限为 `1.0m/s`。但 capability15 是父 Actor85
+未经归一化直接读取的 observation；父模型训练时末六维为
+`up=[0.30,0.30,1.00]`、`release=[0.30,0.60,2.50]`。instant 模式必须保留这组输入兼容值，不能把
+10Hz 单周期完整轴范围 `[10,6,18]` 直接写入旧 Actor。后者只作为 controller 的真实物理变化率写入
+command contract 和监控，不进入策略输入，也不构成新的 slew。Goal freshness 和预测风险保留在
+各自的观测/诊断通道，不得通过一个与实际 mapper 不一致的隐式 speed cap 改变策略行为。
+
+父 Actor anchor 只在父 target 由上一条 exec 按旧 slew 在一个 10Hz tick 内可达、且三轴没有符号
+反转时启用。不可达的父 target 是旧控制器的未来目标，不是瞬时执行策略应当模仿的当前物理命令。
 
 ## 学习时程
 

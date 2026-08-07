@@ -38,13 +38,17 @@ ACTION_MAPPER_VERSION = "p4_capability_action_mapper_v1"
 GOAL_BELIEF_VERSION = "p4_goal_belief_v4_full_track_metric_raw"
 CAMERA_CONTRACT_VERSION = "p4_shared_camera_v4_recovery_nominal_light"
 ADAPTER_RECORD_CONTRACT_VERSION = "p4_adapter_record_v1"
-INSTANT_ADAPTER_RECORD_CONTRACT_VERSION = "p4_adapter_record_v2_instant_command"
+INSTANT_ADAPTER_RECORD_CONTRACT_VERSION = (
+    "p4_adapter_record_v3_instant_command_inputfix"
+)
 SAFETY_REWARD_RAMP_VERSION = "p4_maze_credit_repair_safety_group_v1"
 CHECKPOINT_CONTRACT_VERSION = "p4_maze_credit_repair_v1"
 MAZE_CLOSED_LOOP_SAFETY_REWARD_VERSION = "p4_maze_closed_loop_recovery_translation_v4"
 MAZE_CLOSED_LOOP_CHECKPOINT_VERSION = "p4_maze_closed_loop_v3"
 INSTANT_COMMAND_REWARD_CONTRACT_VERSION = "p4_maze_instant_command_reward_r4"
-INSTANT_COMMAND_CHECKPOINT_CONTRACT_VERSION = "p4_maze_instant_command_r4"
+INSTANT_COMMAND_CHECKPOINT_CONTRACT_VERSION = (
+    "p4_maze_instant_command_r4_inputfix"
+)
 INSTANT_COMMAND_STUCK_RESET_CONTRACT_VERSION = (
     "p4_stuck_reset_v6_instant_shadow_12s_to_active_10s"
 )
@@ -117,14 +121,26 @@ P4_MAX_ABS_WZ = 0.90
 P4_MAX_VX = 1.00
 P4_NAV_PERIOD_FRAMES = 5
 P4_NAV_DT_S = p2_contract.CONTROL_DT_S * P4_NAV_PERIOD_FRAMES
-# Actor85 keeps the historical six rate-capability slots. In instant mode they
-# describe the largest finite axis change achievable in one 10 Hz period; they
-# are observations only and are never consumed by the command controller.
+# Actor85 was trained with the historical capability15 values below. Feeding
+# the physical instant-command rates (10/6/18 per second) directly into those
+# unnormalized LSTM inputs saturates the parent policy before PPO can adapt.
+# Keep the parent observation semantics stable; the authoritative instant
+# controller mode and physical rate are recorded separately in the command
+# contract and never inferred from these compatibility slots.
+INSTANT_ACTOR_CAPABILITY_PROFILE15 = (
+    1.0, 1.0, 1.0,
+    0.0, -0.30, -0.90,
+    1.0, 0.30, 0.90,
+    0.30, 0.30, 1.00,
+    0.30, 0.60, 2.50,
+)
 INSTANT_CAPABILITY_CHANGE_RATE = (
     P4_MAX_VX / P4_NAV_DT_S,
     (2.0 * P4_MAX_ABS_VY) / P4_NAV_DT_S,
     (2.0 * P4_MAX_ABS_WZ) / P4_NAV_DT_S,
 )
+INSTANT_PARENT_ANCHOR_SLEW_UP = (0.30, 0.30, 1.00)
+INSTANT_PARENT_ANCHOR_SLEW_RELEASE = (0.30, 0.60, 2.50)
 P4_SLEW_RATE = (0.60, 0.60, 2.00)
 P4_SLEW_RELEASE_RATE = (1.20, 1.20, 4.00)
 LEGACY_P4_SLEW_RATE = (0.30, 0.40, 1.50)
@@ -825,6 +841,34 @@ def map_normalized_action(
 def map_normalized_action_legacy(normalized_action: torch.Tensor) -> torch.Tensor:
     """Versioned parent mapper used only for migration/equality validation."""
     return p2_contract.map_normalized_action(normalized_action, hard_abs_vy=0.40)
+
+
+def instant_parent_anchor_reachable(
+    parent_target_cmd3: torch.Tensor,
+    previous_exec_cmd3: torch.Tensor,
+) -> torch.Tensor:
+    """Return rows where the legacy parent target was reachable in one nav tick.
+
+    The immutable parent Actor predicts a target that used to pass through the
+    50 Hz slew controller.  Anchoring an instant policy to a target that the old
+    controller could not physically reach in the same 10 Hz interval preserves
+    the wrong transition semantics.  Only smooth, non-reversing parent targets
+    are therefore eligible for the distribution anchor.
+    """
+    parent = torch.as_tensor(parent_target_cmd3)
+    previous = torch.as_tensor(
+        previous_exec_cmd3, device=parent.device, dtype=parent.dtype
+    )
+    if parent.ndim != 2 or parent.shape[1] != 3 or previous.shape != parent.shape:
+        raise ValueError("P4 instant parent anchor expects matching [N,3] commands")
+    finite = torch.isfinite(parent).all(dim=-1) & torch.isfinite(previous).all(dim=-1)
+    opposite = parent * previous < 0.0
+    growing = parent.abs() > previous.abs()
+    up = parent.new_tensor(INSTANT_PARENT_ANCHOR_SLEW_UP) * P4_NAV_DT_S
+    release = parent.new_tensor(INSTANT_PARENT_ANCHOR_SLEW_RELEASE) * P4_NAV_DT_S
+    reachable_delta = torch.where(growing, up, release)
+    within_delta = (parent - previous).abs() <= reachable_delta + 1.0e-6
+    return finite & ~opposite.any(dim=-1) & within_delta.all(dim=-1)
 
 
 def stale_goal_cap(user_cap: torch.Tensor, goal_freshness: torch.Tensor) -> torch.Tensor:
@@ -2477,7 +2521,7 @@ def command_contract(
     profile = _normalized_training_profile(training_profile)
     if profile == "maze_instant_command_r4":
         return {
-            "version": "p4_maze_instant_command_r4",
+            "version": "p4_maze_instant_command_r4_inputfix",
             "mapper_version": ACTION_MAPPER_VERSION,
             "legacy_mapper_version": LEGACY_ACTION_MAPPER_VERSION,
             "normalized_action": "unchanged_tanh_gaussian_v2",
@@ -2492,12 +2536,15 @@ def command_contract(
             "nav_period_frames": P4_NAV_PERIOD_FRAMES,
             "nav_frequency_hz": 1.0 / P4_NAV_DT_S,
             "policy_target_equals_exec": "at_10hz_tick_boundary",
-            "capability_change_rate_per_s": list(
+            "instant_physical_change_rate_per_s": list(
                 INSTANT_CAPABILITY_CHANGE_RATE
             ),
-            "capability_rate_semantics": (
-                "finite_full_axis_range_per_10hz_period_observation_only"
-            ),
+            "actor_capability_profile15": {
+                "values": list(INSTANT_ACTOR_CAPABILITY_PROFILE15),
+                "semantics": (
+                    "frozen_parent_observation_compatibility_not_controller_rate"
+                ),
+            },
             "command_rewrites": {
                 "slew": "disabled",
                 "zero_cross_guard": "disabled",
@@ -2894,7 +2941,7 @@ def training_contract(
         ),
         "training_profile": profile,
         "run_name": (
-            "p4maze8h-instant-r4"
+            "p4maze8h-instant-r4-inputfix"
             if instant_command
             else (
                 RUN_NAME
@@ -3116,6 +3163,9 @@ def training_contract(
                     "multiplier": "explicit_per_instant_phase",
                     "target_ratio": "explicit_per_instant_phase",
                     "phase_labels": list(INSTANT_COMMAND_PHASE_LABELS),
+                    "eligibility": (
+                        "low_risk_and_parent_target_reachable_by_legacy_slew_in_one_nav_tick"
+                    ),
                 },
                 "exact_resume_incompatible_command_transition_modes": ["slew"],
             }
@@ -3193,7 +3243,7 @@ def training_contract(
         },
         "soft_cruise": command_contract(profile)["soft_cruise"],
         "exact_resume": (
-            "p4_maze_instant_command_r4_only_incompatible_with_slew_profiles"
+            "p4_maze_instant_command_r4_inputfix_only"
             if instant_command
             else (
                 "p4_maze_closed_loop_v3_only"

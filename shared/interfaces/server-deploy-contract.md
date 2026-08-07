@@ -628,7 +628,7 @@ checkpoint 版本为 `p4_maze_closed_loop_v3`，新保存标签优先级为
 start；完整匹配 command/reward/training/stuck/camera digest 的新包才可 exact resume。Standard eval
 仍只抽取低层，Track eval 加载完整 P4；所有 training-only 教师与诊断头均不进入部署执行。
 
-##### 活动 `p4_maze_instant_command_r4` 合同
+##### 活动 `p4_maze_instant_command_r4_inputfix` 合同
 
 R4 保持 Actor85、Critic 输入、三轴 tanh-Gaussian、物理动作范围和训练/评估 wire 不变，但明确
 取消高低层之间的命令 slew。每个 10Hz 高层 tick 产生的 `policy_target_cmd3` 只经过有限值处理和
@@ -638,10 +638,12 @@ translation limiter、near-goal rewrite 或 recovery command override。PPO log-
 tracking 目标和低层 observation command 因此对应同一个 policy target。command contract 必须记录
 `command_transition_mode=instant_hold_10hz` 与 `hold_frames=5`，不得写入候选 slew 或父 slew
 回退结果；R4 exact resume 遇到旧 slew command contract 必须拒绝，旧包只可 warm start。
-Actor85 没有独立的 instant-mode 输入位；历史 capability 变化率槽统一写为 10Hz 单周期完整轴范围
-`[10,6,18]`，表示每个 tick 可到达任意合法 `vx/vy/wz`，只用于 observation，不得被运行时重新解释
-成 slew 参数。未知 reason-0 reset 行保留 recurrent boundary，但必须通过 rollout validity mask 从
-PPO、Critic、return statistics 和所有训练辅助项中完全排除。
+Actor85 没有独立的 instant-mode 输入位，且 capability15 未归一化。为兼容父 checkpoint，历史
+变化率槽保持父模型的 `up=[0.30,0.30,1.00]`、`release=[0.30,0.60,2.50]`；10Hz instant controller
+的真实物理变化率 `[10,6,18]` 只记录在 checkpoint command contract 和监控中，不能写入旧 Actor
+输入，也不能从 capability 数值反推 transition mode。父 Actor anchor 只允许旧 slew 在一个 10Hz
+tick 内可达且不反向的样本。未知 reason-0 reset 行保留 recurrent boundary，但必须通过 rollout
+validity mask 从 PPO、Critic、return statistics 和所有训练辅助项中完全排除。
 
 R4 从 `p4maze8h10hz_1416926-mazefinal` 继承低层、高层 Actor、Critic、NavigationEncoder、
 SafetyHead 与 ResponseAdapter 权重。低层、NavigationEncoder、SafetyHead、StuckHead 全程冻结。
