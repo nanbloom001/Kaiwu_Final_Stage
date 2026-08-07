@@ -8,6 +8,7 @@ from typing import Any
 from agent_ppo.feature import p2_contract
 from agent_ppo.p4 import profiles as _profile_registry
 from agent_ppo.p4.constants import *
+from agent_ppo.p4.constants import STABLE_DIRECTION_PHASE_LABELS
 from agent_ppo.p4.profiles import (
     LEGACY_COMPATIBILITY_DEFAULT,
     PROFILE_FULL_TRACK,
@@ -561,13 +562,7 @@ def _training_contract_part_1(
             {
                 "checkpoint_phase_labels": list(
                     (
-                        [
-                            "stable_warm",
-                            "stable_early",
-                            "stable_mid",
-                            "stable_late",
-                            "stable_stabilize",
-                        ]
+                        STABLE_DIRECTION_PHASE_LABELS
                         if stable_direction
                         else INSTANT_REPAIR_PHASE_LABELS
                         if instant_repair

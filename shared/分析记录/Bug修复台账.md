@@ -4746,14 +4746,25 @@
   （28800s）活动 profile；只对安全教师有效、目标新鲜、存在明确安全出口且非 terminal/reset/grace
   的 transition 启用三项负奖励。安全组从前 30 分钟 `-0.01/tick` 渐进到 `-0.02/tick`，按比例
   缩放，不产生正奖励、不覆盖动作。PPO 分解现在同时记录 eligible、applied 与 cap-hit，
-  并要求分解和等于 storage reward。
+  并要求分解和等于 storage reward。2026-08-08 容器 smoke 进一步发现平台只会读取 canonical
+  `train_env_conf_track_p4_nav_ppo.toml`，新增的独立 TOML 不会自动选中；已将 canonical TOML
+  改为 8h stable profile，并让 `NAV_FULL_SMOKE=1` 仅在内存中切换到 smoke profile，防止测试
+  静默运行旧 instant-repair 合同。随后 stable smoke 暴露 checkpoint schedule 使用
+  `stable_smoke_*` / `stable_*` 下划线标签，而 Arena probe 仅接受纯小写字母，造成 PPO 已完成
+  迭代但平台拒绝保存。已统一为 `stablecalibrate/stabledirection/stablewarm/...`，并将 canonical
+  phase label 列表接入 scheduler、training contract 与 P4 loader；同时将平台轻量 logger 的格式化
+  调用改为单个 f-string，避免 reset 时因 logger 签名不同抛出 `TypeError`。
 - 排除方向：未改变 Actor85、Critic 输入、动作范围、instant command、低层/视觉/Adapter 权重
   或平台 `BaseEnv`；旧 profile 仍保留 shadow 语义。
-- 本地验证：定向 P4 profile/contract/reward/architecture 回归 `54 passed`，Python 编译通过。
-  容器同步、1/8-env smoke、固定种子父模型对比和平台任务尚未执行，不能据此宣称成功率或碰撞率
-  已改善。
+- 本地验证：定向 P4 profile/contract/reward/architecture 回归 `54 passed`，追加 canonical
+  profile/smoke override 回归 `39 passed`，修复后 P4 定向回归 `157 passed`，Python 编译通过。
+  容器同步后的定向回归 `50 passed`；
+  首次 8-env full smoke 已完成一次完整 rollout、PPO iteration 与 checkpoint dump，但当时仍为旧
+  profile，因此仅作为框架证据；修正后需要重跑 stable smoke。固定种子父模型对比和平台任务尚未执行，
+  不能据此宣称成功率或碰撞率已改善。
 - 关联分支：`codex/p4maze-stable-direction`；父基线 `codex/p4-engineered-baseline`；
-  任务名 `p4maze30m-stable-smoke` / `p4maze8h-stable-direction`；代码 commit `d64a21e`；
+  任务名 `p4maze30m-stable-smoke` / `p4maze8h-stable-direction`；代码 commit `d7bf5d5`
+  （profile assembly 后续修订待提交）；
   checkpoint、SHA256、平台任务和 PR：待生成。回滚方式：恢复 stable profile 之前的配置或回到父分支。
 - 后续最短检查路径：先确认 `reward_*_eligible` 非零且 `reward_*_applied` 非零，再检查
   cap-hit、reward conservation 和 target→exec 链；若 applied 仍为零，优先查 profile 合同

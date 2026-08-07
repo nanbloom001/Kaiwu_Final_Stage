@@ -61,6 +61,18 @@ INSTANT_REPAIR_PHASE_LABELS = (
     "repairtrain",
     "repairstable",
 )
+# Arena's checkpoint probe accepts only lowercase alphabetic stage labels.
+# Keep the stable-direction schedule labels canonical here so the scheduler,
+# checkpoint contract, and loader cannot silently diverge.
+STABLE_DIRECTION_PHASE_LABELS = (
+    "stablecalibrate",
+    "stabledirection",
+    "stablewarm",
+    "stableearly",
+    "stablemid",
+    "stablelate",
+    "stablestabilize",
+)
 INSTANT_REPAIR_SCHEDULE_BOUNDARIES_SECONDS = (300.0, 1_800.0, 5_400.0, 7_200.0)
 INSTANT_REPAIR_CHECKPOINT_BOUNDARIES_SECONDS = (
     300.0,

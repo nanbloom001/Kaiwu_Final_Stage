@@ -14,7 +14,7 @@ from agent_ppo.feature import p2_contract, p4_contract
 from agent_ppo.feature.p2_command_controller import P2CommandController
 
 
-def test_legacy_closed_loop_schedule_and_current_repair_config_are_aligned():
+def test_legacy_closed_loop_schedule_and_current_stable_config_are_aligned():
     config_path = Path(__file__).parents[1] / "conf" / "train_env_conf_track_p4_nav_ppo.toml"
     config = tomllib.loads(config_path.read_text())
     stage = config["p4_nav_ppo"]
@@ -33,7 +33,9 @@ def test_legacy_closed_loop_schedule_and_current_repair_config_are_aligned():
     )
     legacy_command = p4_contract.command_contract("maze_closed_loop_v3")
     assert legacy_training["required_platform_wall_seconds"] == 29_700
-    assert stage["task_end_hours"] == 2.25
+    assert stage["task_end_hours"] == 8.25
+    assert stage["training_profile"] == "maze_stable_direction_8h"
+    assert stage["maze_training_branch"] == "stable_direction_8h"
     assert stage["parent_model_id"] == 1416926
     assert tuple(legacy_command["slew_rate"]) == p4_contract.P4_SLEW_RATE
     assert tuple(legacy_command["slew_release_rate"]) == p4_contract.P4_SLEW_RELEASE_RATE

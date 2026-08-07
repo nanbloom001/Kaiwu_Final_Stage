@@ -29,7 +29,7 @@ def _stuck_reset() -> dict[str, float | bool | str]:
     }
 
 
-def test_repair2h_config_and_command_contract_are_instant_only():
+def test_canonical_config_uses_stable_profile_and_legacy_command_stays_instant():
     path = Path(__file__).parents[1] / "conf" / "train_env_conf_track_p4_nav_ppo.toml"
     with path.open("rb") as stream:
         config = tomllib.load(stream)
@@ -47,14 +47,14 @@ def test_repair2h_config_and_command_contract_are_instant_only():
         "sub_terrains": ["open_entry_maze"],
         "num_parallel_tracks": 20,
     }
-    assert stage["run_name"] == "p4maze2h-instant-repair-r1"
+    assert stage["run_name"] == "p4maze8h-stable-direction"
     assert stage["parent_model_id"] == 1416926
     assert stage["parent_model_label"] == "p4maze8h10hz_1416926-mazefinal"
     assert "load_mode" not in stage
-    assert stage["training_profile"] == REPAIR_PROFILE
-    assert stage["maze_training_branch"] == "instant_repair2h"
-    assert stage["task_end_hours"] == pytest.approx(2.25)
-    assert stage["target_effective_seconds"] == 7_200
+    assert stage["training_profile"] == "maze_stable_direction_8h"
+    assert stage["maze_training_branch"] == "stable_direction_8h"
+    assert stage["task_end_hours"] == pytest.approx(8.25)
+    assert stage["target_effective_seconds"] == 28_800
     assert stage["command_transition_mode"] == "instant_hold_10hz"
     assert stage["hold_frames"] == 5
     assert "slew_rate" not in stage

@@ -5,15 +5,18 @@ from __future__ import annotations
 import pytest
 import torch
 
+from agent_ppo.conf import conf as runtime_conf
+from agent_ppo.checkpoint_io import validate_probe_filename
 from agent_ppo.feature import p4_contract
+from agent_ppo.p4.constants import STABLE_DIRECTION_PHASE_LABELS
 from agent_ppo.p4 import contracts, profiles, rewards
 
 
 @pytest.mark.parametrize(
     ("profile", "target", "phase0"),
     [
-        ("maze_stable_direction_smoke", 1_800, "stable_smoke_calibrate"),
-        ("maze_stable_direction_8h", 28_800, "stable_warm"),
+        ("maze_stable_direction_smoke", 1_800, "stablecalibrate"),
+        ("maze_stable_direction_8h", 28_800, "stablewarm"),
     ],
 )
 def test_stable_profile_contract_and_clock(profile, target, phase0):
@@ -38,11 +41,11 @@ def test_stable_direction_schedule_has_exact_boundaries_and_cap():
     late = p4_contract.training_schedule(10_800.0, branch=branch)
     final = p4_contract.training_schedule(21_600.0, branch=branch)
     assert [row["phase"] for row in (warm, early, mid, late, final)] == [
-        "stable_warm",
-        "stable_early",
-        "stable_mid",
-        "stable_late",
-        "stable_stabilize",
+        "stablewarm",
+        "stableearly",
+        "stablemid",
+        "stablelate",
+        "stablestabilize",
     ]
     assert [row["actor_lr"] for row in (warm, early, mid, late, final)] == [
         0.0,
@@ -54,6 +57,19 @@ def test_stable_direction_schedule_has_exact_boundaries_and_cap():
     assert warm["safety_group_floor"] == pytest.approx(-0.01)
     assert final["safety_group_floor"] == pytest.approx(-0.02)
     assert final["teacher_gradient_target_ratio"] == pytest.approx(0.01)
+
+
+def test_stable_checkpoint_labels_are_probe_compatible_and_canonical():
+    profile = "maze_stable_direction_8h"
+    contract = contracts.training_contract(profile, mode="train")
+    labels = contract["clock_semantics"].get("checkpoint_phase_labels")
+    if labels is None:
+        labels = contract["checkpoint_phase_labels"]
+    assert labels == list(STABLE_DIRECTION_PHASE_LABELS)
+    assert all(
+        validate_probe_filename(f"model.ckpt-{label}-1419200.pkl")
+        for label in labels
+    )
 
 
 def test_stable_direction_reward_spec_activates_only_directional_terms():
@@ -70,6 +86,40 @@ def test_stable_direction_reward_spec_activates_only_directional_terms():
             "yaw_exit_response",
         }
     )
+
+
+def test_canonical_p4_toml_selects_eight_hour_profile():
+    import tomllib
+    from pathlib import Path
+
+    path = Path(__file__).parents[1] / "conf" / "train_env_conf_track_p4_nav_ppo.toml"
+    with path.open("rb") as stream:
+        config = tomllib.load(stream)
+    p4 = config["p4_nav_ppo"]
+    assert p4["training_profile"] == profiles.PROFILE_MAZE_STABLE_DIRECTION_8H
+    assert p4["target_effective_seconds"] == 28_800
+
+
+def test_nav_smoke_uses_in_memory_stable_profile(monkeypatch):
+    class Logger:
+        def __init__(self):
+            self.messages = []
+
+        def warning(self, message):
+            self.messages.append(message)
+
+    monkeypatch.delenv("KAIWU_TRAIN_TEST", raising=False)
+    monkeypatch.setenv("NAV_FULL_SMOKE", "1")
+    monkeypatch.setenv("NAV_FULL_SMOKE_NUM_ENVS", "8")
+    monkeypatch.delenv("NAV_FULL_SMOKE_PROFILE", raising=False)
+    config = {"env": {"num_envs": 128}, "p4_nav_ppo": {}}
+    logger = Logger()
+    runtime_conf._apply_runtime_env_overrides(config, logger)
+    p4 = config["p4_nav_ppo"]
+    assert config["env"]["num_envs"] == 8
+    assert p4["training_profile"] == profiles.PROFILE_MAZE_STABLE_DIRECTION_SMOKE
+    assert p4["target_effective_seconds"] == 1_800
+    assert p4["maze_training_branch"] == "stable_direction_smoke"
 
 
 def test_proportional_cap_is_dynamic_and_preserves_reward_conservation():

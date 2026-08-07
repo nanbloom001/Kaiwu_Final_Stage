@@ -713,6 +713,34 @@ def _apply_runtime_env_overrides(usr_conf, logger) -> None:
         raise ValueError("NAV_FULL_SMOKE_NUM_ENVS must be in [1, 256]")
     configured_num_envs = int(usr_conf["env"]["num_envs"])
     usr_conf["env"]["num_envs"] = smoke_num_envs
+    p4_conf = usr_conf.get("p4_nav_ppo")
+    if isinstance(p4_conf, dict):
+        # The platform always resolves P4 training through the canonical
+        # train_env_conf_track_p4_nav_ppo.toml. A nav smoke must therefore
+        # switch the in-memory P4 profile explicitly instead of relying on an
+        # unreferenced alternate TOML file.
+        from agent_ppo.p4.profiles import (
+            PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+            require_training_profile,
+        )
+
+        smoke_profile = os.environ.get(
+            "NAV_FULL_SMOKE_PROFILE", PROFILE_MAZE_STABLE_DIRECTION_SMOKE
+        )
+        spec = require_training_profile(smoke_profile)
+        p4_conf.update(
+            {
+                "run_name": spec.run_name,
+                "training_profile": spec.name,
+                "task_end_hours": spec.task_end_hours,
+                "target_effective_seconds": spec.target_effective_seconds,
+                "maze_training_branch": spec.schedule_branch,
+            }
+        )
+        logger.warning(
+            f"[NavSmoke] temporary P4 profile override: {spec.name}; production "
+            "TOML remains maze_stable_direction_8h"
+        )
     logger.warning(
         "[NavSmoke] temporary in-memory num_envs override: "
         f"configured={configured_num_envs}, smoke={smoke_num_envs}; "

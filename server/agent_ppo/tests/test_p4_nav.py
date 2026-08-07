@@ -1018,11 +1018,11 @@ def test_p4_configuration_and_monitor_route_are_explicit():
     root = Path(__file__).resolve().parents[1]
     config = toml.load(root / "conf/train_env_conf_track_p4_nav_ppo.toml")
     app_config = toml.load(root.parent / "conf/configure_app.toml")
-    assert config["p4_nav_ppo"]["run_name"] == "p4maze2h-instant-repair-r1"
-    assert config["p4_nav_ppo"]["target_effective_seconds"] == 7_200
-    assert config["p4_nav_ppo"]["task_end_hours"] == pytest.approx(2.25)
-    assert config["p4_nav_ppo"]["maze_training_branch"] == "instant_repair2h"
-    assert config["p4_nav_ppo"]["training_profile"] == "maze_instant_repair2h"
+    assert config["p4_nav_ppo"]["run_name"] == "p4maze8h-stable-direction"
+    assert config["p4_nav_ppo"]["target_effective_seconds"] == 28_800
+    assert config["p4_nav_ppo"]["task_end_hours"] == pytest.approx(8.25)
+    assert config["p4_nav_ppo"]["maze_training_branch"] == "stable_direction_8h"
+    assert config["p4_nav_ppo"]["training_profile"] == "maze_stable_direction_8h"
     assert config["p4_nav_ppo"]["command_transition_mode"] == "instant_hold_10hz"
     assert config["p4_nav_ppo"]["nav_period_frames"] == 5
     assert config["env"]["num_envs"] == 128

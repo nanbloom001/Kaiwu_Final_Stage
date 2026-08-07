@@ -634,7 +634,7 @@ def _stable_direction_schedule(
         if seconds < 300.0:
             return {
                 **common,
-                "phase": "stable_smoke_calibrate",
+                "phase": "stablecalibrate",
                 "actor_multiplier": 0.0,
                 "actor_lr": 0.0,
                 "critic_lr": 4.0e-5,
@@ -644,7 +644,7 @@ def _stable_direction_schedule(
         ratio = min(1.0, (seconds - 300.0) / 1_500.0)
         return {
             **common,
-            "phase": "stable_smoke_direction",
+            "phase": "stabledirection",
             "actor_multiplier": 1.0,
             "actor_lr": 1.0e-5,
             "critic_lr": 4.0e-5,
@@ -654,7 +654,7 @@ def _stable_direction_schedule(
     if seconds < 600.0:
         return {
             **common,
-            "phase": "stable_warm",
+            "phase": "stablewarm",
             "actor_multiplier": 0.0,
             "actor_lr": 0.0,
             "critic_lr": 4.0e-5,
@@ -664,7 +664,7 @@ def _stable_direction_schedule(
     if seconds < 3_600.0:
         return {
             **common,
-            "phase": "stable_early",
+            "phase": "stableearly",
             "actor_multiplier": 1.0,
             "actor_lr": 1.0e-5,
             "critic_lr": 4.0e-5,
@@ -674,7 +674,7 @@ def _stable_direction_schedule(
     if seconds < 10_800.0:
         return {
             **common,
-            "phase": "stable_mid",
+            "phase": "stablemid",
             "actor_multiplier": 1.0,
             "actor_lr": 7.5e-6,
             "critic_lr": 3.0e-5,
@@ -684,7 +684,7 @@ def _stable_direction_schedule(
     if seconds < 21_600.0:
         return {
             **common,
-            "phase": "stable_late",
+            "phase": "stablelate",
             "actor_multiplier": 1.0,
             "actor_lr": 5.0e-6,
             "critic_lr": 2.0e-5,
@@ -693,7 +693,7 @@ def _stable_direction_schedule(
         }
     return {
         **common,
-        "phase": "stable_stabilize",
+        "phase": "stablestabilize",
         "actor_multiplier": 1.0,
         "actor_lr": 2.5e-6,
         "critic_lr": 1.0e-5,

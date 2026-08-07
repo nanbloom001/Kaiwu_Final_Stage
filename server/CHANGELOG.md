@@ -4,6 +4,16 @@
 
 ## [未发布]
 
+- **[P4 stable-direction profile assembly]** 平台唯一实际加载的
+  `train_env_conf_track_p4_nav_ppo.toml` 现在指向八小时
+  `maze_stable_direction_8h`，不再静默落到旧的 instant-repair profile。
+  `NAV_FULL_SMOKE=1` 则只在内存中覆盖为
+  `maze_stable_direction_smoke`，同步设置其 run name、有效训练时钟和
+  schedule branch；生产 TOML 不会被 smoke 写回。
+  稳定方向 schedule 的 checkpoint phase 现统一为 Arena probe 可接受的纯小写字母
+  标签（例如 `stablewarm`），并由 scheduler、contract 和 P4 loader 共用同一 canonical
+  列表，避免 rollout/PPO 已运行但 checkpoint 因文件名被平台拒绝。
+
 - **[P4 compact rollout 首帧修复]** 修复 NavigationEncoder 冻结阶段已切换为
   `nav_feat32` compact storage，却仍在每个高层 tick 无条件申请 depth rollout slot 的错误。
   现在仅在 `store_depth=true` 时取得 pinned depth 所有权；冻结阶段直接保存已计算的

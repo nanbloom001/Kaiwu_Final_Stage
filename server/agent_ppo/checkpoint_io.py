@@ -153,6 +153,13 @@ P4_NAV_PHASE_LABELS = (
     "pnavrobust",
     "pnavfull",
     "pnavstable",
+    "stablecalibrate",
+    "stabledirection",
+    "stablewarm",
+    "stableearly",
+    "stablemid",
+    "stablelate",
+    "stablestabilize",
 )
 
 # Do not infer recency by reversing the validation tuple: it includes legacy

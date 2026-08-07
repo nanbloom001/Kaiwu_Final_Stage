@@ -155,6 +155,7 @@ def _run(runtime_dir: Path, num_envs: int, stop_after_first_update: bool) -> int
     os.environ.pop("KAIWU_TRAIN_TEST", None)
     os.environ["NAV_FULL_SMOKE"] = "1"
     os.environ["NAV_FULL_SMOKE_NUM_ENVS"] = str(num_envs)
+    os.environ["NAV_FULL_SMOKE_PROFILE"] = "maze_stable_direction_smoke"
     os.environ["NAV_SMOKE_EVENT_LOG"] = str(paths["events"])
 
     if stop_after_first_update:
@@ -183,6 +184,7 @@ def _run(runtime_dir: Path, num_envs: int, stop_after_first_update: bool) -> int
                 "max_frame_no": "100000000",
                 "NAV_FULL_SMOKE": "1",
                 "NAV_FULL_SMOKE_NUM_ENVS": str(num_envs),
+                "NAV_FULL_SMOKE_PROFILE": "maze_stable_direction_smoke",
                 "NAV_SMOKE_EVENT_LOG": str(paths["events"]),
             },
             shell="bash",
