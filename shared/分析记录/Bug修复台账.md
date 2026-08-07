@@ -107,6 +107,45 @@
   日志的 selected path、payload ID、filename ID 和 command digest；4）检查 worker terminal snapshot
   hook readback；5）分别比较 producer age 与 upload failure，再决定是训练生产者还是上传链故障。
 
+### 2026-08-07 独立审查更正与基线闭合
+
+- 状态：本地已验证；开发容器最终代码尚未完成远端哈希闭合，最小 Isaac smoke 尚未执行，平台
+  训练/评估仍未执行。
+- 独立审查确认初版工程化提交仍有七个确定性缺口：Track eval 仍把 instant command 当成所有 P4
+  profile 的唯一合同；full-track 误用 repair2h 的 success-first 终止顺序；profile 未绑定 optimizer
+  schedule；depth 写入 pinned slot 前仍构造临时 CPU tensor；P4 eval 生命周期可误写不完整 bundle；
+  自动 reset 只冻结基础 aux 而未冻结 P4 terminal-safe 字段；P3 parent 的唯一兼容跨 ID fallback
+  未实现。上述问题均不依赖模型 ID、分数或性能假设。
+- 修复：Track validator 和最终 loader 从 checkpoint training contract 解析 profile，再校验并重建对应
+  command controller；registry 增加 schedule 和终止优先级所有权；repair2h 保持 success-first，
+  full-track/legacy 保持 wall-stuck-first；P4 eval 的 bootstrap save 为 no-op、其他 save 硬失败；
+  P3 parent discovery 只接受唯一结构兼容候选，多候选报歧义；worker reset hook 冻结 raw goal 与
+  实际 wall term；rollout 直接 `target.copy_(source)` 写最终 pinned slot。
+- 回归：新增 active/legacy/full-track Track eval round-trip、P4 eval no-save、P3 parent discovery/ambiguity、
+  profile schedule、终止重叠优先级、terminal P4 字段和无 `Tensor.to()` depth-copy 测试。最终本地
+  `agent_ppo/tests` 为 `720 passed, 5 skipped, 3 subtests passed`，Python compileall、TOML 解析、
+  `git diff --check` 和 release verifier 通过。
+- 同步插曲：首次手工 tar bundle 带入 14 个 macOS `._*` resource-fork 文件；发现后发起 RPC 删除，
+  并改用仓库 `local_sync_client.build_bundle()` 生成无元数据 bundle，但浏览器传输在最终 manifest
+  复核前中断，不能确认远端清理或最终代码闭合。后续必须先复核 manifest/hash，再执行 1-env reset、
+  8-env 32-tick PPO、Adapter、save/resume 和双评估。
+- 防复发：以后只用 canonical bundle builder，不用系统 tar 制作代码同步包；容器证据必须记录当前
+  source SHA/hash 与实际 Isaac 启动入口。评估 loader 的 discovery validator 与最终 loader 必须共用
+  同一 profile-aware command contract，不能再用某个最新实验合同替代全部历史兼容语义。
+
+- 无上下文复核追加：首版修复曾在 reset hook 复制上一帧完整 P4 tail，只刷新 raw goal 和 wall term。
+  这虽然避免了新 episode 数据混入，却会把 stuck candidate/duration、mapping 和 spawn diagnostics
+  整体回退一帧。最终实现只在 captured reset row 覆盖 `RAW_GOAL_XY_SLICE` 与
+  `STUCK_RAW_TERM_INDEX`，其余字段保留当前 worker 值；回归明确断言未捕获行和非 terminal-safe
+  字段不变。无上下文代理复核该修复后未再发现离散问题。
+- 最终本地证据：从规定的 `server/` 入口运行 `agent_ppo/tests` 得到
+  `720 passed, 5 skipped, 3 subtests passed`；release verifier、Python compileall、10 个 TOML
+  解析和 `git diff --check` 通过。若从仓库上层目录直接运行，旧 smoke launcher 测试会因其历史
+  cwd 前置条件失败，不属于本轮生产代码回归。
+- 容器证据更正：较早上传不包含最终字段级修复；Chrome transport 在远端 manifest/hash 闭合前
+  断开，当前不得称为已同步或已完成 1-env/8-env smoke。恢复连接后必须重新上传当前 source、逐文件
+  核对 hash，再执行固定最小流程。
+
 ## BUG-20260807-001：P4 高层 slew 隐式延迟、恢复后合同回退与卡滞伪恢复
 
 - 状态：旧 R4 开发容器最小 smoke 已验证、平台长训运行中但行为失败；inputfix 本地定向测试已验证，

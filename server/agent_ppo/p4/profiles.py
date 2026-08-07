@@ -27,6 +27,8 @@ class TrainingProfileSpec:
     allowed_modes: frozenset[str]
     maze_only: bool
     instant_command: bool
+    schedule_branch: str
+    wall_stuck_precedes_success: bool
     run_name: str
     training_hours: float
     target_effective_seconds: int
@@ -54,6 +56,8 @@ class TrainingProfileSpec:
             )
         if not self.run_name:
             raise ValueError(f"P4 profile {self.name!r} has no run name")
+        if not self.schedule_branch:
+            raise ValueError(f"P4 profile {self.name!r} has no schedule branch")
         if self.training_hours <= 0.0 or self.target_effective_seconds <= 0:
             raise ValueError(f"P4 profile {self.name!r} has an invalid training clock")
         if self.required_platform_wall_seconds < self.target_effective_seconds:
@@ -106,6 +110,8 @@ _PROFILE_SPECS = (
         allowed_modes=_ALL_MODES,
         maze_only=True,
         instant_command=True,
+        schedule_branch="instant_repair2h",
+        wall_stuck_precedes_success=False,
         run_name="p4maze2h-instant-repair-r1",
         training_hours=2.0,
         target_effective_seconds=7_200,
@@ -126,6 +132,8 @@ _PROFILE_SPECS = (
         allowed_modes=_ALL_MODES,
         maze_only=False,
         instant_command=False,
+        schedule_branch="auto",
+        wall_stuck_precedes_success=True,
         run_name="p4full8h-r2",
         training_hours=8.0,
         target_effective_seconds=28_800,
@@ -144,6 +152,8 @@ _PROFILE_SPECS = (
         allowed_modes=_LEGACY_MODES,
         maze_only=True,
         instant_command=False,
+        schedule_branch="credit_repair",
+        wall_stuck_precedes_success=True,
         run_name="p4maze2h-credit-repair",
         training_hours=2.0,
         target_effective_seconds=7_200,
@@ -172,6 +182,8 @@ _PROFILE_SPECS = (
         allowed_modes=_LEGACY_MODES,
         maze_only=True,
         instant_command=False,
+        schedule_branch="closed_loop_v3",
+        wall_stuck_precedes_success=True,
         run_name="p4maze8h-closedloop-r3",
         training_hours=8.0,
         target_effective_seconds=28_800,
@@ -191,6 +203,8 @@ _PROFILE_SPECS = (
         allowed_modes=_LEGACY_MODES,
         maze_only=True,
         instant_command=True,
+        schedule_branch="instant_command_r4",
+        wall_stuck_precedes_success=True,
         run_name="p4maze8h-instant-r4-inputfix",
         training_hours=8.0,
         target_effective_seconds=28_800,

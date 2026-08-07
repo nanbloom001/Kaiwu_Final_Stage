@@ -22,6 +22,7 @@ from agent_ppo.feature.goal_features import build_track_goal_raw
 from agent_ppo.feature.p3_gait import validate_mirror_assembly
 from agent_ppo.feature.p4_spawn import install_p4_full_track_spawn
 from agent_ppo.feature.p4_stuck import MotionWallStuckTracker
+from agent_ppo.p4.profiles import get_training_profile
 
 
 _STATE_ATTR = "_agent_ppo_p2_worker_bridge"
@@ -107,6 +108,8 @@ def _termination_reason_codes(
     env,
     reset: torch.Tensor,
     wall_stuck: torch.Tensor | None = None,
+    *,
+    wall_stuck_precedes_success: bool = False,
 ) -> torch.Tensor:
     """Encode the worker-owned terminal cause into the existing aux30 wire."""
     result = torch.zeros(reset.shape[0], device=reset.device, dtype=torch.float32)
@@ -144,10 +147,16 @@ def _termination_reason_codes(
         if torch.is_tensor(wall_stuck) and wall_stuck.numel() == reset.numel()
         else torch.zeros_like(reset)
     )
-    success_mask &= reset
-    failure_mask &= reset & ~success_mask
-    wall_mask &= reset & ~success_mask & ~failure_mask
-    timeout_mask &= reset & ~success_mask & ~failure_mask & ~wall_mask
+    if wall_stuck_precedes_success:
+        wall_mask &= reset
+        success_mask &= reset & ~wall_mask
+        failure_mask &= reset & ~wall_mask & ~success_mask
+        timeout_mask &= reset & ~wall_mask & ~success_mask & ~failure_mask
+    else:
+        success_mask &= reset
+        failure_mask &= reset & ~success_mask
+        wall_mask &= reset & ~success_mask & ~failure_mask
+        timeout_mask &= reset & ~success_mask & ~failure_mask & ~wall_mask
     result[success_mask] = 1.0
     result[failure_mask] = 2.0
     result[wall_mask] = 4.0
@@ -322,6 +331,12 @@ class P2WorkerBridge:
         self.runtime_stage_type = str(
             self.config.pop("_worker_stage_type", "p2_nav_ppo")
         )
+        self._wall_stuck_precedes_success = False
+        if self.runtime_stage_type == "p4_nav_ppo":
+            profile = get_training_profile(str(self.config.get("training_profile")))
+            self._wall_stuck_precedes_success = (
+                profile.wall_stuck_precedes_success
+            )
         # ``track_diagnostics_enabled`` stays training-oriented (and P2 eval).
         # ``p3_track_eval`` intentionally keeps the curriculum probe off so the
         # eval worker has no dependency on training-only curriculum state.
@@ -360,6 +375,10 @@ class P2WorkerBridge:
             p4_contract.P4_WORKER_EXTRA_DIM,
             device=self.device,
             dtype=torch.float32,
+        )
+        self._terminal_p4_extra_snapshot = torch.zeros_like(self.last_p4_extra)
+        self._terminal_p4_snapshot_mask = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
         )
         self.feedback = FeedbackEmulator(
             self.num_envs,
@@ -617,7 +636,10 @@ class P2WorkerBridge:
             else torch.zeros_like(reset)
         )
         reason = _termination_reason_codes(
-            self.env, reset, wall_stuck=wall_stuck
+            self.env,
+            reset,
+            wall_stuck=wall_stuck,
+            wall_stuck_precedes_success=self._wall_stuck_precedes_success,
         ).round().long()
         snapshot[env_ids, 24] = 1.0
         snapshot[env_ids, 25] = reason[env_ids].float()
@@ -625,6 +647,21 @@ class P2WorkerBridge:
         self._terminal_aux_snapshot[env_ids] = snapshot[env_ids]
         self._terminal_snapshot_reason[env_ids] = reason[env_ids]
         self._terminal_snapshot_mask[env_ids] = True
+        if self.runtime_stage_type == "p4_nav_ppo":
+            raw_goal_xy = build_track_goal_raw(self.env).to(self.device)
+            if not bool(torch.isfinite(raw_goal_xy).all()):
+                raise RuntimeError(
+                    "P4 terminal raw metric goal contains non-finite values"
+                )
+            self._terminal_p4_extra_snapshot[
+                env_ids, p4_contract.RAW_GOAL_XY_SLICE
+            ] = raw_goal_xy[env_ids]
+            self._terminal_p4_extra_snapshot[
+                env_ids, p4_contract.STUCK_RAW_TERM_INDEX
+            ] = (
+                wall_stuck.to(torch.float32)
+            )[env_ids]
+            self._terminal_p4_snapshot_mask[env_ids] = True
 
     def _apply_training_terminal_snapshot(
         self,
@@ -646,6 +683,25 @@ class P2WorkerBridge:
         aux[captured, 26] = float(step)
         self._terminal_snapshot_mask[captured] = False
         return aux, terminal_reason
+
+    def _apply_training_terminal_p4_snapshot(
+        self, p4_extra: torch.Tensor, reset: torch.Tensor
+    ) -> torch.Tensor:
+        captured = reset.bool() & self._terminal_p4_snapshot_mask
+        if not bool(captured.any()):
+            return p4_extra
+        p4_extra[captured, p4_contract.RAW_GOAL_XY_SLICE] = (
+            self._terminal_p4_extra_snapshot[
+                captured, p4_contract.RAW_GOAL_XY_SLICE
+            ]
+        )
+        p4_extra[captured, p4_contract.STUCK_RAW_TERM_INDEX] = (
+            self._terminal_p4_extra_snapshot[
+                captured, p4_contract.STUCK_RAW_TERM_INDEX
+            ]
+        )
+        self._terminal_p4_snapshot_mask[captured] = False
+        return p4_extra
 
     def _robot(self):
         scene = getattr(self.env, "scene", None)
@@ -1122,6 +1178,9 @@ class P2WorkerBridge:
                 self.env,
                 reset,
                 wall_stuck=wall_stuck_term,
+                wall_stuck_precedes_success=(
+                    self._wall_stuck_precedes_success
+                ),
             )
             if self.last_step is not None
             else torch.zeros(self.num_envs, device=self.device)
@@ -1284,6 +1343,10 @@ class P2WorkerBridge:
                     ),
                 ):
                     self.last_p4_extra[:, index] = float(counters[name])
+        if self.runtime_stage_type == "p4_nav_ppo":
+            self.last_p4_extra = self._apply_training_terminal_p4_snapshot(
+                self.last_p4_extra, reset
+            )
         if self.curriculum_probe is not None:
             self.curriculum_probe.observe(self.env)
         gait_metrics = {}

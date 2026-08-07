@@ -431,12 +431,10 @@ class P4WorkflowHooks(NavWorkflowHooks):
     ):
         if terminal_extra is None or not bool(new_done.any()):
             return
-        terminal_extra[new_done, p4_contract.RAW_GOAL_XY_SLICE] = frame_extra[
-            new_done, p4_contract.RAW_GOAL_XY_SLICE
-        ]
-        terminal_extra[new_done, 2:] = next_critic[
+        del frame_extra
+        terminal_extra[new_done] = next_critic[
             new_done,
-            p3_contract.P3_PRIVILEGED_WIRE_DIM + 2 :
+            p3_contract.P3_PRIVILEGED_WIRE_DIM :
             p4_contract.P4_PRIVILEGED_WIRE_DIM,
         ]
 

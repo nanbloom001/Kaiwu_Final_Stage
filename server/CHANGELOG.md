@@ -15,6 +15,13 @@
   metric age 与 upload age/failure，checkpoint 日志区分 payload ID 与 filename ID。rollout depth
   直接写入预留 pinned slot，删除重复所有权复制。新增固定验证工具、AST 架构边界和基线说明；
   未修改奖励数值、学习率、动作范围、地形、网络结构、`BaseEnv` 或部署接口。
+  独立审查进一步修复了四类基线缺口：Track eval 现在按 checkpoint 内 canonical profile
+  校验并重建 full-track/legacy/instant command runtime；repair2h 与 full-track 分别保持
+  success-first 和 wall-stuck-first 的终止优先级；profile registry 强制绑定 optimizer schedule；
+  CUDA depth 直接跨设备复制到最终 pinned slot。评估生命周期禁止 P4 eval 写 checkpoint，
+  P3 parent 支持唯一结构兼容的跨 ID discovery。自动 reset 仅冻结必须保留旧 episode
+  语义的 raw goal 与真实 wall-stuck term；独立复核发现整段冻结会把其余 P4 诊断整体回退一帧，
+  因此 current diagnostics、mapping 与 spawn 计数继续使用实时 worker 值。
 
 - **[P4 Maze Instant 2h 闭环修复]** 新入口 `p4maze2h-instant-repair-r1` 从
   `p4maze8h10hz_1416926-mazefinal` warm start，保持 10Hz instant command、Actor85 和全部

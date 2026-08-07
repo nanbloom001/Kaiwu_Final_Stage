@@ -115,7 +115,11 @@ class P2RolloutStorage:
 
     @staticmethod
     def _copy(target: torch.Tensor, value: torch.Tensor) -> None:
-        target.copy_(value.detach().to(device="cpu", dtype=target.dtype))
+        source = value.detach()
+        target.copy_(
+            source,
+            non_blocking=bool(target.is_pinned() and source.is_cuda),
+        )
 
     def own_current_depth_slot(self, value: torch.Tensor) -> torch.Tensor:
         """Copy a camera frame into the current rollout slot exactly once.

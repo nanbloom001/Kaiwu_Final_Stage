@@ -1783,11 +1783,11 @@ class Agent(BaseAgent):
         id 由平台框架注入（调用 agent.save_model() 时不传 id）；不得用 iteration
         人工计算 id，否则平台模型池 ID / 文件名 / 任务页记录会不一致。
         """
-        if self.is_p3_eval:
+        if self.is_p3_eval or self.is_p4_eval:
             # 评估装配不含训练状态，绝不允许写出 checkpoint。
             if str(id) == "0":
                 self.logger.warning(
-                    "[P3 eval] skip framework bootstrap save id=0; "
+                    "[P3/P4 eval] skip framework bootstrap save id=0; "
                     "evaluation never writes checkpoints"
                 )
                 return
@@ -2307,6 +2307,7 @@ class Agent(BaseAgent):
         self.cur_model_name = selected
         self.logger.info(
             f"[P4 eval] loaded mode={mode} phase={disposition['phase_label']} "
+            f"profile={disposition.get('training_profile')} "
             f"selected={selection['selected_path']} payload_id={selection['payload_id']} "
             f"filename_model_id={selection['filename_model_id']} "
             f"requested_id={selection['requested_model_id']} "

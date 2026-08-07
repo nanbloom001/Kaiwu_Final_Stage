@@ -85,13 +85,21 @@ exceptions. Tests and legacy material are excluded by design.
 | Layer | Status | Evidence |
 | --- | --- | --- |
 | Local directed tests | Passed | Each code commit was tested in an isolated worktree. |
-| Local full suite | Passed | `713 passed, 5 skipped, 3 subtests`; release verifier passed. |
-| Development container | Pending | Requires 1-env reset, 8-env 32-tick PPO, Adapter, save/resume and dual eval assembly. |
+| Local full suite | Passed | `720 passed, 5 skipped, 3 subtests`; release verifier passed. |
+| Development container | Pending | Earlier RPC upload did not include the final terminal-field fix; Chrome transport disconnected before remote hash closure and minimum smoke. |
 | Platform training/evaluation | Not run | This refactor does not claim policy-quality evidence. |
 | Real robot | Not run | No Sim2Real claim is made. |
 
 Rollback is commit-scoped: revert the newest refactor commit first; the audited
 repair2h behavior snapshot remains available at `d8b0928`.
+
+The final independent-review closure also verifies profile-aware Track eval,
+profile-specific terminal priority, P4 eval no-save lifecycle, unique
+cross-ID P3 parent discovery, field-level P4 terminal ownership, schedule binding
+and direct pinned-depth copy. Only raw metric goal and the actual wall-stuck term
+are frozen at reset; freezing the whole prior P4 tail was rejected because it
+made stateful diagnostics one frame stale. These are correctness/compatibility fixes; they do
+not change policy reward weights, learning rates or action dynamics.
 
 ## Follow-On Branches
 

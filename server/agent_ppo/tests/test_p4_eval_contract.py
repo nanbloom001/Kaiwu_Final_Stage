@@ -5,6 +5,8 @@ from __future__ import annotations
 import copy
 import hashlib
 from pathlib import Path
+import sys
+import types
 
 import pytest
 import torch
@@ -19,6 +21,11 @@ from agent_ppo.checkpoint_io import (
 from agent_ppo.feature import p4_contract
 
 
+class _Logger:
+    def warning(self, *_args, **_kwargs):
+        pass
+
+
 def _command_contract() -> dict:
     return p4_contract.command_contract("maze_instant_repair2h")
 
@@ -31,7 +38,11 @@ def _leaf(spec: dict) -> dict:
     }
 
 
-def _p4_bundle(*, command: dict | None = None) -> dict:
+def _p4_bundle(
+    *,
+    command: dict | None = None,
+    training_profile: str = "maze_instant_repair2h",
+) -> dict:
     from agent_ppo.model.p2_high_level import (
         navigation_actor_spec,
         navigation_encoder_spec,
@@ -73,8 +84,15 @@ def _p4_bundle(*, command: dict | None = None) -> dict:
             "depth_channels": 1,
         },
         "contracts": {
+            "training": p4_contract.training_contract(
+                training_profile=training_profile
+            ),
             "command": copy.deepcopy(
-                _command_contract() if command is None else command
+                (
+                    p4_contract.command_contract(training_profile)
+                    if command is None
+                    else command
+                )
             )
         },
         "modules": {
@@ -92,6 +110,7 @@ def test_track_accepts_current_inputfix_contract_and_reports_digest():
     result = validate_p4_eval_bundle(_p4_bundle(), mode="track")
     assert result["phase_label"] == "repairstable"
     assert result["phase_label_known"] is True
+    assert result["training_profile"] == "maze_instant_repair2h"
     assert result["command_digest"]
     assert result["loaded_modules"] == [
         "high_level.actor",
@@ -102,7 +121,19 @@ def test_track_accepts_current_inputfix_contract_and_reports_digest():
     ]
 
 
-def test_track_strictly_rejects_stale_or_slew_inputfix_contract():
+def test_track_accepts_each_canonical_eval_profile_and_rejects_drift():
+    for profile in (
+        "maze_instant_repair2h",
+        "full_track",
+        "maze_credit_repair",
+        "maze_closed_loop_v3",
+        "maze_instant_command_r4",
+    ):
+        result = validate_p4_eval_bundle(
+            _p4_bundle(training_profile=profile), mode="track"
+        )
+        assert result["training_profile"] == profile
+
     stale = _command_contract()
     stale["version"] = "p4_maze_instant_command_r4"
     with pytest.raises(ValueError, match="version"):
@@ -113,15 +144,13 @@ def test_track_strictly_rejects_stale_or_slew_inputfix_contract():
     with pytest.raises(ValueError, match="slew"):
         validate_p4_eval_bundle(_p4_bundle(command=slew), mode="track")
 
-    legacy_slew = {
-        "version": "p4_maze_closed_loop_command_v3",
-        "mapper_version": "p4_capability_action_mapper_v1",
-        "command_transition_mode": "slew",
-        "slew_rate": [0.30, 0.30, 1.00],
-        "slew_release_rate": [0.30, 0.60, 2.50],
-    }
-    with pytest.raises(ValueError, match="requires the active inputfix"):
-        validate_p4_eval_bundle(_p4_bundle(command=legacy_slew), mode="track")
+
+
+def test_track_requires_canonical_training_profile_metadata():
+    bundle = _p4_bundle()
+    del bundle["contracts"]["training"]
+    with pytest.raises(ValueError, match="training_profile"):
+        validate_p4_eval_bundle(bundle, mode="track")
 
 
 def test_standard_uses_low_level_only_and_ignores_high_level_command_version():
@@ -179,6 +208,7 @@ def test_selection_metadata_has_filename_payload_id_phase_command_digest_and_sha
     assert metadata["payload_id"] == "payload-123"
     assert metadata["filename_model_id"] == "999999"
     assert metadata["phase_label"] == "repairstable"
+    assert metadata["training_profile"] == "maze_instant_repair2h"
     assert metadata["requested_model_id"] == "1416926"
     assert metadata["selected_path"] == str(path.resolve())
     assert metadata["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
@@ -193,3 +223,41 @@ def test_track_rejects_drift_in_any_canonical_command_field():
     changed["instant_physical_change_rate_per_s"] = [0.0, 0.0, 0.0]
     with pytest.raises(ValueError, match="instant_physical_change_rate_per_s"):
         validate_p4_eval_bundle(_p4_bundle(command=changed), mode="track")
+
+
+@pytest.mark.parametrize("standard_eval", (True, False))
+def test_p4_eval_lifecycle_never_writes_training_checkpoint(
+    tmp_path: Path, standard_eval: bool, monkeypatch
+):
+    root_module = types.ModuleType("kaiwudrl")
+    interface_module = types.ModuleType("kaiwudrl.interface")
+    agent_module = types.ModuleType("kaiwudrl.interface.agent")
+    agent_module.BaseAgent = object
+    interface_module.agent = agent_module
+    root_module.interface = interface_module
+    monkeypatch.setitem(sys.modules, "kaiwudrl", root_module)
+    monkeypatch.setitem(sys.modules, "kaiwudrl.interface", interface_module)
+    monkeypatch.setitem(sys.modules, "kaiwudrl.interface.agent", agent_module)
+    tools_module = types.ModuleType("tools")
+    tools_module.__path__ = []
+    validate_module = types.ModuleType("tools.train_env_conf_validate")
+    validate_module.check_usr_conf = lambda *_args, **_kwargs: None
+    tools_module.train_env_conf_validate = validate_module
+    monkeypatch.setitem(sys.modules, "tools", tools_module)
+    monkeypatch.setitem(
+        sys.modules, "tools.train_env_conf_validate", validate_module
+    )
+    from agent_ppo.agent import Agent
+
+    agent = object.__new__(Agent)
+    agent.is_p3_eval = False
+    agent.is_p4_eval = True
+    agent.is_p4_standard_eval = standard_eval
+    agent.is_p4_track_eval = not standard_eval
+    agent.logger = _Logger()
+
+    assert agent.save_model(str(tmp_path), id="0") is None
+    assert list(tmp_path.iterdir()) == []
+    with pytest.raises(RuntimeError, match="evaluation assembly"):
+        agent.save_model(str(tmp_path), id="1")
+    assert list(tmp_path.iterdir()) == []

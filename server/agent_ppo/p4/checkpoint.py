@@ -12,9 +12,11 @@ import torch
 from agent_ppo.checkpoint_io import (
     normalize_kaiwu_train_bundle,
     validate_p3_eval_bundle,
+    validate_p4_eval_bundle,
     validate_state_dict_finite,
 )
 from agent_ppo.feature import p2_contract, p3_contract, p4_contract
+from agent_ppo.feature.p2_command_controller import P2CommandController
 from agent_ppo.feature.feedback_emulator import feedback_implementation_digest
 from agent_ppo.model.p2_high_level import (
     navigation_actor_spec,
@@ -29,6 +31,7 @@ from agent_ppo.p4.profiles import (
     PROFILE_MAZE_CREDIT_REPAIR,
     PROFILE_MAZE_INSTANT_COMMAND_R4,
     PROFILE_MAZE_INSTANT_REPAIR2H,
+    get_training_profile,
 )
 
 
@@ -1095,19 +1098,35 @@ class P4CheckpointMixin:
 
     def load_evaluation_bundle(self, path: str, *, platform_model_id) -> str:
         raw = torch.load(path, weights_only=False, map_location="cpu")
-        if raw.get("stage_type") != self.STAGE_TYPE:
-            raise ValueError("P4 Track evaluation requires stage_type=p4_nav_ppo")
-        mapper = (raw.get("contracts", {}).get("command") or {}).get("mapper_version")
-        if mapper != p4_contract.ACTION_MAPPER_VERSION:
-            raise ValueError("P4 Track evaluation action mapper mismatch")
+        disposition = validate_p4_eval_bundle(raw, mode="track")
+        saved_profile = disposition.get("training_profile")
+        profile = get_training_profile(str(saved_profile), mode="eval")
         saved_command = raw.get("contracts", {}).get("command") or {}
-        expected_command = p4_contract.command_contract(self.training_profile)
-        if saved_command != expected_command:
-            raise ValueError(
-                "P4 Track evaluation command contract does not match runtime profile: "
-                f"saved={saved_command.get('version')!r}/"
-                f"{saved_command.get('command_transition_mode', 'slew')!r} "
-                f"runtime={expected_command.get('version')!r}/"
-                f"{expected_command.get('command_transition_mode', 'slew')!r}"
+        self.training_profile = profile.name
+        self.maze_training_branch = profile.schedule_branch
+        self.command_transition_mode = str(
+            saved_command.get("command_transition_mode", "slew")
+        )
+        self.command_slew_rate = tuple(
+            saved_command.get("slew_rate", self.command_slew_rate)
+        )
+        self.command_slew_release_rate = tuple(
+            saved_command.get(
+                "slew_release_rate", self.command_slew_release_rate
             )
+        )
+        self.config.update(
+            training_profile=self.training_profile,
+            maze_training_branch=self.maze_training_branch,
+            command_transition_mode=self.command_transition_mode,
+            slew_rate=list(self.command_slew_rate),
+            slew_release_rate=list(self.command_slew_release_rate),
+        )
+        self.command = P2CommandController(
+            self.num_envs,
+            self.device,
+            slew_rate=self.command_slew_rate,
+            slew_release_rate=self.command_slew_release_rate,
+            command_transition_mode=self.command_transition_mode,
+        )
         return super().load_evaluation_bundle(path, platform_model_id=platform_model_id)

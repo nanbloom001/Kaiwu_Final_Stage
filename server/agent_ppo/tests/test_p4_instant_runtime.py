@@ -359,7 +359,7 @@ def test_r4_exact_resume_restores_instant_contract_and_parent_anchor():
     assert resumed.parent_anchor_digest == algorithm.parent_anchor_digest
 
 
-def test_r4_eval_rejects_default_slew_runtime_and_accepts_matching_runtime():
+def test_r4_eval_reconfigures_default_runtime_from_checkpoint_profile():
     algorithm = _algorithm()
     algorithm._initial_low_digest = algorithm._module_digest(
         (("vision", algorithm.low_level_encoder), ("actor", algorithm.low_level_actor))
@@ -372,16 +372,14 @@ def test_r4_eval_rejects_default_slew_runtime_and_accepts_matching_runtime():
         path = Path(directory) / "model.ckpt-instantadapt-42.pkl"
         algorithm.save_training_bundle(str(path), platform_model_id="42")
 
-        with pytest.raises(ValueError, match="command contract"):
-            _eval_algorithm("full_track").load_evaluation_bundle(
-                str(path), platform_model_id="42"
-            )
-
-        mode = _eval_algorithm("maze_instant_command_r4").load_evaluation_bundle(
-            str(path), platform_model_id="42"
-        )
+        evaluated = _eval_algorithm("full_track")
+        mode = evaluated.load_evaluation_bundle(str(path), platform_model_id="42")
 
     assert mode == "evaluate_full_modules_only"
+    assert evaluated.training_profile == "maze_instant_command_r4"
+    assert evaluated.maze_training_branch == "instant_command_r4"
+    assert evaluated.command_transition_mode == "instant_hold_10hz"
+    assert evaluated.command.command_transition_mode == "instant_hold_10hz"
 
 
 def _assert_nested_equal(left, right):

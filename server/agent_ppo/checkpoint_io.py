@@ -621,16 +621,6 @@ def _validate_p3_eval_leaf(leaf: Any, name: str, expected: dict[str, Any], *, co
 P4_INSTANT_COMMAND_R4_INPUTFIX_VERSION = "p4_maze_instant_command_r4_inputfix"
 
 
-def _canonical_p4_instant_command_contract() -> dict[str, Any]:
-    # Keep checkpoint discovery and the runtime loader on one source of truth.
-    # The local import avoids making the generic checkpoint module part of the
-    # feature package's import cycle.
-    from agent_ppo.feature import p4_contract
-    from agent_ppo.p4.profiles import PROFILE_MAZE_INSTANT_REPAIR2H
-
-    return p4_contract.command_contract(PROFILE_MAZE_INSTANT_REPAIR2H)
-
-
 def p4_nav_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
     """Return same-ID P4 candidates in explicit newest-stage-first order."""
     model_id = str(model_id)
@@ -685,6 +675,30 @@ def _p4_nav_training_discovery_candidates(path: str) -> list[str]:
     return compatible
 
 
+def _p3_parent_discovery_candidates(path: str) -> list[str]:
+    """Return structurally compatible P3/P3.5 parents across platform IDs."""
+    discovered = sorted(
+        {
+            candidate
+            for label in P3_STANDARD_JOINT_PHASE_LABELS
+            for candidate in glob.glob(
+                os.path.join(path, f"model.ckpt-{label}-*.pkl")
+            )
+        }
+    )
+    compatible: list[str] = []
+    for candidate in discovered:
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            payload = torch.load(candidate, weights_only=False, map_location="cpu")
+            validate_p3_eval_bundle(payload, mode="track")
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+            continue
+        compatible.append(candidate)
+    return compatible
+
+
 def p4_nav_training_candidates(
     path: str,
     model_id: str | int,
@@ -716,6 +730,14 @@ def p4_nav_training_candidates(
             )
             if candidate not in result:
                 result.append(candidate)
+    if not any(os.path.isfile(candidate) for candidate in result):
+        discovered_p3 = _p3_parent_discovery_candidates(path)
+        if len(discovered_p3) > 1:
+            raise RuntimeError(
+                "P4 P3-parent discovery is ambiguous; configure the parent/model "
+                f"ID. candidates={discovered_p3}"
+            )
+        result.extend(discovered_p3)
     return result
 
 
@@ -750,8 +772,8 @@ def validate_p4_eval_bundle(bundle: dict[str, Any], *, mode: str) -> dict[str, A
     Standard consumes only the frozen low-level modules.  It intentionally
     does not constrain the P4 high-level command contract, so an otherwise
     valid P4 low-level package remains usable when a Track command contract
-    evolves.  Track consumes the high-level policy and therefore requires the
-    complete active R4 inputfix contract.
+    evolves.  Track consumes the high-level policy and therefore resolves the
+    saved canonical training profile before validating its command contract.
     """
     if not isinstance(bundle, dict) or not is_kaiwu_train_bundle(bundle):
         raise ValueError("P4 evaluation requires a kaiwu_train_v1 checkpoint")
@@ -765,10 +787,24 @@ def validate_p4_eval_bundle(bundle: dict[str, Any], *, mode: str) -> dict[str, A
 
     phase_label = bundle.get("phase_label")
     phase_label_known = isinstance(phase_label, str) and phase_label in P4_NAV_PHASE_LABELS
+    training = (bundle.get("contracts") or {}).get("training")
+    training_profile = None
+    if isinstance(training, dict):
+        training_profile = training.get("training_profile")
     command = (bundle.get("contracts") or {}).get("command")
     command_digest = _p4_command_digest(command)
     if mode == "track":
-        _validate_p4_track_command_contract(command)
+        if not isinstance(training_profile, str) or not training_profile:
+            raise ValueError(
+                "P4 Track evaluation requires canonical training_profile metadata"
+            )
+        _validate_p4_track_command_contract(command, training_profile)
+    elif isinstance(training_profile, str) and training_profile:
+        from agent_ppo.p4.profiles import get_training_profile
+
+        training_profile = get_training_profile(
+            training_profile, mode="eval"
+        ).name
 
     # P4 has the same frozen low-level and complete Track module shapes as P3.
     # Reuse those leaf checks without making P4 identity or phase a P3 gate.
@@ -780,6 +816,7 @@ def validate_p4_eval_bundle(bundle: dict[str, Any], *, mode: str) -> dict[str, A
         stage_type="p4_nav_ppo",
         phase_label=phase_label,
         phase_label_known=phase_label_known,
+        training_profile=training_profile,
         command_digest=command_digest,
     )
     return disposition
@@ -808,6 +845,11 @@ def p4_eval_selection_metadata(
         "filename_model_id": _checkpoint_filename_model_id(path),
         "payload_id": None if payload_id in (None, "") else str(payload_id),
         "phase_label": _optional_string(bundle.get("phase_label")),
+        "training_profile": _optional_string(
+            (((bundle.get("contracts") or {}).get("training") or {}).get(
+                "training_profile"
+            ))
+        ),
         "command_digest": _p4_command_digest(
             ((bundle.get("contracts") or {}).get("command"))
         ),
@@ -815,16 +857,16 @@ def p4_eval_selection_metadata(
     }
 
 
-def _validate_p4_track_command_contract(command: Any) -> None:
+def _validate_p4_track_command_contract(
+    command: Any, training_profile: str
+) -> None:
     if not isinstance(command, dict):
         raise ValueError("P4 Track evaluation missing command contract")
-    transition_mode = command.get("command_transition_mode", "slew")
-    if transition_mode != "instant_hold_10hz":
-        raise ValueError(
-            "P4 Track evaluation requires the active inputfix instant command "
-            f"contract, got transition mode {transition_mode!r}"
-        )
-    expected = _canonical_p4_instant_command_contract()
+    from agent_ppo.p4.contracts import command_contract
+    from agent_ppo.p4.profiles import get_training_profile
+
+    profile = get_training_profile(training_profile, mode="eval")
+    expected = command_contract(profile.name, mode="eval")
     if command != expected:
         mismatched = sorted(
             key
@@ -832,11 +874,12 @@ def _validate_p4_track_command_contract(command: Any) -> None:
             if command.get(key) != expected.get(key)
         )
         raise ValueError(
-            "P4 Track evaluation command contract mismatch: "
+            "P4 Track evaluation command contract mismatch for profile "
+            f"{profile.name!r}: "
             f"fields={mismatched}"
         )
     forbidden = {"slew_rate", "slew_release_rate"}.intersection(command)
-    if forbidden:
+    if profile.instant_command and forbidden:
         raise ValueError(
             "P4 Track instant command contract must not contain "
             f"slew fields: {sorted(forbidden)}"

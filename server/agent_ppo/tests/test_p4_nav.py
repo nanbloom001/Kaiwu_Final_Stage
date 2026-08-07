@@ -899,6 +899,7 @@ def test_p4_missed_safe_direction_ramp_and_event_normalization():
 def test_p4_recovery_has_no_diagnostic_wall_clock():
     algorithm = _p4_algorithm()
     algorithm.maze_training_branch = "auto"
+    algorithm._resolved_maze_training_branch = None
     algorithm.update_training_clocks(599.0)
     assert algorithm.current_phase == "fullwarm"
     assert algorithm.diagnostic_elapsed_seconds == pytest.approx(0.0)
@@ -916,6 +917,7 @@ def test_p4_recovery_has_no_diagnostic_wall_clock():
 def test_p4_auto_branch_uses_accumulated_perception_metrics_not_last_tick():
     algorithm = _p4_algorithm()
     algorithm.maze_training_branch = "auto"
+    algorithm._resolved_maze_training_branch = None
     algorithm.diagnostic_elapsed_seconds = p4_contract.DIAGNOSTIC_SECONDS
     algorithm._maze_diag_total.fill_(1_000.0)
     algorithm._maze_diag_valid.fill_(950.0)
@@ -940,7 +942,8 @@ def test_p4_auto_branch_uses_accumulated_perception_metrics_not_last_tick():
     for index in range(5):
         algorithm._maze_diag_fault_scene_confusion[index, index] = 10.0
     algorithm.last_tick_diagnostics = {"scanner_available": torch.zeros(1, 1)}
-    assert algorithm._effective_maze_branch(0.0) == "actor_attack"
+    summary = algorithm._maze_diagnostic_summary()
+    assert algorithm._effective_maze_branch(0.0) == "actor_attack", summary
 
 
 def test_p4_checkpoint_priority_prefers_new_maze_labels():
@@ -990,6 +993,25 @@ def test_p4_training_discovers_one_structurally_compatible_parent_before_p3():
         if "stairfinal-1013548" in candidate
     )
     assert candidates.index(str(discovered)) < p3_index
+
+
+def test_p4_training_discovers_unique_cross_id_p3_parent_and_rejects_ambiguity():
+    from agent_ppo.tests.test_p3_eval import _p3_fixture_bundle
+
+    with tempfile.TemporaryDirectory() as directory:
+        parent = Path(directory) / "model.ckpt-stairfinal-777.pkl"
+        torch.save(_p3_fixture_bundle(mode="track"), parent)
+        candidates = p4_nav_training_candidates(
+            directory, "99", parent_model_id="1013548"
+        )
+        assert candidates[-1] == str(parent)
+
+        second = Path(directory) / "model.ckpt-highslow-888.pkl"
+        torch.save(_p3_fixture_bundle(mode="track"), second)
+        with pytest.raises(RuntimeError, match="P3-parent discovery is ambiguous"):
+            p4_nav_training_candidates(
+                directory, "99", parent_model_id="1013548"
+            )
 
 
 def test_p4_configuration_and_monitor_route_are_explicit():
@@ -1112,13 +1134,21 @@ def test_p4_layered_eval_validator_separates_standard_and_active_track_contracts
     bundle = _p3_fixture_bundle(
         mode="track", stage_type="p4_nav_ppo", phase_label="pnavstable"
     )
-    bundle["contracts"] = {"command": p4_contract.command_contract("full_track")}
+    bundle["contracts"] = {
+        "training": p4_contract.training_contract(
+            training_profile="full_track"
+        ),
+        "command": p4_contract.command_contract("full_track"),
+    }
     standard = validate_p4_eval_bundle(bundle, mode="standard")
     assert standard["stage_type"] == "p4_nav_ppo"
-    with pytest.raises(ValueError, match="active inputfix instant command"):
-        validate_p4_eval_bundle(bundle, mode="track")
+    full_track = validate_p4_eval_bundle(bundle, mode="track")
+    assert full_track["training_profile"] == "full_track"
 
     active = copy.deepcopy(bundle)
+    active["contracts"]["training"] = p4_contract.training_contract(
+        training_profile="maze_instant_repair2h"
+    )
     active["contracts"]["command"] = p4_contract.command_contract(
         "maze_instant_repair2h"
     )
@@ -1237,7 +1267,7 @@ def test_p4_terminal_wire_keeps_old_raw_goal_and_stuck_diagnostics():
     assert torch.equal(p4_tail[1], live[1, p3_contract.P3_PRIVILEGED_WIRE_DIM :])
 
 
-def test_p4_success_owns_wall_stuck_overlap_and_preserves_priority():
+def test_p4_full_track_wall_stuck_owns_success_overlap():
     class _TerminationManager:
         active_terms = ("goal_reached", "nav_stuck_timeout")
         terminated = torch.tensor([False])
@@ -1251,8 +1281,13 @@ def test_p4_success_owns_wall_stuck_overlap_and_preserves_priority():
     env = SimpleNamespace(termination_manager=_TerminationManager())
     reset = torch.tensor([True])
     raw_wall_term = torch.tensor([True])
-    reason = _termination_reason_codes(env, reset, wall_stuck=raw_wall_term)
-    assert reason.tolist() == [1.0]
+    reason = _termination_reason_codes(
+        env,
+        reset,
+        wall_stuck=raw_wall_term,
+        wall_stuck_precedes_success=True,
+    )
+    assert reason.tolist() == [4.0]
     assert raw_wall_term.tolist() == [True]
 
     live = torch.zeros(1, p4_contract.P4_PRIVILEGED_WIRE_DIM)
@@ -2264,7 +2299,8 @@ def test_p4_full_track_checkpoint_metadata_and_exact_resume_round_trip():
     )
     algorithm.low_level_state_digest = algorithm._initial_low_digest
     algorithm._configure_adapter_contract()
-    algorithm.update_training_clocks(28_800.0)
+    algorithm.update_training_clocks(p4_contract.DIAGNOSTIC_SECONDS)
+    algorithm.update_training_clocks(p4_contract.DIAGNOSTIC_SECONDS + 28_800.0)
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "model.ckpt-fullstabilize-42.pkl"
         algorithm.save_training_bundle(str(path), platform_model_id="42")
@@ -2452,3 +2488,28 @@ def test_p4_track_eval_loads_only_inference_modules_from_new_checkpoint():
     assert evaluation.actor_optimizer is None
     assert evaluation.critic is None
     assert evaluation.safety_head is None
+
+
+def test_p4_track_eval_reconfigures_runtime_from_saved_full_track_profile():
+    training = _p4_algorithm(
+        config={
+            "training_profile": "full_track",
+            "maze_training_branch": "auto",
+        }
+    )
+    training._initial_low_digest = training._module_digest(
+        (("vision", training.low_level_encoder), ("actor", training.low_level_actor))
+    )
+    training.low_level_state_digest = training._initial_low_digest
+    with tempfile.TemporaryDirectory() as directory:
+        path = str(Path(directory) / "model.ckpt-pnavstable-42.pkl")
+        training.save_training_bundle(path, platform_model_id="42")
+        evaluation = _p4_eval_algorithm()
+        evaluation.load_evaluation_bundle(path, platform_model_id="42")
+    assert evaluation.training_profile == "full_track"
+    assert evaluation.maze_training_branch == "auto"
+    assert evaluation.command_transition_mode == "slew"
+    expected = p4_contract.command_contract("full_track")
+    assert tuple(evaluation.command.slew_rate.reshape(-1).tolist()) == pytest.approx(
+        expected["slew_rate"]
+    )

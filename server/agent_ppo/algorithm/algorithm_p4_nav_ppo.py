@@ -27,6 +27,7 @@ from agent_ppo.p4.profiles import (
     PROFILE_MAZE_CREDIT_REPAIR,
     PROFILE_MAZE_INSTANT_COMMAND_R4,
     PROFILE_MAZE_INSTANT_REPAIR2H,
+    get_training_profile,
 )
 
 
@@ -70,9 +71,11 @@ class AlgorithmP4NavPPO(
         early_training_profile = str(
             early_config.get("training_profile", PROFILE_FULL_TRACK)
         )
+        profile_spec = get_training_profile(early_training_profile)
         early_command_contract = p4_contract.command_contract(
             early_training_profile
         )
+        early_config.setdefault("maze_training_branch", profile_spec.schedule_branch)
         early_config.setdefault(
             "nav_period_frames", p4_contract.P4_NAV_PERIOD_FRAMES
         )
@@ -96,7 +99,10 @@ class AlgorithmP4NavPPO(
         self, early_config: dict, early_training_profile: str
     ) -> None:
         self.maze_training_branch = str(
-            early_config.get("maze_training_branch", "actor_attack")
+            early_config.get(
+                "maze_training_branch",
+                get_training_profile(early_training_profile).schedule_branch,
+            )
         )
         self.training_profile = early_training_profile
         self._resolved_maze_training_branch = None
@@ -105,6 +111,13 @@ class AlgorithmP4NavPPO(
         self._training_clock_origin_seconds = None
 
     def _validate_runtime_contract(self) -> None:
+        profile_spec = get_training_profile(self.training_profile)
+        if self.maze_training_branch != profile_spec.schedule_branch:
+            raise ValueError(
+                f"P4 {self.training_profile} requires schedule branch "
+                f"{profile_spec.schedule_branch!r}; got "
+                f"{self.maze_training_branch!r}"
+            )
         runtime_segments = tuple(
             self.config.get(
                 "track_segment_labels", p4_contract.FULL_TRACK_SEGMENT_LABELS
@@ -174,7 +187,10 @@ class AlgorithmP4NavPPO(
             self.num_envs, self.device, seed=seed + 2
         )
         self.maze_training_branch = str(
-            self.config.get("maze_training_branch", "actor_attack")
+            self.config.get(
+                "maze_training_branch",
+                get_training_profile(self.training_profile).schedule_branch,
+            )
         )
         self.camera_fault_course_enabled = bool(
             self.config.get("camera_fault_course_enabled", True)

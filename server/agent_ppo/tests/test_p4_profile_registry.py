@@ -49,6 +49,8 @@ def test_active_profile_specs_own_runtime_clock_and_boundaries():
     assert repair.target_effective_seconds == 7_200
     assert repair.task_end_hours == 2.25
     assert repair.required_platform_wall_seconds == 8_100
+    assert repair.schedule_branch == "instant_repair2h"
+    assert repair.wall_stuck_precedes_success is False
     assert repair.schedule_boundaries_seconds == (
         300.0,
         1_800.0,
@@ -69,6 +71,8 @@ def test_active_profile_specs_own_runtime_clock_and_boundaries():
     assert full_track.target_effective_seconds == 28_800
     assert full_track.task_end_hours == 8.25
     assert full_track.required_platform_wall_seconds == 29_700
+    assert full_track.schedule_branch == "auto"
+    assert full_track.wall_stuck_precedes_success is True
     assert full_track.schedule_boundaries_seconds[-1] == 28_800.0
     assert full_track.checkpoint_boundaries_seconds[-1] == 28_800.0
 

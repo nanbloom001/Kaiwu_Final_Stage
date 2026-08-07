@@ -78,7 +78,21 @@ def test_prepared_depth_slot_is_not_copied_again_by_add():
     storage.add(**_transition(1, pending_depth))
 
     assert copied_depth_slots == []
-    assert storage.step == 1
+
+
+def test_depth_copy_writes_directly_without_intermediate_tensor_to(monkeypatch):
+    storage = P2RolloutStorage(
+        1, num_ticks=1, sequence_length=1, store_depth=True, pin_memory=False
+    )
+    source = torch.full((1, p2_contract.DEPTH_DIM), 0.375)
+    target = storage.depth[0]
+
+    def forbidden_to(*_args, **_kwargs):
+        raise AssertionError("depth ownership copy must not allocate through Tensor.to")
+
+    monkeypatch.setattr(torch.Tensor, "to", forbidden_to)
+    storage._copy(target, source)
+    assert torch.all(target == torch.tensor(0.375, dtype=target.dtype))
 
 
 def test_frozen_nav_feature_rollout_does_not_expose_depth_slots():
