@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import copy
+import functools
+import inspect
 import math
 import sys
 import time
@@ -26,6 +29,7 @@ _TERMINAL_RETURN_BRIDGE_ATTR = "_agent_ppo_p2_terminal_return_bridge"
 _TERMINAL_RETURN_DIAGNOSTIC_COUNT_ATTR = (
     "_agent_ppo_p2_terminal_return_diagnostic_count"
 )
+_TERMINAL_SNAPSHOT_WRAPPER_ATTR = "_is_p2_training_terminal_snapshot_wrapper"
 
 
 def _print(message: str) -> None:
@@ -337,6 +341,14 @@ class P2WorkerBridge:
             device=self.device,
             dtype=torch.float32,
         )
+        self._terminal_aux_snapshot = torch.zeros_like(self.last_aux)
+        self._terminal_snapshot_mask = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._terminal_snapshot_reason = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self._terminal_snapshot_hook_installed = False
         self.last_p3_extra = torch.zeros(
             self.num_envs,
             p3_contract.P3_WORKER_EXTRA_DIM,
@@ -474,6 +486,11 @@ class P2WorkerBridge:
                     "segments=slope,slope_inv,stairs,stairs_inv,maze "
                     f"all_position_spawn_active={spawn_diagnostics['all_position_spawn_active']}"
                 )
+        if self.runtime_stage_type in {"p2_nav_ppo", "p4_nav_ppo"}:
+            if not self._install_training_terminal_snapshot_hook():
+                raise RuntimeError(
+                    "P2/P4 training requires the reset-base terminal snapshot hook"
+                )
         terrain = getattr(getattr(self.env, "scene", None), "terrain", None)
         initial_segment, segment_status = _track_segment_index(
             terrain, robot.data.root_pos_w[:, 0], describe=True
@@ -488,6 +505,147 @@ class P2WorkerBridge:
             "initial_segment_histogram="
             f"{torch.bincount(initial_segment[initial_segment >= 0], minlength=(len(p4_contract.FULL_TRACK_SEGMENT_LABELS) if self._p4_enabled else 3)).tolist() if bool((initial_segment >= 0).any()) else []}"
         )
+
+    def _install_training_terminal_snapshot_hook(self) -> bool:
+        manager = getattr(self.env, "event_manager", None)
+        getter = getattr(manager, "get_term_cfg", None)
+        setter = getattr(manager, "set_term_cfg", None)
+        if not callable(getter) or not callable(setter):
+            return False
+        try:
+            cfg = copy.deepcopy(getter("reset_base"))
+            original = getattr(cfg, "func", None)
+            if not callable(original):
+                return False
+            if bool(getattr(original, _TERMINAL_SNAPSHOT_WRAPPER_ATTR, False)):
+                self._terminal_snapshot_hook_installed = True
+                return True
+            signature = inspect.signature(original)
+            bridge = self
+
+            @functools.wraps(original)
+            def wrapped(*args, **kwargs):
+                bound = signature.bind_partial(*args, **kwargs)
+                env_ids = bound.arguments.get(
+                    "env_ids", args[1] if len(args) > 1 else None
+                )
+                bridge._capture_training_terminal_snapshot(env_ids)
+                return original(*args, **kwargs)
+
+            setattr(wrapped, _TERMINAL_SNAPSHOT_WRAPPER_ATTR, True)
+            cfg.func = wrapped
+            setter("reset_base", cfg)
+            readback = getter("reset_base")
+            self._terminal_snapshot_hook_installed = bool(
+                getattr(
+                    getattr(readback, "func", None),
+                    _TERMINAL_SNAPSHOT_WRAPPER_ATTR,
+                    False,
+                )
+            )
+        except Exception:
+            self._terminal_snapshot_hook_installed = False
+        if self._terminal_snapshot_hook_installed:
+            _print(
+                "[P2TerminalSnapshot] installed transport=training_only "
+                f"runtime_stage={self.runtime_stage_type} wire_dim_unchanged=1"
+            )
+        return self._terminal_snapshot_hook_installed
+
+    def _capture_training_terminal_snapshot(self, env_ids) -> None:
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        env_ids = torch.as_tensor(
+            env_ids, device=self.device, dtype=torch.long
+        ).reshape(-1)
+        env_ids = env_ids[(env_ids >= 0) & (env_ids < self.num_envs)]
+        if not env_ids.numel():
+            return
+        reset = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        reset[env_ids] = True
+        robot = self._robot()
+        data = robot.data
+        snapshot = self.last_aux.clone()
+        true_velocity = torch.stack(
+            (
+                data.root_lin_vel_b[:, 0],
+                data.root_lin_vel_b[:, 1],
+                data.root_ang_vel_b[:, 2],
+            ),
+            dim=-1,
+        )
+        root_quat = getattr(data, "root_quat_w", None)
+        yaw = (
+            _yaw_from_wxyz(root_quat)
+            if torch.is_tensor(root_quat)
+            else torch.zeros(self.num_envs, device=self.device)
+        )
+        root_pose = torch.cat(
+            (data.root_pos_w[:, :2], yaw.unsqueeze(-1)), dim=-1
+        )
+        family, level = self._terrain_metadata()
+        goal_distance = self._goal_distance(robot)
+        terrain = getattr(getattr(self.env, "scene", None), "terrain", None)
+        segment, _ = _track_segment_index(terrain, data.root_pos_w[:, 0])
+        snapshot[env_ids, 12:15] = true_velocity[env_ids]
+        snapshot[env_ids, 15:18] = root_pose[env_ids]
+        snapshot[env_ids, 18:21] = data.root_ang_vel_b[env_ids, :3]
+        snapshot[env_ids, 21:24] = data.projected_gravity_b[env_ids, :3]
+        snapshot[env_ids, 28] = family[env_ids]
+        snapshot[env_ids, 29] = level[env_ids]
+        snapshot[env_ids, p2_contract.PRE_STEP_TERRAIN_TYPE_INDEX] = family[env_ids]
+        snapshot[env_ids, p2_contract.PRE_STEP_TERRAIN_LEVEL_INDEX] = level[env_ids]
+        snapshot[env_ids, p2_contract.PRE_STEP_GOAL_DISTANCE_INDEX] = goal_distance[
+            env_ids
+        ]
+        snapshot[env_ids, p2_contract.CURRENT_SEGMENT_INDEX] = segment[
+            env_ids
+        ].float()
+        instant_collision = self._instant_body_collision_force()
+        snapshot[
+            env_ids, p2_contract.BODY_COLLISION_FORCE_INDEX
+        ] = instant_collision[env_ids]
+        snapshot[
+            env_ids, p2_contract.GAIT_SENSOR_MAPPING_VALID_INDEX
+        ] = float(self._gait_window.valid)
+        snapshot[
+            env_ids, p2_contract.BODY_COLLISION_MAPPING_VALID_INDEX
+        ] = float(self._gait_window.collision_valid)
+        wall_stuck = (
+            self._p4_stuck_tracker.termination_mask(reset)
+            if self._p4_stuck_tracker is not None
+            else torch.zeros_like(reset)
+        )
+        reason = _termination_reason_codes(
+            self.env, reset, wall_stuck=wall_stuck
+        ).round().long()
+        snapshot[env_ids, 24] = 1.0
+        snapshot[env_ids, 25] = reason[env_ids].float()
+        snapshot[env_ids, 26] = float(_step_key(self.env))
+        self._terminal_aux_snapshot[env_ids] = snapshot[env_ids]
+        self._terminal_snapshot_reason[env_ids] = reason[env_ids]
+        self._terminal_snapshot_mask[env_ids] = True
+
+    def _apply_training_terminal_snapshot(
+        self,
+        aux: torch.Tensor,
+        reset: torch.Tensor,
+        terminal_reason: torch.Tensor,
+        step: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        captured = reset.bool() & self._terminal_snapshot_mask
+        if not bool(captured.any()):
+            return aux, terminal_reason
+        aux[captured] = self._terminal_aux_snapshot[captured]
+        terminal_reason = terminal_reason.clone()
+        terminal_reason[captured] = self._terminal_snapshot_reason[captured].to(
+            terminal_reason.dtype
+        )
+        aux[captured, 24] = 1.0
+        aux[captured, 25] = terminal_reason[captured].float()
+        aux[captured, 26] = float(step)
+        self._terminal_snapshot_mask[captured] = False
+        return aux, terminal_reason
 
     def _robot(self):
         scene = getattr(self.env, "scene", None)
@@ -898,13 +1056,10 @@ class P2WorkerBridge:
             goal[:, :2].to(self.device) - robot.data.root_pos_w[:, :2], dim=-1
         )
 
-    def _body_collision_force(self, reset: torch.Tensor) -> torch.Tensor:
-        """Return the max non-foot contact force over the latest 5 Hz window."""
-        if bool(reset.any()):
-            self._collision_force_history[:, reset] = 0.0
+    def _instant_body_collision_force(self) -> torch.Tensor:
+        """Read current non-foot contact force without advancing window state."""
         instant = torch.zeros(self.num_envs, device=self.device)
         if not self._gait_window.collision_valid:
-            self._collision_force_history.zero_()
             return instant
         sensor = self._gait_window.sensor
         foot_ids = self._gait_window.sensor_foot_ids
@@ -932,9 +1087,17 @@ class P2WorkerBridge:
                 f"expected=({self.num_envs},{expected_bodies},3)"
             )
         if not self._gait_window.collision_valid:
+            return instant
+        return torch.nan_to_num(instant, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _body_collision_force(self, reset: torch.Tensor) -> torch.Tensor:
+        """Return the max non-foot contact force over the latest 5 Hz window."""
+        if bool(reset.any()):
+            self._collision_force_history[:, reset] = 0.0
+        instant = self._instant_body_collision_force()
+        if not self._gait_window.collision_valid:
             self._collision_force_history.zero_()
             return instant
-        instant = torch.nan_to_num(instant, nan=0.0, posinf=0.0, neginf=0.0)
         instant[reset] = 0.0
         self._collision_force_history[self._collision_force_index] = instant
         self._collision_force_index = (
@@ -1043,6 +1206,10 @@ class P2WorkerBridge:
         aux[:, p2_contract.BODY_COLLISION_MAPPING_VALID_INDEX] = float(
             self._gait_window.collision_valid
         )
+        if self.runtime_stage_type in {"p2_nav_ppo", "p4_nav_ppo"}:
+            aux, terminal_reason = self._apply_training_terminal_snapshot(
+                aux, reset, terminal_reason, step
+            )
         self.last_aux = aux
         if self.runtime_stage_type in {"p3_standard_joint", "p4_nav_ppo"}:
             self.last_p3_extra = self._p3_extra(robot, reset)

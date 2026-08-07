@@ -137,7 +137,16 @@ def workflow(envs, agents, logger=None, monitor=None, *args, **kwargs):
             envs, agents, logger=logger, monitor=monitor, *args, **kwargs
         )
 
-    if getattr(agent, "is_p2_nav", False) or getattr(agent, "is_p4_nav", False):
+    if getattr(agent, "is_p4_nav", False):
+        from agent_ppo.workflow.p4_nav_ppo_workflow import (
+            workflow as p4_nav_ppo_workflow,
+        )
+
+        return p4_nav_ppo_workflow(
+            envs, agents, logger=logger, monitor=monitor, *args, **kwargs
+        )
+
+    if getattr(agent, "is_p2_nav", False):
         from agent_ppo.workflow.p2_nav_ppo_workflow import (
             workflow as p2_nav_ppo_workflow,
         )
