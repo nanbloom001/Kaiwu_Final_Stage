@@ -7,6 +7,13 @@ from pathlib import Path
 import toml
 from kaiwudrl.common.monitor.monitor_config_builder import MonitorConfigBuilder
 
+from agent_ppo.p4.profiles import (
+    DEFAULT_EVAL_PROFILE,
+    PROFILE_FULL_TRACK,
+    PROFILE_MAZE_INSTANT_REPAIR2H,
+    get_training_profile,
+)
+
 
 P15_PANEL_SPECS = (
     ("策略损失", "p15_policy_loss", "policy_loss"),
@@ -1406,9 +1413,11 @@ def _configured_p4_training_profile() -> str:
     try:
         config = toml.load(path)
     except (OSError, TypeError, ValueError):
-        return "full_track"
+        return DEFAULT_EVAL_PROFILE
     return str(
-        config.get("p4_nav_ppo", {}).get("training_profile", "full_track")
+        config.get("p4_nav_ppo", {}).get(
+            "training_profile", DEFAULT_EVAL_PROFILE
+        )
     ).strip().lower()
 
 
@@ -1526,34 +1535,22 @@ def _build_p4_monitor(training_profile=None):
     profile = str(
         training_profile or _configured_p4_training_profile()
     ).strip().lower()
-    if profile not in {
-        "maze_credit_repair",
-        "maze_closed_loop_v3",
-        "maze_instant_command_r4",
-        "maze_instant_repair2h",
-        "full_track",
-    }:
-        raise ValueError(f"unsupported P4 monitor training profile {profile!r}")
+    profile_spec = get_training_profile(profile)
     monitor = MonitorConfigBuilder()
     monitor.title(
         "P4迷宫闭环强化训练"
-        if profile in {
-            "maze_credit_repair",
-            "maze_closed_loop_v3",
-            "maze_instant_command_r4",
-            "maze_instant_repair2h",
-        }
+        if profile_spec.maze_only
         else "P4五段全赛道训练"
     )
     _add_p4_track_outcome_panels(monitor)
-    if profile == "full_track":
+    if profile == PROFILE_FULL_TRACK:
         _add_p4_full_track_panels(monitor)
     for group_name, group_name_en, panels in P2_MONITOR_GROUPS:
         monitor.add_group(group_name=group_name, group_name_en=group_name_en)
         for name, name_en, metrics in panels:
             _add_multi_line_panel(monitor, name, name_en, metrics)
         monitor.end_group()
-    if profile in {"maze_instant_command_r4", "maze_instant_repair2h"}:
+    if profile_spec.instant_command:
         monitor.add_group(
             group_name="P4瞬时命令合同",
             group_name_en="p4_instant_command_contract",
@@ -1606,7 +1603,7 @@ def _build_p4_monitor(training_profile=None):
                 "teacher_guidance_valid_steps",
             ),
         )
-        if profile == "maze_instant_repair2h":
+        if profile == PROFILE_MAZE_INSTANT_REPAIR2H:
             _add_multi_line_panel(
                 monitor,
                 "Repair2h训练阶段",
@@ -1722,7 +1719,19 @@ def _build_p4_monitor(training_profile=None):
             "P4冻结与性能",
             "p4_runtime",
             (
-                ("监控合同健康度", "p4_monitor_contract", ("p4_monitor_expected_metric_count", "p4_monitor_metric_with_data_count", "p4_monitor_empty_metric_count", "p4_monitor_longest_data_age_s")),
+                (
+                    "监控合同健康度",
+                    "p4_monitor_contract",
+                    (
+                        "p4_monitor_expected_metric_count",
+                        "p4_monitor_metric_with_data_count",
+                        "p4_monitor_empty_metric_count",
+                        "p4_monitor_producer_longest_age_s",
+                        "p4_monitor_upload_age_s",
+                        "p4_monitor_upload_failure_count",
+                        "p4_monitor_longest_data_age_s",
+                    ),
+                ),
                 ("八小时闭环阶段", "p4_credit_phase", ("closedloop_phase_critic_warm", "closedloop_phase_actor_adapt", "closedloop_phase_train", "closedloop_phase_stabilize", "session_effective_seconds", "session_wall_seconds")),
                 ("冻结模块", "p4_credit_frozen", ("low_digest_drift", "low_optimizer_steps", "adapter_frozen", "navigation_learning_rate", "safety_head_learning_rate", "adapter_learning_rate")),
                 ("冻结合同", "p4_frozen_contract", ("low_digest_drift", "low_optimizer_steps", "high_updates", "p4_tbptt_sequences_per_env", "p4_tbptt_nav_ticks")),

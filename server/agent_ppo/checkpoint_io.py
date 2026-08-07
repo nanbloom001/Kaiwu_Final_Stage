@@ -626,8 +626,9 @@ def _canonical_p4_instant_command_contract() -> dict[str, Any]:
     # The local import avoids making the generic checkpoint module part of the
     # feature package's import cycle.
     from agent_ppo.feature import p4_contract
+    from agent_ppo.p4.profiles import PROFILE_MAZE_INSTANT_REPAIR2H
 
-    return p4_contract.command_contract("maze_instant_repair2h")
+    return p4_contract.command_contract(PROFILE_MAZE_INSTANT_REPAIR2H)
 
 
 def p4_nav_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
