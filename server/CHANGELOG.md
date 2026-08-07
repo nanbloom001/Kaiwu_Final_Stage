@@ -4,6 +4,18 @@
 
 ## [未发布]
 
+- **[P4 工程化基线]** 新分支 `codex/p4-engineered-baseline` 完整吸收已审计的
+  `maze_instant_repair2h` 修复，同时把 P4 profile、training/reward/command/checkpoint contract、
+  reward、Teacher、diagnostics、checkpoint lifecycle 和 workflow runtime 拆为明确所有权模块。
+  新训练只接受 `maze_instant_repair2h` 与 `full_track`；三个历史 profile 仅保留 warm-start/eval
+  兼容，不再创建新任务。repair2h/full-track 有效时钟分别固定为 7200/28800 秒，并与 TOML 的
+  run name、target seconds 和平台墙钟交叉验证。P4 worker 在自动 reset 前保存同一旧 episode 的
+  terminal aux，避免 reason、goal、command、velocity、collision 和 gait 被新 episode 覆盖；
+  训练 wire 版本升级但维度、Actor85、Critic observation 和 eval wire 不变。监控区分 producer
+  metric age 与 upload age/failure，checkpoint 日志区分 payload ID 与 filename ID。rollout depth
+  直接写入预留 pinned slot，删除重复所有权复制。新增固定验证工具、AST 架构边界和基线说明；
+  未修改奖励数值、学习率、动作范围、地形、网络结构、`BaseEnv` 或部署接口。
+
 - **[P4 Maze Instant 2h 闭环修复]** 新入口 `p4maze2h-instant-repair-r1` 从
   `p4maze8h10hz_1416926-mazefinal` warm start，保持 10Hz instant command、Actor85 和全部
   部署 I/O 不变。P4 专用 command-rate/tracking 权重降为 `-0.003/-0.002`，Maze new-best

@@ -689,6 +689,38 @@ exact resume 才允许恢复同一 repair session 的 records。仍保留 10% ne
 `deployable=false`，默认 Track 入口不得接受历史 slew P4 bundle；训练代码修复只有经过新 checkpoint
 保存后才会进入平台评估包。
 
+##### `codex/p4-engineered-baseline` 工程化基线合同
+
+工程化基线不改变 Actor85、Critic observation、三轴动作范围、10Hz instant hold、Standard/Track
+评估 I/O 或部署接口。活动训练 profile 仅为 `maze_instant_repair2h` 与 `full_track`；
+`maze_credit_repair`、`maze_closed_loop_v3`、`maze_instant_command_r4` 只能用于已知 legacy
+checkpoint 的 warm start 或兼容评估，不能创建新训练任务。profile 的训练资格来自
+`agent_ppo.p4.profiles.TrainingProfileSpec`，业务代码不得以字符串分支或模型 ID 替代该 registry。
+
+P4 training/reward/command/checkpoint contract 的唯一 canonical 定义位于
+`agent_ppo.p4.contracts`，`agent_ppo.feature.p4_contract` 仅作为兼容 facade。Standard eval 只验证并
+加载低层；Track eval 必须用 discovery 和最终加载共用的完整 command contract/digest 验证高层。
+模型 ID、标签和文件名只参与候选排序与日志；唯一结构兼容候选允许跨 ID，多候选必须明确报歧义。
+
+训练专属 transport 版本升级为 `p4_worker_wire_v7_terminal_snapshot`，维度仍为 519。新增语义不是
+网络输入，而是在 worker 的 `reset_base` event 执行前保存同一旧 episode 的 reason、goal、command、
+velocity、collision 和 gait aux，再覆盖自动 reset 后的训练 tail。Actor85、Critic observation 与
+稳定 Track eval wire 不变。若当前平台 event manager 无法安装并 readback 该 hook，P2/P4 训练必须
+fail closed；不得使用 reset 后新 episode 的传感器值填补 terminal transition。
+
+活动 profile 的有效时钟由 registry 提供，并与 TOML 的 `run_name`、
+`target_effective_seconds`、`task_end_hours` 精确交叉验证。`maze_instant_repair2h` 在 7200 秒自主
+最终保存并结束，`full_track` 在 28800 秒结束；平台墙钟只提供保存余量，不能成为训练时钟的第二
+事实来源。checkpoint 保存 producer metric age、monitor upload age/failure、真实 payload/lineage ID
+和独立 filename model ID；这些字段均不改变部署 payload。
+
+父包 `p4maze8h10hz_1416926.zip` SHA256 为
+`106908c8830f4fc7989125372f6ed397366f7ca1b4aac071128dccf71add0f6c`，其中
+`model.ckpt-mazefinal-1416926.pkl` SHA256 为
+`0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`，冻结低层 digest 为
+`8f2a214dd2a0177d8298f08711d40eb036c6eacb16d54d7cbae4f1104113e63e`。这些值是血缘证据，
+不是按 ID 设立的单点加载门禁。
+
 当前稳定部署树 `deploy/sim2real_test_loco` 仍是独立 Actor80 低层路线，不执行上述 P4 高层控制器。
 因此本合同只约束 server 训练和 Track eval；P4 checkpoint 继续 `deployable=false`。在完成高层导出、
 Jetson runtime、ONNX 数值和真机验证前，不得声称真机已采用 instant-command 语义，也不得在低层

@@ -19,7 +19,12 @@
 
 ## 活动基线
 
-- **当前 P4 Maze 即时命令修复入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
+- **P4 工程化基线**：后续 P4 开发统一从 `codex/p4-engineered-baseline` 创建短期分支。新训练只
+  接受 `maze_instant_repair2h`（7200 秒）与 `full_track`（28800 秒）；历史 P4 profile 只保留
+  warm-start/eval 兼容。profile、contract、reward、Teacher、diagnostics、checkpoint 与 workflow
+  所有权、父包哈希和分层验证状态见
+  [`docs/p4-engineered-baseline.md`](./docs/p4-engineered-baseline.md)。
+- **历史 P4 Maze R4 入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
   `codex/p4-maze8h-instant-command-r4-inputfix`，任务 `p4maze8h-instant-r4-inputfix`。父包固定为
   `p4maze8h10hz_1416926` 的 `mazefinal` checkpoint；128 env、10Hz 高层、50Hz 低层、
   32-tick rollout、TBPTT16、4 PPO epochs，单段 `open_entry_maze`、20 列、课程关闭、
@@ -51,7 +56,7 @@
   `instantwarm/instantadapt/instantcorrect/instantstable/instantfrozen`，旧 `loop*`/`closed*`/`credit*`
   仅保留发现和 warm-start 兼容性。
 
-- **历史 P4 五段全赛道入口**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
+- **活动 P4 五段全赛道 profile**：`P4NavPPOConfig`（`p4_nav_ppo`），分支
   `codex/p4-full8h-r2`，任务 `p4full8h-r2`，父包
   `p4maze8h10hz_1416926`。ZIP SHA256 为
   `106908c8830f4fc7989125372f6ed397366f7ca1b4aac071128dccf71add0f6c`，checkpoint
@@ -235,6 +240,69 @@
 - 同步服务和本地客户端必须通过 `IDE_SYNC_TOKEN` 或客户端 `--token` 使用同一个随机共享值。本地客户端会在 CLI 参数与已导出的环境变量均未提供时，自动读取 `<同步根>/conf/.env` 中的 `IDE_SYNC_TOKEN`；优先级为 `--token`、环境变量、`.env`。仓库不保存 Token 或网页 Cookie。浏览器代理 Cookie 只通过环境变量、CLI、本地缓存或交互输入提供。
 - `.vscode/launch.json` 使用 `${workspaceFolder}/train_test.py`--用 VS Code 打开 `server/` 即自适应，无需改路径。
 - 不引入指向 `../shared/` 或 `../archive/` 的运行时引用。
+
+## 固定训练验证流程
+
+训练端验证统一使用 `agent_ppo.tools.verify_training`，不再为每个实验临时
+拼接一套重复命令。工具不生成 `pyc` 或 pytest cache，并把 Git SHA、工作区
+指纹、选中测试、命令、耗时和结果写入 `.verification/<profile>.json`。该目录
+已忽略，不进入同步或 Git。
+
+### 快速档
+
+每次代码或 TOML 修改后先运行：
+
+```bash
+python3 -B -m agent_ppo.tools.verify_training \
+  --profile quick \
+  --reuse-valid
+```
+
+该档执行 `git diff --check`、变更 Python 内存编译、变更 TOML 解析和按路径
+选择的定向 pytest。未安装 pytest 时会明确失败；`--skip-tests` 只能用于诊断，
+不能当作完整通过证据。使用 `--plan` 可以先查看将运行的文件和测试。
+
+### 容器档
+
+源码同步后，在开发容器 `server/` 根目录运行：
+
+```bash
+python3 -B -m agent_ppo.tools.verify_training \
+  --profile container
+```
+
+需要真实父包 preload、32-tick PPO、Adapter 和 checkpoint lifecycle 时，先确认父包
+已挂载，再运行有界 smoke：
+
+```bash
+python3 -B -m agent_ppo.tools.verify_training \
+  --profile container \
+  --nav-smoke \
+  --num-envs 8 \
+  --smoke-timeout 600
+```
+
+工具会轮询现有 `nav_full_smoke`，只有观测到 `target_reached=true` 才通过，
+且无论成功或失败都会执行有界 stop。它不修改生产 TOML、不上传模型，
+也不替代 128-env 专项和平台 smoke。带 `--nav-smoke` 的证据永不复用，
+因为容器运行时和父包状态可能在源码不变时发生变化。
+
+### 发布档
+
+正式长训、推送或合并前运行：
+
+```bash
+python3 -B -m agent_ppo.tools.verify_training \
+  --profile release \
+  --reuse-valid
+```
+
+该档对 `agent_ppo/`、`conf/`、`isaac_env/` 和 `train_test.py` 执行全量无缓存语法
+检查，解析全部 TOML，并运行 `agent_ppo/tests` 和 `server/tests` 的现役测试。
+已知绑定退役 ST9/J9/LBC 语义的历史节点会以精确名称和原因写入证据，
+不会静默消失；清理这些历史债务时可使用 `--include-quarantined` 重跑全部节点。
+`--reuse-valid` 只在 profile、HEAD 和工作区输入指纹都一致且上次成功时生效；
+任何相关文件变化都会强制重新验证。
 
 同步前可先做完全离线检查：
 

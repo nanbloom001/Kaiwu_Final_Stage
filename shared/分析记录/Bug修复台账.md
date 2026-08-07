@@ -51,6 +51,62 @@
 
 ## 2. 历史恢复条目
 
+## BUG-20260807-002：P4 多轮补丁累积造成 profile、合同、终止数据与验证边界漂移
+
+- 状态：本地已验证。开发容器、平台训练和固定条件评估仍待本条目后续追加证据。
+- 影响：P4/P2 高层训练 workflow、reward/Teacher/diagnostics/checkpoint 所有权、repair2h 与
+  full-track 时钟、Track/Standard 评估合同、自动 reset terminal 数据、监控健康度、depth rollout
+  内存所有权；不修改平台覆盖的 `server/isaac_env/base_env.py`，不改变 Actor85、Critic observation、
+  三轴动作范围、Standard/Track eval wire 或部署接口。
+- 首次发现：2026-08-07，对 `codex/p4-maze2h-instant-repair-r1` 做完整工程审计时确认。该问题不是
+  一次平台报错，而是多轮 P4 热修后形成的可维护性和正确性风险。
+- 症状：活动代码在多个大文件直接判断 profile 字符串；training/reward/command contract 和评估
+  discovery 分散；P4 target seconds 可退回平台全局时钟；自动 reset 后的 reason/goal/速度/碰撞
+  可能来自不同 episode；监控把生产者未上报与上传失败合并成一个 age；日志用文件名 ID 冒充
+  payload identity；depth 进入 rollout 前存在两次所有权复制。`algorithm_p4_nav_ppo.py`、
+  `p4_contract.py` 和 P2/P4 共用 workflow 均超过可审查规模，后续补丁很难证明没有旁路行为。
+- 根因：profile、合同、workflow hooks 和训练服务没有 canonical owner；历史兼容与活动训练共享自由
+  字符串分支；公共 rollout 通过 `is_p4` 特判扩张；平台自动 reset 在 observation 重算前发生，而旧
+  transport 没有在 reset event 前冻结 terminal aux；监控和 checkpoint selection 缺少明确的数据
+  来源字段。此前测试主要覆盖单个行为，没有约束模块尺寸、profile 散落、合同重复和 facade 边界。
+- 排除项：不通过模型 ID、标签或父包 SHA 设置单点硬门禁；不重新调奖励、学习率、地形、动作范围
+  或网络结构；不修改 `BaseEnv`；不把本地测试或静态镜像描述为容器/平台/评估证据。
+- 修复：
+  - 新增 `agent_ppo/p4/`，以冻结 `TrainingProfileSpec` 和 canonical contract registry 管理两个活动
+    profile 与三个 legacy profile；legacy 只能 warm start/eval。
+  - 将 reward、Teacher、diagnostics、checkpoint 和 training/runtime 服务拆出；RewardSpec 显式
+    选择参与项，DiagnosticSpec 避免构造禁用 profile 指标，Teacher 运行时断言辅助 loss 的参数
+    所有权。`p4_contract.py` 只保留兼容转发。
+  - 新增 `nav_ppo_runtime.py` 与 P4 hooks；P2/P4 wrapper 只组装 spec，公共循环不再出现 P4 分支。
+    repair2h/full-track 从 registry 读取 7200/28800 秒，并与 TOML 三字段精确交叉验证。
+  - worker 在 `reset_base` event 前保存 terminal aux，再覆盖 reset 后 transport；wire version 升级为
+    `p4_worker_wire_v7_terminal_snapshot`，维度 519 和网络/eval 输入不变。
+  - 监控拆分 producer age、upload age、upload failure；checkpoint selection 分开记录 payload ID 与
+    filename model ID。rollout depth 直接复制到预留 pinned FP16 slot，保留 buffer alias 回归。
+  - 新增 `verify_training`、AST 架构测试和基线说明；P4 orchestration 小于 1000 行，其他新生产模块
+    小于 1200 行，除两个显式 tensor kernel 外函数不超过 150 行。
+- 验证：提交 `981a760` 的 profile/contract/facade 独立 worktree `127 passed`；提交 `ec71eeb` 的
+  P4 service/algorithm 独立 worktree `232 passed`；提交 `d9b721d` 的 workflow/terminal/P2 回归
+  `149 passed`；提交 `c8ae38d` 的 depth/P2 回归 `115 passed`；提交 `7b92576` 的架构与验证工具
+  `43 passed`。最终本地 `agent_ppo/tests` 为 `713 passed, 5 skipped, 3 subtests passed`；170 个
+  Python 文件内存编译、14 个 TOML 解析、`git diff --check` 和 release verifier 均通过。开发容器、
+  平台 smoke、评估和真机证据待追加，不能由上述本地证据替代。
+- 防复发：profile literal AST 扫描、canonical contract/facade 测试、模块与函数尺寸边界、RewardSpec/
+  DiagnosticSpec 覆盖、Teacher 参数所有权断言、真实训练退出时钟、terminal snapshot、monitor age、
+  depth alias 和 Standard/Track round-trip 均进入版本化测试。推送前统一运行
+  `python -m agent_ppo.tools.verify_training --profile release`。
+- 血缘：分支 `codex/p4-engineered-baseline`；行为修复起点 `d8b0928`；工程实现基线 `7b92576`；
+  父包 `p4maze8h10hz_1416926.zip` SHA256
+  `106908c8830f4fc7989125372f6ed397366f7ca1b4aac071128dccf71add0f6c`；父 checkpoint SHA256
+  `0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`；冻结低层 digest
+  `8f2a214dd2a0177d8298f08711d40eb036c6eacb16d54d7cbae4f1104113e63e`；PR、平台任务和新 checkpoint
+  尚不存在。
+- 回滚：按问题域逐个 `git revert` 最新工程化提交；若需恢复拆分前但保留已审计 repair2h 行为，
+  回退到 `d8b0928`，不得 reset 或覆盖共享历史。
+- 再遇检查：1）打印 registry profile 与三份 digest；2）核对 TOML/registry 三项时钟；3）检查加载
+  日志的 selected path、payload ID、filename ID 和 command digest；4）检查 worker terminal snapshot
+  hook readback；5）分别比较 producer age 与 upload failure，再决定是训练生产者还是上传链故障。
+
 ## BUG-20260807-001：P4 高层 slew 隐式延迟、恢复后合同回退与卡滞伪恢复
 
 - 状态：旧 R4 开发容器最小 smoke 已验证、平台长训运行中但行为失败；inputfix 本地定向测试已验证，
