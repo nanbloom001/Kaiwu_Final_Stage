@@ -4,6 +4,11 @@
 
 ## [未发布]
 
+- **[P4 compact rollout 首帧修复]** 修复 NavigationEncoder 冻结阶段已切换为
+  `nav_feat32` compact storage，却仍在每个高层 tick 无条件申请 depth rollout slot 的错误。
+  现在仅在 `store_depth=true` 时取得 pinned depth 所有权；冻结阶段直接保存已计算的
+  `nav_feat32`。该修复不改变策略、奖励、网络、训练时钟或部署接口。
+
 - **[P4 工程化基线]** 新分支 `codex/p4-engineered-baseline` 完整吸收已审计的
   `maze_instant_repair2h` 修复，同时把 P4 profile、training/reward/command/checkpoint contract、
   reward、Teacher、diagnostics、checkpoint lifecycle 和 workflow runtime 拆为明确所有权模块。

@@ -24,6 +24,11 @@ from agent_ppo.model.p2_high_level import (
 )
 from agent_ppo.model.response_adapter import CommandResponseAdapter
 from agent_ppo.model.vision_encoder import VisionEncoder
+from agent_ppo.p4.profiles import (
+    PROFILE_FULL_TRACK,
+    PROFILE_MAZE_INSTANT_COMMAND_R4,
+    PROFILE_MAZE_INSTANT_REPAIR2H,
+)
 
 
 def _algorithm(num_envs: int, device: str, config: dict) -> AlgorithmP4NavPPO:
@@ -330,9 +335,13 @@ def main() -> int:
             full_config["terrain"]["track"]["sub_terrains"]
         )
     )
-    instant_r4 = config.get("training_profile") == "maze_instant_command_r4"
+    training_profile = str(config.get("training_profile", PROFILE_FULL_TRACK))
+    instant_r4 = training_profile == PROFILE_MAZE_INSTANT_COMMAND_R4
+    instant_repair = training_profile == PROFILE_MAZE_INSTANT_REPAIR2H
     config["maze_training_branch"] = (
-        "instant_command_r4" if instant_r4 else "auto"
+        "instant_repair2h"
+        if instant_repair
+        else ("instant_command_r4" if instant_r4 else "auto")
     )
 
     checkpoint = Path(args.checkpoint).resolve()
@@ -356,26 +365,38 @@ def main() -> int:
         str(checkpoint), platform_model_id=platform_model_id
     )
     expected_warm_start = (
-        "p4_maze_instant_r4_warm_start"
-        if instant_r4
-        else "p4_full_track_warm_start"
+        "p4_maze_instant_repair2h_warm_start"
+        if instant_repair
+        else (
+            "p4_maze_instant_r4_warm_start"
+            if instant_r4
+            else "p4_full_track_warm_start"
+        )
     )
     if mode != expected_warm_start:
         raise AssertionError(f"unexpected warm-start mode: {mode}")
-    if not instant_r4:
+    if training_profile == PROFILE_FULL_TRACK:
         _exercise_fp16_mirror_auxiliary(algorithm)
     low_digest_before = _module_digest(algorithm)
 
     algorithm._resolved_maze_training_branch = (
-        "instant_command_r4" if instant_r4 else "actor_attack"
+        "instant_repair2h"
+        if instant_repair
+        else ("instant_command_r4" if instant_r4 else "actor_attack")
     )
     algorithm.update_training_clocks(
-        1_800.0 if instant_r4 else p4_contract.DIAGNOSTIC_SECONDS
+        1_800.0
+        if (instant_r4 or instant_repair)
+        else p4_contract.DIAGNOSTIC_SECONDS
     )
     valid_phases = (
-        {"instantadapt"}
-        if instant_r4
-        else {"fullwarm", "fulladapt", "fulltrain", "fullstabilize"}
+        {"repairtrain"}
+        if instant_repair
+        else (
+            {"instantadapt"}
+            if instant_r4
+            else {"fullwarm", "fulladapt", "fulltrain", "fullstabilize"}
+        )
     )
     if algorithm.current_phase not in valid_phases:
         raise AssertionError("P4 smoke failed to enter the full-track schedule")

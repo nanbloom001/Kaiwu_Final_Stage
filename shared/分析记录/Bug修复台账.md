@@ -4701,3 +4701,34 @@
   有急停，并核对逐帧反馈日志。
 - 回滚：将 `stuck_recovery.enabled` 设为 `false`，或回滚本条部署代码；再次遇到时先查
   `feedback_source/feedback_age_s`、恢复方向、实测 `vy` 和恢复进度，不先调模型。
+
+## BUG-20260807-003：P4 compact nav-feature rollout 首个高层 tick 申请不存在的 depth slot
+
+- 日期：2026-08-07；状态：容器已验证；影响范围：P2/P4 高层 PPO 在
+  NavigationEncoder 冻结、rollout 使用 `nav_feat32` compact storage 的阶段。网络、奖励、动作、
+  worker/eval wire、checkpoint 和部署接口不变。
+- 用户可见症状：开发容器 1-env Isaac smoke 已完成环境和 P4 Agent 装配，首个高层 tick 随后报错：
+  `RuntimeError: depth slots are unavailable while nav features are stored`。日志定位到
+  `AlgorithmP2NavPPO.frame_begin()` 调用 `P2RolloutStorage.own_current_depth_slot()`。
+- 根因：工程化基线让冻结 NavigationEncoder 的 rollout 只保存已经计算出的 `nav_feat32`，此时
+  `store_depth=false` 且不会分配 depth slots；公共 `frame_begin()` 仍无条件取得 depth slot，
+  与 `add()` 和 PPO replay 已经支持的双存储模式不一致。静态 storage 测试只验证了禁止直接申请
+  depth slot，没有覆盖完整 `frame_begin()` 的冻结模式，因而未在本地审查中暴露。
+- 修复：`frame_begin()` 仅在 `rollout.store_depth=true` 时把借用的 Isaac depth 直接复制到当前
+  pinned slot；compact 模式把 pending depth 设为 `None`，继续保存 `nav_feat32`。新增完整 tick
+  回归，显式把 rollout 切换到 `store_depth=false`，验证不申请 depth slot 且 feature 有限。
+- 排除方向：不是父模型 ID 门禁、checkpoint 反序列化、Isaac reset 或 GPU OOM。此前的
+  `torch`、`isaaclab`、`kaiwudrl`、`dynaconf` 缺失均为测试启动器需要组合 Isaac Python、
+  IsaacLab/Unitree 源码、项目根目录和平台 Conda site-packages，已分别通过父子进程 import 验证。
+- 验证：本地定向回归 `2 passed, 107 deselected`，Python 编译和 `git diff --check` 通过；
+  RPC 同步后容器同组回归同样为 `2 passed, 107 deselected`。真实 Isaac 1-env 与 8-env smoke
+  均完成 32 个高层 tick，8-env 得到 `valid_ticks=256` 且未跳过更新。使用真实
+  `p4maze8h10hz_1416926-mazefinal` 的 8-env CUDA 续训 smoke 得到 Actor/Critic 各 16 次梯度步、
+  Adapter 1 次更新、低层 digest 不变，并完成保存与 `p4_exact_resume_history_reset`。同一新
+  checkpoint 的 Standard/Track 装配分别只加载低层和完整高低层，评估合同回归 `10 passed`。
+  尚未运行平台正式训练或平台评估，因此状态止于“容器已验证”。
+- 回归防线：保留 depth 所有权复用测试，同时增加 frozen encoder 完整 tick 测试。以后 compact
+  rollout 变更必须同时覆盖 `frame_begin -> add -> PPO replay` 三段，不得只测 storage API。
+- 关联分支：`codex/p4-engineered-baseline`；父模型 `p4maze8h10hz_1416926-mazefinal`；当前平台
+  任务、模型 ID、checkpoint 和 PR：不适用。回滚为撤销本条条件分支；再次遇到时先打印
+  `cnn_unfrozen/rollout.store_depth`，不要降低环境数或关闭 compact storage 掩盖问题。

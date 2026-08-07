@@ -1053,7 +1053,13 @@ class AlgorithmP2NavPPO:
                     # Isaac may reuse its observation buffer on the next
                     # low-level step. Take ownership directly in the current
                     # pinned rollout slot so add() need not copy it again.
-                    "depth": self.rollout.own_current_depth_slot(parts["depth"]),
+                    # Frozen encoders store nav_feat32 instead and deliberately
+                    # allocate no depth slots.
+                    "depth": (
+                        self.rollout.own_current_depth_slot(parts["depth"])
+                        if self.rollout.store_depth
+                        else None
+                    ),
                     "nav_feat": nav_feat.detach(),
                     "nav_nonvisual": nav_nonvisual.detach(),
                     "response_profile": profile.detach(),

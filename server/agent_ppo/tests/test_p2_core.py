@@ -2400,6 +2400,25 @@ def test_tick_depth_owns_storage_when_environment_reuses_observation_buffer():
     assert torch.all(algorithm.pending_tick["depth"] == 0.25)
 
 
+def test_frozen_navigation_encoder_tick_stores_feature_without_depth_slot():
+    algorithm = _make_p2_algorithm(training=True)
+    algorithm.cnn_unfrozen = False
+    algorithm.rollout = algorithm.rollout.reset(store_depth=False)
+    obs = torch.zeros(1, nav_contract.POLICY_OBS_DIM)
+    obs[:, nav_contract.DEPTH_OBS_START:] = 0.25
+    wire = torch.zeros(1, p2_contract.PRIVILEGED_WIRE_DIM)
+    wire[:, p2_contract.CRITIC_OBS_DIM + 9] = 1.0
+
+    algorithm.frame_begin(obs, wire)
+
+    assert algorithm.pending_tick["depth"] is None
+    assert algorithm.pending_tick["nav_feat"].shape == (
+        1,
+        p2_contract.NAV_FEATURE_DIM,
+    )
+    assert torch.isfinite(algorithm.pending_tick["nav_feat"]).all()
+
+
 def test_eval_runtime_constructs_no_training_only_state():
     algorithm = _make_p2_algorithm(training=False)
     assert algorithm.critic is None
