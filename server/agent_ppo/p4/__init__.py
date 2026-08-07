@@ -1,0 +1,53 @@
+"""Public P4 profile and contract APIs."""
+
+from agent_ppo.p4.contracts import (
+    canonical_contracts,
+    command_contract,
+    contract_metadata,
+    reward_contract,
+    stable_digest,
+    training_contract,
+)
+from agent_ppo.p4.profiles import (
+    ACTIVE_TRAIN_PROFILES,
+    DEFAULT_EVAL_PROFILE,
+    DEFAULT_TRAIN_PROFILE,
+    EVAL_MODE,
+    LEGACY_COMPATIBILITY_DEFAULT,
+    LEGACY_PROFILE_NAMES,
+    PROFILE_MODES,
+    PROFILE_REGISTRY,
+    TRAIN_MODE,
+    WARM_START_MODE,
+    TrainingProfileSpec,
+    get_training_profile,
+    is_instant_profile,
+    is_maze_profile,
+    normalize_training_profile,
+    require_training_profile,
+)
+
+__all__ = [
+    "ACTIVE_TRAIN_PROFILES",
+    "DEFAULT_EVAL_PROFILE",
+    "DEFAULT_TRAIN_PROFILE",
+    "EVAL_MODE",
+    "LEGACY_COMPATIBILITY_DEFAULT",
+    "LEGACY_PROFILE_NAMES",
+    "PROFILE_MODES",
+    "PROFILE_REGISTRY",
+    "TRAIN_MODE",
+    "WARM_START_MODE",
+    "TrainingProfileSpec",
+    "canonical_contracts",
+    "command_contract",
+    "contract_metadata",
+    "get_training_profile",
+    "is_instant_profile",
+    "is_maze_profile",
+    "normalize_training_profile",
+    "require_training_profile",
+    "reward_contract",
+    "stable_digest",
+    "training_contract",
+]
