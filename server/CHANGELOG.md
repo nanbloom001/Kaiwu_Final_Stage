@@ -10,6 +10,9 @@
   `release=[0.30,0.60,2.50]`；真实 instant 速率只进入 command contract/诊断。父 Actor anchor
   同时限制为旧 slew 在一个 10Hz tick 内可达且不反向的样本。网络维度、三轴硬范围、
   `policy_target==exec` 和 instant hold 语义不变。
+- **[P4 R4 辅助梯度闭环修复]** 修复 instant schedule 将 Actor 辅助梯度总上限误设为 `0`，导致
+  五方向 Teacher 与父 Actor anchor 虽有有效样本和非零 loss，实际梯度比例始终为零。总上限现为
+  `3%`，覆盖活动阶段最大 `2.75%` 的 Teacher+Anchor 目标，并新增合同与实际梯度回归。
 
 - **[P4 Maze R4 完全取消 slew]** 新入口 `p4maze8h-instant-r4` 从
   `p4maze8h10hz_1416926-mazefinal` warm start，固定单段 Maze、128 env、10Hz 高层和

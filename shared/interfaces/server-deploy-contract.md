@@ -661,6 +661,10 @@ credit，success 保留。碰撞 onset=`-0.16-0.24*severity`、persistent=`-0.06
 只接受 termination manager 的实际 term readback，不根据本地候选伪造；未分类 reset 也不得改记
 timeout。仅 yaw 改变不能证明脱困，必须同时看到墙接触 EMA 比候选持续接触峰值下降至少 30%。
 
+R4 的五方向 Teacher 与父 Actor anchor 共用 `auxiliary_gradient_hard_cap=0.03`。活动阶段的目标比例
+之和最大为 `0.0275`；checkpoint/监控必须保存并上报目标比例与实际梯度比例。若有效样本和 raw loss
+非零而实际比例长期为零，应视为训练合同失效，不能把它解释为教师已经参与策略更新。
+
 当前稳定部署树 `deploy/sim2real_test_loco` 仍是独立 Actor80 低层路线，不执行上述 P4 高层控制器。
 因此本合同只约束 server 训练和 Track eval；P4 checkpoint 继续 `deployable=false`。在完成高层导出、
 Jetson runtime、ONNX 数值和真机验证前，不得声称真机已采用 instant-command 语义，也不得在低层

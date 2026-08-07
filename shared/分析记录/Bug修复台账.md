@@ -156,6 +156,15 @@
   Python 编译、活动 TOML 解析与 `git diff --check` 已通过。独立审查发现并已修复 checkpoint
   `run_name` 仍为旧值，以及非有限 sampled target 未执行时 anchor 错用缓存 policy target 的边界；
   后者现在以 pre-tick `command.exec_cmd` 为唯一上一物理命令来源，并有定向回归。
+- 2026-08-07 平台长训进一步更正：任务 `p4maze8h-instant-r4` 的五方向 Teacher 和父 Actor anchor
+  并未按计划参与策略修复。`instant_command_r4` schedule 虽配置了非零目标比例，但公共
+  `auxiliary_gradient_hard_cap` 被误设为 `0.0`，校准器因此把两个系数都压为零。平台捕获中
+  `teacher_guidance_valid_steps`、`teacher_guidance_loss`、`parent_anchor_valid_steps` 和
+  `parent_anchor_loss` 均非零，而三项 actual gradient ratio 全程为零，确认不是样本不足。inputfix
+  分支将总上限修复为 `0.03`，覆盖活动阶段最大 `0.0275` 的目标比例之和，并新增合同不变量与实际
+  梯度非零/不越上限回归。定向合同/runtime/controller 套件 `27 passed`，P2/P4 导航相关套件
+  `439 passed, 3 subtests passed`，Python 编译、P4 TOML 解析与 `git diff --check` 通过。该修复状态
+  为本地已验证，容器和平台待验证；旧平台任务不能作为修复证据。
 - 防复发：监控必须同时上报 transition mode、hold frames、policy-limited/exec MAE、三轴正负 delta/
   reversal、phase、Actor/Adapter freeze、parent anchor loss、unknown reset、reason4 和墙接触 EMA 恢复。
   exact-resume 测试必须实际 load 后再次检查 controller mode，并逐值验证冻结期 Actor/Adapter 参数

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from agent_ppo.algorithm.algorithm_visual_ppo import _calibrate_auxiliary_gradients
 from agent_ppo.feature import p4_contract
 
 
@@ -121,6 +122,9 @@ def test_r4_schedule_has_explicit_anchor_and_adapter_controls(
     assert schedule["safety_head_multiplier"] == 0.0
     assert schedule["stuck_head_multiplier"] == 0.0
     assert schedule["critic_multiplier"] == 1.0
+    requested_auxiliary_ratio = teacher + anchor
+    assert schedule["auxiliary_gradient_hard_cap"] == pytest.approx(0.03)
+    assert schedule["auxiliary_gradient_hard_cap"] >= requested_auxiliary_ratio
     if phase == "instantwarm":
         assert schedule["actor_multiplier"] == 0.0
         assert schedule["anchor_multiplier"] == 0.0
@@ -137,6 +141,42 @@ def test_r4_schedule_has_explicit_anchor_and_adapter_controls(
         assert schedule["actor_multiplier"] == 0.0
         assert schedule["anchor_multiplier"] == 0.0
         assert schedule["adapter_multiplier"] == 0.0
+
+
+def test_r4_active_teacher_and_anchor_receive_nonzero_bounded_gradients():
+    schedule = p4_contract.training_schedule(
+        7_200.0, branch="instant_command_r4"
+    )
+    parameter = torch.nn.Parameter(torch.tensor([1.0, 1.0]))
+    policy_loss = parameter[0]
+    teacher_loss = parameter[0] + parameter[1]
+    anchor_loss = parameter[0] - parameter[1]
+    calibrated, combined_ratio = _calibrate_auxiliary_gradients(
+        policy_loss,
+        [
+            (
+                "teacher",
+                teacher_loss,
+                schedule["teacher_gradient_target_ratio"],
+            ),
+            ("anchor", anchor_loss, schedule["anchor_target_ratio"]),
+        ],
+        [parameter],
+        schedule["auxiliary_gradient_hard_cap"],
+    )
+    ratios = {item["name"]: item["component_ratio"] for item in calibrated}
+    auxiliary_loss = sum(item["loss"] * item["multiplier"] for item in calibrated)
+    auxiliary_grad = torch.autograd.grad(auxiliary_loss, parameter)[0]
+    policy_grad = torch.autograd.grad(policy_loss, parameter)[0]
+
+    assert ratios["teacher"] > 0.0
+    assert ratios["anchor"] > 0.0
+    assert auxiliary_grad.norm().item() > 0.0
+    assert combined_ratio <= schedule["auxiliary_gradient_hard_cap"] + 1.0e-6
+    assert (
+        auxiliary_grad.norm() / policy_grad.norm()
+        <= schedule["auxiliary_gradient_hard_cap"] + 1.0e-6
+    )
 
 
 def test_r4_reward_checkpoint_and_stuck_contract_are_separate_from_slew_profiles():

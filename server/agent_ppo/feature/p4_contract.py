@@ -2229,7 +2229,11 @@ def training_schedule(
             "mirror_sequence_share": 0.0,
             "cruise_multiplier": 0.0,
             "teacher_gradient_hard_cap": 0.03,
-            "auxiliary_gradient_hard_cap": 0.0,
+            # Teacher and parent-anchor are the only Actor auxiliaries enabled
+            # by this profile. Their largest requested sum is 2.75%, so a 3%
+            # aggregate cap preserves both signals without exceeding the
+            # documented auxiliary-gradient budget.
+            "auxiliary_gradient_hard_cap": 0.03,
             "mirror_gradient_hard_cap": 0.0,
             "navigation_multiplier": 0.0,
             "safety_head_multiplier": 0.0,
