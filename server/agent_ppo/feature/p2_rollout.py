@@ -44,6 +44,7 @@ class P2RolloutStorage:
             raise ValueError("P2 rollout ticks must be divisible by TBPTT length")
         self.store_depth = bool(store_depth)
         self.step = 0
+        self._depth_slot_prepared = False
         common = (self.num_ticks, self.num_envs)
         self.depth = (
             _cpu_tensor(*common, p2_contract.DEPTH_DIM, dtype=torch.float16, pin_memory=pin_memory)
@@ -116,16 +117,39 @@ class P2RolloutStorage:
     def _copy(target: torch.Tensor, value: torch.Tensor) -> None:
         target.copy_(value.detach().to(device="cpu", dtype=target.dtype))
 
-    @staticmethod
-    def own_depth_sample(value: torch.Tensor, *, pin_memory: bool = True) -> torch.Tensor:
-        """Take immediate CPU FP16 ownership of a camera frame."""
-        owned = _cpu_tensor(
-            *value.shape,
-            dtype=torch.float16,
-            pin_memory=pin_memory,
+    def own_current_depth_slot(self, value: torch.Tensor) -> torch.Tensor:
+        """Copy a camera frame into the current rollout slot exactly once.
+
+        The Isaac observation buffer is only borrowed.  A pending tick keeps
+        this returned view until ``add()`` advances the rollout, so the depth
+        sample is both alias-safe and already in its final pinned CPU FP16
+        storage location.
+        """
+        if not self.store_depth:
+            raise RuntimeError("depth slots are unavailable while nav features are stored")
+        if self.full:
+            raise RuntimeError("P2 rollout is already full")
+        if self._depth_slot_prepared:
+            raise RuntimeError("P2 depth slot is already owned by the pending tick")
+        if value.numel() != self.num_envs * p2_contract.DEPTH_DIM:
+            raise ValueError(
+                "P2 depth transition must contain "
+                f"{self.num_envs * p2_contract.DEPTH_DIM} values, got "
+                f"{value.numel()}"
+            )
+        slot = self.depth[self.step]
+        self._copy(slot, value.reshape(self.num_envs, p2_contract.DEPTH_DIM))
+        self._depth_slot_prepared = True
+        return slot
+
+    def _is_current_depth_slot(self, value: torch.Tensor, index: int) -> bool:
+        slot = self.depth[index]
+        return (
+            value.device.type == "cpu"
+            and value.dtype == torch.float16
+            and value.shape == slot.shape
+            and value.data_ptr() == slot.data_ptr()
         )
-        owned.copy_(value.detach(), non_blocking=False)
-        return owned
 
     def add(self, **transition) -> None:
         if self.full:
@@ -149,10 +173,14 @@ class P2RolloutStorage:
                     f"{self.num_envs * p2_contract.DEPTH_DIM} values, got "
                     f"{depth.numel()}"
                 )
-            self._copy(
-                self.depth[index],
-                depth.reshape(self.num_envs, p2_contract.DEPTH_DIM),
-            )
+            if self._depth_slot_prepared:
+                if not self._is_current_depth_slot(depth, index):
+                    raise ValueError("P2 pending depth must use the owned rollout slot")
+            else:
+                self._copy(
+                    self.depth[index],
+                    depth.reshape(self.num_envs, p2_contract.DEPTH_DIM),
+                )
         else:
             self._copy(self.nav_feat[index], transition["nav_feat"])
         for name, source in (
@@ -219,6 +247,7 @@ class P2RolloutStorage:
         self._copy(self.critic_h[index], critic_h)
         self._copy(self.critic_c[index], critic_c)
         self.step += 1
+        self._depth_slot_prepared = False
 
     def compute_returns(self) -> None:
         if not self.full:
@@ -319,4 +348,5 @@ class P2RolloutStorage:
                 store_depth=requested,
             )
         self.step = 0
+        self._depth_slot_prepared = False
         return self

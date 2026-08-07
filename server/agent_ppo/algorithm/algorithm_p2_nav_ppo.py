@@ -1050,9 +1050,10 @@ class AlgorithmP2NavPPO:
                         "selected_safest": zeros,
                     }
                 self.pending_tick = {
-                    # Own the high-level visual sample immediately. Isaac may
-                    # reuse its observation buffer on the next low-level step.
-                    "depth": P2RolloutStorage.own_depth_sample(parts["depth"]),
+                    # Isaac may reuse its observation buffer on the next
+                    # low-level step. Take ownership directly in the current
+                    # pinned rollout slot so add() need not copy it again.
+                    "depth": self.rollout.own_current_depth_slot(parts["depth"]),
                     "nav_feat": nav_feat.detach(),
                     "nav_nonvisual": nav_nonvisual.detach(),
                     "response_profile": profile.detach(),
