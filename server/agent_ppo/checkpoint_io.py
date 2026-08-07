@@ -13,6 +13,8 @@ the top-level schema.  Deployment artifacts remain separate.
 from __future__ import annotations
 
 import glob
+import hashlib
+import json
 import os
 import re
 from typing import Any
@@ -111,12 +113,20 @@ P3_STANDARD_JOINT_PHASE_LABELS = (
     "stable",
 )
 
+# P4 phase labels are deliberately kept separate from P3.  A P4 evaluator
+# must never select a P3/P2/LBC file merely because the Arena-provided model ID
+# was rewritten.  The repair2h labels are a continuation of the R4 inputfix
+# command contract, not a new command family.
 P4_NAV_PHASE_LABELS = (
     "instantwarm",
     "instantadapt",
     "instantcorrect",
     "instantstable",
     "instantfrozen",
+    "repaircollect",
+    "repairadapt",
+    "repairtrain",
+    "repairstable",
     "loopwarm",
     "loopadapt",
     "looptrain",
@@ -145,10 +155,14 @@ P4_NAV_PHASE_LABELS = (
     "pnavstable",
 )
 
-# Explicit newest-stage-first selection.  P4_NAV_PHASE_LABELS remains the
-# complete validation set; candidate discovery must not infer priority by
-# reversing that mixed new/legacy tuple.
+# Do not infer recency by reversing the validation tuple: it includes legacy
+# phases for loading older P4 packages.  repair2h is the active R4 inputfix
+# continuation and has priority over its parent instant-command stages.
 P4_NAV_CHECKPOINT_PRIORITY = (
+    "repairstable",
+    "repairtrain",
+    "repairadapt",
+    "repaircollect",
     "instantfrozen",
     "instantstable",
     "instantcorrect",
@@ -604,7 +618,31 @@ def _validate_p3_eval_leaf(leaf: Any, name: str, expected: dict[str, Any], *, co
         raise KeyError(f"{context}.{name} missing state_dict")
 
 
+P4_INSTANT_COMMAND_R4_INPUTFIX_VERSION = "p4_maze_instant_command_r4_inputfix"
+P4_ACTION_MAPPER_VERSION = "p4_capability_action_mapper_v1"
+P4_INSTANT_COMMAND_R4_INPUTFIX_CONTRACT = {
+    "version": P4_INSTANT_COMMAND_R4_INPUTFIX_VERSION,
+    "mapper_version": P4_ACTION_MAPPER_VERSION,
+    "mapped_ranges": {"vx": [0.0, 1.0], "vy": [-0.30, 0.30], "wz": [-0.90, 0.90]},
+    "policy_target_vx": [0.0, 1.0],
+    "command_transition_mode": "instant_hold_10hz",
+    "hold_frames": 5,
+    "nav_period_frames": 5,
+    "policy_target_equals_exec": "at_10hz_tick_boundary",
+    "command_rewrites": {
+        "slew": "disabled",
+        "zero_cross_guard": "disabled",
+        "reversal_guard": "disabled",
+        "runtime_limiter": "disabled",
+        "near_goal_rewrite": "disabled",
+        "recovery_override": "disabled",
+    },
+    "hard_action_ranges_only": True,
+}
+
+
 def p4_nav_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
+    """Return same-ID P4 candidates in explicit newest-stage-first order."""
     model_id = str(model_id)
     return [
         os.path.join(path, f"model.ckpt-{label}-{model_id}.pkl")
@@ -612,7 +650,8 @@ def p4_nav_checkpoint_candidates(path: str, model_id: str | int) -> list[str]:
     ]
 
 
-def _p4_nav_discovery_candidates(path: str) -> list[str]:
+def _p4_nav_discovery_candidates(path: str, *, mode: str) -> list[str]:
+    """Return structurally compatible P4 files, without selecting among them."""
     discovered: list[str] = []
     for label in P4_NAV_CHECKPOINT_PRIORITY:
         discovered.extend(
@@ -624,7 +663,7 @@ def _p4_nav_discovery_candidates(path: str) -> list[str]:
             continue
         try:
             payload = torch.load(candidate, weights_only=False, map_location="cpu")
-            validate_p4_eval_bundle(payload, mode="track")
+            validate_p4_eval_bundle(payload, mode=mode)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError):
             continue
         compatible.append(candidate)
@@ -642,7 +681,7 @@ def p4_nav_training_candidates(
     for candidate in p4_nav_checkpoint_candidates(path, parent_model_id):
         if candidate not in result:
             result.append(candidate)
-    discovered = _p4_nav_discovery_candidates(path)
+    discovered = _p4_nav_discovery_candidates(path, mode="track")
     selected_paths = {os.path.abspath(candidate) for candidate in result}
     discovered = [
         candidate
@@ -665,11 +704,23 @@ def p4_nav_training_candidates(
     return result
 
 
-def p4_nav_eval_candidates(path: str, model_id: str | int) -> list[str]:
+def p4_nav_eval_candidates(
+    path: str, model_id: str | int, *, mode: str = "track"
+) -> list[str]:
+    """Prefer the requested P4 ID, then permit only one compatible fallback.
+
+    The platform ID is selection metadata, not an integrity assertion.  Exact
+    same-ID paths are deliberately returned without pre-validating their
+    payload: after a loader selects an existing exact file, a bad payload must
+    fail hard instead of silently falling through to a different checkpoint.
+    Discovery is different: it is used only when the requested ID has no P4
+    files, so every returned discovery candidate is structurally compatible
+    with the requested eval mode and ambiguity is an error.
+    """
     candidates = p4_nav_checkpoint_candidates(path, model_id)
     if any(os.path.isfile(candidate) for candidate in candidates):
         return candidates
-    discovered = _p4_nav_discovery_candidates(path)
+    discovered = _p4_nav_discovery_candidates(path, mode=mode)
     if len(discovered) > 1:
         raise RuntimeError(
             "P4 eval checkpoint discovery is ambiguous; configure model ID. "
@@ -679,46 +730,108 @@ def p4_nav_eval_candidates(path: str, model_id: str | int) -> list[str]:
 
 
 def validate_p4_eval_bundle(bundle: dict[str, Any], *, mode: str) -> dict[str, Any]:
-    """Layered P3/P4 validator used by Standard and Track evaluation."""
-    if not isinstance(bundle, dict) or bundle.get("stage_type") != "p4_nav_ppo":
+    """Validate a P4 package for low-level Standard or full Track evaluation.
+
+    Standard consumes only the frozen low-level modules.  It intentionally
+    does not constrain the P4 high-level command contract, so an otherwise
+    valid P4 low-level package remains usable when a Track command contract
+    evolves.  Track consumes the high-level policy and therefore requires the
+    complete active R4 inputfix contract.
+    """
+    if not isinstance(bundle, dict) or not is_kaiwu_train_bundle(bundle):
+        raise ValueError("P4 evaluation requires a kaiwu_train_v1 checkpoint")
+    if bundle.get("stage_type") != "p4_nav_ppo":
         raise ValueError(
             "P4 evaluation requires stage_type='p4_nav_ppo', got "
-            f"{getattr(bundle, 'get', lambda *_: None)('stage_type')!r}"
+            f"{bundle.get('stage_type')!r}"
         )
-    phase = bundle.get("phase_label")
-    phase_known = isinstance(phase, str) and phase in P4_NAV_PHASE_LABELS
-    command = (bundle.get("contracts", {}).get("command") or {})
-    if command.get("mapper_version") != "p4_capability_action_mapper_v1":
-        raise ValueError("P4 evaluation action mapper contract mismatch")
-    transition_mode = command.get("command_transition_mode", "slew")
-    if transition_mode == "instant_hold_10hz":
-        if command.get("version") != "p4_maze_instant_command_r4":
-            raise ValueError("P4 instant evaluation command version mismatch")
-        if int(command.get("hold_frames", 0)) != 5:
-            raise ValueError("P4 instant evaluation requires hold_frames=5")
-        if int(command.get("nav_period_frames", 0)) != 5:
-            raise ValueError("P4 instant evaluation requires nav_period_frames=5")
-        if "slew_rate" in command or "slew_release_rate" in command:
-            raise ValueError("P4 instant evaluation contract must not contain slew rates")
-    elif transition_mode == "slew":
-        if "slew_rate" not in command or "slew_release_rate" not in command:
-            raise ValueError("P4 slew evaluation contract is missing slew rates")
-    else:
-        raise ValueError(
-            f"P4 evaluation command transition mode unsupported: {transition_mode!r}"
-        )
-    # Reuse the structural low/high leaf validator without making P4 pretend
-    # that P3 is the only accepted stage family.
+    if mode not in {"standard", "track"}:
+        raise ValueError(f"P4 eval mode must be 'standard' or 'track', got {mode!r}")
+
+    phase_label = bundle.get("phase_label")
+    phase_label_known = isinstance(phase_label, str) and phase_label in P4_NAV_PHASE_LABELS
+    command = (bundle.get("contracts") or {}).get("command")
+    command_digest = _p4_command_digest(command)
+    if mode == "track":
+        _validate_p4_track_command_contract(command)
+
+    # P4 has the same frozen low-level and complete Track module shapes as P3.
+    # Reuse those leaf checks without making P4 identity or phase a P3 gate.
     structural = dict(bundle)
     structural["stage_type"] = "p3_standard_joint"
     structural["phase_label"] = P3_STANDARD_JOINT_PHASE_LABELS[-1]
     disposition = validate_p3_eval_bundle(structural, mode=mode)
     disposition.update(
         stage_type="p4_nav_ppo",
-        phase_label=phase,
-        phase_label_known=phase_known,
+        phase_label=phase_label,
+        phase_label_known=phase_label_known,
+        command_digest=command_digest,
     )
     return disposition
+
+
+def p4_eval_selection_metadata(
+    path: str,
+    bundle: dict[str, Any],
+    *,
+    requested_model_id: str | int,
+) -> dict[str, str | None]:
+    """Return log-ready identity/integrity metadata after eval validation.
+
+    The loader owns emission, but this helper makes the selected filename,
+    payload ID, phase, canonical command digest and on-disk SHA256 explicit.
+    """
+    return {
+        "selected_path": os.path.abspath(path),
+        "requested_model_id": str(requested_model_id),
+        "payload_id": _checkpoint_filename_model_id(path),
+        "phase_label": _optional_string(bundle.get("phase_label")),
+        "command_digest": _p4_command_digest(
+            ((bundle.get("contracts") or {}).get("command"))
+        ),
+        "sha256": _file_sha256(path),
+    }
+
+
+def _validate_p4_track_command_contract(command: Any) -> None:
+    if not isinstance(command, dict):
+        raise ValueError("P4 Track evaluation missing command contract")
+    for field, expected in P4_INSTANT_COMMAND_R4_INPUTFIX_CONTRACT.items():
+        if command.get(field) != expected:
+            raise ValueError(
+                "P4 Track evaluation command contract mismatch: "
+                f"{field}={command.get(field)!r}, expected={expected!r}"
+            )
+    forbidden = {"slew_rate", "slew_release_rate"}.intersection(command)
+    if forbidden:
+        raise ValueError(
+            "P4 Track instant command contract must not contain "
+            f"slew fields: {sorted(forbidden)}"
+        )
+
+
+def _p4_command_digest(command: Any) -> str | None:
+    if not isinstance(command, dict):
+        return None
+    encoded = json.dumps(command, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _checkpoint_filename_model_id(path: str) -> str | None:
+    match = re.match(r"^model\.ckpt-[a-z]+-(\d+)\.[^.]+$", os.path.basename(path))
+    return match.group(1) if match else None
+
+
+def _optional_string(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
 
 
 def low_level_only_parent_candidates(path: str, model_id: str | int) -> list[str]:
