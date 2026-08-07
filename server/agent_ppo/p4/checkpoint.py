@@ -31,6 +31,8 @@ from agent_ppo.p4.profiles import (
     PROFILE_MAZE_CREDIT_REPAIR,
     PROFILE_MAZE_INSTANT_COMMAND_R4,
     PROFILE_MAZE_INSTANT_REPAIR2H,
+    PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+    PROFILE_MAZE_STABLE_DIRECTION_8H,
     get_training_profile,
 )
 
@@ -315,19 +317,7 @@ class P4CheckpointMixin:
         if isinstance(high_state, dict):
             warm_schedule = p4_contract.training_schedule(
                 0.0,
-                branch=(
-                    "instant_command_r4"
-                    if self.training_profile == PROFILE_MAZE_INSTANT_COMMAND_R4
-                    else (
-                        "instant_repair2h"
-                        if self.training_profile == PROFILE_MAZE_INSTANT_REPAIR2H
-                        else (
-                            "closed_loop_v3"
-                            if self.training_profile == PROFILE_MAZE_CLOSED_LOOP_V3
-                            else ("credit_repair" if maze_profile else "actor_attack")
-                        )
-                    )
-                ),
+                branch=get_training_profile(self.training_profile).schedule_branch,
             )
             inherited_seconds = max(
                 0.0,
@@ -413,9 +403,17 @@ class P4CheckpointMixin:
             saved_scope = global_state.get("train_scope")
             expected_scope = (
                 (
-                    "maze_instant_repair2h_actor_critic_adapter_calibration"
-                    if self.training_profile == PROFILE_MAZE_INSTANT_REPAIR2H
-                    else "maze_instant_command_r4_actor_critic_adapter_calibration"
+                    "stable_direction_actor_critic_calibration"
+                    if self.training_profile
+                    in {
+                        PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+                        PROFILE_MAZE_STABLE_DIRECTION_8H,
+                    }
+                    else (
+                        "maze_instant_repair2h_actor_critic_adapter_calibration"
+                        if self.training_profile == PROFILE_MAZE_INSTANT_REPAIR2H
+                        else "maze_instant_command_r4_actor_critic_adapter_calibration"
+                    )
                 )
                 if self.training_profile in self.INSTANT_PROFILES
                 else (
@@ -1043,9 +1041,17 @@ class P4CheckpointMixin:
             payload["modules"]["high_level"]["parent_actor_anchor"] = parent_anchor_leaf
         payload["training_states"]["global"]["train_scope"] = (
             (
-                "maze_instant_repair2h_actor_critic_adapter_calibration"
-                if self.training_profile == PROFILE_MAZE_INSTANT_REPAIR2H
-                else "maze_instant_command_r4_actor_critic_adapter_calibration"
+                "stable_direction_actor_critic_calibration"
+                if self.training_profile
+                in {
+                    PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+                    PROFILE_MAZE_STABLE_DIRECTION_8H,
+                }
+                else (
+                    "maze_instant_repair2h_actor_critic_adapter_calibration"
+                    if self.training_profile == PROFILE_MAZE_INSTANT_REPAIR2H
+                    else "maze_instant_command_r4_actor_critic_adapter_calibration"
+                )
             )
             if self.training_profile in self.INSTANT_PROFILES
             else (

@@ -27,6 +27,8 @@ from agent_ppo.p4.profiles import (
     PROFILE_MAZE_CREDIT_REPAIR,
     PROFILE_MAZE_INSTANT_COMMAND_R4,
     PROFILE_MAZE_INSTANT_REPAIR2H,
+    PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+    PROFILE_MAZE_STABLE_DIRECTION_8H,
     get_training_profile,
 )
 
@@ -46,10 +48,14 @@ class AlgorithmP4NavPPO(
         PROFILE_MAZE_CLOSED_LOOP_V3,
         PROFILE_MAZE_INSTANT_COMMAND_R4,
         PROFILE_MAZE_INSTANT_REPAIR2H,
+        PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+        PROFILE_MAZE_STABLE_DIRECTION_8H,
     }
     INSTANT_PROFILES = {
         PROFILE_MAZE_INSTANT_COMMAND_R4,
         PROFILE_MAZE_INSTANT_REPAIR2H,
+        PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+        PROFILE_MAZE_STABLE_DIRECTION_8H,
     }
 
     def __init__(self, *args, **kwargs):
@@ -479,6 +485,8 @@ class AlgorithmP4NavPPO(
             PROFILE_MAZE_CLOSED_LOOP_V3,
             PROFILE_MAZE_INSTANT_COMMAND_R4,
             PROFILE_MAZE_INSTANT_REPAIR2H,
+            PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+            PROFILE_MAZE_STABLE_DIRECTION_8H,
         }
         context = self._frame_stuck_context(pending, aux, reset, safe3)
         masks = self._frame_teacher_masks(

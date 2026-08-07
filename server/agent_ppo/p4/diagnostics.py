@@ -18,6 +18,8 @@ from agent_ppo.p4.profiles import (
     PROFILE_MAZE_CREDIT_REPAIR,
     PROFILE_MAZE_INSTANT_COMMAND_R4,
     PROFILE_MAZE_INSTANT_REPAIR2H,
+    PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+    PROFILE_MAZE_STABLE_DIRECTION_8H,
 )
 from agent_ppo.p4.primitives import safety_scene_diagnostics
 
@@ -35,6 +37,8 @@ DIAGNOSTIC_SPECS = MappingProxyType(
         PROFILE_MAZE_CLOSED_LOOP_V3: DiagnosticSpec(True, False),
         PROFILE_MAZE_INSTANT_COMMAND_R4: DiagnosticSpec(True, False),
         PROFILE_MAZE_INSTANT_REPAIR2H: DiagnosticSpec(True, False),
+        PROFILE_MAZE_STABLE_DIRECTION_SMOKE: DiagnosticSpec(True, False),
+        PROFILE_MAZE_STABLE_DIRECTION_8H: DiagnosticSpec(True, False),
     }
 )
 

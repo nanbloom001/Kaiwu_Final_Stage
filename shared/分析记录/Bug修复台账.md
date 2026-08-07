@@ -4732,3 +4732,29 @@
 - 关联分支：`codex/p4-engineered-baseline`；父模型 `p4maze8h10hz_1416926-mazefinal`；当前平台
   任务、模型 ID、checkpoint 和 PR：不适用。回滚为撤销本条条件分支；再次遇到时先打印
   `cnn_unfrozen/rollout.store_depth`，不要降低环境数或关闭 compact storage 掩盖问题。
+
+## BUG-20260808-001：P4 Maze 方向教师长期停留在 shadow，PPO 实际不学习安全出口选择
+
+- 日期：2026-08-08；状态：代码已修复待验证；影响范围：P4 单段 Maze 稳定方向 smoke/8h
+  训练 profile。旧 profile 的行为合同保持不变。
+- 用户可见症状：监控中 `missed_safe_direction`、`goal_safe_preference`、
+  `yaw_exit_response` 的 raw/eligible 信号存在，但实际 PPO reward 长期为 0，导致
+  `head_correct_actor_wrong`、风险未减速和错误侧向替代转向没有直接策略梯度。
+- 根因：P4 reward spec 将三项方向信号固定放在 shadow 集合；既有 safety cap 也没有覆盖
+  这些项，因此面板无法区分“没有资格结算”和“资格存在但合同禁用”。
+- 修复：新增 `maze_stable_direction_smoke`（1800s）和 `maze_stable_direction_8h`
+  （28800s）活动 profile；只对安全教师有效、目标新鲜、存在明确安全出口且非 terminal/reset/grace
+  的 transition 启用三项负奖励。安全组从前 30 分钟 `-0.01/tick` 渐进到 `-0.02/tick`，按比例
+  缩放，不产生正奖励、不覆盖动作。PPO 分解现在同时记录 eligible、applied 与 cap-hit，
+  并要求分解和等于 storage reward。
+- 排除方向：未改变 Actor85、Critic 输入、动作范围、instant command、低层/视觉/Adapter 权重
+  或平台 `BaseEnv`；旧 profile 仍保留 shadow 语义。
+- 本地验证：定向 P4 profile/contract/reward/architecture 回归 `54 passed`，Python 编译通过。
+  容器同步、1/8-env smoke、固定种子父模型对比和平台任务尚未执行，不能据此宣称成功率或碰撞率
+  已改善。
+- 关联分支：`codex/p4maze-stable-direction`；父基线 `codex/p4-engineered-baseline`；
+  任务名 `p4maze30m-stable-smoke` / `p4maze8h-stable-direction`；代码 commit `d64a21e`；
+  checkpoint、SHA256、平台任务和 PR：待生成。回滚方式：恢复 stable profile 之前的配置或回到父分支。
+- 后续最短检查路径：先确认 `reward_*_eligible` 非零且 `reward_*_applied` 非零，再检查
+  cap-hit、reward conservation 和 target→exec 链；若 applied 仍为零，优先查 profile 合同
+  是否正确加载，不先增大学习率或修改动作 limiter。

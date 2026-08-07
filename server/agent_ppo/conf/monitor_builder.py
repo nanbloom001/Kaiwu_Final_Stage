@@ -1669,6 +1669,8 @@ def _build_p4_monitor(training_profile=None):
                 ("迷宫非重复进展", "p4_maze_credit", ("maze_new_best_credit", "maze_new_best_delta_m", "maze_new_best_episode_earned", "terminal_potential_clawback")),
                 ("安全原始项", "p4_safety_raw", ("reward_predictive_raw", "reward_missed_safe_raw", "reward_yaw_raw", "reward_goal_safe_raw", "reward_yaw_exit_raw")),
                 ("安全奖励应用与禁用核验", "p4_safety_applied", ("reward_predictive_collision_risk", "reward_missed_safe_direction", "reward_yaw_cancellation", "reward_yaw_exit_response", "reward_safety_group_scale", "reward_stuck_sustained", "reward_goal_safe_preference", "reward_stuck_reset", "reward_continuous_time_scale")),
+                ("稳定方向奖励资格", "p4_stable_direction_eligibility", ("reward_missed_safe_eligible", "reward_goal_safe_eligible", "reward_yaw_exit_eligible", "reward_safety_group_cap_hit", "teacher_valid_steps")),
+                ("稳定方向实际应用", "p4_stable_direction_applied", ("reward_missed_safe_applied", "reward_goal_safe_applied", "reward_yaw_exit_applied", "reward_safety_group_scale", "reward_predictive_collision_risk")),
                 ("Frontier停滞实际与Shadow", "p4_frontier_stagnation", ("reward_frontier_stagnation", "reward_frontier_stagnation_shadow")),
                 ("奖励守恒", "p4_reward_conservation", ("reward_decomposed_total", "rollout_reward_mean", "reward_conservation_error")),
                 ("命令变化逐轴贡献", "p4_command_rate_axes", ("reward_command_rate_vx", "reward_command_rate_vy", "reward_command_rate_wz", "reward_command_rate_vy_positive", "reward_command_rate_vy_negative", "reward_command_rate_wz_positive", "reward_command_rate_wz_negative")),

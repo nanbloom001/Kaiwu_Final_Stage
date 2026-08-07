@@ -13,19 +13,47 @@ from agent_ppo.p4.runtime import (
 from agent_ppo.p4.primitives import (
     adapter_compatibility_metric_name, teacher_guidance_mask, privileged_safe_directions5, teacher_guidance_loss, instant_r4_teacher_masks, instant_r4_teacher_guidance_loss,
 )
-from agent_ppo.p4.rewards import (
-    soft_cruise_penalty, sustained_wall_stuck_penalty, maze_new_best_credit, goal_safe_direction_penalty, yaw_exit_response_penalty, route_excess_penalty, segment_frontier_potential, track_boundary_distance_m, open_straight_penalty, yaw_cancellation, proportional_negative_cap, maze_missed_safe_direction_penalty,
-)
-from agent_ppo.p4.diagnostics import (
-    safety_scene_diagnostics,
-)
-from agent_ppo.p4.training import (
-    push_phase_config, camera_mix, safe_direction_weight, training_schedule,
-)
+from agent_ppo.p4.primitives import safety_scene_diagnostics
 from agent_ppo.p4.contracts import (
     normalize_stuck_reset_contract, stable_digest, adapter_record_contract,
 )
 from agent_ppo.p4.profiles import LEGACY_COMPATIBILITY_DEFAULT
+
+_LAZY_REWARD_EXPORTS = frozenset(
+    {
+        "soft_cruise_penalty",
+        "sustained_wall_stuck_penalty",
+        "maze_new_best_credit",
+        "goal_safe_direction_penalty",
+        "yaw_exit_response_penalty",
+        "route_excess_penalty",
+        "segment_frontier_potential",
+        "track_boundary_distance_m",
+        "open_straight_penalty",
+        "yaw_cancellation",
+        "proportional_negative_cap",
+        "maze_missed_safe_direction_penalty",
+    }
+)
+_LAZY_TRAINING_EXPORTS = frozenset(
+    {"push_phase_config", "camera_mix", "safe_direction_weight", "training_schedule"}
+)
+
+
+def __getattr__(name: str):
+    if name in _LAZY_REWARD_EXPORTS:
+        from agent_ppo.p4 import rewards
+
+        value = getattr(rewards, name)
+        globals()[name] = value
+        return value
+    if name in _LAZY_TRAINING_EXPORTS:
+        from agent_ppo.p4 import training
+
+        value = getattr(training, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 for _name in _constants.__all__:
     globals()[_name] = getattr(_constants, _name)
@@ -34,7 +62,7 @@ del _name
 MONITOR_REQUIRED_METRICS = (
     'session_wall_seconds', 'session_effective_seconds', 'teacher_guidance_loss', 'teacher_direction_loss',
     'teacher_speed_loss', 'teacher_yaw_loss', 'teacher_edge_loss', 'teacher_edge_active_share',
-    'teacher_recovery_loss', 'teacher_recovery_active_share', 'teacher_stale_goal_loss', 'teacher_stale_goal_active_share',
+    'teacher_recovery_loss', 'teacher_recovery_active_share', 'teacher_stale_goal_loss', 'teacher_stale_goal_active_share', 'teacher_valid_steps',
     'teacher_near_goal_loss', 'teacher_near_goal_active_share', 'teacher_guidance_valid_steps', 'teacher_guidance_gradient_ratio',
     'mirror_aux_gradient_ratio', 'mirror_aux_sequence_share', 'mirror_aux_eligible_sequence_count', 'mirror_aux_scheduled_sequence_share',
     'stuck_aux_gradient_ratio', 'stuck_aux_loss', 'stuck_aux_valid_steps', 'auxiliary_gradient_ratio',
@@ -81,6 +109,8 @@ MONITOR_REQUIRED_METRICS = (
     'yaw_true_cancellation', 'yaw_exec_sign_flip', 'yaw_true_sign_flip', 'yaw_true_overshoot',
     'reward_predictive_raw', 'reward_missed_safe_raw', 'reward_yaw_raw', 'reward_continuous_time_scale',
     'reward_predictive_collision_risk', 'reward_missed_safe_direction', 'reward_yaw_cancellation', 'reward_safety_group_scale',
+    'reward_missed_safe_eligible', 'reward_goal_safe_eligible', 'reward_yaw_exit_eligible',
+    'reward_missed_safe_applied', 'reward_goal_safe_applied', 'reward_yaw_exit_applied', 'reward_safety_group_cap_hit',
     'reward_decomposed_total', 'reward_conservation_error', 'camera_frame_id', 'camera_capture',
     'camera_frame_changed', 'camera_age_s', 'camera_raw_hole_rate', 'camera_near_clip_added_hole_rate',
     'camera_delivered_hole_rate', 'camera_center_hole_rate', 'camera_lower_hole_rate', 'near_clip_m',

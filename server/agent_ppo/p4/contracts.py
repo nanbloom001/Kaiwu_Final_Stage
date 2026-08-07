@@ -13,6 +13,8 @@ from agent_ppo.p4.profiles import (
     PROFILE_FULL_TRACK,
     PROFILE_MAZE_CLOSED_LOOP_V3,
     PROFILE_MAZE_CREDIT_REPAIR,
+    PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+    PROFILE_MAZE_STABLE_DIRECTION_8H,
     get_training_profile,
 )
 
@@ -23,6 +25,13 @@ def stable_digest(value: Any) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_stable_direction(profile: str) -> bool:
+    return profile in {
+        PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+        PROFILE_MAZE_STABLE_DIRECTION_8H,
+    }
 
 
 def _normalize_profile_argument(
@@ -244,6 +253,7 @@ def _build_command_contract(
 def _reward_new_terms_part_1(
     profile, closed_loop, instant_command, instant_repair, stuck, stuck_term
 ) -> dict[str, Any]:
+    stable_direction = _is_stable_direction(profile)
     return {
         "predictive_collision_raw_floor": PREDICTIVE_RAW_FLOOR,
         "predictive_collision_scale": PREDICTIVE_COLLISION_SCALE,
@@ -272,7 +282,14 @@ def _reward_new_terms_part_1(
             else LEGACY_SAFETY_GROUP_FLOOR
         ),
         "safety_group_terms": (
-            ["predictive_collision"]
+            [
+                "predictive_collision",
+                "missed_safe_direction",
+                "goal_safe_preference",
+                "yaw_exit_response",
+            ]
+            if stable_direction
+            else ["predictive_collision"]
             if closed_loop or instant_command
             else [
                 "predictive_collision",
@@ -299,6 +316,7 @@ def _reward_new_terms_part_1(
 def _reward_new_terms_part_2(
     profile, closed_loop, instant_command, instant_repair, stuck, stuck_term
 ) -> dict[str, Any]:
+    stable_direction = _is_stable_direction(profile)
     return {
         "success_impulse": SUCCESS_IMPULSE,
         **(
@@ -503,9 +521,12 @@ def _training_contract_part_1(
     profile_spec,
     serialized_stuck,
 ) -> dict[str, Any]:
+    stable_direction = _is_stable_direction(profile)
     return {
         "version": (
-            INSTANT_REPAIR_CHECKPOINT_CONTRACT_VERSION
+            "p4_maze_stable_direction_v1"
+            if stable_direction
+            else INSTANT_REPAIR_CHECKPOINT_CONTRACT_VERSION
             if instant_repair
             else (
                 INSTANT_COMMAND_CHECKPOINT_CONTRACT_VERSION
@@ -539,9 +560,19 @@ def _training_contract_part_1(
         **(
             {
                 "checkpoint_phase_labels": list(
-                    INSTANT_REPAIR_PHASE_LABELS
-                    if instant_repair
-                    else INSTANT_COMMAND_PHASE_LABELS
+                    (
+                        [
+                            "stable_warm",
+                            "stable_early",
+                            "stable_mid",
+                            "stable_late",
+                            "stable_stabilize",
+                        ]
+                        if stable_direction
+                        else INSTANT_REPAIR_PHASE_LABELS
+                        if instant_repair
+                        else INSTANT_COMMAND_PHASE_LABELS
+                    )
                 )
             }
             if instant_command
@@ -549,7 +580,9 @@ def _training_contract_part_1(
         ),
         "safety_reward_ramp": {
             "version": (
-                INSTANT_REPAIR_REWARD_CONTRACT_VERSION
+                "p4_maze_reward_v6_stable_direction"
+                if stable_direction
+                else INSTANT_REPAIR_REWARD_CONTRACT_VERSION
                 if instant_repair
                 else (
                     INSTANT_COMMAND_REWARD_CONTRACT_VERSION
@@ -567,9 +600,13 @@ def _training_contract_part_1(
             ),
             "segments": [
                 {
-                    "seconds": [0, 7200 if instant_repair or legacy_maze else 28800],
+                    "seconds": [0, profile_spec.target_effective_seconds],
                     "weight": (
-                        [0.0, 0.0] if closed_loop or instant_command else [0.012, 0.012]
+                        [-0.01, -0.02]
+                        if stable_direction
+                        else [0.0, 0.0]
+                        if closed_loop or instant_command
+                        else [0.012, 0.012]
                     ),
                 }
             ],
@@ -591,7 +628,7 @@ def _training_contract_part_1(
             "segments": (
                 [
                     {
-                        "seconds": [0, 7200 if instant_repair else 28800],
+                        "seconds": [0, profile_spec.target_effective_seconds],
                         "multiplier": [0.0, 0.0],
                     }
                 ]
@@ -621,22 +658,25 @@ def _training_contract_part_2(
     profile_spec,
     serialized_stuck,
 ) -> dict[str, Any]:
+    stable_direction = _is_stable_direction(profile)
     return {
         "tbptt_nav_ticks": 16,
         "nav_period_frames": P4_NAV_PERIOD_FRAMES,
         "nav_frequency_hz": 1.0 / P4_NAV_DT_S,
         "frozen_low_level": ["cnn", "lstm", "actor", "std", "critic"],
         "trainable": (
-            [
-                "high_actor_lstm",
-                "high_actor_head",
-                "high_critic",
-                (
-                    "response_adapter_phase_5m_to_90m_only"
-                    if instant_repair
-                    else "response_adapter_phase_30m_to_2h_only"
-                ),
-            ]
+            ["high_actor_lstm", "high_actor_head", "high_critic"]
+            + (
+                []
+                if stable_direction
+                else [
+                    (
+                        "response_adapter_phase_5m_to_90m_only"
+                        if instant_repair
+                        else "response_adapter_phase_30m_to_2h_only"
+                    )
+                ]
+            )
             if instant_command
             else (
                 ["high_actor_lstm", "high_actor_head", "high_critic"]
@@ -657,15 +697,19 @@ def _training_contract_part_2(
             )
         ),
         "frozen_high_level": (
-            ["navigation_encoder", "safety_head", "stuck_head"]
-            if instant_command
+            ["navigation_encoder", "safety_head", "stuck_head", "response_adapter"]
+            if stable_direction
             else (
-                ["navigation_encoder", "safety_head", "stuck_head", "response_adapter"]
-                if closed_loop
+                ["navigation_encoder", "safety_head", "stuck_head"]
+                if instant_command
                 else (
-                    ["navigation_encoder", "safety_head", "response_adapter"]
-                    if legacy_maze
-                    else []
+                    ["navigation_encoder", "safety_head", "stuck_head", "response_adapter"]
+                    if closed_loop
+                    else (
+                        ["navigation_encoder", "safety_head", "response_adapter"]
+                        if legacy_maze
+                        else []
+                    )
                 )
             )
         ),
@@ -689,12 +733,16 @@ def _training_contract_part_2(
             else ADAPTER_RECORD_CONTRACT_VERSION
         ),
         "adapter_replay_policy": (
-            "instant_compatible_current_only_parent_ratio_0"
-            if instant_repair
+            "frozen_no_adapter_update"
+            if stable_direction
             else (
-                "p4_compatible_50_25_25"
-                if instant_command
-                else "legacy_profile_default"
+                "instant_compatible_current_only_parent_ratio_0"
+                if instant_repair
+                else (
+                    "p4_compatible_50_25_25"
+                    if instant_command
+                    else "legacy_profile_default"
+                )
             )
         ),
     }
@@ -841,6 +889,7 @@ def _training_contract_part_6(
     profile_spec,
     serialized_stuck,
 ) -> dict[str, Any]:
+    stable_direction = _is_stable_direction(profile)
     return {
         "track_segment_labels": (
             ["maze"] if maze_profile else list(FULL_TRACK_SEGMENT_LABELS)
@@ -869,7 +918,9 @@ def _training_contract_part_6(
         },
         "soft_cruise": command_contract(profile)["soft_cruise"],
         "exact_resume": (
-            "p4_maze_instant_repair2h_v1_only"
+            "p4_maze_stable_direction_v1_only"
+            if stable_direction
+            else "p4_maze_instant_repair2h_v1_only"
             if instant_repair
             else (
                 "p4_maze_instant_command_r4_inputfix_only"
@@ -893,6 +944,7 @@ def _build_reward_contract(
     training_profile: str = PROFILE_MAZE_CREDIT_REPAIR,
 ) -> dict[str, Any]:
     profile = _profile_registry.normalize_training_profile(training_profile)
+    stable_direction = _is_stable_direction(profile)
     closed_loop = profile == PROFILE_MAZE_CLOSED_LOOP_V3
     instant_command = _profile_registry.is_instant_profile(profile)
     profile_spec = _profile_registry.get_training_profile(profile)
@@ -937,9 +989,35 @@ def _build_reward_contract(
             "stuck_sustained",
         ]
         contract["nonterminal_positive_shaping_cap"] = MAZE_NEW_BEST_EPISODE_CAP
-        contract["new_terms"]["missed_safe_direction"] = "shadow_only_zero_ppo_weight"
-        contract["new_terms"]["goal_safe_preference"] = "shadow_only_zero_ppo_weight"
-        contract["new_terms"]["yaw_exit_response"] = "shadow_only_zero_ppo_weight"
+        if stable_direction:
+            contract["reward_allowlist"].extend(
+                [
+                    "missed_safe_direction",
+                    "goal_safe_preference",
+                    "yaw_exit_response",
+                ]
+            )
+            contract["new_terms"]["missed_safe_direction"] = {
+                "status": "active_negative_ppo_reward",
+                "eligibility": "teacher_valid_moving_clear_alternative_nonterminal",
+            }
+            contract["new_terms"]["goal_safe_preference"] = {
+                "status": "active_negative_ppo_reward",
+                "eligibility": "fresh_goal_only_among_safe_exits",
+            }
+            contract["new_terms"]["yaw_exit_response"] = {
+                "status": "active_negative_ppo_reward",
+                "eligibility": "fresh_goal_clear_side_exit_nonterminal",
+            }
+            contract["safety_group_cap"] = {
+                "seconds": [0, 1800, profile_spec.target_effective_seconds],
+                "floor": [-0.01, -0.02],
+                "semantics": "proportional_cap_no_positive_shaping",
+            }
+        else:
+            contract["new_terms"]["missed_safe_direction"] = "shadow_only_zero_ppo_weight"
+            contract["new_terms"]["goal_safe_preference"] = "shadow_only_zero_ppo_weight"
+            contract["new_terms"]["yaw_exit_response"] = "shadow_only_zero_ppo_weight"
         contract["new_terms"]["soft_cruise"]["status"] = "disabled"
     if profile == PROFILE_FULL_TRACK:
         contract["new_terms"]["maze_new_best_credit"] = {

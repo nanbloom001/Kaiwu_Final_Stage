@@ -17,6 +17,8 @@ PROFILE_FULL_TRACK = "full_track"
 PROFILE_MAZE_CREDIT_REPAIR = "maze_credit_repair"
 PROFILE_MAZE_CLOSED_LOOP_V3 = "maze_closed_loop_v3"
 PROFILE_MAZE_INSTANT_COMMAND_R4 = "maze_instant_command_r4"
+PROFILE_MAZE_STABLE_DIRECTION_SMOKE = "maze_stable_direction_smoke"
+PROFILE_MAZE_STABLE_DIRECTION_8H = "maze_stable_direction_8h"
 
 
 @dataclass(frozen=True)
@@ -143,6 +145,52 @@ _PROFILE_SPECS = (
         checkpoint_boundaries_seconds=(
             1_800.0,
             7_200.0,
+            21_600.0,
+            28_800.0,
+        ),
+    ),
+    TrainingProfileSpec(
+        name=PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+        allowed_modes=_ALL_MODES,
+        maze_only=True,
+        instant_command=True,
+        schedule_branch="stable_direction_smoke",
+        wall_stuck_precedes_success=False,
+        run_name="p4maze30m-stable-smoke",
+        training_hours=0.5,
+        target_effective_seconds=1_800,
+        task_end_hours=0.75,
+        required_platform_wall_seconds=2_700,
+        schedule_boundaries_seconds=(300.0, 1_800.0),
+        checkpoint_boundaries_seconds=(300.0, 900.0, 1_800.0),
+    ),
+    TrainingProfileSpec(
+        name=PROFILE_MAZE_STABLE_DIRECTION_8H,
+        allowed_modes=_ALL_MODES,
+        maze_only=True,
+        instant_command=True,
+        schedule_branch="stable_direction_8h",
+        wall_stuck_precedes_success=False,
+        run_name="p4maze8h-stable-direction",
+        training_hours=8.0,
+        target_effective_seconds=28_800,
+        task_end_hours=8.25,
+        required_platform_wall_seconds=29_700,
+        schedule_boundaries_seconds=(
+            600.0,
+            3_600.0,
+            10_800.0,
+            21_600.0,
+            28_800.0,
+        ),
+        checkpoint_boundaries_seconds=(
+            300.0,
+            900.0,
+            1_800.0,
+            3_600.0,
+            5_400.0,
+            7_200.0,
+            10_800.0,
             21_600.0,
             28_800.0,
         ),
@@ -283,3 +331,12 @@ def is_maze_profile(training_profile: str) -> bool:
 
 def is_instant_profile(training_profile: str) -> bool:
     return get_training_profile(training_profile).instant_command
+
+
+STABLE_DIRECTION_PROFILES = frozenset(
+    {PROFILE_MAZE_STABLE_DIRECTION_SMOKE, PROFILE_MAZE_STABLE_DIRECTION_8H}
+)
+
+
+def is_stable_direction_profile(training_profile: str) -> bool:
+    return normalize_training_profile(training_profile) in STABLE_DIRECTION_PROFILES

@@ -11,7 +11,12 @@ from agent_ppo.p4.legacy_profiles import LEGACY_PROFILE_REGISTRY
 
 def test_registry_exposes_only_two_active_train_profiles():
     assert profiles.ACTIVE_TRAIN_PROFILES == frozenset(
-        {"maze_instant_repair2h", "full_track"}
+        {
+            "maze_instant_repair2h",
+            "full_track",
+            "maze_stable_direction_smoke",
+            "maze_stable_direction_8h",
+        }
     )
     assert profiles.LEGACY_PROFILE_NAMES == frozenset(
         {
@@ -75,6 +80,18 @@ def test_active_profile_specs_own_runtime_clock_and_boundaries():
     assert full_track.wall_stuck_precedes_success is True
     assert full_track.schedule_boundaries_seconds[-1] == 28_800.0
     assert full_track.checkpoint_boundaries_seconds[-1] == 28_800.0
+
+    smoke = profiles.require_training_profile("maze_stable_direction_smoke")
+    assert smoke.run_name == "p4maze30m-stable-smoke"
+    assert smoke.target_effective_seconds == 1_800
+    assert smoke.task_end_hours == 0.75
+    assert smoke.schedule_branch == "stable_direction_smoke"
+
+    stable = profiles.require_training_profile("maze_stable_direction_8h")
+    assert stable.run_name == "p4maze8h-stable-direction"
+    assert stable.target_effective_seconds == 28_800
+    assert stable.task_end_hours == 8.25
+    assert stable.schedule_branch == "stable_direction_8h"
 
 
 @pytest.mark.parametrize("profile", sorted(profiles.PROFILE_REGISTRY))

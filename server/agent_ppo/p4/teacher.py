@@ -16,6 +16,8 @@ from agent_ppo.p4.profiles import (
     PROFILE_MAZE_CLOSED_LOOP_V3,
     PROFILE_MAZE_INSTANT_COMMAND_R4,
     PROFILE_MAZE_INSTANT_REPAIR2H,
+    PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+    PROFILE_MAZE_STABLE_DIRECTION_8H,
 )
 
 
@@ -295,6 +297,8 @@ class P4TeacherMixin:
                     PROFILE_MAZE_CLOSED_LOOP_V3,
                     PROFILE_MAZE_INSTANT_COMMAND_R4,
                     PROFILE_MAZE_INSTANT_REPAIR2H,
+                    PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+                    PROFILE_MAZE_STABLE_DIRECTION_8H,
                 }
                 else batch["teacher_safe3"]
             )
@@ -408,6 +412,8 @@ class P4TeacherMixin:
                 PROFILE_MAZE_CLOSED_LOOP_V3,
                 PROFILE_MAZE_INSTANT_COMMAND_R4,
                 PROFILE_MAZE_INSTANT_REPAIR2H,
+                PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+                PROFILE_MAZE_STABLE_DIRECTION_8H,
             }
             if stuck_frozen:
                 # Keep frozen-head quality metrics without an Actor graph.

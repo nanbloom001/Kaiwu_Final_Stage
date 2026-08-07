@@ -598,6 +598,110 @@ def _full_track_schedule(seconds: float, branch: str) -> dict[str, float | str |
     }
 
 
+def _stable_direction_schedule(
+    seconds: float, branch: str, *, smoke: bool
+) -> dict[str, float | str | bool]:
+    """Conservative actor schedule for the closed-loop direction credit smoke.
+
+    The two runs deliberately share the same reward/command contract.  Only
+    the effective-clock horizon differs; the smoke therefore exercises the
+    exact same active terms as the eventual eight-hour run.
+    """
+    seconds = max(0.0, float(seconds))
+    common = {
+        "training_branch": branch,
+        "reward_multiplier": 1.0,
+        "goal_fault_multiplier": 0.0,
+        "camera_aux_ratio": 0.0,
+        "stuck_gradient_target_ratio": 0.0,
+        "mirror_sequence_share": 0.0,
+        "cruise_multiplier": 0.0,
+        "teacher_gradient_hard_cap": 0.02,
+        "auxiliary_gradient_hard_cap": 0.02,
+        "mirror_gradient_hard_cap": 0.0,
+        "navigation_multiplier": 0.0,
+        "safety_head_multiplier": 0.0,
+        "stuck_head_multiplier": 0.0,
+        "adapter_multiplier": 0.0,
+        "adapter_lr_override": 0.0,
+        "anchor_multiplier": 1.0,
+        "anchor_target_ratio": 0.005,
+        "mirror_gradient_target_ratio": 0.0,
+        "entropy_coefficient": 0.004,
+        "safety_group_floor": -0.01 if seconds < 1_800.0 else -0.02,
+    }
+    if smoke:
+        if seconds < 300.0:
+            return {
+                **common,
+                "phase": "stable_smoke_calibrate",
+                "actor_multiplier": 0.0,
+                "actor_lr": 0.0,
+                "critic_lr": 4.0e-5,
+                "critic_multiplier": 1.0,
+                "teacher_gradient_target_ratio": 0.0,
+            }
+        ratio = min(1.0, (seconds - 300.0) / 1_500.0)
+        return {
+            **common,
+            "phase": "stable_smoke_direction",
+            "actor_multiplier": 1.0,
+            "actor_lr": 1.0e-5,
+            "critic_lr": 4.0e-5,
+            "critic_multiplier": 1.0,
+            "teacher_gradient_target_ratio": 0.010 + 0.005 * ratio,
+        }
+    if seconds < 600.0:
+        return {
+            **common,
+            "phase": "stable_warm",
+            "actor_multiplier": 0.0,
+            "actor_lr": 0.0,
+            "critic_lr": 4.0e-5,
+            "critic_multiplier": 1.0,
+            "teacher_gradient_target_ratio": 0.0,
+        }
+    if seconds < 3_600.0:
+        return {
+            **common,
+            "phase": "stable_early",
+            "actor_multiplier": 1.0,
+            "actor_lr": 1.0e-5,
+            "critic_lr": 4.0e-5,
+            "critic_multiplier": 1.0,
+            "teacher_gradient_target_ratio": 0.010,
+        }
+    if seconds < 10_800.0:
+        return {
+            **common,
+            "phase": "stable_mid",
+            "actor_multiplier": 1.0,
+            "actor_lr": 7.5e-6,
+            "critic_lr": 3.0e-5,
+            "critic_multiplier": 0.75,
+            "teacher_gradient_target_ratio": 0.015,
+        }
+    if seconds < 21_600.0:
+        return {
+            **common,
+            "phase": "stable_late",
+            "actor_multiplier": 1.0,
+            "actor_lr": 5.0e-6,
+            "critic_lr": 2.0e-5,
+            "critic_multiplier": 0.5,
+            "teacher_gradient_target_ratio": 0.010,
+        }
+    return {
+        **common,
+        "phase": "stable_stabilize",
+        "actor_multiplier": 1.0,
+        "actor_lr": 2.5e-6,
+        "critic_lr": 1.0e-5,
+        "critic_multiplier": 0.25,
+        "teacher_gradient_target_ratio": 0.010,
+    }
+
+
 def training_schedule(
     session_effective_seconds: float,
     *,
@@ -614,10 +718,16 @@ def training_schedule(
         "closed_loop_v3",
         "instant_command_r4",
         "instant_repair2h",
+        "stable_direction_smoke",
+        "stable_direction_8h",
     }:
         branch = "actor_attack"
     if branch == "instant_repair2h":
         return _instant_repair_schedule(seconds, branch)
+    if branch == "stable_direction_smoke":
+        return _stable_direction_schedule(seconds, branch, smoke=True)
+    if branch == "stable_direction_8h":
+        return _stable_direction_schedule(seconds, branch, smoke=False)
     if branch == "instant_command_r4":
         return _instant_command_schedule(seconds, branch)
     if branch == "closed_loop_v3":

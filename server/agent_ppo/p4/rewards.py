@@ -29,6 +29,8 @@ from agent_ppo.p4.profiles import (
     PROFILE_MAZE_CREDIT_REPAIR,
     PROFILE_MAZE_INSTANT_COMMAND_R4,
     PROFILE_MAZE_INSTANT_REPAIR2H,
+    PROFILE_MAZE_STABLE_DIRECTION_SMOKE,
+    PROFILE_MAZE_STABLE_DIRECTION_8H,
 )
 
 
@@ -108,6 +110,15 @@ _LEGACY_SAFETY_CAP_COMPONENTS = frozenset(
 _SINGLE_SIGNAL_SAFETY_CAP_COMPONENTS = frozenset(
     {"predictive_collision_risk", "yaw_cancellation"}
 )
+_STABLE_DIRECTION_ENABLED = _SINGLE_SIGNAL_COMPONENTS | _DIRECTIONAL_COMPONENTS
+_STABLE_DIRECTION_SAFETY_CAP_COMPONENTS = frozenset(
+    {
+        "predictive_collision_risk",
+        "missed_safe_direction",
+        "goal_safe_preference",
+        "yaw_exit_response",
+    }
+)
 
 REWARD_SPECS = MappingProxyType(
     {
@@ -135,6 +146,16 @@ REWARD_SPECS = MappingProxyType(
             _SINGLE_SIGNAL_COMPONENTS,
             _SINGLE_SIGNAL_SHADOW_COMPONENTS,
             _SINGLE_SIGNAL_SAFETY_CAP_COMPONENTS,
+        ),
+        PROFILE_MAZE_STABLE_DIRECTION_SMOKE: RewardSpec(
+            _STABLE_DIRECTION_ENABLED,
+            _BASE_REWARD_COMPONENTS - _STABLE_DIRECTION_ENABLED,
+            _STABLE_DIRECTION_SAFETY_CAP_COMPONENTS,
+        ),
+        PROFILE_MAZE_STABLE_DIRECTION_8H: RewardSpec(
+            _STABLE_DIRECTION_ENABLED,
+            _BASE_REWARD_COMPONENTS - _STABLE_DIRECTION_ENABLED,
+            _STABLE_DIRECTION_SAFETY_CAP_COMPONENTS,
         ),
     }
 )
@@ -388,10 +409,13 @@ class P4RewardMixin:
                 active_yaw,
                 goal_safe_raw=active_goal_safe,
                 yaw_exit_raw=active_yaw_exit,
-                floor=(
-                    p4_contract.SAFETY_GROUP_FLOOR
-                    if single_signal_profile
-                    else p4_contract.LEGACY_SAFETY_GROUP_FLOOR
+                floor=float(
+                    schedule.get(
+                        "safety_group_floor",
+                        p4_contract.SAFETY_GROUP_FLOOR
+                        if single_signal_profile
+                        else p4_contract.LEGACY_SAFETY_GROUP_FLOOR,
+                    )
                 ),
             )
         )
@@ -426,6 +450,14 @@ class P4RewardMixin:
             "missed_shadow_raw": missed_shadow_raw,
             "goal_safe_shadow_raw": goal_safe_shadow_raw,
             "yaw_exit_shadow_raw": yaw_exit_shadow_raw,
+            "missed_applied": missed.detach(),
+            "goal_safe_applied": goal_safe.detach(),
+            "yaw_exit_applied": yaw_exit.detach(),
+            "safety_group_cap_hit": (scale < 0.999999).float().detach(),
+            "missed_eligible": missed_diagnostics.get(
+                "missed_safe_event_active",
+                torch.zeros_like(missed_raw),
+            ).detach(),
             "scale": scale,
             "missed_diagnostics": missed_diagnostics,
             "goal_safe_diag": goal_safe_diag,
@@ -812,13 +844,32 @@ class P4RewardMixin:
             "command_rate_axis_penalty": command_rate_axis_penalty,
         }
 
-    def _set_p4_reward_diagnostics(self, reward_context) -> None:
+    def _set_p4_reward_diagnostics(self, reward_context, components) -> None:
         self._p4_reward_diagnostics = {
             "reward_predictive_raw": reward_context["predictive_raw"].detach(),
             "reward_missed_safe_raw": reward_context["missed_shadow_raw"],
             "reward_yaw_raw": reward_context["yaw_raw"].detach(),
             "reward_goal_safe_raw": reward_context["goal_safe_shadow_raw"],
             "reward_yaw_exit_raw": reward_context["yaw_exit_shadow_raw"],
+            "reward_missed_safe_eligible": reward_context["missed_eligible"],
+            "reward_goal_safe_eligible": reward_context["goal_safe_diag"][
+                "goal_safe_preference_eligible"
+            ].detach(),
+            "reward_yaw_exit_eligible": reward_context["yaw_exit_diag"][
+                "yaw_exit_response_eligible"
+            ].detach(),
+            "reward_missed_safe_applied": components[
+                "missed_safe_direction"
+            ].detach(),
+            "reward_goal_safe_applied": components[
+                "goal_safe_preference"
+            ].detach(),
+            "reward_yaw_exit_applied": components[
+                "yaw_exit_response"
+            ].detach(),
+            "reward_safety_group_cap_hit": reward_context[
+                "safety_group_cap_hit"
+            ],
             "reward_continuous_time_scale": reward_context[
                 "continuous_time_scale"
             ].detach(),
@@ -958,7 +1009,7 @@ class P4RewardMixin:
         reward_context.update(
             self._tracking_reward_context(components, context, reward_context)
         )
-        self._set_p4_reward_diagnostics(reward_context)
+        self._set_p4_reward_diagnostics(reward_context, components)
         terminal = reward_context["terminal"]
         if bool(terminal.any()):
             self._segment_state_initialized[terminal] = False

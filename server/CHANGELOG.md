@@ -1140,3 +1140,11 @@
 - 阶段 5：通过 PR merge commit 合入 `main`，随后按分支登记执行带远程 SHA 复核的分支收敛。
 - 训练长跑与 Jetson 真机验证属于后续模型发布验收，不作为本次仓库布局合并的阻断条件。
 - **[P4 全赛道监控平台校验修复]** 五段出生覆盖和出生位置四分位面板移除平台不接受的中文括号，标题缩短到 20 字符以内；新增 P4 面板标题字符集和长度回归，避免单个非法标题导致平台跳过整份自定义监控配置。
+# 2026-08-08
+
+- **P4 stable-direction smoke/8h profiles**: 新增 `p4maze30m-stable-smoke` 和
+  `p4maze8h-stable-direction` 两个单段 Maze 活动 profile，保持 instant command、无
+  slew/limiter、shadow stuck reset 和冻结低层/视觉/Adapter。将此前仅作 shadow 的
+  `missed_safe_direction`、`goal_safe_preference`、`yaw_exit_response` 按严格 eligibility
+  纳入 PPO 负奖励，并加入 30 分钟安全组上限渐进、raw/eligible/applied/cap-hit 监控与
+  正负三轴执行链指标。Smoke 与正式长训分别从同一父 checkpoint warm start，不互相续训。
