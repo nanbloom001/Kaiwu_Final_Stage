@@ -179,6 +179,19 @@ class LocalCheckTests(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertIn("eligible files: 1", stdout.getvalue())
 
+    def test_collect_local_files_ignores_macos_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_dir = root / "agent_ppo"
+            source_dir.mkdir()
+            (source_dir / "model.py").write_text("x = 1\n", encoding="utf-8")
+            (source_dir / "._model.py").write_bytes(b"AppleDouble metadata")
+            (source_dir / ".DS_Store").write_bytes(b"Finder metadata")
+
+            files = MODULE.collect_local_files(root, max_bytes=1024)
+
+            self.assertEqual(set(files), {"agent_ppo/model.py"})
+
 
 class AuthInvalidationTests(unittest.TestCase):
     def _run_auth_failure(self, argv):

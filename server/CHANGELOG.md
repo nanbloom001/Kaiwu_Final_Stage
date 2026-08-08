@@ -4,6 +4,12 @@
 
 ## [未发布]
 
+- **[Kaiwu WebIDE 传输恢复]** 恢复历史提交中已验证的
+  `shared/tools/tencent_kaiwu_webide_upload.mjs`，用于通过已登录 WebIDE 的
+  Remote 文件协议上传模型制品；源码仍只通过受限 RPC bundle 同步。`local_sync_client`
+  现在跳过 macOS `.DS_Store` 与 `._*` AppleDouble 元数据，避免把 Finder 旁路文件
+  当作 Python/TOML 输入同步到 Linux 容器。该项不改变训练、奖励、网络或部署合同。
+
 - **[P4 stable-direction profile assembly]** 平台唯一实际加载的
   `train_env_conf_track_p4_nav_ppo.toml` 现在指向八小时
   `maze_stable_direction_8h`，不再静默落到旧的 instant-repair profile。

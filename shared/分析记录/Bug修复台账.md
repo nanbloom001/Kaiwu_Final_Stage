@@ -4769,3 +4769,35 @@
 - 后续最短检查路径：先确认 `reward_*_eligible` 非零且 `reward_*_applied` 非零，再检查
   cap-hit、reward conservation 和 target→exec 链；若 applied 仍为零，优先查 profile 合同
   是否正确加载，不先增大学习率或修改动作 limiter。
+
+## BUG-20260808-002：开发容器重启后缺失 WebIDE 模型传输模块，并同步了 macOS 元数据
+
+- 日期：2026-08-08；状态：容器已验证；影响范围：开发容器的源码同步、父 checkpoint
+  准备和 P4 最小 smoke。训练策略、`BaseEnv`、Actor85、奖励与部署接口不受影响。
+- 用户可见症状：仓库文档引用
+  `shared/tools/tencent_kaiwu_webide_upload.mjs`，但当前 P4 worktree 没有该文件，导致
+  不能使用预期的 VSCode Remote 模型上传通道。此前一次源码 bundle 还把 macOS
+  `._train_env_conf_track_p4_nav_ppo.toml` 同步到容器，使 TOML 遍历误读 AppleDouble
+  二进制元数据。
+- 根因：工具文件曾存在于可达历史提交 `a6927b29c8775f0fa3aeb362b9ec5e88b8f7f39e`，
+  但未被后续分支带入；同步排除规则只覆盖缓存、模型和平台托管路径，没有排除 Finder
+  元数据。两者均是开发同步链问题，不是模型 ID、模型 SHA、P4 checkpoint 合同或 Isaac
+  环境本身的问题。
+- 修复：从该历史提交精确恢复 `shared/tools/tencent_kaiwu_webide_upload.mjs`；
+  `server/local_sync_client.py` 明确跳过 `.DS_Store` 与 `._*`，并新增
+  `test_collect_local_files_ignores_macos_metadata`。模型制品优先使用已登录 WebIDE 的
+  文件协议，源码继续使用 RPC；容器重启后先验证一个会删除的 26-byte 文件上传，再上传
+  大模型，避免把远程文件系统尚未重连误判为路径缺失。
+- 容器验证：恢复的工具已成功启动 `conf/start_tongbu.sh`、通过 double-SHA256 完成小文件
+  round-trip。父 ZIP `p4maze8h10hz_1416926.zip` 在容器中 SHA256 为
+  `106908c8830f4fc7989125372f6ed397366f7ca1b4aac071128dccf71add0f6c`；其内部
+  `model.ckpt-mazefinal-1416926.pkl` 已原子解出并校验 SHA256
+  `0bf54e3c18e6450492d7c1d44d69596d79beddbebb57166432220f8cb93dd2e4`。同步后
+  Python 编译和活动 TOML 解析通过。采用 Isaac Sim Python 并显式注入 IsaacLab/Unitree
+  源码路径的 8-env smoke 完成 `valid_ticks=256`、PPO iteration、平台 checkpoint save；
+  fresh-process 加载该 checkpoint 返回 `p4_exact_resume_history_reset`。同一 checkpoint
+  的 Standard 装配只加载低层，Track 装配加载完整高低层。
+- 遗留风险与回滚：WebIDE 容器重启后的 Remote 文件系统可能在数十秒内尚未可写；先运行
+  小文件 round-trip，失败时等待重连后重试，不能退回通用 RPC 传模型。容器回收会清除
+  临时 smoke 产物，下一次先重建源码 bundle 并复核模型 ZIP；不得删除用户保留的父 ZIP。
+  回滚为删除恢复的工具并撤销元数据排除规则，但会重新暴露上述传输和污染风险。

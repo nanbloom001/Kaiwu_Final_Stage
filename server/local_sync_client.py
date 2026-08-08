@@ -149,6 +149,10 @@ def should_skip(path: Path, root: Path, max_bytes: int) -> bool:
     rel = path.relative_to(root)
     if is_protected_sync_path(rel.as_posix()):
         return True
+    # macOS may materialize Finder metadata alongside otherwise valid source
+    # files.  These are opaque AppleDouble payloads, not repository inputs.
+    if path.name == ".DS_Store" or path.name.startswith("._"):
+        return True
     if any(part in SKIP_DIR_NAMES for part in rel.parts):
         return True
     if path.name.endswith(".sync-tmp"):
