@@ -21,14 +21,14 @@ import json
 import math
 import os
 import re
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-from browser_auth import agent_browser_env
+from browser_auth import agent_browser_command
+from browser_auth import default_session_from_env, default_session_name_from_env
 
 
 ROOT = Path(__file__).resolve().parent
@@ -37,8 +37,8 @@ RUNTIME_DIR = Path(
 ).expanduser().resolve() / "overview_capture"
 SESSIONS_DIR = RUNTIME_DIR / "sessions"
 
-DEFAULT_SESSION = os.environ.get("AGENT_BROWSER_SESSION", "tencent-arena")
-DEFAULT_SESSION_NAME = os.environ.get("AGENT_BROWSER_SESSION_NAME", DEFAULT_SESSION)
+DEFAULT_SESSION = default_session_from_env()
+DEFAULT_SESSION_NAME = default_session_name_from_env(DEFAULT_SESSION)
 
 MONITOR_URL_HINT = "/p/v5/exp/monitor"
 OVERVIEW_TAB = "监控总览"
@@ -138,10 +138,9 @@ def decode_output(data: bytes) -> str:
 
 
 def run_agent_browser(args: list[str], session: str, session_name: str, timeout: int = 30) -> str:
-    env = agent_browser_env(session, session_name)
-    executable = shutil.which("agent-browser") or shutil.which("agent-browser.cmd") or "agent-browser"
+    command, env = agent_browser_command(args, session, session_name)
     proc = subprocess.run(
-        [executable] + args,
+        command,
         cwd=str(ROOT),
         env=env,
         capture_output=True,
