@@ -3,8 +3,7 @@ set -euo pipefail
 
 TOOL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-export AGENT_BROWSER_SESSION="${AGENT_BROWSER_SESSION:-tencent-arena}"
-export AGENT_BROWSER_SESSION_NAME="${AGENT_BROWSER_SESSION_NAME:-$AGENT_BROWSER_SESSION}"
+eval "$(python3 "$TOOL_DIR/browser_auth.py" shell-env)"
 
 if [[ -n "${MONITOR_URL:-}" ]]; then
   set -- --monitor-url "$MONITOR_URL" "$@"

@@ -6,7 +6,7 @@
 
 ## 适用范围
 
-- 复用已经登录腾讯竞技平台的 `agent-browser` 会话。
+- 复用已经登录腾讯竞技平台的 `agent-browser` 会话和本地持久化浏览器 profile。
 - 采集“监控总览”中按需加载的指标卡片。
 - 采集“训练日志”及重要错误、告警和训练状态记录。
 - 导出 `GetTrainMetricRange`、`GetTrainLog` 前端请求。
@@ -17,15 +17,55 @@
 
 - Python 3.9 或更高版本。
 - `agent-browser` 命令已经安装并位于 `PATH`。
-- `agent-browser` 中已有登录成功的腾讯竞技平台会话。
-- 当前标签页已经打开目标训练任务的监控页面。
+- 首次运行时在可视化 `agent-browser` 窗口中完成一次腾讯竞技平台登录。
+- 当前标签页已经打开目标训练任务的监控页面，或运行时显式传入监控 URL。
 
-默认会话名为 `tencent-arena`，也可以通过环境变量覆盖：
+默认会话名为 `tencent-arena-persistent-v2`，也可以通过环境变量覆盖：
 
 ```bash
-export AGENT_BROWSER_SESSION=tencent-arena
-export AGENT_BROWSER_SESSION_NAME=tencent-arena
+export AGENT_BROWSER_SESSION=tencent-arena-persistent-v2
+export AGENT_BROWSER_SESSION_NAME=tencent-arena-persistent-v2
 ```
+
+### 登录状态持久化
+
+工具默认把独立 Chrome profile 保存在：
+
+```text
+shared/arena_frontend_monitor/runtime/browser_profile/
+```
+
+该目录会保存 Cookie、localStorage 等登录状态，并已被 Git 忽略。第一次使用
+`manual_metric_recorder.sh` 时正常登录一次；以后使用同一 profile 的采集命令会自动复用登录态，
+不需要再次输入密码。平台主动让会话过期时，才需要重新登录。
+
+新版使用独立的 `tencent-arena-persistent-v2` 会话，避免复用升级前已经启动、仍绑定临时
+Chrome 目录的旧 `tencent-arena` daemon。旧窗口不需要强制关闭；第一次运行新版手动入口时
+登录一次即可。确认新版稳定后，可在旧会话没有采集任务时执行
+`agent-browser --session tencent-arena close`。
+
+如果本地旧 `.env` 仍把 session 和 session-name 写成 `tencent-arena`，工具会自动迁移到 v2
+并在终端打印提示。只有确实需要操作旧 daemon 时才设置
+`AGENT_BROWSER_ALLOW_LEGACY_SESSION=1`；普通抓取不要设置该兼容开关。
+
+需要自定义位置时，可创建仅保存在本机的配置：
+
+```bash
+cp shared/arena_frontend_monitor/.env.example \
+  shared/arena_frontend_monitor/.env
+```
+
+然后修改 `.env` 中的 `AGENT_BROWSER_PROFILE`。仓库内路径必须位于已忽略的 `runtime/` 下，
+相对路径以本工具目录为基准；也可以使用仓库外的绝对路径。工具会拒绝把 profile 写入其他
+仓库目录，避免 Cookie 作为普通未跟踪文件出现。所有 Python 和 shell 入口都会自动读取该文件，已存在的进程环境变量优先于
+`.env`。不要在 `.env` 中保存密码或粘贴原始 Cookie；profile 本身已经负责安全地保存浏览器
+登录状态。
+
+所有入口默认统一使用 headed 模式，并把 session、session-name 和 profile 作为显式
+`agent-browser` 命令行参数传入，
+不会只依赖已有 daemon 的启动环境。手动入口启动时还会打印实际 session 和 profile 路径；若
+输出不是上述 `runtime/browser_profile/` 或你在 `.env` 中指定的绝对路径，应先停止采集并检查
+环境变量覆盖。
 
 先执行不会打开、切换或刷新网页的离线检查：
 
@@ -35,7 +75,7 @@ python3 shared/arena_frontend_monitor/network_export.py --check
 
 该检查只验证 Python、`agent-browser --version`、各配套 CLI 的 `--help`、固定
 HAR fixture 解析和输出目录可写性。
-它不验证腾讯登录态；真实采集前仍需人工打开并登录目标监控页面。
+它不验证腾讯登录态；首次真实采集仍需人工打开并登录目标监控页面，后续会复用本地 profile。
 
 ## 推荐用法
 
@@ -166,7 +206,8 @@ export ARENA_MONITOR_RUNTIME_DIR="$HOME/arena-monitor-runtime"
 
 - 不要把平台 Token、Cookie、HAR、训练日志或采集结果提交到 Git。
 - 监控 URL 可能包含任务标识或查询参数，只应通过命令行或环境变量临时传入。
-- 工具复用现有登录会话，不负责保存或分发登录凭据。
+- 工具在本机 Git 忽略目录中保存独立浏览器 profile，不保存明文密码，也不分发登录凭据。
+- `runtime/browser_profile/` 和 `.env` 都属于敏感本地状态，不要复制到共享目录或提交到 Git。
 - 页面结构变化后，自动点击和滚动选择器可能需要同步调整。
 - 采集过程中不要同时让其他程序控制同一个 `agent-browser` 会话。
 - 训练已停止时，页面可能需要先启用“每 5 秒自动刷新”才能重新请求历史指标。
