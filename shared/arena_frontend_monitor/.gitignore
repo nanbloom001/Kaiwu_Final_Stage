@@ -1,4 +1,7 @@
 runtime/
+.env
+.env.*
+!.env.example
 *.har
 *.log
 __pycache__/

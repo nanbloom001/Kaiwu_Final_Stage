@@ -23,6 +23,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from browser_auth import agent_browser_command
+from browser_auth import default_session_from_env, default_session_name_from_env
+
 
 ROOT = Path(__file__).resolve().parent
 RUNTIME_DIR = Path(
@@ -32,8 +35,8 @@ NETWORK_DIR = RUNTIME_DIR / "network_capture"
 SESSIONS_DIR = NETWORK_DIR / "sessions"
 INDEX_JSONL = NETWORK_DIR / "index.jsonl"
 
-DEFAULT_SESSION = os.environ.get("AGENT_BROWSER_SESSION", "tencent-arena")
-DEFAULT_SESSION_NAME = os.environ.get("AGENT_BROWSER_SESSION_NAME", DEFAULT_SESSION)
+DEFAULT_SESSION = default_session_from_env()
+DEFAULT_SESSION_NAME = default_session_name_from_env(DEFAULT_SESSION)
 
 MONITOR_URL_HINT = "/p/v5/exp/monitor"
 IDE_URL_HINT = "/p/common/competition/ide/"
@@ -89,11 +92,7 @@ def decode_output(data: bytes) -> str:
 
 
 def run_agent_browser(args: list[str], session: str, session_name: str, timeout: int = 30) -> str:
-    env = os.environ.copy()
-    env["AGENT_BROWSER_SESSION"] = session
-    env["AGENT_BROWSER_SESSION_NAME"] = session_name
-    executable = shutil.which("agent-browser") or shutil.which("agent-browser.cmd") or "agent-browser"
-    cmd = [executable] + args
+    cmd, env = agent_browser_command(args, session, session_name)
     proc = subprocess.run(
         cmd,
         cwd=str(ROOT),
