@@ -19,8 +19,9 @@ Examples:
   shared/arena_frontend_monitor/manual_metric_recorder.sh 'https://tencentarena.com/p/v5/exp/monitor?...' --poll-interval 1
 
 Environment:
-  AGENT_BROWSER_SESSION       Default: tencent-arena
+  AGENT_BROWSER_SESSION       Default: tencent-arena-persistent-v2
   AGENT_BROWSER_SESSION_NAME  Default: same as AGENT_BROWSER_SESSION
+  AGENT_BROWSER_PROFILE       Default: runtime/browser_profile (stores login locally)
   AGENT_BROWSER_HEADED        Default: 1
 EOF
 }
@@ -63,21 +64,28 @@ if [[ "$MONITOR_URL" != http://* && "$MONITOR_URL" != https://* ]]; then
   exit 2
 fi
 
-export AGENT_BROWSER_SESSION="${AGENT_BROWSER_SESSION:-tencent-arena}"
-export AGENT_BROWSER_SESSION_NAME="${AGENT_BROWSER_SESSION_NAME:-$AGENT_BROWSER_SESSION}"
-export AGENT_BROWSER_HEADED="${AGENT_BROWSER_HEADED:-1}"
+eval "$(python3 "$TOOL_DIR/browser_auth.py" shell-env)"
 
 if ! command -v agent-browser >/dev/null 2>&1; then
   echo "missing agent-browser command on PATH" >&2
   exit 127
 fi
 
-echo "[manual_metric_recorder] opening new headed browser tab session=${AGENT_BROWSER_SESSION}"
+AGENT_BROWSER_CMD=(
+  agent-browser
+  --session "$AGENT_BROWSER_SESSION"
+  --session-name "$AGENT_BROWSER_SESSION_NAME"
+  --profile "$AGENT_BROWSER_PROFILE"
+)
+
+echo "[manual_metric_recorder] session=${AGENT_BROWSER_SESSION}"
+echo "[manual_metric_recorder] profile=${AGENT_BROWSER_PROFILE}"
+echo "[manual_metric_recorder] opening new headed browser tab"
 # Clear stale requests before opening the target page.  The recorder itself
 # still runs with --no-clear-network, so requests loaded between page open and
 # pressing Enter are preserved.
-agent-browser network requests --clear >/dev/null || true
-agent-browser tab new "$MONITOR_URL"
+"${AGENT_BROWSER_CMD[@]}" network requests --clear >/dev/null || true
+"${AGENT_BROWSER_CMD[@]}" tab new "$MONITOR_URL"
 
 cat <<EOF
 

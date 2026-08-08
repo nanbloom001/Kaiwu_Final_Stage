@@ -2,7 +2,7 @@
 
 > 维护规则：本文件是仓库级 Bug 根因与修复知识库，长期追加，不按训练阶段另起一份。
 > `server/CHANGELOG.md` 记录“改了什么”，本文件记录“为什么坏、如何证明修好、如何防复发”。
-> 最近更新：2026-08-07。
+> 最近更新：2026-08-08。
 
 ## 1. 使用方法
 
@@ -4801,3 +4801,41 @@
   小文件 round-trip，失败时等待重连后重试，不能退回通用 RPC 传模型。容器回收会清除
   临时 smoke 产物，下一次先重建源码 bundle 并复核模型 ZIP；不得删除用户保留的父 ZIP。
   回滚为删除恢复的工具并撤销元数据排除规则，但会重新暴露上述传输和污染风险。
+
+## BUG-20260808-003：Arena 抓取窗口绑定临时 Chrome profile 导致重复登录
+
+- 状态：本地已验证。
+- 影响：`shared/arena_frontend_monitor` 的网页抓取登录态；不影响训练、评估、checkpoint、
+  部署或 server-deploy 接口。
+- 首次发现：2026-08-08；本地 `tencent-arena` daemon PID 2315 启动于 2026-08-02，平台任务、
+  模型 ID 和 checkpoint 不适用。
+- 症状：每次新开抓取窗口仍需重新输入腾讯竞技平台密码。仓库下虽存在约 43 MB 的
+  `runtime/browser_profile` 和 `Default/Cookies`，当前 Chrome 实际使用
+  `/var/folders/.../agent-browser-chrome-<uuid>` 临时 `--user-data-dir`；持久 profile 的 Cookie
+  最后写入停在 2026-08-03，当前临时 Cookie 在 2026-08-08 更新且内容不同。
+- 根因：持久化提交 `563fee0` 只存在于 `codex/p35-gaitfix2h`，此前未进入 `main`。该版本即使
+  使用时也继续沿用旧 `tencent-arena` session；诊断时实际运行的主线脚本没有 profile 配置，
+  当前 Chrome 因而仍绑定临时目录。shell 直接 source `.env` 还会覆盖调用者显式环境，与
+  Python 的“进程环境优先”语义不一致。`agent-browser 0.26.0` 在 launch hash 改变时可以重启
+  浏览器，因此“环境变量永远不能改变既有 daemon”不是本次确定根因。
+- 排除项：不是 Cookie 原理失效。固定 profile 内存在标准 Chromium Cookie 数据库；问题是当前
+  窗口没有稳定绑定同一持久化上下文。腾讯服务端仍可主动使 Cookie 过期，此时重新登录一次属于
+  正常行为。
+- 修复：主线 PR `#35` 将默认 session 升级为 `tencent-arena-persistent-v2`，绕开遗留 daemon。
+  五个 Python 入口和手动 shell 入口均显式传递 `--session`、`--session-name`、`--profile`；两个
+  shell 入口统一通过 `browser_auth.py shell-env` 解析 `.env`，保持外部环境优先。旧 `.env` 的
+  默认 session 自动迁移到 v2，所有入口统一默认 headed，空 profile 回退到安全目录；仓库内
+  profile 只允许位于 Git 忽略的 `runtime/` 下，仓库外绝对路径仍允许。
+- 验证：本目录全部 Python 文件通过 `py_compile`，两个 shell 入口通过 `bash -n`，18 个单元
+  测试全部通过，`git diff --check` 通过。使用本机 `agent-browser 0.26.0` 和 `example.com` 做两组
+  无敏感数据重启 smoke：`profile + session-name` 关闭/重启后 localStorage 返回
+  `persisted-v2`；仅固定 `profile` 关闭/重启后返回 `profile-only`。旧 `tencent-arena` shell
+  环境自动迁移到 v2；手动 recorder Python 入口启动 headed 会话后，frontend monitor Python
+  入口继续读取同一标签页。未使用用户腾讯账号执行真实登录 E2E；平台 Cookie 主动到期仍需重登。
+- 防复发：单元测试固定新 session 名，并断言显式认证选项、环境优先级、安全 profile 路径、
+  `0700` 权限和旧 session 迁移。再次遇到时先看启动日志 profile，再看 Chrome
+  `--user-data-dir` 与 Cookie mtime，最后检查腾讯服务端 Cookie 到期；不要只看目录是否存在。
+- 血缘：主线 squash commit `b08fa6c`、PR `#35`；当前集成分支
+  `codex/arena-auth-persistence-p4`，目标 `codex/p4maze-stable-direction`。不涉及父模型、
+  checkpoint、制品 SHA256、容器同步或真机验证；P4 训练代码与验证记录保持不变。
+- 回滚：回滚本工具提交即可；不得删除用户已有 `runtime/browser_profile`、`.env` 或浏览器凭据。
