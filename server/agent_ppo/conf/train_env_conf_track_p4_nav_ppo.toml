@@ -1,4 +1,4 @@
-# P4 stable-direction eight-hour Maze training over the verified parent.
+# P4 stable-direction 30-minute reward-credit smoke over the verified parent.
 
 [env]
 num_envs = 128
@@ -71,18 +71,18 @@ max_depth = 5.0
 enabled = false
 
 [p4_nav_ppo]
-run_name = "p4maze8h-stable-direction"
+run_name = "p4maze30m-stable-smoke"
 # Model ID selects the intended parent candidate; structure/spec/shape/finite
 # validation remains authoritative after selection.
 parent_model_id = 1416926
 parent_model_label = "p4maze8h10hz_1416926-mazefinal"
-training_profile = "maze_stable_direction_8h"
-# All 28,800 seconds are effective training. The 0.25 hour margin is reserved
+training_profile = "maze_stable_direction_smoke"
+# The smoke has 1,800 effective seconds. The 0.25 hour margin is reserved
 # for checkpoint/save/normal shutdown only.
-task_end_hours = 8.25
-target_effective_seconds = 28800
+task_end_hours = 0.75
+target_effective_seconds = 1800
 diagnostic_seconds = 0
-maze_training_branch = "stable_direction_8h"
+maze_training_branch = "stable_direction_smoke"
 nav_rollout_ticks = 32
 nav_period_frames = 5
 tbptt_sequence_length = 16
