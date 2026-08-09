@@ -1,7 +1,7 @@
 # Experiment outputs and large model artifacts
+# Trained model weights are not tracked; obtain per ARTIFACTS.md SHA256.
 /logs/
 /models/*
-!/models/model.ckpt-vision-378413.pkl
 /deploy_loco_backups
 
 # Runtime-generated policy data

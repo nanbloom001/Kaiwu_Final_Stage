@@ -1,8 +1,23 @@
 # Kaiwu Final Stage
 
-腾讯开悟四足机器人自主导航赛题的训练与 Sim-to-Real 部署仓库，面向 Unitree Go2、Intel RealSense D435i 和 Jetson 部署环境。
+> **English**: Training and Sim2Real deployment codebase for a quadruped-robot autonomous-navigation competition, targeting Unitree Go2 + Intel RealSense D435i + Jetson. PPO teacher policies with privileged height-scan observations are distilled into depth-image vision student policies, exported to ONNX, and run in real time on-robot. Documentation is primarily in Chinese; see the glossary below.
 
-本仓库同时维护服务器训练工程、真机部署工程、跨端接口资料与历史归档。训练端和部署端各自独立运行，通过明确的模型、观测和制品契约保持一致。
+腾讯开悟四足机器人自主导航赛题（[Tencent Kaiwu](https://kaiwu.tencent.com/) Legged Robot Competition）的训练与 Sim2Real 部署仓库，面向 Unitree Go2、Intel RealSense D435i 和 Jetson 部署环境。
+
+本仓库同时维护服务器训练工程、真机部署工程、跨端接口资料与历史归档。训练端和部署端各自独立运行，通过明确的模型、观测和制品契约保持一致。本项目以 [MIT 许可证](./LICENSE) 开源。
+
+## 术语表
+
+| 名称 | 含义 |
+|---|---|
+| **fwwb** | 仓库工作目录名（"fwwb-Final"）；GitHub 仓库为 `Kaiwu_Final_Stage`，两者指同一项目 |
+| **Kaiwu / 开悟** | [腾讯开悟](https://kaiwu.tencent.com/) 强化学习竞赛与训练平台，本项目训练运行其上 |
+| **Sim2Real** | Simulation-to-Real，把仿真训练的策略迁移到真机运行 |
+| **PPO** | Proximal Policy Optimization，本项目主干强化学习算法 |
+| **LBC / 蒸馏** | Learning By Cheating / behavior distillation，把教师特权信息蒸馏到视觉学生模型 |
+| **Actor77 / Actor80** | 两种部署模型契约：Actor77 = Standard（无 goal），Actor80 = Track（带 goal），不可混用 |
+| **Go2** | Unitree Go2 四足机器人，本项目的真机平台 |
+
 
 ## 项目目标
 
@@ -114,6 +129,8 @@ cd deploy/sim2real_test_loco
 - 相机标定、命令来源和最近一次验证结果。
 
 Git LFS pointer 只是制品引用，不是真实 checkpoint、ONNX 或动态库。部署前必须检查实际文件类型、大小和 SHA256，不能把百字节左右的 pointer 当成可加载模型。
+
+**训练得到的模型权重（`.pkl` / `.pth` / `.onnx`）不入库**：它们体积大且属训练成果，已通过 `.gitignore` 排除。部署时按对应 `ARTIFACTS.md` 记录的 SHA256 自行获取或导出。
 
 ## 重要说明
 

@@ -2,7 +2,7 @@
 
 ## Baseline
 
-- Code baseline: `/Users/cheng/Downloads/st7.zip`.
+- Code baseline: the ST7 source archive (`st7.zip`).
 - Parent checkpoint: the original ST7 checkpoint corresponding to `logs-595320`.
 - Training entry: `TrackNavConfig` (`name = "nav"`).
 - Learning rate: `1.5e-5`.
