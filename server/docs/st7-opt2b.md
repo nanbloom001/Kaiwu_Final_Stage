@@ -2,7 +2,7 @@
 
 ## Baseline
 
-- Code baseline: the clean ST7 source restored from `/Users/cheng/Downloads/st7.zip`.
+- Code baseline: the clean ST7 source restored from the ST7 source archive (`st7.zip`).
 - Parent checkpoint: the exact original ST7 checkpoint evaluated in `logs-595320`.
 - Training entry: `TrackNavConfig` (`name = "nav"`).
 - Do not continue from an Opt2A or Opt1A checkpoint.

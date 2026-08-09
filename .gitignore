@@ -5,7 +5,6 @@
 /.zcode/
 __pycache__/
 *.py[cod]
-kaiwu_ide_crack/
 
 # 迁移前保留在仓库根目录的本地工作副本。
 # 正式内容分别位于 archive/unitree_isaaclab_deploy/、archive/代码存档/ 和 shared/分析记录/。
@@ -19,3 +18,19 @@ kaiwu_ide_crack/
 
 # Local evaluation recordings are evidence artifacts, not source files.
 /shared/视频存档/
+
+# Trained model weights / checkpoints / exported artifacts are not tracked.
+# Obtain them per the SHA256 in each deploy/<route>/ARTIFACTS.md instead.
+**/models/*.pkl
+**/models/*.pth
+**/models/*.onnx
+**/ckpt/*.pkl
+**/ckpt/*.pth
+**/exported/*.onnx
+
+# Personal career materials (résumé / cold-email / application drafts) must
+# never enter the public repository. Backed up outside the repo before cleanup.
+*保研套磁*
+*履历原始材料*
+*简历要点*
+*比赛文书*

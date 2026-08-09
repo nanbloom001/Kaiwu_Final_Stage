@@ -45,7 +45,7 @@
 
 - **迁移分支**：`codex/repository-layout-migration`；实时 tip 以 PR #1 head 和 `git ls-remote` 为准
 - **结构**：`server/`(108 文件) / `shared/`(42) / `archive/`(444) / `deploy/`(439) + 根 README+.gitignore
-- **worktree**：`/Users/nanbloom001/codespace/fwwb-migration`（迁移分支）；主仓 `/Users/nanbloom001/codespace/fwwb-Final` 保持在 `main`，未跟踪文件未动
+- **worktree**：本地 `fwwb-migration` worktree（迁移分支）；主仓保持在 `main`，未跟踪文件未动
 - **基线**：`server/` = ST7-Opt3 + J9 接口修复（latent，TrackNav 保自适应 1.5e-5）+ Opt4 角速度调整
 
 ## 4. 关键决策与注意事项
@@ -118,4 +118,4 @@ git push origin --delete deploy/jetson-sim2real codex/repository-layout-migratio
 - `shared/分析记录/版本训练演进与改动规模详解.md`（各版本训练演进与改动规模）
 - `shared/interfaces/server-deploy-contract.md`（stub，待人工填充 server↔deploy 契约）
 
-**回滚**：迁移在独立 worktree/分支完成，未合入 main 前可 `git worktree remove /Users/nanbloom001/codespace/fwwb-migration` 放弃；合入后用 `git revert`（deploy subtree 用 `git revert -m 1`），禁 reset/rebase/force-push。
+**回滚**：迁移在独立 worktree/分支完成，未合入 main 前可 `git worktree remove <migration-worktree>` 放弃；合入后用 `git revert`（deploy subtree 用 `git revert -m 1`），禁 reset/rebase/force-push。

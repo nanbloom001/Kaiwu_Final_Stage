@@ -12,8 +12,8 @@
 | 迁移分支 | `codex/repository-layout-migration` |
 | 起点（server 基线） | `origin/codex/st7-opt3` = `9b0b3df4172f7e0e1ca17b367e44ada23b9a891b` |
 | 原 `main` HEAD | `042a1f883801d1d859106fcab07c8ffae2ced9d5` |
-| 迁移 worktree | `/Users/nanbloom001/codespace/fwwb-migration` |
-| 原工作区 | `/Users/nanbloom001/codespace/fwwb-Final`（保持在 `main`，未跟踪文件未动） |
+| 迁移 worktree | 本地 `fwwb-migration` worktree |
+| 原工作区 | 本地仓库检出（保持在 `main`，未跟踪文件未动） |
 | 迁移方式 | `git mv` 整体移动 + J9/Opt4 移植 + 新增文档；不重写历史、不 force-push |
 | 迁移内容状态 | ✅ 四层重构、J9 接口修复、Opt4 移植、deploy subtree、资料归档均已完成 |
 
