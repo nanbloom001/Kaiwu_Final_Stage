@@ -34,3 +34,8 @@ __pycache__/
 *履历原始材料*
 *简历要点*
 *比赛文书*
+
+# Local agent/IDE caches and scratch dirs.
+.claude/
+.pytest_cache/
+/tmp/
