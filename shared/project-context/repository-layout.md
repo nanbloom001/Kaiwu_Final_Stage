@@ -1,11 +1,11 @@
 # 仓库布局说明
 
-> 本文件说明 Kaiwu_Final_Stage 仓库的四层目录结构与迁移背景。
+> 本文件说明 kaiwu-final-sim2real 仓库的四层目录结构与迁移背景。
 
 ## 四层结构
 
 ```text
-Kaiwu_Final_Stage/
+kaiwu-final-sim2real/
 ├── README.md
 ├── .gitignore              # 仓库级规则
 ├── server/                 # 训练运行时（Opt3 基线 + J9 接口 + Opt4）
