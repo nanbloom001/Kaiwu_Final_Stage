@@ -10,7 +10,10 @@
 
 ## 项目展示
 
-<!-- TODO：补充 GIF / 视频 / 真机图片 -->
+| | |
+|---|---|
+| <img src="docs/images/demo-01.gif" width="426" alt="演示动图 1"> | <img src="docs/images/demo-02.gif" width="426" alt="演示动图 2"> |
+| <img src="docs/images/demo-03.gif" width="426" alt="演示动图 3"> | <img src="docs/images/demo-04.gif" width="426" alt="演示动图 4"> |
 
 ---
 
