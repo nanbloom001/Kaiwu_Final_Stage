@@ -1,11 +1,11 @@
-# Kaiwu_Final_Stage 仓库迁移 - 交接状态（供审查）
+# kaiwu-final-sim2real 仓库迁移 - 交接状态（供审查）
 
 > 生成：2026-07-21。本文件自包含，供另一 AI / 审查者接手审查与完成剩余工作。
 > 源规约：本仓库 `shared/分析记录/版本训练演进与改动规模详解.md` 与本目录 `branch-migration-register.md`、`repository-layout.md`。分支实时 SHA 以 `git ls-remote origin` 为准，本文件不把自身提交 SHA 当作长期状态字段。
 
 ## 1. 项目与目标
 
-- **仓库**：https://github.com/nanbloom001/Kaiwu_Final_Stage （腾讯开悟四足机器人自主导航 Sim2Real 决赛；Unitree Go2 + Isaac Lab；track 导航 + standard 运控 + 蒸馏/Sim2Real）
+- **仓库**：https://github.com/nanbloom001/kaiwu-final-sim2real （腾讯开悟四足机器人自主导航 Sim2Real 决赛；Unitree Go2 + Isaac Lab；track 导航 + standard 运控 + 蒸馏/Sim2Real）
 - **目标**：① 仓库重构为四层（`server/` 训练运行时 / `deploy/` 真机部署 / `shared/` 规则+分析+契约 / `archive/` 历史快照）；② 分支治理——保留重大改动节点作 tag 或活动实验分支，删除散落的历史记录分支。
 - **关键事实**：原 `main` = `042a1f8`（初始决赛代码，仅 1 提交）；远程主干 = `codex/st7-opt3`(`9b0b3df`) 及其后续。`main` 是迁移分支的祖先（fast-forward 可行，但应走 PR merge commit）。
 
@@ -29,7 +29,7 @@
 
 **7 个 tag 已推送 origin**：`stage3i2-nogate-safe-60m`(d777c1f)、`stage3j4-neargoal-rejected`(d372dce)、`st7-opt2a-baseline-rewrite`(09d88e7)、`st7-opt3-server-baseline`(9b0b3df)、`st7-opt5-hard-start-replay`(b81cbf4)、`st7-opt5-debug-hard-start-diagnostics`(9570780)、`st9-opt3-d1-vision-distill`(5ea7ba9)
 
-**PR**：https://github.com/nanbloom001/Kaiwu_Final_Stage/pull/1 （**draft**，未合并）
+**PR**：https://github.com/nanbloom001/kaiwu-final-sim2real/pull/1 （**draft**，未合并）
 
 **静态验证基线**：
 - `bash -n` 部署脚本 22/22 通过

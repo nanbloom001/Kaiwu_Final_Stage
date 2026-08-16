@@ -1,4 +1,4 @@
-# Kaiwu_Final_Stage 仓库协作与版本管理规范
+# kaiwu-final-sim2real 仓库协作与版本管理规范
 
 本规范面向第一次参与 Git 协作的成员和 AI Agent。它说明什么时候更新 `main`、如何安全同步、怎样提交实验，以及训练端和部署端同时修改时如何避免覆盖彼此的工作。
 
@@ -221,7 +221,7 @@ PR 描述必须记录：
 CANDIDATE_SHA=$(git rev-parse origin/<功能分支>)
 
 gh pr merge <PR编号> \
-  --repo nanbloom001/Kaiwu_Final_Stage \
+  --repo nanbloom001/kaiwu-final-sim2real \
   --squash \
   --match-head-commit "$CANDIDATE_SHA" \
   --delete-branch
@@ -236,7 +236,7 @@ gh pr merge <PR编号> \
 ```bash
 git fetch --all --prune
 gh pr view <PR编号> \
-  --repo nanbloom001/Kaiwu_Final_Stage \
+  --repo nanbloom001/kaiwu-final-sim2real \
   --json state,mergedAt,mergeCommit
 git log -1 --oneline origin/main
 ```
