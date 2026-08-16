@@ -12,8 +12,8 @@
 
 | | |
 |---|---|
-| <img src="docs/images/demo-01.gif" width="426" alt="演示动图 1"> | <img src="docs/images/demo-02.gif" width="426" alt="演示动图 2"> |
-| <img src="docs/images/demo-03.gif" width="426" alt="演示动图 3"> | <img src="docs/images/demo-04.gif" width="426" alt="演示动图 4"> |
+| <img src="docs/images/demo-01.gif" width="320" alt="演示动图 1"> | <img src="docs/images/demo-02.gif" width="320" alt="演示动图 2"> |
+| <img src="docs/images/demo-03.gif" width="320" alt="演示动图 3"> | <img src="docs/images/demo-04.gif" width="320" alt="演示动图 4"> |
 
 ---
 
