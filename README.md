@@ -64,9 +64,25 @@
 
 ## 系统架构
 
-<!-- TODO：补充系统架构图（建议采用横向三段流：训练 server/ → ONNX 导出 → 部署 deploy/，底部以接口契约虚线约束两端） -->
+```mermaid
+graph LR
+  subgraph TRAIN["训练端 server/"]
+    A["仿真环境<br/>Isaac Lab 特权观测"] --> B["特权教师 PPO<br/>高度扫描输入"]
+    B --> C["蒸馏管线<br/>LBC / DAgger / 视觉 PPO"]
+    C --> D["深度视觉学生<br/>低层运控 · depth→CNN→LSTM"]
+    F["高层导航策略<br/>PPO / DAgger"] --> D
+    D --> E["版本化 checkpoint<br/>kaiwu_train_v1"]
+  end
+  subgraph DEPLOY["部署端 deploy/"]
+    G["ONNX 导出<br/>数值对拍验证"] --> H["Go2 / Jetson 真机推理<br/>50Hz C++ · LSTM 回喂"]
+  end
+  E --> G
+  S["D435i + UWB / 固定指令<br/>传感器输入"] -.-> H
+  I["接口契约<br/>server-deploy-contract"] -. 约束 .-> E
+  I -. 约束 .-> G
+```
 
----
+> 主链路：特权仿真训练 → 蒸馏得到深度视觉学生 → 版本化 checkpoint 导出 ONNX 并通过数值对拍 → Go2 / Jetson 50Hz 真机推理；高层导航策略经指令链路驱动低层视觉运控，两端以接口契约约束一致性。
 
 ## 关键问题
 
