@@ -1,8 +1,15 @@
 # Kaiwu Final Stage · 四足机器人自主导航与 Sim2Real 部署
 
-面向腾讯开悟四足机器人自主导航赛题的训练与部署项目：在仿真中用高度扫描等特权观测训练 PPO 教师策略，蒸馏为以 RealSense D435i 深度图像为输入的视觉学生策略，导出 ONNX 后在 Unitree Go2 / Jetson 上实时推理。项目已完成首次真机行走验证，并沉淀出训练-部署接口契约、版本化 checkpoint 与分级验证体系。
+本项目面向四足机器人自主导航，构建了一条从特权仿真训练到真机部署的完整 Sim-to-Real 管线：
 
-**平台：** Unitree Go2 · Intel RealSense D435i · Jetson（ONNX Runtime）· 腾讯开悟（Isaac Lab）
+- 在腾讯开悟的 Isaac Lab 仿真环境中，用高度扫描等特权观测训练 PPO 教师策略；
+- 通过行为蒸馏 / LBC，把教师能力迁移到以 D435i 深度图像为输入的视觉学生策略；
+- 将视觉学生导出为 ONNX，经 Python↔ONNX 数值对拍验证后随部署配置下发；
+- 部署到 Unitree Go2 + Jetson，由 50 Hz C++ 运行时实时推理并输出 12 维关节动作。
+
+仓库内包含完整的训练 / 蒸馏 / 导出 / 部署代码与全过程分析记录；项目已在 Go2 真机上完成固定指令与 UWB 模式的行走验证，并沉淀出训练-部署接口契约、版本化 checkpoint 与分级验证体系。
+
+**平台：** Unitree Go2 · Intel RealSense D435i · Jetson · 腾讯开悟仿真平台
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -10,10 +17,13 @@
 
 ## 项目展示
 
-| | |
-|---|---|
-| <img src="docs/images/demo-01.gif" width="320" alt="演示动图 1"> | <img src="docs/images/demo-02.gif" width="320" alt="演示动图 2"> |
-| <img src="docs/images/demo-03.gif" width="320" alt="演示动图 3"> | <img src="docs/images/demo-04.gif" width="320" alt="演示动图 4"> |
+<div align="center">
+
+<img src="docs/images/demo-01.gif" width="320" alt="演示动图 1"> <img src="docs/images/demo-02.gif" width="320" alt="演示动图 2">
+
+<img src="docs/images/demo-03.gif" width="320" alt="演示动图 3"> <img src="docs/images/demo-04.gif" width="320" alt="演示动图 4">
+
+</div>
 
 ---
 
@@ -21,24 +31,24 @@
 
 ### 训练：从特权教师到深度视觉学生
 
-- [x] 高度扫描特权教师 PPO，以及行为蒸馏 / LBC / 视觉 PPO 完整蒸馏管线
-- [x] 深度视觉学生（D435i 深度图 → CNN → LSTM → latent32），180×320×1 深度输入
-- [x] 版本化 checkpoint（schema v2，支持阶段 / 时钟 / RNG / 优化器精确恢复）
-- [x] 本地单测回归 165 项通过（平台模块 stub 化），容器 full-smoke 可重复执行
+- [x] 高度扫描特权教师 PPO，以及行为蒸馏 / LBC / 视觉 PPO 蒸馏管线
+- [x] D435i 深度视觉学生，180×320×1 深度输入，depth→CNN→LSTM 编码
+- [x] 版本化 checkpoint，支持阶段 / 时钟 / RNG / 优化器精确恢复
+- [x] 单测回归 165 项通过，容器 full-smoke 可重复执行
 
 ### 部署：Sim2Real 真机闭环
 
-- [x] ONNX 导出与数值对拍（opset 17，tol=1e-4），200 帧 LSTM 状态回灌无 NaN
-- [x] Go2 / Jetson 50Hz C++ 推理运行时（LSTM 逐帧回喂、指令覆写、状态机）
+- [x] ONNX 导出与数值对拍，200 帧 LSTM 状态回灌无 NaN
+- [x] Go2 / Jetson 50Hz C++ 推理运行时，LSTM 逐帧回喂、指令覆写
 - [x] D435i 深度 + UWB / 固定指令多指令源，含 UWB 标定与监控工具
-- [x] 真机行走验证通过，部署制品（checkpoint / ONNX / 二进制）SHA256 清单化管理
+- [x] 真机行走验证通过，部署制品 SHA256 清单化管理
 
 ### 系统扩展与生产化
 
-- [x] 高低层导航架构：高层导航策略 → 有界速度指令 → 低层视觉运控
-- [x] P1.5 低层 PPO 与响应器联合训练（分优化器、分梯度、独立调度）
-- [x] 迷宫导航系列（闭环策略 / 即时指令 / 10Hz 控制 / 卡住恢复）
-- [x] 真机诊断与运行时加固（足底力 / 关节力矩日志、启动平滑、幂等收尾）
+- [x] 高低层导航架构，从高层导航策略到低层视觉运控的指令链路
+- [x] P1.5 低层 PPO 与响应器联合训练，独立优化器与梯度
+- [x] 迷宫导航系列，覆盖闭环策略、即时指令、10Hz 控制与卡住恢复
+- [x] 真机诊断与运行时加固，力矩日志、启动平滑与幂等收尾
 
 ### 下一步
 
