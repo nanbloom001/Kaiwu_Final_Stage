@@ -13,8 +13,8 @@
 
 **🏁 赛程系列仓库**
 
-- [初赛 · kaiwu-prelim-vacuum](https://github.com/nanbloom001/kaiwu-prelim-vacuum)
-- [复赛 · kaiwu-semi-locomotion](https://github.com/nanbloom001/kaiwu-semi-locomotion)
+- [初赛 · kaiwu-prelim-vacuum](https://github.com/nanbloom001/kaiwu-prelim-vacuum) — 清扫大作战 RL 智能体，PPO 学习清扫与自主充电策略
+- [复赛 · kaiwu-semi-locomotion](https://github.com/nanbloom001/kaiwu-semi-locomotion) — Go2 四足仿真训练，PPO 地形穿越与迷宫导航
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
