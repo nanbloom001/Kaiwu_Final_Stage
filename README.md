@@ -11,6 +11,11 @@
 
 **平台：** Unitree Go2 · Intel RealSense D435i · Jetson · 腾讯开悟仿真平台
 
+**🏁 赛程系列仓库**
+
+- [初赛 · kaiwu-prelim-vacuum](https://github.com/nanbloom001/kaiwu-prelim-vacuum)
+- [复赛 · kaiwu-semi-locomotion](https://github.com/nanbloom001/kaiwu-semi-locomotion)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 ---
